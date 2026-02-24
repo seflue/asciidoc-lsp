@@ -1,0 +1,6 @@
+= Document B
+
+This document is the second part of the circular include test.
+It includes Document A, completing the cycle.
+
+include::a.adoc[]

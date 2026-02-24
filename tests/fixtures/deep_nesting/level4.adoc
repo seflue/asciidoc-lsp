@@ -1,0 +1,5 @@
+==== Level 4
+
+Content at nesting level 4.
+
+include::level5.adoc[]

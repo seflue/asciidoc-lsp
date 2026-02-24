@@ -1,0 +1,54 @@
+== Solution Strategy
+:parser-version: 0.6.0
+
+The solution strategy for asciidoc-lsp is guided by three core principles: leverage existing community work wherever possible, prioritize incremental delivery of user-visible features, and maintain a modular architecture that allows swapping components as the project matures.
+
+=== Why Rust
+
+Rust was chosen as the implementation language for several compelling reasons.
+First, the LSP server runs as a long-lived process that must handle concurrent document updates without memory leaks or crashes — Rust's ownership model provides these guarantees at compile time.
+Second, the Treesitter ecosystem has first-class Rust bindings through the `tree-sitter` crate, enabling direct integration without FFI overhead.
+Third, the `tower-lsp-server` crate (a community fork of `tower-lsp`) provides a production-proven foundation for LSP server development in Rust, used by projects like Biome, Harper, and Oxc.
+
+The main trade-off is a steeper learning curve compared to TypeScript-based LSP implementations.
+However, the performance and reliability benefits justify this investment for a tool that will be used daily by technical writers and developers.
+
+=== Why Treesitter
+
+Treesitter provides incremental, error-tolerant parsing — exactly the properties needed for an LSP server that must update its understanding of a document on every keystroke.
+The cathaysia AsciiDoc grammar is available as a Rust crate on crates.io (`tree-sitter-asciidoc` and `tree-sitter-asciidoc-inline`), making integration straightforward.
+
+The grammar uses a dual-grammar approach (block-level and inline-level), which mirrors how AsciiDoc itself works: block structure is parsed first, then inline markup within each block is parsed separately.
+This is handled via Treesitter's `set_included_ranges` mechanism, analogous to how `tree-sitter-markdown` handles its own dual grammar.
+
+For quality goal references, see <<project-goals>>.
+
+=== Dual-Parser Strategy
+
+While Treesitter handles the syntactic parsing, semantic analysis requires understanding AsciiDoc-specific constructs like attribute substitution, conditional includes, and cross-reference resolution.
+The `acdc-parser` crate (v{parser-version}, PEG-based) was evaluated as a secondary parser for these tasks.
+
+The current strategy is *Treesitter-only-first*: build the initial LSP features entirely on Treesitter's CST, and only introduce `acdc-parser` if specific semantic features cannot be adequately implemented with Treesitter alone.
+This keeps the dependency graph simple and avoids the complexity of maintaining two parsing pipelines from the start.
+
+=== Technology Stack Summary
+
+[cols="1,2", options="header"]
+|===
+| Component | Technology
+
+| Language
+| Rust (edition 2024)
+
+| LSP Framework
+| tower-lsp-server
+
+| Parser
+| tree-sitter-asciidoc / tree-sitter-asciidoc-inline
+
+| Transport
+| stdio (standard LSP transport)
+
+| Build System
+| Cargo
+|===

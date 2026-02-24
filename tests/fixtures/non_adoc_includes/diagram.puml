@@ -1,0 +1,18 @@
+@startuml
+title Include Resolution Flow
+
+start
+:Receive include directive;
+if (Path contains attributes?) then (yes)
+    :Substitute attributes;
+else (no)
+endif
+:Resolve relative path;
+if (File exists?) then (yes)
+    :Read and parse file;
+else (no)
+    :Emit diagnostic;
+endif
+stop
+
+@enduml

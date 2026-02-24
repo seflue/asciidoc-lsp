@@ -1,0 +1,4 @@
+== Included via Attribute Path
+
+This file was included using an attribute-based path: `{path-attr}/file.adoc`.
+If you see this content, the attribute resolution in include paths is working correctly.

@@ -1,0 +1,40 @@
+@startuml
+!theme plain
+
+title asciidoc-lsp Building Block View
+
+package "Editor (LSP Client)" as client {
+}
+
+package "asciidoc-lsp" {
+    component "Transport Layer" as transport <<tower-lsp-server>> {
+        port "stdio" as stdio
+    }
+
+    component "Workspace Manager" as workspace {
+        component "Document Store" as docstore
+        component "Include Graph" as includegraph
+    }
+
+    component "Semantic Layer" as semantic {
+        component "Symbol Index" as symbols
+        component "Reference Resolver" as resolver
+        component "Diagnostics Engine" as diagnostics
+    }
+
+    component "Treesitter Parser" as parser {
+        component "Block Grammar" as block <<tree-sitter-asciidoc>>
+        component "Inline Grammar" as inline <<tree-sitter-asciidoc-inline>>
+    }
+}
+
+client --> stdio : JSON-RPC
+
+transport --> workspace : document events
+transport --> semantic : LSP requests
+
+workspace --> parser : parse / reparse
+semantic --> workspace : query documents
+semantic --> parser : tree queries
+
+@enduml

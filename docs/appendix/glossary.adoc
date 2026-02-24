@@ -1,0 +1,31 @@
+== Glossary
+
+LSP::
+Language Server Protocol.
+A JSON-RPC-based protocol defined by Microsoft that standardizes communication between code editors (clients) and language analysis tools (servers).
+LSP enables features like auto-completion, go-to-definition, diagnostics, and hover information across any editor that supports the protocol.
+
+Treesitter::
+An incremental parsing system originally developed by Max Brunsfeld for the Atom editor, now widely adopted across editors including Neovim, Helix, and Zed.
+Treesitter generates parsers from grammar definitions that produce concrete syntax trees (CSTs) and support incremental re-parsing, error recovery, and syntax-aware queries.
+
+AsciiDoc::
+A lightweight markup language for writing technical documentation, articles, books, and other prose content.
+AsciiDoc documents can be converted to HTML, PDF, EPUB, and other formats using processors like Asciidoctor.
+The syntax supports rich features including cross-references, conditional includes, attribute substitution, and admonition blocks.
+
+arc42::
+A template for documenting software architecture, created by Gernot Starke and Peter Hruschka.
+The template defines 12 sections that cover everything from introduction and goals to deployment view and glossary.
+It is widely used in the German-speaking software engineering community and is available in AsciiDoc, Markdown, and other formats.
+
+CST::
+Concrete Syntax Tree.
+A parse tree that represents the complete syntactic structure of a source document, including all tokens, whitespace, and punctuation.
+Unlike an AST (Abstract Syntax Tree), a CST preserves enough information to reconstruct the original source text exactly, which is essential for source-location-aware tooling like LSP servers.
+
+AST::
+Abstract Syntax Tree.
+A simplified tree representation of a source document's structure that omits syntactically insignificant details like whitespace and delimiters.
+ASTs are commonly used in compilers and code analysis tools where the exact source layout is not important.
+In the context of asciidoc-lsp, the Treesitter parser produces a CST rather than an AST, which provides the positional accuracy needed for editor integration.

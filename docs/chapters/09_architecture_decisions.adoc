@@ -1,0 +1,71 @@
+== Architecture Decisions
+
+This section documents the key architectural decisions made during the design and implementation of asciidoc-lsp.
+Each decision follows the ADR (Architecture Decision Record) format with context, decision, and consequences.
+
+[[adr-treesitter]]
+=== ADR-1: Use Treesitter for Parsing
+
+*Status:* Accepted
+
+*Context:*
+The LSP server needs a parser that can handle incomplete and syntactically invalid documents gracefully, provide incremental re-parsing for responsiveness, and produce a concrete syntax tree that preserves all source information (whitespace, comments, positions).
+Three parser options were evaluated: writing a custom PEG parser, using the `acdc-parser` crate (an existing PEG-based AsciiDoc parser), and using the cathaysia Treesitter grammar for AsciiDoc.
+
+*Decision:*
+We chose the cathaysia Treesitter grammar as the primary parser.
+It provides error-tolerant parsing out of the box, supports incremental updates via Treesitter's edit API, and is available as a Rust crate on crates.io.
+The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing model and is a proven pattern from `tree-sitter-markdown`.
+
+*Consequences:*
+
+* Positive: Incremental parsing, error recovery, and syntax highlighting queries are provided by the Treesitter framework with minimal custom code.
+* Positive: The grammar is community-maintained, reducing the maintenance burden on the asciidoc-lsp project.
+* Negative: The cathaysia grammar may not cover all AsciiDoc constructs. Edge cases may require contributing fixes upstream.
+* Negative: The dual-grammar approach adds complexity to the parser integration layer; for details, see xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
+
+[[adr-rust]]
+=== ADR-2: Implement in Rust
+
+*Status:* Accepted
+
+*Context:*
+The LSP server is a long-running process that must handle concurrent document updates from the editor.
+Memory safety, performance, and ecosystem support for both Treesitter and LSP protocol handling are critical requirements.
+TypeScript (via vscode-languageserver), Rust (via tower-lsp-server), and Go (via gopls patterns) were considered.
+
+*Decision:*
+We chose Rust as the implementation language.
+The `tower-lsp-server` crate provides a mature, async-first LSP framework used by production servers like Biome, Harper, and Oxc.
+Treesitter's Rust bindings are first-class, and Rust's ownership model prevents the memory leaks and data races that are common in long-running server processes.
+
+*Consequences:*
+
+* Positive: Memory safety without garbage collection overhead. The server can maintain large in-memory caches without worrying about GC pauses affecting responsiveness.
+* Positive: The Rust ecosystem provides excellent tooling (cargo, clippy, rustfmt) and a strong type system that catches bugs at compile time.
+* Negative: Higher learning curve compared to TypeScript. Contributors need Rust experience or must be willing to learn.
+* Negative: Longer compile times compared to TypeScript or Go, though incremental compilation and `cargo check` mitigate this in practice.
+
+For the building block structure enabled by this choice, see xref:05_building_block_view.adoc#building-blocks[see Building Block View].
+
+[[adr-dual-parser]]
+=== ADR-3: Treesitter-Only-First, Dual-Parser Later
+
+*Status:* Accepted
+
+*Context:*
+The `acdc-parser` crate (v0.6.0, PEG-based) provides semantic-level parsing of AsciiDoc, including attribute substitution, conditional processing, and include resolution.
+However, integrating two parsers from the start increases complexity and creates the risk of inconsistent behavior when both parsers disagree on the document structure.
+
+*Decision:*
+We adopt a *Treesitter-only-first* strategy: the initial LSP features (document symbols, go-to-definition, basic diagnostics) are built entirely on the Treesitter CST.
+The `acdc-parser` is introduced only if specific semantic features (full attribute substitution, conditional includes) cannot be adequately implemented with Treesitter tree queries alone.
+
+*Consequences:*
+
+* Positive: Simpler initial architecture with a single parsing pipeline. Easier to debug, test, and reason about.
+* Positive: The decision is reversible — adding `acdc-parser` later does not require rewriting existing features.
+* Negative: Some advanced AsciiDoc features (conditional directives, complex attribute substitution) may have limited support in the initial release.
+* Negative: If `acdc-parser` is needed later, integrating it into an existing codebase is harder than designing for it from the start.
+
+The quality goals and stakeholder expectations that drove this trade-off are documented in xref:05_building_block_view.adoc#building-blocks[see Building Block View] and xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].

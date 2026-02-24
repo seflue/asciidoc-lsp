@@ -1,0 +1,35 @@
+= Non-AsciiDoc Includes
+
+This document tests the inclusion of non-AsciiDoc files.
+The LSP server must handle these gracefully — they should appear in the include tree
+but not be parsed as AsciiDoc.
+
+== Java Source Include
+
+The following includes a Java source file with tag filtering:
+
+[source,java]
+----
+include::Example.java[tags=main]
+----
+
+== Full Java File
+
+[source,java]
+----
+include::Example.java[]
+----
+
+== YAML Configuration
+
+[source,yaml]
+----
+include::config.yaml[]
+----
+
+== PlantUML Diagram
+
+[plantuml]
+----
+include::diagram.puml[]
+----

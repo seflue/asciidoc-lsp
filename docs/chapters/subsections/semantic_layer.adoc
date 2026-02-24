@@ -1,0 +1,38 @@
+=== Semantic Layer
+
+[[semantic]]
+The Semantic Layer builds on top of the parsed syntax trees and workspace state to provide the intelligence behind LSP features.
+It is responsible for cross-reference resolution, anchor indexing, attribute substitution tracking, and diagnostic generation.
+
+For the overall system context, see xref:../05_building_block_view.adoc#building-blocks[Building Block View].
+
+==== Cross-Reference Resolution
+
+The core responsibility of the Semantic Layer is resolving AsciiDoc cross-references (xrefs) to their target locations.
+This involves several steps: parsing the xref macro to extract the target document path and anchor ID, resolving the document path relative to the current file (accounting for attribute substitutions in paths), and looking up the anchor in the target document's symbol index.
+
+The resolver handles three types of cross-references:
+
+* *Intra-document xrefs* — References to anchors within the same file (e.g., `<<section-id>>`).
+* *Inter-document xrefs* — References to anchors in other files (e.g., `xref:other.adoc#anchor[Label]`).
+* *Implicit section IDs* — AsciiDoc automatically generates IDs from section titles. The resolver must replicate this ID generation algorithm to resolve references to sections that lack explicit anchor definitions.
+
+==== Parser Integration
+
+The Semantic Layer queries the Treesitter CST (Concrete Syntax Tree) using tree queries to extract semantic information.
+For example, a query for all section headings returns their titles, levels, and positions, which are then used to build the document symbol hierarchy reported via `textDocument/documentSymbol`.
+
+The dual-grammar architecture (block-level and inline-level) means that some semantic constructs span both grammars.
+For instance, a cross-reference macro appears as inline content within a paragraph block.
+The Semantic Layer coordinates between both parse trees to provide a unified view of the document's semantic structure.
+
+==== Diagnostic Generation
+
+The Semantic Layer produces diagnostics for common issues:
+
+* Broken cross-references (target anchor or document not found)
+* Missing include targets (referenced file does not exist)
+* Circular includes (file A includes file B which includes file A)
+* Undefined attributes (attribute referenced but never defined)
+
+Each diagnostic includes a severity level, a human-readable message, and the exact source range in the document, enabling editors to display inline error annotations.

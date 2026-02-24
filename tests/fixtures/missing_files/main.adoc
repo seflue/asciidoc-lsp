@@ -1,0 +1,12 @@
+= Missing Files Test
+
+This document references includes that do not exist on the filesystem.
+The LSP server should produce diagnostics for each missing include target.
+
+== First Missing Include
+
+include::nonexistent.adoc[]
+
+== Second Missing Include
+
+include::also_missing.adoc[]

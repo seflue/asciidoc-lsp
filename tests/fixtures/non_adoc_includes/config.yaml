@@ -1,0 +1,13 @@
+server:
+  host: localhost
+  port: 8080
+  transport: stdio
+
+logging:
+  level: info
+  format: json
+
+parser:
+  grammar: tree-sitter-asciidoc
+  inline_grammar: tree-sitter-asciidoc-inline
+  timeout_ms: 5000

@@ -1,0 +1,65 @@
+== Introduction and Goals
+
+AsciiDoc is a powerful lightweight markup language used extensively in technical documentation, software architecture descriptions, and publishing workflows.
+Despite its expressive syntax and mature toolchain (Asciidoctor), editor support has historically lagged behind Markdown.
+Modern editors like VS Code and Neovim benefit from Language Server Protocol (LSP) integrations, but no production-quality LSP server exists for AsciiDoc today.
+
+The asciidoc-lsp project aims to fill this gap by providing a fast, reliable, and feature-rich language server for AsciiDoc.
+Built in Rust for performance and safety, it leverages Treesitter grammars for incremental parsing and provides standard LSP features such as document symbols, go-to-definition, diagnostics, and hover information.
+
+[[project-goals]]
+=== Project Goals
+
+The primary goals of the asciidoc-lsp project are:
+
+. *Accurate navigation* — Enable go-to-definition for cross-references, includes, and anchors across multi-file AsciiDoc projects.
+. *Fast feedback* — Provide real-time diagnostics for broken references, missing includes, and syntax errors without blocking the editor.
+. *Multi-file awareness* — Understand workspace-wide document structures, including include trees, shared attributes, and inter-document references.
+. *Incremental parsing* — Re-parse only changed portions of documents to maintain responsiveness even in large documentation projects.
+. *Extensibility* — Design a modular architecture that allows adding new LSP features (completions, code actions, formatting) incrementally.
+
+=== Stakeholders
+
+The following stakeholders have been identified for this project:
+
+[cols="1,2,2", options="header"]
+|===
+| Role | Description | Expectations
+
+| Technical Writers
+| Authors who write AsciiDoc documentation daily
+| Fast navigation, reliable diagnostics, include resolution
+
+| Software Developers
+| Developers who maintain architecture docs (arc42, ADRs)
+| Go-to-definition for xrefs, workspace-wide symbol search
+
+| Neovim Users
+| Power users who prefer terminal-based editors
+| Zero-config LSP integration, Treesitter highlighting
+
+| Plugin Maintainers
+| Developers of editor plugins (Neovim, VS Code)
+| Stable LSP protocol adherence, well-documented capabilities
+|===
+
+=== Quality Goals
+
+[cols="1,2", options="header"]
+|===
+| Quality Goal | Description
+
+| Performance
+| Parsing a 500-file arc42 project must complete within 2 seconds on a modern machine.
+
+| Correctness
+| Cross-reference resolution must handle all standard AsciiDoc patterns including inter-document xrefs, attribute-based paths, and implicit section IDs.
+
+| Fault Tolerance
+| The server must remain operational even when documents contain syntax errors. Partial results are always preferred over crashes.
+
+| Responsiveness
+| Diagnostics must update within 200ms of a document change in typical usage scenarios.
+|===
+
+For details on specific technology choices, see xref:09_architecture_decisions.adoc#adr-treesitter[Treesitter Decision].

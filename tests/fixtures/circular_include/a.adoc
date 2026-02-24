@@ -1,0 +1,7 @@
+= Document A
+
+This document demonstrates a circular include scenario.
+It includes Document B, which in turn includes this document, creating an infinite loop
+that the LSP server must detect and handle gracefully.
+
+include::b.adoc[]

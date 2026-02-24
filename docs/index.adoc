@@ -1,0 +1,20 @@
+= asciidoc-lsp Architecture Documentation
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+
+This document describes the architecture of asciidoc-lsp, a Language Server Protocol implementation for AsciiDoc built in Rust.
+The architecture follows the arc42 template to provide a structured overview of the system's design decisions, building blocks, and cross-cutting concerns.
+
+include::chapters/01_introduction_and_goals.adoc[]
+
+include::chapters/04_solution_strategy.adoc[leveloffset=+1]
+
+include::chapters/05_building_block_view.adoc[]
+
+include::chapters/08_concepts.adoc[]
+
+include::chapters/09_architecture_decisions.adoc[]
+
+include::{docdir}/appendix/glossary.adoc[]

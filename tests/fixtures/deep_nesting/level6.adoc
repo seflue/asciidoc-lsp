@@ -1,0 +1,6 @@
+====== Level 6
+
+This is the deepest level of nesting in the test fixture.
+No further includes — this is the leaf node of the include tree.
+
+The LSP server should report this as depth 6 in the include tree output.

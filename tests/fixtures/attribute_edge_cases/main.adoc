@@ -1,0 +1,27 @@
+= Attribute Edge Cases
+:defined-attr: hello
+:path-attr: hello
+:empty-attr:
+
+This document tests various attribute edge cases that the LSP server must handle.
+
+== Defined Attribute Usage
+
+The value of defined-attr is: {defined-attr}.
+
+== Undefined Attribute Usage
+
+The value of undefined-attr is: {undefined-attr}.
+Another missing one: {also-not-defined}.
+
+== Empty Attribute
+
+The empty attribute resolves to: "{empty-attr}" (should be empty string).
+
+== Attribute in Include Path
+
+include::{path-attr}/file.adoc[]
+
+== Undefined Attribute in Include Path
+
+include::{nonexistent-path}/file.adoc[]

@@ -1,0 +1,7 @@
+= Deep Nesting Test — Level 1
+
+This is the entry point for the deep nesting test.
+It includes level 2, which includes level 3, and so on down to level 6.
+The LSP server should handle deeply nested include chains correctly.
+
+include::level2.adoc[]

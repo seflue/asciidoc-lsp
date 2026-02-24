@@ -1,0 +1,16 @@
+= Broken Cross-References Test
+
+This document contains cross-references that point to non-existent targets.
+The LSP server should produce diagnostics for each broken reference.
+
+== Inter-Document Broken Reference
+
+See xref:nonexistent.adoc#missing-anchor[this link] for details that do not exist.
+
+== Intra-Document Broken Reference
+
+The following reference points to an ID that is never defined in this document: <<nonexistent-id>>.
+
+== Mixed Broken References
+
+Both xref:also_missing.adoc#another-bad-anchor[this external ref] and <<also-undefined>> should be flagged.
