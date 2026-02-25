@@ -1,14 +1,19 @@
+mod attributes;
+mod diagnostics;
 mod extractors;
+mod graph;
 mod parser;
+mod references;
 mod types;
 mod walker;
+mod workspace;
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use clap::Parser as ClapParser;
 
 use crate::types::IncludeTree;
+use crate::workspace::Workspace;
 
 #[derive(ClapParser)]
 #[command(name = "asciidoc-lsp", about = "AsciiDoc Treesitter Parser PoC")]
@@ -23,16 +28,43 @@ struct Cli {
     /// Show all extracted information (sections, includes, xrefs, attributes, anchors)
     #[arg(long)]
     all: bool,
+
+    /// Run diagnostics (broken xrefs, broken includes, duplicate anchors)
+    #[arg(long)]
+    diagnostics: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if cli.tree {
-        // Include-tree mode: walk recursively from start file
-        let attrs = load_default_attributes(&cli.path);
-        let mut visited = HashSet::new();
-        let tree = walker::walk_includes(&cli.path, &attrs, &mut visited);
+    if cli.diagnostics {
+        let root = cli
+            .path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let ws = Workspace::build(&root, &cli.path)?;
+
+        if ws.diagnostics.is_empty() {
+            println!("No diagnostics found.");
+        } else {
+            for d in &ws.diagnostics {
+                println!("{}:{}: {}", d.file.display(), d.line, d.message);
+            }
+            std::process::exit(1);
+        }
+    } else if cli.tree {
+        // Include-tree mode via Workspace → Graph → Tree
+        let root = cli
+            .path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let ws = Workspace::build(&root, &cli.path)?;
+        let entry_canonical = cli.path.canonicalize().unwrap_or(cli.path.clone());
+        let tree = ws
+            .include_graph
+            .to_include_tree(&entry_canonical, &ws.documents);
         print_include_tree(&tree, "", true, cli.all);
     } else {
         // Single-file mode: parse and extract everything
@@ -123,59 +155,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load attributes from .asciidoctorconfig files, searching upward from the
-/// file's directory to the filesystem root (like .gitignore). Configs closer
-/// to the file override values from parent directories.
-fn load_default_attributes(file_path: &std::path::Path) -> HashMap<String, String> {
-    let start_dir = match file_path.parent() {
-        Some(dir) => match dir.canonicalize() {
-            Ok(d) => d,
-            Err(_) => return HashMap::new(),
-        },
-        None => return HashMap::new(),
-    };
-
-    // Collect config files from current dir upward (closest first)
-    let mut config_contents = Vec::new();
-    let mut current = Some(start_dir.as_path());
-    while let Some(dir) = current {
-        let config_path = dir.join(".asciidoctorconfig");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            config_contents.push(content);
-        }
-        current = dir.parent();
-    }
-
-    // Merge from root to leaf (later entries = closer to file = override)
-    let mut attrs = HashMap::new();
-    for content in config_contents.iter().rev() {
-        for (key, value) in parse_asciidoctorconfig(content) {
-            attrs.insert(key, value);
-        }
-    }
-    attrs
-}
-
-/// Parse :key: value lines from an .asciidoctorconfig file.
-fn parse_asciidoctorconfig(content: &str) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with(':') && line.len() > 1 {
-            if let Some(rest) = line.strip_prefix(':') {
-                if let Some((key, value)) = rest.split_once(':') {
-                    let key = key.trim();
-                    let value = value.trim();
-                    if !key.is_empty() {
-                        result.push((key.to_string(), value.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
 /// Print include tree with Unicode box-drawing characters
 fn print_include_tree(tree: &IncludeTree, _prefix: &str, _is_last: bool, show_all: bool) {
     // Root node
@@ -247,55 +226,4 @@ fn format_tree_node(tree: &IncludeTree, show_all: bool) -> String {
         "{}{}{}{}",
         file_display, section_info, inline_info, error_suffix
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    #[test]
-    fn test_parse_asciidoctorconfig() {
-        let content = ":imagesdir: images\n:source-dir: ../src\n:toc:\n\nNot an attribute line\n";
-        let result = parse_asciidoctorconfig(content);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], ("imagesdir".into(), "images".into()));
-        assert_eq!(result[1], ("source-dir".into(), "../src".into()));
-        assert_eq!(result[2], ("toc".into(), "".into()));
-    }
-
-    #[test]
-    fn test_parse_asciidoctorconfig_empty() {
-        let result = parse_asciidoctorconfig("");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_load_default_attributes_hierarchy() {
-        // Create temp dir structure: parent/child/
-        let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("parent");
-        let child = parent.join("child");
-        fs::create_dir_all(&child).unwrap();
-
-        // Parent config
-        fs::write(
-            parent.join(".asciidoctorconfig"),
-            ":imagesdir: images\n:chapdir: chapters\n",
-        )
-        .unwrap();
-
-        // Child config overrides imagesdir
-        fs::write(child.join(".asciidoctorconfig"), ":imagesdir: img\n").unwrap();
-
-        // Fake file in child dir
-        let file_path = child.join("test.adoc");
-        fs::write(&file_path, "").unwrap();
-
-        let attrs = load_default_attributes(&file_path);
-        // Child overrides parent
-        assert_eq!(attrs.get("imagesdir").unwrap(), "img");
-        // Parent value inherited
-        assert_eq!(attrs.get("chapdir").unwrap(), "chapters");
-    }
 }

@@ -1,3 +1,6 @@
+// Legacy walker from adoc-0009 — kept as reference, replaced by graph.rs
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

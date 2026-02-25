@@ -1,0 +1,276 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::types::AttributeDef;
+
+pub struct AttributeRegistry {
+    builtin: HashMap<String, String>,
+    config: HashMap<String, String>,
+    per_file: HashMap<PathBuf, HashMap<String, String>>,
+}
+
+impl AttributeRegistry {
+    pub fn new(root: &Path) -> Self {
+        let mut builtin = HashMap::new();
+        builtin.insert("docdir".into(), root.display().to_string());
+        Self {
+            builtin,
+            config: HashMap::new(),
+            per_file: HashMap::new(),
+        }
+    }
+
+    /// Load attributes from .asciidoctorconfig files, searching upward from root.
+    /// Configs closer to root override values from parent directories.
+    /// Path values (containing `/` or starting with `.`) are canonicalized
+    /// relative to the config file's directory.
+    pub fn load_config(&mut self, root: &Path) {
+        let start_dir = match root.canonicalize() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let mut config_contents: Vec<(PathBuf, String)> = Vec::new();
+        let mut current = Some(start_dir.as_path());
+        while let Some(dir) = current {
+            let config_path = dir.join(".asciidoctorconfig");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                config_contents.push((dir.to_path_buf(), content));
+            }
+            current = dir.parent();
+        }
+
+        // Merge from root to leaf (later entries = closer to file = override)
+        for (config_dir, content) in config_contents.iter().rev() {
+            for (key, value) in parse_asciidoctorconfig(content) {
+                let resolved = canonicalize_path_value(&value, config_dir);
+                self.config.insert(key, resolved);
+            }
+        }
+    }
+
+    pub fn register_file_attributes(&mut self, file: &Path, attrs: &[AttributeDef]) {
+        let map: HashMap<String, String> = attrs
+            .iter()
+            .map(|a| (a.name.clone(), a.value.clone()))
+            .collect();
+        self.per_file.insert(file.to_path_buf(), map);
+    }
+
+    /// Resolve an attribute by name with priority: Document-Header > Config > Built-in
+    pub fn resolve(&self, file: &Path, name: &str) -> Option<&str> {
+        self.per_file
+            .get(file)
+            .and_then(|m| m.get(name))
+            .or_else(|| self.config.get(name))
+            .or_else(|| self.builtin.get(name))
+            .map(|s| s.as_str())
+    }
+
+    /// Substitute all `{attr}` references in a string using resolve().
+    pub fn substitute(&self, file: &Path, input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '{' {
+                let mut name = String::new();
+                let mut found_close = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        found_close = true;
+                        break;
+                    }
+                    name.push(inner);
+                }
+                if found_close && !name.is_empty() {
+                    if let Some(val) = self.resolve(file, &name) {
+                        result.push_str(val);
+                    } else {
+                        // Undefined attribute: leave as-is
+                        result.push('{');
+                        result.push_str(&name);
+                        result.push('}');
+                    }
+                } else {
+                    result.push('{');
+                    result.push_str(&name);
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+
+        result
+    }
+}
+
+/// Parse :key: value lines from an .asciidoctorconfig file.
+fn parse_asciidoctorconfig(content: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with(':') && line.len() > 1 {
+            if let Some(rest) = line.strip_prefix(':') {
+                if let Some((key, value)) = rest.split_once(':') {
+                    let key = key.trim();
+                    let value = value.trim();
+                    if !key.is_empty() {
+                        result.push((key.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Heuristic: if a value looks like a relative path (starts with `.` or `../`),
+/// canonicalize it relative to the config file's directory.
+fn canonicalize_path_value(value: &str, config_dir: &Path) -> String {
+    if value.starts_with("../") || value.starts_with("./") {
+        let resolved = config_dir.join(value);
+        match resolved.canonicalize() {
+            Ok(canonical) => canonical.display().to_string(),
+            // Path doesn't exist yet — normalize without canonicalize
+            Err(_) => resolved.display().to_string(),
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_builtin_docdir() {
+        let registry = AttributeRegistry::new(Path::new("/tmp/docs"));
+        let dummy = Path::new("/tmp/docs/file.adoc");
+        assert_eq!(registry.resolve(dummy, "docdir"), Some("/tmp/docs"));
+    }
+
+    #[test]
+    fn test_config_loader_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: images\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(tmp.path());
+        registry.load_config(tmp.path());
+
+        let dummy = Path::new("any.adoc");
+        assert_eq!(registry.resolve(dummy, "imagesdir"), Some("images"));
+    }
+
+    #[test]
+    fn test_config_path_canonicalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("project").join("docs");
+        let src = tmp.path().join("project").join("src");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&src).unwrap();
+
+        fs::write(docs.join(".asciidoctorconfig"), ":source-dir: ../src\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&docs);
+        registry.load_config(&docs);
+
+        let dummy = Path::new("any.adoc");
+        let resolved = registry.resolve(dummy, "source-dir").unwrap();
+        let canonical_src = src.canonicalize().unwrap();
+        assert_eq!(resolved, canonical_src.display().to_string());
+    }
+
+    #[test]
+    fn test_config_hierarchy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        fs::write(
+            parent.join(".asciidoctorconfig"),
+            ":imagesdir: images\n:chapdir: chapters\n",
+        )
+        .unwrap();
+        fs::write(child.join(".asciidoctorconfig"), ":imagesdir: img\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&child);
+        registry.load_config(&child);
+
+        let dummy = Path::new("any.adoc");
+        assert_eq!(registry.resolve(dummy, "imagesdir"), Some("img"));
+        assert_eq!(registry.resolve(dummy, "chapdir"), Some("chapters"));
+    }
+
+    #[test]
+    fn test_register_file_attributes() {
+        let mut registry = AttributeRegistry::new(Path::new("/tmp"));
+        let file = Path::new("/tmp/doc.adoc");
+        let attrs = vec![
+            AttributeDef {
+                name: "author".into(),
+                value: "Alice".into(),
+                line: 1,
+            },
+            AttributeDef {
+                name: "version".into(),
+                value: "1.0".into(),
+                line: 2,
+            },
+        ];
+        registry.register_file_attributes(file, &attrs);
+        assert_eq!(registry.resolve(file, "author"), Some("Alice"));
+        assert_eq!(registry.resolve(file, "version"), Some("1.0"));
+    }
+
+    #[test]
+    fn test_resolve_priority() {
+        let mut registry = AttributeRegistry::new(Path::new("/root"));
+        // Built-in: docdir = /root
+        registry.config.insert("docdir".into(), "/config".into());
+
+        let file = Path::new("/root/doc.adoc");
+        // Config overrides built-in
+        assert_eq!(registry.resolve(file, "docdir"), Some("/config"));
+
+        // Doc-header overrides config
+        let attrs = vec![AttributeDef {
+            name: "docdir".into(),
+            value: "/header".into(),
+            line: 1,
+        }];
+        registry.register_file_attributes(file, &attrs);
+        assert_eq!(registry.resolve(file, "docdir"), Some("/header"));
+    }
+
+    #[test]
+    fn test_resolve_fallback() {
+        let registry = AttributeRegistry::new(Path::new("/root"));
+        let file = Path::new("any.adoc");
+        assert_eq!(registry.resolve(file, "docdir"), Some("/root"));
+        assert_eq!(registry.resolve(file, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_substitute_in_path() {
+        let registry = AttributeRegistry::new(Path::new("/project/docs"));
+        let file = Path::new("any.adoc");
+        let result = registry.substitute(file, "{docdir}/file.adoc");
+        assert_eq!(result, "/project/docs/file.adoc");
+    }
+
+    #[test]
+    fn test_substitute_undefined_attr() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let file = Path::new("any.adoc");
+        let result = registry.substitute(file, "{unknown}/path");
+        assert_eq!(result, "{unknown}/path");
+    }
+}
