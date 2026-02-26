@@ -5,16 +5,21 @@ Extracts sections, includes, xrefs, anchors, and attributes from `.adoc` files.
 
 ## Commands
 
+Bevorzuge `just` statt direkte `cargo`-Aufrufe:
+
 ```sh
-cargo build              # Build debug binary
-cargo build --release    # Build release binary
-cargo test               # Run all tests
-cargo clippy -- -D warnings  # Lint (warnings = errors)
-cargo fmt                # Format code
-cargo fmt -- --check     # Check formatting without changes
-just lint                # All checks: fmt + clippy + test
-just run docs/index.adoc # Run against a file
+just build               # Build debug binary
+just build-release       # Build release binary
+just test                # Run all tests
+just lint                # Clippy with -D warnings
+just fmt                 # Format code
+just fmt-check           # Check formatting without changes
+just ci                  # All checks: fmt-check + lint + test
+just run docs/index.adoc # Run CLI against a file
+just lsp                 # Start LSP server
 just tree                # Show include tree for docs/index.adoc
+just clean               # cargo clean
+just fix                 # cargo clippy --fix
 ```
 
 ## Architecture

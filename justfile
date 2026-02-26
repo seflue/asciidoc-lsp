@@ -1,64 +1,59 @@
-# asciidoc-lsp task runner
+# asciidoc-lsp workspace task runner
 
 default:
     @just --list
 
-# Build debug binary
+# Build all crates (debug)
 build:
     cargo build
 
-# Build optimized release binary
-release:
+# Build all crates (release)
+build-release:
     cargo build --release
-
-# Run all tests
-test:
-    cargo test
-
-# Run clippy lints
-clippy:
-    cargo clippy -- -D warnings
 
 # Type-check without building
 check:
     cargo check
 
+# Run all tests
+test:
+    cargo test
+
+# Run clippy lints (warnings = errors)
+lint:
+    cargo clippy -- -D warnings
+
 # Format code
 fmt:
     cargo fmt
+
+# Check formatting without changes
+fmt-check:
+    cargo fmt -- --check
 
 # Auto-fix: format + apply clippy suggestions
 fix:
     cargo fmt
     cargo clippy --fix --allow-dirty -- -D warnings
 
-# Check all: formatting, lints, tests (CI/pre-commit)
-lint:
-    cargo fmt -- --check
-    cargo clippy -- -D warnings
-    cargo test
+# All quality checks (CI / pre-commit)
+ci: fmt-check lint test
 
-# Run against a file (e.g.: just run docs/index.adoc)
+# All checks + release build
+all: ci build-release
+
+# Run CLI against a file (e.g.: just run docs/index.adoc)
 run *ARGS:
-    cargo run -- {{ARGS}}
+    cargo run -p asciidoc-cli -- {{ARGS}}
 
 # Show include tree for docs/index.adoc
 tree:
-    cargo run -- --tree docs/index.adoc
+    cargo run -p asciidoc-cli -- --tree docs/index.adoc
 
-# Run all quality checks + build release
-all:
-    cargo fmt -- --check
-    cargo clippy -- -D warnings
-    cargo test
-    cargo build --release
+# Start the LSP server (stdio)
+lsp:
+    cargo run -p asciidoc-lsp
 
 # Remove build artifacts
 clean:
     cargo clean
-
-# Open arc42 architecture docs
-arc42:
-    @echo "docs/index.adoc"
-    @echo "Chapters:"
-    @ls docs/chapters/
