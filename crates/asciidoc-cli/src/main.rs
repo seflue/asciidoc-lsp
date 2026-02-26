@@ -1,22 +1,12 @@
-mod attributes;
-mod diagnostics;
-mod extractors;
-mod graph;
-mod parser;
-mod references;
-mod types;
-mod walker;
-mod workspace;
-
 use std::path::PathBuf;
 
 use clap::Parser as ClapParser;
 
-use crate::types::IncludeTree;
-use crate::workspace::Workspace;
+use asciidoc_core::types::IncludeTree;
+use asciidoc_core::workspace::Workspace;
 
 #[derive(ClapParser)]
-#[command(name = "asciidoc-lsp", about = "AsciiDoc Treesitter Parser PoC")]
+#[command(name = "asciidoc-cli", about = "AsciiDoc Treesitter Parser PoC")]
 struct Cli {
     /// Path to AsciiDoc file
     path: PathBuf,
@@ -54,7 +44,7 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     } else if cli.tree {
-        // Include-tree mode via Workspace → Graph → Tree
+        // Include-tree mode via Workspace -> Graph -> Tree
         let root = cli
             .path
             .parent()
@@ -69,26 +59,26 @@ fn main() -> anyhow::Result<()> {
     } else {
         // Single-file mode: parse and extract everything
         let source = std::fs::read_to_string(&cli.path)?;
-        let mut block_parser = parser::init_block_parser()?;
-        let block_tree = parser::parse(&mut block_parser, &source)?;
+        let mut block_parser = asciidoc_core::parser::init_block_parser()?;
+        let block_tree = asciidoc_core::parser::parse(&mut block_parser, &source)?;
         let root = block_tree.root_node();
 
-        let sections = extractors::extract_sections(root, source.as_bytes());
-        let includes = extractors::extract_includes(root, source.as_bytes());
-        let attributes = extractors::extract_attributes(root, source.as_bytes());
+        let sections = asciidoc_core::extractors::extract_sections(root, source.as_bytes());
+        let includes = asciidoc_core::extractors::extract_includes(root, source.as_bytes());
+        let attributes = asciidoc_core::extractors::extract_attributes(root, source.as_bytes());
 
         // Inline parsing for xrefs and anchors
-        let inline_ranges = extractors::collect_inline_ranges(root);
+        let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(root);
         let (xrefs, anchors) = if !inline_ranges.is_empty() {
-            let mut inline_parser = parser::init_inline_parser()?;
+            let mut inline_parser = asciidoc_core::parser::init_inline_parser()?;
             inline_parser
                 .set_included_ranges(&inline_ranges)
                 .map_err(|e| anyhow::anyhow!("Failed to set inline ranges: {:?}", e))?;
-            let inline_tree = parser::parse(&mut inline_parser, &source)?;
+            let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, &source)?;
             let inline_root = inline_tree.root_node();
             (
-                extractors::extract_xrefs(inline_root, source.as_bytes()),
-                extractors::extract_anchors(inline_root, source.as_bytes()),
+                asciidoc_core::extractors::extract_xrefs(inline_root, source.as_bytes()),
+                asciidoc_core::extractors::extract_anchors(inline_root, source.as_bytes()),
             )
         } else {
             (vec![], vec![])

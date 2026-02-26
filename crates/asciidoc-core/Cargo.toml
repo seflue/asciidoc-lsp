@@ -1,0 +1,13 @@
+[package]
+name = "asciidoc-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-asciidoc = "0.6"
+tree-sitter-asciidoc-inline = "0.6"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

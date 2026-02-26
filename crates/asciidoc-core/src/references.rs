@@ -11,6 +11,12 @@ pub struct ReferenceIndex {
     pub by_file: HashMap<PathBuf, Vec<String>>,
 }
 
+impl Default for ReferenceIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReferenceIndex {
     pub fn new() -> Self {
         Self {

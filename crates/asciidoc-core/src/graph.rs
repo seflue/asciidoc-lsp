@@ -9,6 +9,12 @@ pub struct IncludeGraph {
     pub reverse: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
+impl Default for IncludeGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IncludeGraph {
     pub fn new() -> Self {
         Self {
@@ -98,11 +104,29 @@ pub fn build_graph(
     entry: &Path,
     registry: &mut AttributeRegistry,
 ) -> (IncludeGraph, HashMap<PathBuf, DocumentModel>) {
+    build_graph_with_overrides(entry, registry, &HashMap::new())
+}
+
+/// Build the include graph with content overrides for open editor buffers.
+///
+/// Files present in `overrides` will be read from the map instead of disk.
+pub fn build_graph_with_overrides(
+    entry: &Path,
+    registry: &mut AttributeRegistry,
+    overrides: &HashMap<PathBuf, String>,
+) -> (IncludeGraph, HashMap<PathBuf, DocumentModel>) {
     let mut graph = IncludeGraph::new();
     let mut documents = HashMap::new();
     let mut visited = HashSet::new();
 
-    walk(entry, registry, &mut graph, &mut documents, &mut visited);
+    walk(
+        entry,
+        registry,
+        &mut graph,
+        &mut documents,
+        &mut visited,
+        overrides,
+    );
     (graph, documents)
 }
 
@@ -112,6 +136,7 @@ fn walk(
     graph: &mut IncludeGraph,
     documents: &mut HashMap<PathBuf, DocumentModel>,
     visited: &mut HashSet<PathBuf>,
+    overrides: &HashMap<PathBuf, String>,
 ) {
     let canonical = match file.canonicalize() {
         Ok(p) => p,
@@ -122,10 +147,13 @@ fn walk(
         return; // Already parsed → dedup
     }
 
-    // Read file
-    let source = match std::fs::read_to_string(&canonical) {
-        Ok(s) => s,
-        Err(_) => return,
+    // Read file: prefer override content, fall back to disk (V-2)
+    let source = match overrides.get(&canonical) {
+        Some(content) => content.clone(),
+        None => match std::fs::read_to_string(&canonical) {
+            Ok(s) => s,
+            Err(_) => return,
+        },
     };
 
     // Parse with block parser
@@ -199,7 +227,7 @@ fn walk(
             },
         );
 
-        walk(&full_path, registry, graph, documents, visited);
+        walk(&full_path, registry, graph, documents, visited, overrides);
     }
 }
 
