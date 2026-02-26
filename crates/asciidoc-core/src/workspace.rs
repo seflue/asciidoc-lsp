@@ -32,7 +32,10 @@ impl std::fmt::Debug for Workspace {
 impl Workspace {
     pub fn build(root: &Path, entry: &Path) -> Result<Self> {
         let mut registry = AttributeRegistry::new(root);
-        registry.load_config(root);
+        // Load config from entry file's directory upward — .asciidoctorconfig
+        // typically lives next to the main document, not at the workspace root.
+        let config_start = entry.parent().unwrap_or(root);
+        registry.load_config(config_start);
         let (graph, documents) = build_graph(entry, &mut registry);
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diagnostics = collect_diagnostics(&documents, &graph, &ref_index, &registry);
@@ -57,7 +60,8 @@ impl Workspace {
         overrides: &HashMap<PathBuf, String>,
     ) -> Result<Self> {
         let mut registry = AttributeRegistry::new(root);
-        registry.load_config(root);
+        let config_start = entry.parent().unwrap_or(root);
+        registry.load_config(config_start);
         let (graph, documents) = build_graph_with_overrides(entry, &mut registry, overrides);
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diagnostics = collect_diagnostics(&documents, &graph, &ref_index, &registry);

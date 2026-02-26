@@ -15,6 +15,8 @@ pub enum NodeKind {
     Xref { target: String },
     /// `<<id,text>>` shorthand cross-reference
     ShorthandXref { target: String },
+    /// `{name}` attribute reference
+    AttributeRef { name: String },
 }
 
 /// Information about a recognized node at a cursor position.
@@ -34,7 +36,14 @@ pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
         column: byte_col,
     };
 
-    // Try block grammar first (includes)
+    // Check {attribute} references first — most specific pattern (cursor inside braces).
+    // This must come before tree-sitter so that e.g. include::{attr}/file.adoc[]
+    // resolves to the attribute when cursor is on {attr}.
+    if let Some(info) = find_attribute_ref_at_position(content, line_1, byte_col) {
+        return Some(info);
+    }
+
+    // Try block grammar (includes)
     let mut block_parser = asciidoc_core::parser::init_block_parser().ok()?;
     let block_tree = asciidoc_core::parser::parse(&mut block_parser, content).ok()?;
 
@@ -44,15 +53,18 @@ pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
 
     // Try inline grammar (xrefs, shorthand xrefs)
     let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(block_tree.root_node());
-    if inline_ranges.is_empty() {
-        return None;
+    if !inline_ranges.is_empty() {
+        let mut inline_parser = asciidoc_core::parser::init_inline_parser().ok()?;
+        inline_parser.set_included_ranges(&inline_ranges).ok()?;
+        let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, content).ok()?;
+
+        if let Some(info) = classify_inline_node(inline_tree.root_node(), point, content.as_bytes())
+        {
+            return Some(info);
+        }
     }
 
-    let mut inline_parser = asciidoc_core::parser::init_inline_parser().ok()?;
-    inline_parser.set_included_ranges(&inline_ranges).ok()?;
-    let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, content).ok()?;
-
-    classify_inline_node(inline_tree.root_node(), point, content.as_bytes())
+    None
 }
 
 /// Resolve a go-to-definition request to a target file and line.
@@ -93,6 +105,11 @@ pub fn resolve_goto_definition(
                 .resolve_xref(&xref, doc_path, &ws.include_graph, &ws.documents)
                 .ok()?;
             Some((resolved.file, resolved.line))
+        }
+        NodeKind::AttributeRef { ref name } => {
+            let ws = workspace?;
+            let source = ws.attributes.resolve_source(doc_path, name)?;
+            Some((source.file, source.line))
         }
     }
 }
@@ -166,6 +183,52 @@ fn classify_inline_node(
             _ => {}
         }
         current = n.parent();
+    }
+
+    None
+}
+
+/// Detect `{attribute-name}` references on the current line using regex-like scanning.
+/// Returns NodeInfo if the cursor is inside a valid `{name}` pattern
+/// (no spaces allowed in attribute names).
+fn find_attribute_ref_at_position(
+    content: &str,
+    line_1: usize,
+    byte_col: usize,
+) -> Option<NodeInfo> {
+    let line_0 = line_1.saturating_sub(1);
+    let line_str = content.lines().nth(line_0)?;
+
+    let bytes = line_str.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let start = i + 1;
+            let mut end = start;
+            let mut valid = true;
+            while end < bytes.len() && bytes[end] != b'}' {
+                if bytes[end] == b' ' || bytes[end] == b'\t' {
+                    valid = false;
+                    break;
+                }
+                end += 1;
+            }
+            if valid && end < bytes.len() && bytes[end] == b'}' && end > start {
+                // {name} found from byte i to end (inclusive)
+                if byte_col >= i && byte_col <= end {
+                    let name = &line_str[start..end];
+                    return Some(NodeInfo {
+                        kind: NodeKind::AttributeRef {
+                            name: name.to_string(),
+                        },
+                        line: line_1,
+                    });
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
     }
 
     None
@@ -406,5 +469,128 @@ mod tests {
         };
 
         assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    // --- Task 3.1: resolve_goto_definition for attribute references ---
+
+    #[test]
+    fn test_goto_def_attribute_doc_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n:author: Alice\n\nWritten by {author}.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // character 12 = 'a' in "{author}" on line 3 (0-indexed)
+        let pos = Position {
+            line: 3,
+            character: 12,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(target, a.canonicalize().unwrap());
+        assert_eq!(line, 2); // :author: is on line 2 (1-indexed)
+    }
+
+    #[test]
+    fn test_goto_def_attribute_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: images\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // character 11 = 'i' in "{imagesdir}" on line 2 (0-indexed)
+        let pos = Position {
+            line: 2,
+            character: 11,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        let config_path = tmp
+            .path()
+            .join(".asciidoctorconfig")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(target, config_path);
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_attribute_undefined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nSee {nonexistent} here.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 5,
+        };
+
+        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    // --- Task 2.1: find_node_at_position for {attribute} references ---
+
+    #[test]
+    fn test_find_node_attribute_ref() {
+        let content = "= Title\n\nThe images are in {imagesdir} directory.\n";
+        // character 27 = 'i' in "imagesdir" (inside the braces)
+        let pos = Position {
+            line: 2,
+            character: 27,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::AttributeRef {
+                name: "imagesdir".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_node_attribute_ref_in_include() {
+        let content = "= Title\n\ninclude::{source-dir}/file.adoc[]\n";
+        // character 10 = 's' in "source-dir" (inside the braces in include target)
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::AttributeRef {
+                name: "source-dir".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_node_plain_braces_not_attr() {
+        // Empty braces and braces with spaces should not be detected
+        let content = "= Title\n\nSome {} text and {with spaces} here.\n";
+        // On the empty braces
+        let pos1 = Position {
+            line: 2,
+            character: 5,
+        };
+        assert!(find_node_at_position(content, pos1).is_none());
+
+        // On "with spaces" — contains space, not a valid attribute name
+        let pos2 = Position {
+            line: 2,
+            character: 27,
+        };
+        assert!(find_node_at_position(content, pos2).is_none());
     }
 }

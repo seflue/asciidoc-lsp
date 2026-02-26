@@ -212,11 +212,9 @@ impl LanguageServer for AsciiDocLsp {
                     TextDocumentSyncOptions {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::FULL),
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(
-                            SaveOptions {
-                                include_text: Some(false),
-                            },
-                        )),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false),
+                        })),
                         ..Default::default()
                     },
                 )),
@@ -1687,6 +1685,38 @@ mod tests {
             target
         );
         assert_eq!(line, 1, "include target should point to line 1");
+    }
+
+    #[test]
+    fn test_integration_arc42_goto_definition_attribute_config() {
+        let docs_dir = arc42_docs_dir();
+        let index = docs_dir.join("index.adoc");
+        let content = fs::read_to_string(&index).unwrap();
+
+        let ws_root = workspace_root();
+        let detected_root = detect_workspace_root(&ws_root);
+        let ws = Workspace::build(&detected_root, &index).unwrap();
+
+        // Line 20 in index.adoc: include::{docdir}/appendix/glossary.adoc[]
+        // {docdir} is at columns 9..16 (0-indexed LSP line 19)
+        let pos = Position {
+            line: 19,
+            character: 12, // inside "docdir"
+        };
+
+        let result = navigation::resolve_goto_definition(&content, pos, &index, Some(&ws));
+        assert!(
+            result.is_some(),
+            "goto-definition on {{docdir}} should resolve to .asciidoctorconfig"
+        );
+
+        let (target, line) = result.unwrap();
+        assert!(
+            target.to_string_lossy().contains(".asciidoctorconfig"),
+            "target should be .asciidoctorconfig, got: {:?}",
+            target
+        );
+        assert_eq!(line, 3, "docdir is on line 3 of .asciidoctorconfig");
     }
 
     // --- path_to_uri tests (Finding 2: URL-encoding) ---
