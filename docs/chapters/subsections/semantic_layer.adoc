@@ -4,7 +4,7 @@
 The Semantic Layer builds on top of the parsed syntax trees and workspace state to provide the intelligence behind LSP features.
 It is responsible for cross-reference resolution, anchor indexing, attribute substitution tracking, and diagnostic generation.
 
-For the overall system context, see xref:../05_building_block_view.adoc#building-blocks[Building Block View].
+For the overall system context, see xref:05_building_block_view.adoc#building-blocks[Building Block View].
 
 ==== Cross-Reference Resolution
 

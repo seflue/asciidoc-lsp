@@ -613,7 +613,7 @@ fn build_symbol_children(
         let symbol = DocumentSymbol {
             name: title,
             detail: None,
-            kind: SymbolKind::STRING,
+            kind: SymbolKind::STRUCT,
             tags: None,
             deprecated: None,
             range,
@@ -642,8 +642,8 @@ fn path_to_uri(path: &Path) -> Option<Uri> {
 
 /// Collect workspace symbols (sections + anchors) matching a query.
 ///
-/// - Sections become `SymbolKind::STRING` symbols
-/// - Anchors become `SymbolKind::KEY` symbols
+/// - Sections become `SymbolKind::STRUCT` symbols
+/// - Anchors become `SymbolKind::CONSTANT` symbols
 /// - Empty query returns all symbols
 /// - Non-empty query filters case-insensitively (name contains query)
 ///
@@ -671,7 +671,7 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
             #[allow(deprecated)]
             let sym = SymbolInformation {
                 name: section.title.clone(),
-                kind: SymbolKind::STRING,
+                kind: SymbolKind::STRUCT,
                 tags: None,
                 deprecated: None,
                 location: Location {
@@ -703,7 +703,7 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
         #[allow(deprecated)]
         let sym = SymbolInformation {
             name: id.clone(),
-            kind: SymbolKind::KEY,
+            kind: SymbolKind::CONSTANT,
             tags: None,
             deprecated: None,
             location: Location {
@@ -1038,7 +1038,7 @@ mod tests {
         // Top level: one root symbol (Title)
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "Title");
-        assert_eq!(symbols[0].kind, SymbolKind::STRING);
+        assert_eq!(symbols[0].kind, SymbolKind::STRUCT);
 
         // Title has two children
         let children = symbols[0].children.as_ref().unwrap();
@@ -1381,7 +1381,7 @@ mod tests {
         for sym in &section_symbols {
             assert_eq!(
                 sym.kind,
-                SymbolKind::STRING,
+                SymbolKind::STRUCT,
                 "section '{}' should be STRING",
                 sym.name
             );
@@ -1396,7 +1396,7 @@ mod tests {
         let symbols = collect_workspace_symbols(&ws, "my-anchor");
         let anchor_sym = symbols.iter().find(|s| s.name == "my-anchor");
         assert!(anchor_sym.is_some(), "expected anchor symbol 'my-anchor'");
-        assert_eq!(anchor_sym.unwrap().kind, SymbolKind::KEY);
+        assert_eq!(anchor_sym.unwrap().kind, SymbolKind::CONSTANT);
     }
 
     #[test]
@@ -1552,7 +1552,7 @@ mod tests {
         let symbols = sections_to_document_symbols(&sections, &content);
         assert!(!symbols.is_empty(), "should produce document symbols");
         assert_eq!(symbols[0].name, "asciidoc-lsp Architecture Documentation");
-        assert_eq!(symbols[0].kind, SymbolKind::STRING);
+        assert_eq!(symbols[0].kind, SymbolKind::STRUCT);
 
         // Verify an included chapter file also produces valid symbols
         let chapter = docs_dir.join("chapters/01_introduction_and_goals.adoc");
