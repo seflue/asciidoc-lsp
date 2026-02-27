@@ -365,15 +365,18 @@ impl LanguageServer for AsciiDocLsp {
             }
         };
 
-        // Parse and extract sections
+        // Parse and extract sections, includes, attributes
         let mut parser = asciidoc_core::parser::init_block_parser()
             .map_err(|e| tower_lsp_server::jsonrpc::Error::invalid_params(e.to_string()))?;
         let tree = asciidoc_core::parser::parse(&mut parser, &content)
             .map_err(|e| tower_lsp_server::jsonrpc::Error::invalid_params(e.to_string()))?;
-        let sections =
-            asciidoc_core::extractors::extract_sections(tree.root_node(), content.as_bytes());
+        let root_node = tree.root_node();
+        let source = content.as_bytes();
+        let sections = asciidoc_core::extractors::extract_sections(root_node, source);
+        let includes = asciidoc_core::extractors::extract_includes(root_node, source);
+        let attributes = asciidoc_core::extractors::extract_attributes(root_node, source);
 
-        let symbols = sections_to_document_symbols(&sections, &content);
+        let symbols = build_document_symbols(&sections, &includes, &attributes, &content);
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
@@ -637,6 +640,107 @@ fn build_symbol_children(
     result
 }
 
+/// Build DocumentSymbol list combining sections (nested), includes (flat), and attributes (flat).
+fn build_document_symbols(
+    sections: &[asciidoc_core::types::Section],
+    includes: &[asciidoc_core::types::IncludeMacro],
+    attributes: &[asciidoc_core::types::AttributeDef],
+    content: &str,
+) -> Vec<DocumentSymbol> {
+    let mut symbols = sections_to_document_symbols(sections, content);
+    symbols.extend(includes_to_document_symbols(includes, content));
+    symbols.extend(attributes_to_document_symbols(attributes, content));
+    symbols
+}
+
+/// Convert includes to flat DocumentSymbol entries (SymbolKind::FILE).
+fn includes_to_document_symbols(
+    includes: &[asciidoc_core::types::IncludeMacro],
+    content: &str,
+) -> Vec<DocumentSymbol> {
+    includes
+        .iter()
+        .map(|inc| {
+            let start_pos = positions::to_lsp_position(inc.line, 0, content);
+            let line_text = content
+                .lines()
+                .nth(inc.line.saturating_sub(1))
+                .unwrap_or_default();
+            let end_pos = positions::to_lsp_position(inc.line, line_text.len(), content);
+
+            let detail = if inc.attributes.is_empty() {
+                None
+            } else {
+                Some(
+                    inc.attributes
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            };
+
+            let range = Range {
+                start: start_pos,
+                end: end_pos,
+            };
+
+            #[allow(deprecated)]
+            DocumentSymbol {
+                name: inc.path.clone(),
+                detail,
+                kind: SymbolKind::FILE,
+                tags: None,
+                deprecated: None,
+                range,
+                selection_range: range,
+                children: None,
+            }
+        })
+        .collect()
+}
+
+/// Convert attribute definitions to flat DocumentSymbol entries (SymbolKind::VARIABLE).
+fn attributes_to_document_symbols(
+    attributes: &[asciidoc_core::types::AttributeDef],
+    content: &str,
+) -> Vec<DocumentSymbol> {
+    attributes
+        .iter()
+        .map(|attr| {
+            let start_pos = positions::to_lsp_position(attr.line, 0, content);
+            let line_text = content
+                .lines()
+                .nth(attr.line.saturating_sub(1))
+                .unwrap_or_default();
+            let end_pos = positions::to_lsp_position(attr.line, line_text.len(), content);
+
+            let detail = if attr.value.is_empty() {
+                None
+            } else {
+                Some(attr.value.clone())
+            };
+
+            let range = Range {
+                start: start_pos,
+                end: end_pos,
+            };
+
+            #[allow(deprecated)]
+            DocumentSymbol {
+                name: attr.name.clone(),
+                detail,
+                kind: SymbolKind::VARIABLE,
+                tags: None,
+                deprecated: None,
+                range,
+                selection_range: range,
+                children: None,
+            }
+        })
+        .collect()
+}
+
 /// Convert a filesystem path to an LSP URI.
 fn path_to_uri(path: &Path) -> Option<Uri> {
     Uri::from_file_path(path)
@@ -646,10 +750,12 @@ fn path_to_uri(path: &Path) -> Option<Uri> {
 // Workspace Symbols (V-8: extracted for testability)
 // ---------------------------------------------------------------------------
 
-/// Collect workspace symbols (sections + anchors) matching a query.
+/// Collect workspace symbols (sections + anchors + includes + attributes) matching a query.
 ///
 /// - Sections become `SymbolKind::STRUCT` symbols
 /// - Anchors become `SymbolKind::CONSTANT` symbols
+/// - Includes become `SymbolKind::FILE` symbols
+/// - Attributes become `SymbolKind::VARIABLE` symbols
 /// - Empty query returns all symbols
 /// - Non-empty query filters case-insensitively (name contains query)
 ///
@@ -659,7 +765,6 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
     let query_lower = query.to_lowercase();
     let mut symbols = Vec::new();
 
-    // Sections from all DocumentModels
     for (path, doc) in &ws.documents {
         let uri = match path_to_uri(path) {
             Some(u) => u,
@@ -667,6 +772,7 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
         };
         let content = std::fs::read_to_string(path).unwrap_or_default();
 
+        // Sections
         for section in &doc.sections {
             if !query_lower.is_empty() && !section.title.to_lowercase().contains(&query_lower) {
                 continue;
@@ -678,6 +784,58 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
             let sym = SymbolInformation {
                 name: section.title.clone(),
                 kind: SymbolKind::STRUCT,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: Range {
+                        start: pos,
+                        end: pos,
+                    },
+                },
+                container_name: None,
+            };
+            symbols.push(sym);
+        }
+
+        // Includes
+        for inc in &doc.includes {
+            if !query_lower.is_empty() && !inc.path.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+
+            let pos = positions::to_lsp_position(inc.line, 0, &content);
+
+            #[allow(deprecated)]
+            let sym = SymbolInformation {
+                name: inc.path.clone(),
+                kind: SymbolKind::FILE,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: Range {
+                        start: pos,
+                        end: pos,
+                    },
+                },
+                container_name: None,
+            };
+            symbols.push(sym);
+        }
+
+        // Attributes
+        for attr in &doc.attributes {
+            if !query_lower.is_empty() && !attr.name.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+
+            let pos = positions::to_lsp_position(attr.line, 0, &content);
+
+            #[allow(deprecated)]
+            let sym = SymbolInformation {
+                name: attr.name.clone(),
+                kind: SymbolKind::VARIABLE,
                 tags: None,
                 deprecated: None,
                 location: Location {
@@ -1466,6 +1624,88 @@ mod tests {
         );
     }
 
+    // --- adoc-0018: workspace/symbol — Include Symbols (Task 2.1) ---
+
+    #[test]
+    fn test_workspace_symbols_includes_as_file_kind() {
+        let (_tmp, ws) = build_test_workspace(&[
+            ("index.adoc", "= Root\n\ninclude::chapters/intro.adoc[]\n"),
+            ("chapters/intro.adoc", "== Intro\n\nContent.\n"),
+        ]);
+
+        let symbols = collect_workspace_symbols(&ws, "");
+        let file_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::FILE)
+            .collect();
+        assert!(
+            !file_symbols.is_empty(),
+            "expected at least one FILE symbol for include"
+        );
+        assert!(
+            file_symbols.iter().any(|s| s.name.contains("intro.adoc")),
+            "expected include path containing 'intro.adoc', got: {:?}",
+            file_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbols_include_query_filter() {
+        let (_tmp, ws) = build_test_workspace(&[
+            ("index.adoc", "= Root\n\ninclude::chapters/intro.adoc[]\n"),
+            ("chapters/intro.adoc", "== Intro\n\nContent.\n"),
+        ]);
+
+        let symbols = collect_workspace_symbols(&ws, "intro");
+        let file_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::FILE)
+            .collect();
+        assert!(
+            !file_symbols.is_empty(),
+            "query 'intro' should match include path"
+        );
+    }
+
+    // --- adoc-0018: workspace/symbol — Attribute Symbols (Task 2.2) ---
+
+    #[test]
+    fn test_workspace_symbols_attributes_as_variable_kind() {
+        let (_tmp, ws) =
+            build_test_workspace(&[("index.adoc", "= Title\n:my-attr: some-value\n\n== Sec\n")]);
+
+        let symbols = collect_workspace_symbols(&ws, "");
+        let var_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::VARIABLE)
+            .collect();
+        assert!(
+            !var_symbols.is_empty(),
+            "expected at least one VARIABLE symbol for attribute"
+        );
+        assert!(
+            var_symbols.iter().any(|s| s.name == "my-attr"),
+            "expected attribute 'my-attr', got: {:?}",
+            var_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbols_attribute_query_filter() {
+        let (_tmp, ws) =
+            build_test_workspace(&[("index.adoc", "= Title\n:my-attr: value\n\n== Sec\n")]);
+
+        let symbols = collect_workspace_symbols(&ws, "my-attr");
+        let var_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::VARIABLE)
+            .collect();
+        assert!(
+            !var_symbols.is_empty(),
+            "query 'my-attr' should match attribute name"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Task 8.1: Integration Tests — arc42 Fixture (AC-12)
     // -----------------------------------------------------------------------
@@ -1668,6 +1908,26 @@ mod tests {
                 uri_str
             );
         }
+
+        // adoc-0018: Includes should appear as FILE symbols
+        let file_symbols: Vec<_> = all_symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::FILE)
+            .collect();
+        assert!(
+            !file_symbols.is_empty(),
+            "arc42 workspace should have FILE symbols for includes"
+        );
+
+        // adoc-0018: Attributes should appear as VARIABLE symbols
+        let var_symbols: Vec<_> = all_symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::VARIABLE)
+            .collect();
+        assert!(
+            !var_symbols.is_empty(),
+            "arc42 workspace should have VARIABLE symbols for attributes"
+        );
     }
 
     #[test]
@@ -1860,5 +2120,137 @@ mod tests {
             uri_str.contains("m%C3%BCller"),
             "umlauts should be percent-encoded: {uri_str}"
         );
+    }
+
+    // --- adoc-0018: documentSymbol — Include Symbols (Task 1.1) ---
+
+    #[test]
+    fn test_document_symbols_include_as_file_kind() {
+        let content = "= Title\n\ninclude::sub/chapter.adoc[]\n\n== Section\n";
+
+        let mut parser = asciidoc_core::parser::init_block_parser().unwrap();
+        let tree = asciidoc_core::parser::parse(&mut parser, content).unwrap();
+        let sections =
+            asciidoc_core::extractors::extract_sections(tree.root_node(), content.as_bytes());
+        let includes =
+            asciidoc_core::extractors::extract_includes(tree.root_node(), content.as_bytes());
+        let attributes =
+            asciidoc_core::extractors::extract_attributes(tree.root_node(), content.as_bytes());
+
+        let symbols = build_document_symbols(&sections, &includes, &attributes, content);
+
+        // Should contain at least one FILE symbol for the include
+        let file_symbols: Vec<_> = symbols_flat(&symbols)
+            .into_iter()
+            .filter(|s| s.kind == SymbolKind::FILE)
+            .collect();
+        assert_eq!(
+            file_symbols.len(),
+            1,
+            "expected 1 FILE symbol for include, got: {:?}",
+            file_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert_eq!(file_symbols[0].name, "sub/chapter.adoc");
+    }
+
+    #[test]
+    fn test_document_symbols_include_position() {
+        let content = "= Title\n\ninclude::sub/chapter.adoc[]\n\n== Section\n";
+
+        let mut parser = asciidoc_core::parser::init_block_parser().unwrap();
+        let tree = asciidoc_core::parser::parse(&mut parser, content).unwrap();
+        let sections =
+            asciidoc_core::extractors::extract_sections(tree.root_node(), content.as_bytes());
+        let includes =
+            asciidoc_core::extractors::extract_includes(tree.root_node(), content.as_bytes());
+        let attributes =
+            asciidoc_core::extractors::extract_attributes(tree.root_node(), content.as_bytes());
+
+        let symbols = build_document_symbols(&sections, &includes, &attributes, content);
+
+        let file_sym = symbols_flat(&symbols)
+            .into_iter()
+            .find(|s| s.kind == SymbolKind::FILE)
+            .expect("should have a FILE symbol");
+        // include::sub/chapter.adoc[] is on line 3 (1-indexed) → LSP line 2 (0-indexed)
+        assert_eq!(file_sym.range.start.line, 2);
+    }
+
+    // --- adoc-0018: documentSymbol — Attribute Symbols (Task 1.2) ---
+
+    #[test]
+    fn test_document_symbols_attribute_as_variable_kind() {
+        let content = "= Title\n:source-dir: ../src\n\n== Section\n";
+
+        let mut parser = asciidoc_core::parser::init_block_parser().unwrap();
+        let tree = asciidoc_core::parser::parse(&mut parser, content).unwrap();
+        let sections =
+            asciidoc_core::extractors::extract_sections(tree.root_node(), content.as_bytes());
+        let includes =
+            asciidoc_core::extractors::extract_includes(tree.root_node(), content.as_bytes());
+        let attributes =
+            asciidoc_core::extractors::extract_attributes(tree.root_node(), content.as_bytes());
+
+        let symbols = build_document_symbols(&sections, &includes, &attributes, content);
+
+        let var_symbols: Vec<_> = symbols_flat(&symbols)
+            .into_iter()
+            .filter(|s| s.kind == SymbolKind::VARIABLE)
+            .collect();
+        assert_eq!(
+            var_symbols.len(),
+            1,
+            "expected 1 VARIABLE symbol for attribute"
+        );
+        assert_eq!(var_symbols[0].name, "source-dir");
+        assert_eq!(var_symbols[0].detail.as_deref(), Some("../src"));
+    }
+
+    #[test]
+    fn test_document_symbols_mixed_sections_includes_attributes() {
+        let content =
+            "= Title\n:imagesdir: images\n:source-dir: ../src\n\ninclude::ch1.adoc[]\n\n== Section\n\ninclude::ch2.adoc[leveloffset=+1]\n";
+
+        let mut parser = asciidoc_core::parser::init_block_parser().unwrap();
+        let tree = asciidoc_core::parser::parse(&mut parser, content).unwrap();
+        let sections =
+            asciidoc_core::extractors::extract_sections(tree.root_node(), content.as_bytes());
+        let includes =
+            asciidoc_core::extractors::extract_includes(tree.root_node(), content.as_bytes());
+        let attributes =
+            asciidoc_core::extractors::extract_attributes(tree.root_node(), content.as_bytes());
+
+        let symbols = build_document_symbols(&sections, &includes, &attributes, content);
+        let flat = symbols_flat(&symbols);
+
+        // Count by kind
+        let struct_count = flat.iter().filter(|s| s.kind == SymbolKind::STRUCT).count();
+        let file_count = flat.iter().filter(|s| s.kind == SymbolKind::FILE).count();
+        let var_count = flat
+            .iter()
+            .filter(|s| s.kind == SymbolKind::VARIABLE)
+            .count();
+
+        assert_eq!(
+            struct_count, 2,
+            "expected 2 STRUCT symbols (Title + Section)"
+        );
+        assert_eq!(file_count, 2, "expected 2 FILE symbols (ch1 + ch2)");
+        assert_eq!(
+            var_count, 2,
+            "expected 2 VARIABLE symbols (imagesdir + source-dir)"
+        );
+    }
+
+    /// Helper: flatten nested DocumentSymbol hierarchy into a flat list for easier assertions.
+    fn symbols_flat(symbols: &[DocumentSymbol]) -> Vec<&DocumentSymbol> {
+        let mut result = Vec::new();
+        for s in symbols {
+            result.push(s);
+            if let Some(children) = &s.children {
+                result.extend(symbols_flat(children));
+            }
+        }
+        result
     }
 }
