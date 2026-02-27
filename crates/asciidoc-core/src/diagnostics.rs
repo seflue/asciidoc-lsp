@@ -77,6 +77,8 @@ pub fn collect_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::types::{Anchor, IncludeMacro, Section, Xref};
 
@@ -234,6 +236,80 @@ mod tests {
             "Include with {{docdir}} attribute should not be reported as broken, got: {:?}",
             broken_includes
         );
+    }
+
+    #[test]
+    fn test_workspace_diagnostics_cover_all_files() {
+        let registry = make_registry();
+        let mut documents = HashMap::new();
+
+        // Entry file (clean — no diagnostics)
+        documents.insert(
+            PathBuf::from("/entry.adoc"),
+            DocumentModel {
+                path: PathBuf::from("/entry.adoc"),
+                sections: vec![Section {
+                    level: 1,
+                    title: "Entry".into(),
+                    line: 1,
+                }],
+                includes: vec![],
+                xrefs: vec![],
+                anchors: vec![Anchor {
+                    id: "entry-anchor".into(),
+                    line: 3,
+                }],
+                attributes: vec![],
+            },
+        );
+
+        // File with broken xref
+        documents.insert(
+            PathBuf::from("/a.adoc"),
+            DocumentModel {
+                path: PathBuf::from("/a.adoc"),
+                sections: vec![],
+                includes: vec![],
+                xrefs: vec![Xref {
+                    target: "nonexistent-target".into(),
+                    display_text: None,
+                    line: 2,
+                }],
+                anchors: vec![],
+                attributes: vec![],
+            },
+        );
+
+        // File with broken include
+        documents.insert(
+            PathBuf::from("/b.adoc"),
+            DocumentModel {
+                path: PathBuf::from("/b.adoc"),
+                sections: vec![],
+                includes: vec![IncludeMacro {
+                    path: "missing.adoc".into(),
+                    attributes: vec![],
+                    line: 4,
+                }],
+                xrefs: vec![],
+                anchors: vec![],
+                attributes: vec![],
+            },
+        );
+
+        let graph = IncludeGraph::new();
+        let ref_index = ReferenceIndex::build(&documents, &registry);
+        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+
+        // Diagnostics must cover multiple files, not just one
+        let files_with_diags: HashSet<_> = diags.iter().map(|d| &d.file).collect();
+        assert!(
+            files_with_diags.len() >= 2,
+            "Expected diagnostics for at least 2 files, got {:?}",
+            files_with_diags
+        );
+        assert!(files_with_diags.contains(&PathBuf::from("/a.adoc")));
+        assert!(files_with_diags.contains(&PathBuf::from("/b.adoc")));
     }
 
     #[test]

@@ -174,6 +174,19 @@ impl AsciiDocLsp {
 
         *self.published_diagnostics.lock().unwrap() = new_published;
     }
+
+    /// Rebuild workspace from document store and publish diagnostics.
+    async fn rebuild_and_publish(&self) {
+        let root = self.root.lock().unwrap().clone();
+        let Some(root) = root else { return };
+
+        let overrides = build_content_overrides(&self.documents);
+
+        if let Some(ws) = rebuild_workspace(&root, &overrides) {
+            self.publish_workspace_diagnostics(&ws).await;
+            *self.workspace.lock().unwrap() = Some(ws);
+        }
+    }
 }
 
 impl LanguageServer for AsciiDocLsp {
@@ -228,6 +241,49 @@ impl LanguageServer for AsciiDocLsp {
         })
     }
 
+    async fn initialized(&self, _: InitializedParams) {
+        // Collect all conversion data synchronously (no MutexGuard across await)
+        let conversions: Option<Vec<(Uri, Vec<Diagnostic>)>> = {
+            let ws_guard = self.workspace.lock().unwrap();
+            ws_guard.as_ref().map(|ws| {
+                let mut diags_by_file: HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>> =
+                    HashMap::new();
+                for diag in &ws.diagnostics {
+                    diags_by_file
+                        .entry(diag.file.clone())
+                        .or_default()
+                        .push(diag.clone());
+                }
+
+                let docs = self.documents.lock().unwrap();
+                diags_by_file
+                    .iter()
+                    .filter_map(|(path, file_diags)| {
+                        let uri = path_to_uri(path)?;
+                        let content = docs
+                            .get(&uri)
+                            .map(|s| s.content.clone())
+                            .unwrap_or_else(|| std::fs::read_to_string(path).unwrap_or_default());
+                        let lsp_diags =
+                            diagnostics_convert::convert_diagnostics(file_diags, &content);
+                        Some((uri, lsp_diags))
+                    })
+                    .collect()
+            })
+        };
+
+        if let Some(conversions) = conversions {
+            let mut new_published = HashSet::new();
+            for (uri, lsp_diags) in conversions {
+                self.client
+                    .publish_diagnostics(uri.clone(), lsp_diags, None)
+                    .await;
+                new_published.insert(uri);
+            }
+            *self.published_diagnostics.lock().unwrap() = new_published;
+        }
+    }
+
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
@@ -237,103 +293,55 @@ impl LanguageServer for AsciiDocLsp {
         let content = params.text_document.text;
         let version = params.text_document.version;
 
-        self.documents.lock().unwrap().insert(
-            uri.clone(),
-            DocumentState {
-                content: content.clone(),
-                version,
-            },
-        );
+        self.documents
+            .lock()
+            .unwrap()
+            .insert(uri, DocumentState { content, version });
 
-        // Publish initial diagnostics from workspace state (V-7: only for files in graph)
-        let lsp_diags = {
-            let ws = self.workspace.lock().unwrap();
-            match (ws.as_ref(), uri.to_file_path()) {
-                (Some(ws), Some(path)) => {
-                    let path_owned = path.into_owned();
-                    if ws.documents.contains_key(&path_owned) {
-                        let file_diags: Vec<_> = ws
-                            .diagnostics
-                            .iter()
-                            .filter(|d| d.file == path_owned)
-                            .cloned()
-                            .collect();
-                        Some(diagnostics_convert::convert_diagnostics(
-                            &file_diags,
-                            &content,
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        };
-
-        if let Some(diags) = lsp_diags {
-            if !diags.is_empty() {
-                self.published_diagnostics
-                    .lock()
-                    .unwrap()
-                    .insert(uri.clone());
-            }
-            self.client
-                .publish_diagnostics(uri, diags, Some(version))
-                .await;
-        }
+        self.rebuild_and_publish().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let new_version = params.text_document.version;
 
-        let mut docs = self.documents.lock().unwrap();
-        // Version guard: discard outdated changes (DC-2)
-        if let Some(existing) = docs.get(&uri) {
-            if new_version <= existing.version {
-                return;
+        // Update document store (lock scope limited)
+        {
+            let mut docs = self.documents.lock().unwrap();
+            // Version guard: discard outdated changes (DC-2)
+            if let Some(existing) = docs.get(&uri) {
+                if new_version <= existing.version {
+                    return;
+                }
+            }
+
+            // Full sync: take the last content change (TextDocumentSyncKind::FULL)
+            if let Some(change) = params.content_changes.into_iter().last() {
+                docs.insert(
+                    uri,
+                    DocumentState {
+                        content: change.text,
+                        version: new_version,
+                    },
+                );
             }
         }
 
-        // Full sync: take the last content change (TextDocumentSyncKind::FULL)
-        if let Some(change) = params.content_changes.into_iter().last() {
-            docs.insert(
-                uri,
-                DocumentState {
-                    content: change.text,
-                    version: new_version,
-                },
-            );
-        }
+        // Rebuild workspace and publish diagnostics (DC-5: Live diagnostics on change)
+        self.rebuild_and_publish().await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.lock().unwrap().remove(&uri);
 
-        // Clear diagnostics for closed file
-        self.published_diagnostics.lock().unwrap().remove(&uri);
-        self.client.publish_diagnostics(uri, vec![], None).await;
+        // Rebuild: uses disk content for closed file, clears stale diagnostics automatically
+        self.rebuild_and_publish().await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let _ = params; // params.text not used; we rebuild from document store
-        let root = self.root.lock().unwrap().clone();
-        let Some(root) = root else { return };
-
-        let workspace_root = detect_workspace_root(&root);
-        let Some(entry) = find_entry_point(&workspace_root) else {
-            return;
-        };
-
-        // Build content overrides from open documents
-        let overrides = build_content_overrides(&self.documents);
-
-        // Rebuild workspace with overrides (DC-3: Semantic Layer on save)
-        if let Ok(ws) = Workspace::build_with_overrides(&workspace_root, &entry, &overrides) {
-            self.publish_workspace_diagnostics(&ws).await;
-            *self.workspace.lock().unwrap() = Some(ws);
-        }
+        let _ = params;
+        self.rebuild_and_publish().await;
     }
 
     async fn document_symbol(
@@ -719,6 +727,14 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
     // Sort by name for deterministic output
     symbols.sort_by(|a, b| a.name.cmp(&b.name));
     symbols
+}
+
+/// Rebuild workspace: detect root, find entry point, build with overrides.
+/// Returns None if no entry point found or build fails.
+fn rebuild_workspace(root: &Path, overrides: &HashMap<PathBuf, String>) -> Option<Workspace> {
+    let workspace_root = detect_workspace_root(root);
+    let entry = find_entry_point(&workspace_root)?;
+    Workspace::build_with_overrides(&workspace_root, &entry, overrides).ok()
 }
 
 /// Build a HashMap of file path -> content for all open documents.
@@ -1717,6 +1733,97 @@ mod tests {
             target
         );
         assert_eq!(line, 3, "docdir is on line 3 of .asciidoctorconfig");
+    }
+
+    // --- rebuild_workspace tests (adoc-0016: Live Diagnostics) ---
+
+    #[test]
+    fn test_rebuild_workspace_returns_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Entry file with a broken xref
+        fs::write(root.join("index.adoc"), "= Title\n\n<<nonexistent>>\n").unwrap();
+
+        let documents: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
+        let overrides = build_content_overrides(&documents);
+
+        let result = rebuild_workspace(root, &overrides);
+
+        assert!(result.is_some());
+        let ws = result.unwrap();
+        // Workspace must have at least one diagnostic (broken xref)
+        assert!(!ws.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_did_change_rebuild_updates_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Setup: file with valid content on disk
+        fs::write(
+            root.join("index.adoc"),
+            "= Title\n\n[[anchor]]\n== Section\n\n<<anchor>>\n",
+        )
+        .unwrap();
+
+        // Simulate did_change: Document Store with modified content
+        let uri = Uri::from_str(&format!(
+            "file://{}",
+            root.join("index.adoc").canonicalize().unwrap().display()
+        ))
+        .unwrap();
+        let documents: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
+        documents.lock().unwrap().insert(
+            uri,
+            DocumentState {
+                content: "= Title\n\n<<broken-xref>>\n".into(),
+                version: 2,
+            },
+        );
+
+        // Rebuild with overrides from Document Store
+        let overrides = build_content_overrides(&documents);
+        let result = rebuild_workspace(root, &overrides);
+
+        assert!(result.is_some());
+        let ws = result.unwrap();
+        // Override content must produce diagnostic for broken xref
+        assert!(
+            ws.diagnostics
+                .iter()
+                .any(|d| d.message.contains("broken-xref")),
+            "Expected diagnostic from did_change content override"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_workspace_uses_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Disk: valid xref
+        fs::write(
+            root.join("index.adoc"),
+            "= Title\n\n[[valid-anchor]]\n== Section\n\n<<valid-anchor>>\n",
+        )
+        .unwrap();
+
+        // Override: broken xref (simulates unsaved edit)
+        let index_path = root.join("index.adoc").canonicalize().unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(index_path, "= Title\n\n<<broken-ref>>\n".to_string());
+
+        let result = rebuild_workspace(root, &overrides);
+        assert!(result.is_some());
+        let ws = result.unwrap();
+        assert!(
+            ws.diagnostics
+                .iter()
+                .any(|d| d.message.contains("broken-ref")),
+            "Expected diagnostic for broken xref from override"
+        );
     }
 
     // --- path_to_uri tests (Finding 2: URL-encoding) ---
