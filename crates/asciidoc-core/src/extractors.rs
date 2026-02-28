@@ -44,6 +44,37 @@ pub fn collect_inline_ranges(node: tree_sitter::Node) -> Vec<tree_sitter::Range>
     ranges
 }
 
+/// Extract xrefs and anchors by parsing each inline range individually.
+///
+/// Parsing all ranges in a single `set_included_ranges` call can cause
+/// cross-range misparses: e.g. a `+` in one paragraph matches a `+` in
+/// another, creating a false passthrough node that swallows xref/anchor
+/// nodes (adoc-0023). Parsing per-range isolates each line's parse context.
+pub fn extract_inline_content_safe(
+    ranges: &[tree_sitter::Range],
+    source: &str,
+) -> (Vec<Xref>, Vec<Anchor>) {
+    let mut all_xrefs = Vec::new();
+    let mut all_anchors = Vec::new();
+
+    let Ok(mut parser) = crate::parser::init_inline_parser() else {
+        return (all_xrefs, all_anchors);
+    };
+
+    for range in ranges {
+        if parser.set_included_ranges(&[*range]).is_err() {
+            continue;
+        }
+        let Ok(tree) = crate::parser::parse(&mut parser, source) else {
+            continue;
+        };
+        all_xrefs.extend(extract_xrefs(tree.root_node(), source.as_bytes()));
+        all_anchors.extend(extract_anchors(tree.root_node(), source.as_bytes()));
+    }
+
+    (all_xrefs, all_anchors)
+}
+
 // --- Private walk functions ---
 
 fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Section>) {

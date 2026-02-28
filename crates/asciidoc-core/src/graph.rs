@@ -171,31 +171,11 @@ fn walk(
     let includes_raw = crate::extractors::extract_includes(root_node, source.as_bytes());
     let file_attrs = crate::extractors::extract_attributes(root_node, source.as_bytes());
 
-    // Inline parsing for xrefs and anchors
+    // Inline parsing for xrefs and anchors.
+    // Parse each range individually to prevent cross-range passthrough
+    // misparses (adoc-0023).
     let inline_ranges = crate::extractors::collect_inline_ranges(root_node);
-    let (xrefs, anchors) = if !inline_ranges.is_empty() {
-        match crate::parser::init_inline_parser() {
-            Ok(mut inline_parser) => {
-                if inline_parser.set_included_ranges(&inline_ranges).is_ok() {
-                    match crate::parser::parse(&mut inline_parser, &source) {
-                        Ok(inline_tree) => {
-                            let inline_root = inline_tree.root_node();
-                            (
-                                crate::extractors::extract_xrefs(inline_root, source.as_bytes()),
-                                crate::extractors::extract_anchors(inline_root, source.as_bytes()),
-                            )
-                        }
-                        Err(_) => (vec![], vec![]),
-                    }
-                } else {
-                    (vec![], vec![])
-                }
-            }
-            Err(_) => (vec![], vec![]),
-        }
-    } else {
-        (vec![], vec![])
-    };
+    let (xrefs, anchors) = crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
 
     // Register file attributes
     registry.register_file_attributes(&canonical, &file_attrs);

@@ -51,11 +51,19 @@ pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
         return Some(info);
     }
 
-    // Try inline grammar (xrefs, shorthand xrefs)
+    // Try inline grammar (xrefs, shorthand xrefs).
+    // Only parse the range(s) containing the cursor position to avoid cross-range
+    // misparses (e.g. a `+` in one paragraph matching a `+` in another, creating
+    // a giant false passthrough node that swallows xref nodes — adoc-0023).
     let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(block_tree.root_node());
-    if !inline_ranges.is_empty() {
+    let cursor_ranges: Vec<_> = inline_ranges
+        .iter()
+        .filter(|r| r.start_point.row <= point.row && r.end_point.row >= point.row)
+        .cloned()
+        .collect();
+    if !cursor_ranges.is_empty() {
         let mut inline_parser = asciidoc_core::parser::init_inline_parser().ok()?;
-        inline_parser.set_included_ranges(&inline_ranges).ok()?;
+        inline_parser.set_included_ranges(&cursor_ranges).ok()?;
         let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, content).ok()?;
 
         if let Some(info) = classify_inline_node(inline_tree.root_node(), point, content.as_bytes())
@@ -592,5 +600,92 @@ mod tests {
             character: 27,
         };
         assert!(find_node_at_position(content, pos2).is_none());
+    }
+
+    // --- adoc-0023: xref after list items ---
+
+    #[test]
+    fn test_find_node_xref_after_list_items() {
+        // Reproduces adoc-0023: xref in paragraph after unordered list is not found.
+        // This matches the pattern in 09_architecture_decisions.adoc:49.
+        let content = "\
+= Title
+
+*Consequences:*
+
+* Positive: First benefit.
+* Negative: A downside.
+
+For details see xref:05_building_block_view.adoc#building-blocks[see Building Block View].
+";
+        // "xref:" starts at character 16 on line 7 (0-indexed)
+        let pos = Position {
+            line: 7,
+            character: 20,
+        };
+
+        let info = find_node_at_position(content, pos);
+        assert!(
+            info.is_some(),
+            "xref after list items must be found (adoc-0023)"
+        );
+        let info = info.unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::Xref {
+                target: "05_building_block_view.adoc#building-blocks".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_node_xref_real_adr_content() {
+        // adoc-0023: xref in 09_architecture_decisions.adoc line 49 was not found
+        // because `+` in "(block + inline)" created a false passthrough spanning
+        // rows 17-70, swallowing the xref nodes.
+        let content = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/chapters/09_architecture_decisions.adoc"
+        ))
+        .unwrap();
+
+        // Line 49 (1-indexed): "...see xref:05_building_block_view.adoc#building-blocks[...]."
+        let pos = Position {
+            line: 48,
+            character: 67,
+        };
+        let info = find_node_at_position(&content, pos);
+        assert!(info.is_some(), "xref on line 49 must be found (adoc-0023)");
+        assert_eq!(
+            info.unwrap().kind,
+            NodeKind::Xref {
+                target: "05_building_block_view.adoc#building-blocks".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_node_xref_real_adr_line_71() {
+        // adoc-0023: second affected xref on line 71, also inside the false passthrough.
+        let content = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/chapters/09_architecture_decisions.adoc"
+        ))
+        .unwrap();
+
+        // Line 71 (1-indexed): "...documented in xref:05_building_block_view.adoc#building-blocks[...]..."
+        // "xref:" starts at character 91, target at 96
+        let pos = Position {
+            line: 70,
+            character: 100,
+        };
+        let info = find_node_at_position(&content, pos);
+        assert!(info.is_some(), "xref on line 71 must be found (adoc-0023)");
+        assert_eq!(
+            info.unwrap().kind,
+            NodeKind::Xref {
+                target: "05_building_block_view.adoc#building-blocks".into()
+            }
+        );
     }
 }
