@@ -8,7 +8,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::*;
+use tower_lsp_server::ls_types::{
+    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MarkedString, MessageType, OneOf, Position, Range, ReferenceParams, SaveOptions,
+    ServerCapabilities, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 use asciidoc_core::workspace::Workspace;
@@ -17,7 +27,7 @@ use asciidoc_core::workspace::Workspace;
 // Document Store (DC-4)
 // ---------------------------------------------------------------------------
 
-/// State for an open document. No cached Tree (V-1: tree_sitter::Tree is !Send).
+/// State for an open document. No cached Tree (V-1: `tree_sitter::Tree` is !Send).
 #[derive(Debug)]
 struct DocumentState {
     content: String,
@@ -145,10 +155,10 @@ impl AsciiDocLsp {
                 .iter()
                 .filter_map(|(path, file_diags)| {
                     let uri = path_to_uri(path)?;
-                    let content = docs
-                        .get(&uri)
-                        .map(|s| s.content.clone())
-                        .unwrap_or_else(|| std::fs::read_to_string(path).unwrap_or_default());
+                    let content = docs.get(&uri).map_or_else(
+                        || std::fs::read_to_string(path).unwrap_or_default(),
+                        |s| s.content.clone(),
+                    );
                     let lsp_diags = diagnostics_convert::convert_diagnostics(file_diags, &content);
                     Some((uri, lsp_diags))
                 })
@@ -199,7 +209,7 @@ impl LanguageServer for AsciiDocLsp {
         let root_path: Option<PathBuf> = params
             .root_uri
             .as_ref()
-            .and_then(|uri| uri.to_file_path().map(|cow| cow.into_owned()))
+            .and_then(|uri| uri.to_file_path().map(std::borrow::Cow::into_owned))
             .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
         if let Some(ref root) = root_path {
@@ -270,10 +280,10 @@ impl LanguageServer for AsciiDocLsp {
                     .iter()
                     .filter_map(|(path, file_diags)| {
                         let uri = path_to_uri(path)?;
-                        let content = docs
-                            .get(&uri)
-                            .map(|s| s.content.clone())
-                            .unwrap_or_else(|| std::fs::read_to_string(path).unwrap_or_default());
+                        let content = docs.get(&uri).map_or_else(
+                            || std::fs::read_to_string(path).unwrap_or_default(),
+                            |s| s.content.clone(),
+                        );
                         let lsp_diags =
                             diagnostics_convert::convert_diagnostics(file_diags, &content);
                         Some((uri, lsp_diags))
@@ -411,11 +421,11 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         // Check if cursor is on an {attribute} reference
-        let attr_name =
-            match find_attribute_at_position(&content, position.line, position.character) {
-                Some(name) => name,
-                None => return Ok(None),
-            };
+        let Some(attr_name) =
+            find_attribute_at_position(&content, position.line, position.character)
+        else {
+            return Ok(None);
+        };
 
         // Resolve the attribute value from the workspace
         let doc_path = match uri.to_file_path() {
@@ -427,7 +437,7 @@ impl LanguageServer for AsciiDocLsp {
         let value = ws
             .as_ref()
             .and_then(|ws| ws.attributes.resolve(&doc_path, &attr_name))
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         match value {
             Some(val) => Ok(Some(Hover {
@@ -490,17 +500,17 @@ impl LanguageServer for AsciiDocLsp {
         // Drop the lock before building response
         drop(ws);
 
-        let (target_path, target_line) = match result {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some((target_path, target_line)) = result else {
+            return Ok(None);
         };
 
-        let target_uri = match Uri::from_file_path(&target_path) {
-            Some(u) => u,
-            None => return Ok(None),
+        let Some(target_uri) = Uri::from_file_path(&target_path) else {
+            return Ok(None);
         };
 
         // Convert 1-indexed line to 0-indexed LSP position
+        // LSP uses u32 for line numbers; real-world files won't exceed u32::MAX lines.
+        #[allow(clippy::cast_possible_truncation)]
         let lsp_line = (target_line as u32).saturating_sub(1);
         let target_pos = Position {
             line: lsp_line,
@@ -552,9 +562,8 @@ impl LanguageServer for AsciiDocLsp {
         );
         drop(ws);
 
-        let refs = match results {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some(refs) = results else {
+            return Ok(None);
         };
 
         let locations: Vec<Location> = refs
@@ -598,9 +607,8 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         // Detect completion context from cursor position
-        let ctx = match completion::detect_completion_context(&content, position) {
-            Some(ctx) => ctx,
-            None => return Ok(None),
+        let Some(ctx) = completion::detect_completion_context(&content, position) else {
+            return Ok(None);
         };
 
         let doc_path = match uri.to_file_path() {
@@ -661,7 +669,7 @@ fn find_attribute_at_position(content: &str, line: u32, character: u32) -> Optio
 // DocumentSymbol helpers (V-8: extracted for testability)
 // ---------------------------------------------------------------------------
 
-/// Convert a flat list of sections into a nested DocumentSymbol hierarchy.
+/// Convert a flat list of sections into a nested `DocumentSymbol` hierarchy.
 ///
 /// Sections are nested by level: a level-2 section becomes a child of the
 /// preceding level-1 section, etc. Range covers from heading to just before
@@ -717,8 +725,7 @@ fn build_symbol_children(
         let heading_len = content
             .lines()
             .nth(start_line.saturating_sub(1))
-            .map(|l| l.len())
-            .unwrap_or(0);
+            .map_or(0, str::len);
         let selection_end = positions::to_lsp_position(start_line, heading_len, content);
 
         let range = Range {
@@ -752,7 +759,7 @@ fn build_symbol_children(
     result
 }
 
-/// Build DocumentSymbol list combining sections (nested), includes (flat), and attributes (flat).
+/// Build `DocumentSymbol` list combining sections (nested), includes (flat), and attributes (flat).
 fn build_document_symbols(
     sections: &[asciidoc_core::types::Section],
     includes: &[asciidoc_core::types::IncludeMacro],
@@ -765,7 +772,7 @@ fn build_document_symbols(
     symbols
 }
 
-/// Convert includes to flat DocumentSymbol entries (SymbolKind::FILE).
+/// Convert includes to flat `DocumentSymbol` entries (`SymbolKind::FILE`).
 fn includes_to_document_symbols(
     includes: &[asciidoc_core::types::IncludeMacro],
     content: &str,
@@ -812,7 +819,7 @@ fn includes_to_document_symbols(
         .collect()
 }
 
-/// Convert attribute definitions to flat DocumentSymbol entries (SymbolKind::VARIABLE).
+/// Convert attribute definitions to flat `DocumentSymbol` entries (`SymbolKind::VARIABLE`).
 fn attributes_to_document_symbols(
     attributes: &[asciidoc_core::types::AttributeDef],
     content: &str,
@@ -878,9 +885,8 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
     let mut symbols = Vec::new();
 
     for (path, doc) in &ws.documents {
-        let uri = match path_to_uri(path) {
-            Some(u) => u,
-            None => continue,
+        let Some(uri) = path_to_uri(path) else {
+            continue;
         };
         let content = std::fs::read_to_string(path).unwrap_or_default();
 
@@ -969,9 +975,8 @@ fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformati
             continue;
         }
 
-        let uri = match path_to_uri(&loc.file) {
-            Some(u) => u,
-            None => continue,
+        let Some(uri) = path_to_uri(&loc.file) else {
+            continue;
         };
         let content = std::fs::read_to_string(&loc.file).unwrap_or_default();
         let pos = positions::to_lsp_position(loc.line, 0, &content);
@@ -1007,7 +1012,7 @@ fn rebuild_workspace(root: &Path, overrides: &HashMap<PathBuf, String>) -> Optio
     Workspace::build_with_overrides(&workspace_root, &entry, overrides).ok()
 }
 
-/// Build a HashMap of file path -> content for all open documents.
+/// Build a `HashMap` of file path -> content for all open documents.
 /// Used as overrides so the semantic layer reads in-memory content
 /// instead of stale disk content.
 fn build_content_overrides(

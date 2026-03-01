@@ -16,6 +16,7 @@ impl Default for IncludeGraph {
 }
 
 impl IncludeGraph {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             forward: HashMap::new(),
@@ -35,19 +36,22 @@ impl IncludeGraph {
             .push(from.to_path_buf());
     }
 
+    #[must_use]
     pub fn includes_of(&self, file: &Path) -> &[IncludeEdge] {
         static EMPTY: Vec<IncludeEdge> = Vec::new();
         self.forward.get(file).map_or(&EMPTY, |v| v.as_slice())
     }
 
     #[allow(dead_code)] // Public API for LSP consumers
+    #[must_use]
     pub fn included_by(&self, file: &Path) -> &[PathBuf] {
         static EMPTY: Vec<PathBuf> = Vec::new();
         self.reverse.get(file).map_or(&EMPTY, |v| v.as_slice())
     }
 
-    /// Generate an IncludeTree from the graph for CLI --tree output.
+    /// Generate an `IncludeTree` from the graph for CLI --tree output.
     /// Breaks cycles by tracking visited nodes.
+    #[must_use]
     pub fn to_include_tree(
         &self,
         root: &Path,
@@ -138,9 +142,8 @@ fn walk(
     visited: &mut HashSet<PathBuf>,
     overrides: &HashMap<PathBuf, String>,
 ) {
-    let canonical = match file.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return, // File doesn't exist — edge in graph is enough for diagnostics
+    let Ok(canonical) = file.canonicalize() else {
+        return; // File doesn't exist — edge in graph is enough for diagnostics
     };
 
     if !visited.insert(canonical.clone()) {
@@ -157,13 +160,11 @@ fn walk(
     };
 
     // Parse with block parser
-    let mut block_parser = match crate::parser::init_block_parser() {
-        Ok(p) => p,
-        Err(_) => return,
+    let Ok(mut block_parser) = crate::parser::init_block_parser() else {
+        return;
     };
-    let block_tree = match crate::parser::parse(&mut block_parser, &source) {
-        Ok(t) => t,
-        Err(_) => return,
+    let Ok(block_tree) = crate::parser::parse(&mut block_parser, &source) else {
+        return;
     };
 
     let root_node = block_tree.root_node();

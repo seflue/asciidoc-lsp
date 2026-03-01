@@ -13,9 +13,9 @@ use crate::positions;
 // Syntax Completion Catalog
 // ---------------------------------------------------------------------------
 
-/// A static catalog entry for AsciiDoc syntax completions.
+/// A static catalog entry for `AsciiDoc` syntax completions.
 struct SyntaxEntry {
-    /// Display name (e.g. "image::", "NOTE:", "toc", "kbd")
+    /// Display name (e.g. "`image::`", "NOTE:", "toc", "kbd")
     name: &'static str,
     /// Snippet with tabstops (LSP snippet syntax)
     snippet: &'static str,
@@ -365,10 +365,11 @@ pub fn detect_completion_context(content: &str, pos: Position) -> Option<Complet
     {
         let word_start = before_cursor
             .rfind(|c: char| !c.is_ascii_alphanumeric())
-            .map(|i| i + 1)
-            .unwrap_or(0);
+            .map_or(0, |i| i + 1);
         let word = &before_cursor[word_start..];
         if !word.is_empty() && INLINE_MACROS.iter().any(|e| e.name.starts_with(word)) {
+            // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX.
+            #[allow(clippy::cast_possible_truncation)]
             let word_start_col = line_str[..word_start].encode_utf16().count() as u32;
             return Some(CompletionContext::InlineMacroPrefix {
                 prefix: word.to_string(),
@@ -388,8 +389,7 @@ pub fn detect_completion_context(content: &str, pos: Position) -> Option<Complet
             let before_colon = &before_cursor[..colon_pos];
             let word_start = before_colon
                 .rfind(|c: char| !c.is_ascii_alphanumeric())
-                .map(|i| i + 1)
-                .unwrap_or(0);
+                .map_or(0, |i| i + 1);
             let word = &before_colon[word_start..];
             if !word.is_empty() && INLINE_MACROS.iter().any(|e| e.name == word) {
                 return Some(CompletionContext::InlineMacro {
@@ -403,7 +403,7 @@ pub fn detect_completion_context(content: &str, pos: Position) -> Option<Complet
 }
 
 /// Resolve xref completions by listing all anchors from the workspace's
-/// ReferenceIndex, filtered by prefix.
+/// `ReferenceIndex`, filtered by prefix.
 ///
 /// Returns `CompletionItem`s with:
 /// - `label`: anchor ID
@@ -411,9 +411,8 @@ pub fn detect_completion_context(content: &str, pos: Position) -> Option<Complet
 /// - `detail`: filename + anchor kind
 /// - `insert_text`: `anchor_id>>` (appends closing `>>`)
 pub fn resolve_xref_completions(prefix: &str, ws: Option<&Workspace>) -> Vec<CompletionItem> {
-    let ws = match ws {
-        Some(ws) => ws,
-        None => return Vec::new(),
+    let Some(ws) = ws else {
+        return Vec::new();
     };
 
     let mut items: Vec<CompletionItem> = ws
@@ -436,8 +435,8 @@ pub fn resolve_xref_completions(prefix: &str, ws: Option<&Workspace>) -> Vec<Com
             CompletionItem {
                 label: id.clone(),
                 kind: Some(CompletionItemKind::REFERENCE),
-                detail: Some(format!("{} ({})", filename, kind_label)),
-                insert_text: Some(format!("{}>>", id)),
+                detail: Some(format!("{filename} ({kind_label})")),
+                insert_text: Some(format!("{id}>>")),
                 ..Default::default()
             }
         })
@@ -484,9 +483,8 @@ pub fn resolve_include_completions(
 
     let list_dir = base.join(resolved_dir);
 
-    let entries = match std::fs::read_dir(&list_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+    let Ok(entries) = std::fs::read_dir(&list_dir) else {
+        return Vec::new();
     };
 
     let mut items: Vec<CompletionItem> = entries
@@ -496,24 +494,27 @@ pub fn resolve_include_completions(
             let path = entry.path();
 
             if path.is_dir() {
-                let dir_name = format!("{}/", name);
+                let dir_name = format!("{name}/");
                 if !dir_name.starts_with(filter) && !name.starts_with(filter) {
                     return None;
                 }
                 Some(CompletionItem {
                     label: dir_name.clone(),
                     kind: Some(CompletionItemKind::FOLDER),
-                    insert_text: Some(format!("{}{}", original_dir_prefix, dir_name)),
+                    insert_text: Some(format!("{original_dir_prefix}{dir_name}")),
                     ..Default::default()
                 })
-            } else if name.ends_with(".adoc") {
+            } else if std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc"))
+            {
                 if !name.starts_with(filter) {
                     return None;
                 }
                 Some(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FILE),
-                    insert_text: Some(format!("{}{}[]", original_dir_prefix, name)),
+                    insert_text: Some(format!("{original_dir_prefix}{name}[]")),
                     ..Default::default()
                 })
             } else {
@@ -527,7 +528,7 @@ pub fn resolve_include_completions(
 }
 
 /// Resolve attribute completions by listing all attributes from the workspace's
-/// AttributeRegistry, filtered by prefix.
+/// `AttributeRegistry`, filtered by prefix.
 ///
 /// Returns `CompletionItem`s with:
 /// - `label`: attribute name
@@ -539,9 +540,8 @@ pub fn resolve_attribute_completions(
     doc_path: &Path,
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
-    let ws = match ws {
-        Some(ws) => ws,
-        None => return Vec::new(),
+    let Some(ws) = ws else {
+        return Vec::new();
     };
 
     let mut items: Vec<CompletionItem> = ws
@@ -553,7 +553,7 @@ pub fn resolve_attribute_completions(
             label: name.clone(),
             kind: Some(CompletionItemKind::VARIABLE),
             detail: Some(value),
-            insert_text: Some(format!("{}}}", name)),
+            insert_text: Some(format!("{name}}}")),
             ..Default::default()
         })
         .collect();
@@ -594,7 +594,7 @@ fn resolve_inline_macro_completions(macro_name: &str) -> Vec<CompletionItem> {
 }
 
 /// Resolve inline macro prefix completions (no `:` typed yet).
-/// Returns items with a TextEdit that replaces the typed prefix with the full macro + snippet.
+/// Returns items with a `TextEdit` that replaces the typed prefix with the full macro + snippet.
 fn resolve_inline_macro_prefix_completions(
     prefix: &str,
     line: u32,
@@ -634,7 +634,7 @@ fn resolve_inline_macro_prefix_completions(
         .collect()
 }
 
-/// Generic resolver: filter a syntax catalog by prefix and build CompletionItems.
+/// Generic resolver: filter a syntax catalog by prefix and build `CompletionItems`.
 fn resolve_syntax_catalog(
     catalog: &[SyntaxEntry],
     prefix: &str,

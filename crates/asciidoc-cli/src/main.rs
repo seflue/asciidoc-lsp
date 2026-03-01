@@ -8,7 +8,7 @@ use asciidoc_core::workspace::Workspace;
 #[derive(ClapParser)]
 #[command(name = "asciidoc-cli", about = "AsciiDoc Treesitter Parser PoC")]
 struct Cli {
-    /// Path to AsciiDoc file
+    /// Path to `AsciiDoc` file
     path: PathBuf,
 
     /// Show include tree
@@ -71,19 +71,19 @@ fn main() -> anyhow::Result<()> {
 
         // Inline parsing for xrefs and anchors
         let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(root);
-        let (xrefs, anchors) = if !inline_ranges.is_empty() {
+        let (xrefs, anchors) = if inline_ranges.is_empty() {
+            (vec![], vec![])
+        } else {
             let mut inline_parser = asciidoc_core::parser::init_inline_parser()?;
             inline_parser
                 .set_included_ranges(&inline_ranges)
-                .map_err(|e| anyhow::anyhow!("Failed to set inline ranges: {:?}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to set inline ranges: {e:?}"))?;
             let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, &source)?;
             let inline_root = inline_tree.root_node();
             (
                 asciidoc_core::extractors::extract_xrefs(inline_root, source.as_bytes()),
                 asciidoc_core::extractors::extract_anchors(inline_root, source.as_bytes()),
             )
-        } else {
-            (vec![], vec![])
         };
 
         // Output
@@ -109,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                         .map(|(k, v)| if v.is_empty() {
                             k.clone()
                         } else {
-                            format!("{}={}", k, v)
+                            format!("{k}={v}")
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -131,7 +131,7 @@ fn main() -> anyhow::Result<()> {
                 let display = x
                     .display_text
                     .as_deref()
-                    .map(|d| format!(" \"{}\"", d))
+                    .map(|d| format!(" \"{d}\""))
                     .unwrap_or_default();
                 println!("  {} (line {}){}", x.target, x.line, display);
             }
@@ -167,9 +167,9 @@ fn print_tree_child(tree: &IncludeTree, prefix: &str, is_last: bool, show_all: b
     );
 
     let child_prefix = if is_last {
-        format!("{}    ", prefix)
+        format!("{prefix}    ")
     } else {
-        format!("{}│   ", prefix)
+        format!("{prefix}│   ")
     };
 
     for (i, child) in tree.includes.iter().enumerate() {
@@ -179,16 +179,15 @@ fn print_tree_child(tree: &IncludeTree, prefix: &str, is_last: bool, show_all: b
 }
 
 fn format_tree_node(tree: &IncludeTree, show_all: bool) -> String {
-    let file_display = tree
-        .file
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| tree.file.display().to_string());
+    let file_display = tree.file.file_name().map_or_else(
+        || tree.file.display().to_string(),
+        |f| f.to_string_lossy().to_string(),
+    );
 
-    let section_info = if !tree.sections.is_empty() {
-        format!(" ({} sections)", tree.sections.len())
-    } else {
+    let section_info = if tree.sections.is_empty() {
         String::new()
+    } else {
+        format!(" ({} sections)", tree.sections.len())
     };
 
     let inline_info = if show_all {
@@ -211,11 +210,8 @@ fn format_tree_node(tree: &IncludeTree, show_all: bool) -> String {
     let error_suffix = tree
         .error
         .as_ref()
-        .map(|e| format!(" ⚠ {}", e))
+        .map(|e| format!(" ⚠ {e}"))
         .unwrap_or_default();
 
-    format!(
-        "{}{}{}{}",
-        file_display, section_info, inline_info, error_suffix
-    )
+    format!("{file_display}{section_info}{inline_info}{error_suffix}")
 }

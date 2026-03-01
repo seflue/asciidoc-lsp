@@ -1,18 +1,30 @@
 use anyhow::Result;
 use tree_sitter::{Parser, Tree};
 
+/// Initialize a tree-sitter parser for the block-level `AsciiDoc` grammar.
+///
+/// # Errors
+/// Returns an error if the tree-sitter language fails to load.
 pub fn init_block_parser() -> Result<Parser> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_asciidoc::language())?;
     Ok(parser)
 }
 
+/// Initialize a tree-sitter parser for the inline-level `AsciiDoc` grammar.
+///
+/// # Errors
+/// Returns an error if the tree-sitter language fails to load.
 pub fn init_inline_parser() -> Result<Parser> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_asciidoc_inline::language())?;
     Ok(parser)
 }
 
+/// Parse source text with the given tree-sitter parser.
+///
+/// # Errors
+/// Returns an error if tree-sitter fails to produce a parse tree.
 pub fn parse(parser: &mut Parser, source: &str) -> Result<Tree> {
     parser
         .parse(source, None)

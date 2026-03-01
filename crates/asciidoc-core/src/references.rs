@@ -18,6 +18,7 @@ impl Default for ReferenceIndex {
 }
 
 impl ReferenceIndex {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             anchors: HashMap::new(),
@@ -48,12 +49,14 @@ impl ReferenceIndex {
     }
 
     #[allow(dead_code)] // Public API for LSP consumers
+    #[must_use]
     pub fn lookup(&self, id: &str) -> Option<&AnchorLocation> {
         self.anchors.get(id)
     }
 
     /// Build the reference index from all parsed documents.
     /// Collects explicit anchors and generates implicit section IDs.
+    #[must_use]
     pub fn build(
         documents: &HashMap<PathBuf, DocumentModel>,
         registry: &AttributeRegistry,
@@ -93,7 +96,10 @@ impl ReferenceIndex {
     }
 
     /// Resolve an xref target to a file and line.
-    /// Supports: `file.adoc#anchor`, `#anchor`, `anchor` (workspace-wide lookup)
+    /// Supports: `file.adoc#anchor`, `#anchor`, `anchor` (workspace-wide lookup).
+    ///
+    /// # Errors
+    /// Returns a `DiagnosticKind::BrokenXref` if the target file or anchor cannot be found.
     pub fn resolve_xref(
         &self,
         xref: &Xref,
@@ -108,8 +114,7 @@ impl ReferenceIndex {
             let target_file = documents.keys().find(|p| {
                 p.ends_with(file_ref)
                     || p.file_name()
-                        .map(|f| f.to_string_lossy() == file_ref)
-                        .unwrap_or(false)
+                        .is_some_and(|f| f.to_string_lossy() == file_ref)
             });
 
             match target_file {
@@ -184,6 +189,7 @@ fn parse_xref_target(target: &str) -> (Option<&str>, Option<&str>) {
 
 /// Generate an implicit section ID from a title.
 /// Rules: lowercase, non-alnum → separator, prepend prefix.
+#[must_use]
 pub fn generate_section_id(title: &str, prefix: &str, separator: &str) -> String {
     let mut result = String::with_capacity(prefix.len() + title.len());
     result.push_str(prefix);

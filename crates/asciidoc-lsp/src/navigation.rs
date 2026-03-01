@@ -70,7 +70,7 @@ pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
     let cursor_ranges: Vec<_> = inline_ranges
         .iter()
         .filter(|r| r.start_point.row <= point.row && r.end_point.row >= point.row)
-        .cloned()
+        .copied()
         .collect();
     if !cursor_ranges.is_empty() {
         let mut inline_parser = asciidoc_core::parser::init_inline_parser().ok()?;
@@ -91,7 +91,7 @@ pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
 /// Returns `(target_path, target_line_1indexed)` or `None` if the node
 /// at the cursor is not a navigable reference or cannot be resolved.
 ///
-/// Extracted from the LanguageServer handler for testability (V-8).
+/// Extracted from the `LanguageServer` handler for testability (V-8).
 pub fn resolve_goto_definition(
     content: &str,
     pos: Position,
@@ -336,7 +336,7 @@ fn classify_inline_node(
 }
 
 /// Detect `:name: value` attribute definitions on the current line.
-/// Returns NodeInfo if the line matches the `:name: value` pattern.
+/// Returns `NodeInfo` if the line matches the `:name: value` pattern.
 fn find_attribute_def_at_position(content: &str, line_1: usize) -> Option<NodeInfo> {
     let line_0 = line_1.saturating_sub(1);
     let line_str = content.lines().nth(line_0)?;
@@ -377,7 +377,7 @@ fn find_attribute_def_at_position(content: &str, line_1: usize) -> Option<NodeIn
 }
 
 /// Detect `{attribute-name}` references on the current line using regex-like scanning.
-/// Returns NodeInfo if the cursor is inside a valid `{name}` pattern
+/// Returns `NodeInfo` if the cursor is inside a valid `{name}` pattern
 /// (no spaces allowed in attribute names).
 fn find_attribute_ref_at_position(
     content: &str,

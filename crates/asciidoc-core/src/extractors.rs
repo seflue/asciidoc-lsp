@@ -2,18 +2,21 @@ use crate::types::{Anchor, AttributeDef, AttributeRef, IncludeMacro, Section, Xr
 
 // --- Block-level extractors (work on block parse tree) ---
 
+#[must_use]
 pub fn extract_sections(node: tree_sitter::Node, source: &[u8]) -> Vec<Section> {
     let mut results = Vec::new();
     walk_for_sections(node, source, &mut results);
     results
 }
 
+#[must_use]
 pub fn extract_includes(node: tree_sitter::Node, source: &[u8]) -> Vec<IncludeMacro> {
     let mut results = Vec::new();
     walk_for_includes(node, source, &mut results);
     results
 }
 
+#[must_use]
 pub fn extract_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<AttributeDef> {
     let mut results = Vec::new();
     walk_for_attributes(node, source, &mut results);
@@ -22,12 +25,14 @@ pub fn extract_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<Attribu
 
 // --- Inline-level extractors (work on inline parse tree) ---
 
+#[must_use]
 pub fn extract_anchors(node: tree_sitter::Node, source: &[u8]) -> Vec<Anchor> {
     let mut results = Vec::new();
     walk_for_anchors(node, source, &mut results);
     results
 }
 
+#[must_use]
 pub fn extract_xrefs(node: tree_sitter::Node, source: &[u8]) -> Vec<Xref> {
     let mut results = Vec::new();
     walk_for_xrefs(node, source, &mut results);
@@ -41,6 +46,7 @@ pub fn extract_xrefs(node: tree_sitter::Node, source: &[u8]) -> Vec<Xref> {
 /// Scans each line for `{name}` patterns using byte-based scanning.
 /// Skips escaped references (`\{name}`), empty braces (`{}`), and
 /// names containing whitespace (`{with spaces}`).
+#[must_use]
 pub fn extract_attribute_refs(source: &str) -> Vec<AttributeRef> {
     let mut results = Vec::new();
 
@@ -89,6 +95,7 @@ pub fn extract_attribute_refs(source: &str) -> Vec<AttributeRef> {
 
 /// Collect byte ranges of `line` nodes inside paragraphs, titles, etc.
 /// These ranges are passed to the inline parser via `set_included_ranges`.
+#[must_use]
 pub fn collect_inline_ranges(node: tree_sitter::Node) -> Vec<tree_sitter::Range> {
     let mut ranges = Vec::new();
     walk_for_inline_ranges(node, &mut ranges);
@@ -101,6 +108,7 @@ pub fn collect_inline_ranges(node: tree_sitter::Node) -> Vec<tree_sitter::Range>
 /// cross-range misparses: e.g. a `+` in one paragraph matches a `+` in
 /// another, creating a false passthrough node that swallows xref/anchor
 /// nodes (adoc-0023). Parsing per-range isolates each line's parse context.
+#[must_use]
 pub fn extract_inline_content_safe(
     ranges: &[tree_sitter::Range],
     source: &str,
@@ -316,8 +324,8 @@ fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option
     None
 }
 
-/// Extract attributes from block_macro_attr children of a block_macro node.
-/// Each block_macro_attr has attribute_name and attribute_value children.
+/// Extract attributes from `block_macro_attr` children of a `block_macro` node.
+/// Each `block_macro_attr` has `attribute_name` and `attribute_value` children.
 fn extract_block_macro_attrs(node: tree_sitter::Node, source: &[u8]) -> Vec<(String, String)> {
     let mut attrs = Vec::new();
     let mut cursor = node.walk();

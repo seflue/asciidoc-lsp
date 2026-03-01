@@ -106,13 +106,13 @@ impl fmt::Display for DiagnosticKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DiagnosticKind::BrokenXref { target } => {
-                write!(f, "broken cross-reference: {}", target)
+                write!(f, "broken cross-reference: {target}")
             }
             DiagnosticKind::BrokenInclude { path } => {
-                write!(f, "broken include: {}", path)
+                write!(f, "broken include: {path}")
             }
             DiagnosticKind::UndefinedAttribute { name } => {
-                write!(f, "undefined attribute: {{{}}}", name)
+                write!(f, "undefined attribute: {{{name}}}")
             }
             DiagnosticKind::DuplicateAnchor { id, first_file } => {
                 write!(

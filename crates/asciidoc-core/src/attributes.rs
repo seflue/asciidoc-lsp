@@ -22,6 +22,7 @@ pub struct AttributeRegistry {
 }
 
 impl AttributeRegistry {
+    #[must_use]
     pub fn new(root: &Path) -> Self {
         let mut builtin = HashMap::new();
         builtin.insert("docdir".into(), root.display().to_string());
@@ -37,9 +38,8 @@ impl AttributeRegistry {
     /// Path values (containing `/` or starting with `.`) are canonicalized
     /// relative to the config file's directory.
     pub fn load_config(&mut self, root: &Path) {
-        let start_dir = match root.canonicalize() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Ok(start_dir) = root.canonicalize() else {
+            return;
         };
 
         let mut config_contents: Vec<(PathBuf, String)> = Vec::new();
@@ -102,8 +102,9 @@ impl AttributeRegistry {
         self.per_file.insert(file.to_path_buf(), map);
     }
 
-    /// Return all attributes merged across layers with priority: per_file > config > builtin.
+    /// Return all attributes merged across layers with priority: `per_file` > config > builtin.
     /// Later layers override earlier ones for the same key.
+    #[must_use]
     pub fn all_attributes(&self, file: &Path) -> Vec<(String, String)> {
         let mut merged: HashMap<String, String> = self
             .builtin
@@ -125,18 +126,20 @@ impl AttributeRegistry {
     }
 
     /// Resolve an attribute by name with priority: Document-Header > Config > Built-in
+    #[must_use]
     pub fn resolve(&self, file: &Path, name: &str) -> Option<&str> {
         self.per_file
             .get(file)
             .and_then(|m| m.get(name))
             .map(|e| e.value.as_str())
             .or_else(|| self.config.get(name).map(|e| e.value.as_str()))
-            .or_else(|| self.builtin.get(name).map(|s| s.as_str()))
+            .or_else(|| self.builtin.get(name).map(std::string::String::as_str))
     }
 
     /// Resolve the source location of an attribute definition.
-    /// Same priority as resolve(): per_file > config > builtin.
+    /// Same priority as `resolve()`: `per_file` > config > builtin.
     /// Builtins have no source location and return None.
+    #[must_use]
     pub fn resolve_source(&self, file: &Path, name: &str) -> Option<AttributeSource> {
         self.per_file
             .get(file)
@@ -146,7 +149,8 @@ impl AttributeRegistry {
         // builtins: no source → implicitly None
     }
 
-    /// Substitute all `{attr}` references in a string using resolve().
+    /// Substitute all `{attr}` references in a string using `resolve()`.
+    #[must_use]
     pub fn substitute(&self, file: &Path, input: &str) -> String {
         let mut result = String::with_capacity(input.len());
         let mut chars = input.chars().peekable();

@@ -22,10 +22,10 @@ fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
     let end = positions::to_lsp_position(diag.line, line_text.len(), content);
 
     let severity = match &diag.kind {
-        DiagnosticKind::BrokenXref { .. } => ls_types::DiagnosticSeverity::WARNING,
         DiagnosticKind::BrokenInclude { .. } => ls_types::DiagnosticSeverity::ERROR,
-        DiagnosticKind::DuplicateAnchor { .. } => ls_types::DiagnosticSeverity::WARNING,
-        DiagnosticKind::UndefinedAttribute { .. } => ls_types::DiagnosticSeverity::WARNING,
+        DiagnosticKind::BrokenXref { .. }
+        | DiagnosticKind::DuplicateAnchor { .. }
+        | DiagnosticKind::UndefinedAttribute { .. } => ls_types::DiagnosticSeverity::WARNING,
     };
 
     ls_types::Diagnostic::new(

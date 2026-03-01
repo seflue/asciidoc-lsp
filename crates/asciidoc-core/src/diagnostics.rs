@@ -7,6 +7,7 @@ use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
 
 /// Collect all diagnostics across the workspace.
+#[must_use]
 pub fn collect_diagnostics(
     documents: &HashMap<PathBuf, DocumentModel>,
     graph: &IncludeGraph,

@@ -25,11 +25,15 @@ impl std::fmt::Debug for Workspace {
             .field("root", &self.root)
             .field("documents", &self.documents.keys().collect::<Vec<_>>())
             .field("diagnostics_count", &self.diagnostics.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl Workspace {
+    /// Build a workspace by parsing the entry file and all its includes.
+    ///
+    /// # Errors
+    /// Returns an error if the workspace cannot be constructed (currently infallible).
     pub fn build(root: &Path, entry: &Path) -> Result<Self> {
         let mut registry = AttributeRegistry::new(root);
         // Load config from entry file's directory upward — .asciidoctorconfig
@@ -51,8 +55,9 @@ impl Workspace {
 
     /// Find all usages of an attribute `{name}` across the workspace.
     ///
-    /// Returns a Vec of (file_path, line, start_col, end_col) for each reference.
+    /// Returns a Vec of (`file_path`, line, `start_col`, `end_col`) for each reference.
     /// Only returns usages (references), not definitions.
+    #[must_use]
     pub fn find_all_attribute_usages(&self, name: &str) -> Vec<(PathBuf, usize, usize, usize)> {
         let mut results = Vec::new();
         for doc in self.documents.values() {
@@ -73,6 +78,7 @@ impl Workspace {
     /// Find all include statements that reference the given target file.
     ///
     /// Returns `(source_file, line, 0, 0)` for each `include::target[]` found.
+    #[must_use]
     pub fn find_all_include_references(
         &self,
         target: &Path,
@@ -91,6 +97,7 @@ impl Workspace {
     /// Find all xrefs that reference the given filename (file part of xref target).
     ///
     /// Returns `(doc_path, line, 0, 0)` for each matching xref.
+    #[must_use]
     pub fn find_all_file_xrefs(&self, filename: &str) -> Vec<(PathBuf, usize, usize, usize)> {
         let mut results = Vec::new();
         for doc in self.documents.values() {
@@ -106,8 +113,8 @@ impl Workspace {
                     continue; // plain anchor, not a file reference
                 };
                 if file_part == filename
-                    || file_part.ends_with(&format!("/{}", filename))
-                    || filename.ends_with(&format!("/{}", file_part))
+                    || file_part.ends_with(&format!("/{filename}"))
+                    || filename.ends_with(&format!("/{file_part}"))
                 {
                     results.push((doc.path.clone(), xref.line, 0, 0));
                 }
@@ -120,6 +127,7 @@ impl Workspace {
     ///
     /// Matches xrefs with targets like `file.adoc#anchor`, `#anchor`, or `anchor`.
     /// Returns `(doc_path, line, 0, 0)` for each matching xref.
+    #[must_use]
     pub fn find_all_anchor_references(
         &self,
         anchor_id: &str,
@@ -151,6 +159,9 @@ impl Workspace {
     /// Files present in `overrides` will be read from the map instead of disk.
     /// This allows the LSP to use in-memory content for files that the user
     /// has modified but not yet saved.
+    ///
+    /// # Errors
+    /// Returns an error if the workspace cannot be constructed (currently infallible).
     pub fn build_with_overrides(
         root: &Path,
         entry: &Path,

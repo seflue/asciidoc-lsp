@@ -7,3 +7,6 @@ edition = "2021"
 asciidoc-core = { path = "../asciidoc-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+[lints]
+workspace = true

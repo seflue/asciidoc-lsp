@@ -5,6 +5,8 @@ use tower_lsp_server::ls_types::Position;
 /// - `line`: 1-indexed line number (from our Section/Anchor types)
 /// - `col`: 0-based byte offset within the line
 /// - `content`: full document text (needed for UTF-16 conversion)
+// LSP uses u32 for line/column numbers; real-world files won't exceed u32::MAX lines.
+#[allow(clippy::cast_possible_truncation)]
 pub fn to_lsp_position(line: usize, col: usize, content: &str) -> Position {
     let lsp_line = line.saturating_sub(1) as u32;
 
@@ -36,6 +38,8 @@ pub fn from_lsp_position(pos: Position, content: &str) -> (usize, usize) {
 
 /// Convert a byte offset within a line to a UTF-16 code unit offset.
 /// Only performs character-by-character counting when non-ASCII is present.
+// LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX code units.
+#[allow(clippy::cast_possible_truncation)]
 fn byte_offset_to_utf16(line: &str, byte_offset: usize) -> u32 {
     if line.is_ascii() {
         return byte_offset as u32;
@@ -53,6 +57,8 @@ fn byte_offset_to_utf16(line: &str, byte_offset: usize) -> u32 {
 
 /// Convert a UTF-16 code unit offset to a byte offset within a line.
 /// Only performs character-by-character counting when non-ASCII is present.
+// LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX code units.
+#[allow(clippy::cast_possible_truncation)]
 fn utf16_offset_to_byte(line: &str, utf16_offset: u32) -> usize {
     if line.is_ascii() {
         return utf16_offset as usize;

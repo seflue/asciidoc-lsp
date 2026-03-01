@@ -54,6 +54,10 @@ tree:
 lsp:
     cargo run -p asciidoc-lsp
 
+# Show lint warnings without -D (for iteration)
+lint-warn:
+    cargo clippy --workspace 2>&1 | grep -E "^(warning|error)\[" | sort | uniq -c | sort -rn
+
 # Remove build artifacts
 clean:
     cargo clean
