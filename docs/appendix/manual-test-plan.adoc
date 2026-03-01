@@ -1,0 +1,397 @@
+[appendix]
+== Manual Test Plan
+
+This file IS the smoke test.
+Open it in Neovim with asciidoc-lsp attached, place the cursor on each stub, trigger the action, and mark the result inline.
+
+=== Prerequisites
+
+. Build the LSP: `just -f asciidoc-lsp/justfile build`
+. Open this file in Neovim from the `docs/` directory
+. Verify LSP is attached: `:LspInfo` should show `asciidoc-lsp`
+. Completion trigger: `Ctrl+Space` or auto-trigger depending on your config
+
+---
+
+=== T1: Go-to-Definition for Images
+
+`gd` on `image::` block macros resolves `:imagesdir:` from `.asciidoctorconfig` automatically.
+
+==== T1.1: Image with imagesdir
+
+// [ ] PASS  [ ] FAIL
+// Place cursor anywhere on the image macro below and press `gd`:
+
+image::test-placeholder.png[Test Placeholder]
+
+// Expected: Jumps to `docs/images/test-placeholder.png`
+
+==== T1.2: Image — non-existent file
+
+// [ ] PASS  [ ] FAIL
+// Place cursor anywhere on the image macro below and press `gd`:
+
+image::does-not-exist.png[Missing]
+
+// Expected: No jump (file does not exist). No crash. LSP stays attached.
+
+==== T1.3: Image in another document (reference)
+
+// Note: Previously tested via docs/chapters/05_building_block_view.adoc.
+// T1.1 above covers the same code path with a stub directly in this file.
+// If you want to verify cross-file: open that file, find `image::building-block-view.puml`, press `gd`.
+// Expected: Jumps to `docs/images/building-block-view.puml`
+
+---
+
+=== T2: Syntax Completions
+
+All stubs below are in this file. Position cursor as described, trigger completion, check result.
+
+==== T2.1: Block Macro completion
+
+Trigger: partial name at the *start of a line* (column 0).
+
+===== T2.1a: include
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `inc` below, trigger completion:
+inc
+// Expected: `include::` with snippet `include::${1:path}[${2:opts}]`
+
+===== T2.1b: image (block)
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `ima` below, trigger completion:
+ima
+// Expected: `image::` with snippet `image::${1:path}[${2:alt}]`
+
+===== T2.1c: video
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `vid` below, trigger completion:
+vid
+// Expected: `video::` with snippet `video::${1:path}[${2:opts}]`
+
+===== T2.1d: audio
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `aud` below, trigger completion:
+aud
+// Expected: `audio::` with snippet `audio::${1:path}[]`
+
+===== T2.1e: toc
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `toc` below, trigger completion:
+toc
+// Expected: `toc::` with snippet `toc::[]`
+// Note: `toc` also matches the `:toc:` doc attribute — verify the block macro variant appears.
+
+===== T2.1f: ifdef
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `ifd` below, trigger completion:
+ifd
+// Expected: `ifdef::` with snippet `ifdef::${1:attribute}[${2:content}]`
+// Known issue from smoke test: was failing previously — verify fixed.
+
+===== T2.1g: ifndef
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `ifn` below, trigger completion:
+ifn
+// Expected: `ifndef::` with snippet `ifndef::${1:attribute}[${2:content}]`
+
+===== T2.1h: endif
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `endif` below, trigger completion:
+end
+// Expected: `endif::` with snippet `endif::${1:attribute}[]`
+
+===== T2.1i: ifeval
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `ife` below, trigger completion:
+ife
+// Expected: `ifeval::` with snippet `ifeval::[${1:expression}]`
+
+==== T2.2: Admonition completion
+
+Trigger: uppercase prefix at the *start of a line*.
+
+===== T2.2a: NOTE
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `NO` below, trigger completion:
+NO
+// Expected: `NOTE:` with snippet `NOTE: $0`
+
+===== T2.2b: TIP
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `TI` below, trigger completion:
+TI
+// Expected: `TIP:` with snippet `TIP: $0`
+
+===== T2.2c: IMPORTANT
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `IMP` below, trigger completion:
+IMP
+// Expected: `IMPORTANT:` with snippet `IMPORTANT: $0`
+
+===== T2.2d: WARNING
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `WAR` below, trigger completion:
+WAR
+// Expected: `WARNING:` with snippet `WARNING: $0`
+
+===== T2.2e: CAUTION
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `CAU` below, trigger completion:
+CAU
+// Expected: `CAUTION:` with snippet `CAUTION: $0`
+// Known issue from smoke test: was failing — verify fixed.
+
+==== T2.3: Document Attribute completion
+
+Trigger: `:` at line start followed by a partial attribute name.
+
+===== T2.3a: toc
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:to` below, trigger completion:
+:to
+// Expected: `:toc:` (and `:toclevels:`) with value snippet `toc: ${1|auto,left,right,preamble|}`
+
+===== T2.3b: icons
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:ico` below, trigger completion:
+:ico
+// Expected: `:icons:` with snippet `icons: ${1|font,image|}`
+
+===== T2.3c: source-highlighter
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:sou` below, trigger completion:
+:sou
+// Expected: `:source-highlighter:` with snippet `source-highlighter: ${1|rouge,highlight.js,coderay|}`
+
+===== T2.3d: doctype
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:doc` below, trigger completion:
+:doc
+// Expected: `:doctype:` with snippet `doctype: ${1|article,book,manpage,inline|}`
+
+===== T2.3e: imagesdir
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:ima` below, trigger completion:
+:ima
+// Expected: `:imagesdir:` with snippet `imagesdir: ${1:images}`
+
+===== T2.3f: numbered
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:num` below, trigger completion:
+:num
+// Expected: `:numbered:` with snippet `numbered:` (deprecated; use sectnums)
+
+===== T2.3g: experimental
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:exp` below, trigger completion:
+:exp
+// Expected: `:experimental:` with snippet `experimental:`
+
+===== T2.3h: data-uri
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:dat` below, trigger completion:
+:dat
+// Expected: `:data-uri:` with snippet `data-uri:`
+
+===== T2.3i: sectnums
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:sec` below, trigger completion:
+:sec
+// Expected: `:sectnums:` (and `:sectanchors:`, `:sectlinks:`) with snippet `sectnums:`
+// Known issue from smoke test: `sectnums` was not completing — verify fixed.
+
+===== T2.3j: sectanchors
+
+// [ ] PASS  [ ] FAIL
+// (covered by `:sec` prefix above — verify it appears in the same list as sectnums)
+// Expected: `:sectanchors:` with snippet `sectanchors:`
+
+===== T2.3k: sectlinks
+
+// [ ] PASS  [ ] FAIL
+// (covered by `:sec` prefix above)
+// Expected: `:sectlinks:` with snippet `sectlinks:`
+
+===== T2.3l: stem
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:ste` below, trigger completion:
+:ste
+// Expected: `:stem:` with snippet `stem: ${1|latexmath,asciimath|}`
+
+===== T2.3m: toclevels
+
+// [ ] PASS  [ ] FAIL
+// (covered by `:to` prefix above — verify it appears in the same list as toc)
+// Expected: `:toclevels:` with snippet `toclevels: ${1:2}`
+
+===== T2.3n: hardbreaks-option
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `:har` below, trigger completion:
+:har
+// Expected: `:hardbreaks-option:` with snippet `hardbreaks-option:`
+
+==== T2.4: Inline Macro completion
+
+Trigger: macro name typed *mid-line* (not at column 0) — uses InlineMacroPrefix feature.
+The stub text must NOT be at the start of the line.
+Note: Inline macros now complete WITHOUT the trailing colon (new InlineMacroPrefix behavior).
+
+===== T2.4a: kbd
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `kbd` in the line below, trigger completion:
+Some text kbd
+// Expected: `kbd:[${1:keys}]` — TextEdit replaces the word `kbd`
+
+===== T2.4b: btn
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `btn` in the line below, trigger completion:
+Some text btn
+// Expected: `btn:[${1:label}]` — TextEdit replaces `btn`
+
+===== T2.4c: menu
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `menu` in the line below, trigger completion:
+Some text menu
+// Expected: `menu${1:menu}[${2:items}]` — TextEdit replaces `menu`
+
+===== T2.4d: link
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `link` in the line below, trigger completion:
+Some text link
+// Expected: `link${1:url}[${2:text}]` — TextEdit replaces `link`
+
+===== T2.4e: image (inline)
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `image` in the line below, trigger completion:
+Some text image
+// Expected: `image${1:path}[${2:alt}]` — TextEdit replaces `image`
+// Note: Distinguish from block `image::` — inline variant triggers mid-line.
+
+===== T2.4f: footnote
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `footnote` in the line below, trigger completion:
+Some text footnote
+// Expected: `footnote:[${1:text}]` — TextEdit replaces `footnote`
+
+===== T2.4g: pass
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `pass` in the line below, trigger completion:
+Some text pass
+// Expected: `pass:[${1:content}]` — TextEdit replaces `pass`
+
+==== T2.5: Priority — semantic completions take precedence
+
+Semantic completions (P1–P4) have higher priority than syntax completions (P5–P8).
+
+===== T2.5a: include:: path completion
+
+// [ ] PASS  [ ] FAIL
+// Type `include::` on a new line, then trigger completion:
+include::
+// Expected: File path completions appear (semantic), NOT the static `include::` block macro item.
+
+===== T2.5b: include:: with attribute reference
+
+// [ ] PASS  [ ] FAIL
+// Type `include::{docdir}/` and trigger completion:
+include::{docdir}/
+// Expected: File paths relative to docdir.
+// Known issue: `include::{docdir}/` may show root-path completion — likely a Blink client issue.
+// If root path appears: note as known Blink bug, not an LSP bug.
+
+==== T2.6: No false positives in prose
+
+// [ ] PASS  [ ] FAIL
+// Place cursor at end of `hello` in the MIDDLE of the paragraph below, trigger completion:
+This is normal prose where the word hello appears mid-line.
+// Expected: No block macro, no admonition completions.
+// Block macros and admonitions only trigger at column 0.
+
+// [ ] PASS  [ ] FAIL
+// Type a normal word at the START of a new line that does not match any catalog prefix:
+xyz
+// Expected: No AsciiDoc syntax completions appear for an unrecognized prefix.
+
+---
+
+=== Test Results Summary
+
+[cols="1,4,1,1", options="header"]
+|===
+| ID | Description | PASS | FAIL
+
+| T1.1 | gd on image:: with imagesdir | |
+| T1.2 | gd on non-existent image | |
+| T2.1a | Block macro: include:: | |
+| T2.1b | Block macro: image:: | |
+| T2.1c | Block macro: video:: | |
+| T2.1d | Block macro: audio:: | |
+| T2.1e | Block macro: toc:: | |
+| T2.1f | Block macro: ifdef:: | |
+| T2.1g | Block macro: ifndef:: | |
+| T2.1h | Block macro: endif:: | |
+| T2.1i | Block macro: ifeval:: | |
+| T2.2a | Admonition: NOTE | |
+| T2.2b | Admonition: TIP | |
+| T2.2c | Admonition: IMPORTANT | |
+| T2.2d | Admonition: WARNING | |
+| T2.2e | Admonition: CAUTION | |
+| T2.3a | Doc attr: toc | |
+| T2.3b | Doc attr: icons | |
+| T2.3c | Doc attr: source-highlighter | |
+| T2.3d | Doc attr: doctype | |
+| T2.3e | Doc attr: imagesdir | |
+| T2.3f | Doc attr: numbered | |
+| T2.3g | Doc attr: experimental | |
+| T2.3h | Doc attr: data-uri | |
+| T2.3i | Doc attr: sectnums | |
+| T2.3j | Doc attr: sectanchors | |
+| T2.3k | Doc attr: sectlinks | |
+| T2.3l | Doc attr: stem | |
+| T2.3m | Doc attr: toclevels | |
+| T2.3n | Doc attr: hardbreaks-option | |
+| T2.4a | Inline macro: kbd | |
+| T2.4b | Inline macro: btn | |
+| T2.4c | Inline macro: menu | |
+| T2.4d | Inline macro: link | |
+| T2.4e | Inline macro: image (inline) | |
+| T2.4f | Inline macro: footnote | |
+| T2.4g | Inline macro: pass | |
+| T2.5a | Priority: include:: → path completion | |
+| T2.5b | Priority: include::{docdir}/ | |
+| T2.6 | No false positives in prose | |
+|===
