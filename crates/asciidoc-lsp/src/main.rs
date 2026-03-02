@@ -1,3 +1,4 @@
+mod completion;
 mod diagnostics_convert;
 mod navigation;
 mod positions;
@@ -235,6 +236,14 @@ impl LanguageServer for AsciiDocLsp {
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "<".into(), // << xref
+                        ":".into(), // include::
+                        "{".into(), // {attribute
+                    ]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -504,6 +513,46 @@ impl LanguageServer for AsciiDocLsp {
                 end: target_pos,
             },
         })))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // Get content from document store or disk fallback
+        let content = {
+            let docs = self.documents.lock().unwrap();
+            if let Some(state) = docs.get(uri) {
+                state.content.clone()
+            } else if let Some(path) = uri.to_file_path() {
+                match std::fs::read_to_string(path.as_ref()) {
+                    Ok(c) => c,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                return Ok(None);
+            }
+        };
+
+        // Detect completion context from cursor position
+        let ctx = match completion::detect_completion_context(&content, position) {
+            Some(ctx) => ctx,
+            None => return Ok(None),
+        };
+
+        let doc_path = match uri.to_file_path() {
+            Some(p) => p.into_owned(),
+            None => return Ok(None),
+        };
+
+        let ws = self.workspace.lock().unwrap();
+        let items = completion::resolve_completions(ctx, &doc_path, ws.as_ref());
+
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(items)))
+        }
     }
 }
 

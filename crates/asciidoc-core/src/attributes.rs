@@ -90,6 +90,28 @@ impl AttributeRegistry {
         self.per_file.insert(file.to_path_buf(), map);
     }
 
+    /// Return all attributes merged across layers with priority: per_file > config > builtin.
+    /// Later layers override earlier ones for the same key.
+    pub fn all_attributes(&self, file: &Path) -> Vec<(String, String)> {
+        let mut merged: HashMap<String, String> = self
+            .builtin
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (k, entry) in &self.config {
+            merged.insert(k.clone(), entry.value.clone());
+        }
+
+        if let Some(file_attrs) = self.per_file.get(file) {
+            for (k, entry) in file_attrs {
+                merged.insert(k.clone(), entry.value.clone());
+            }
+        }
+
+        merged.into_iter().collect()
+    }
+
     /// Resolve an attribute by name with priority: Document-Header > Config > Built-in
     pub fn resolve(&self, file: &Path, name: &str) -> Option<&str> {
         self.per_file
@@ -373,5 +395,58 @@ mod tests {
         let dummy = Path::new("any.adoc");
         // Builtins have no source location
         assert!(registry.resolve_source(dummy, "docdir").is_none());
+    }
+
+    // --- Task 1.1: all_attributes() tests ---
+
+    #[test]
+    fn test_all_attributes_merges_layers() {
+        let mut registry = AttributeRegistry::new(Path::new("/root"));
+        // Config layer
+        registry.config.insert(
+            "imagesdir".into(),
+            AttributeEntry {
+                value: "images".into(),
+                source: None,
+            },
+        );
+        // Per-file layer
+        let file = Path::new("/root/doc.adoc");
+        let attrs = vec![
+            AttributeDef {
+                name: "author".into(),
+                value: "Alice".into(),
+                line: 1,
+            },
+            // Override config key
+            AttributeDef {
+                name: "imagesdir".into(),
+                value: "img".into(),
+                line: 2,
+            },
+        ];
+        registry.register_file_attributes(file, &attrs);
+
+        let all = registry.all_attributes(file);
+        let map: HashMap<&str, &str> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        // Builtin present
+        assert_eq!(map.get("docdir"), Some(&"/root"));
+        // Per-file overrides config
+        assert_eq!(map.get("imagesdir"), Some(&"img"));
+        // Per-file attribute present
+        assert_eq!(map.get("author"), Some(&"Alice"));
+    }
+
+    #[test]
+    fn test_all_attributes_empty_registry() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let file = Path::new("/tmp/doc.adoc");
+        let all = registry.all_attributes(file);
+        let map: HashMap<&str, &str> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        // Only builtin docdir
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("docdir"), Some(&"/tmp"));
     }
 }
