@@ -133,15 +133,29 @@ impl AsciiDocLsp {
         }
     }
 
+    fn get_document_content(&self, uri: &Uri) -> Option<String> {
+        let docs = self.documents.lock().expect("documents lock poisoned");
+        if let Some(state) = docs.get(uri) {
+            Some(state.content.clone())
+        } else if let Some(path) = uri.to_file_path() {
+            std::fs::read_to_string(path.as_ref()).ok()
+        } else {
+            None
+        }
+    }
+
     /// Publish diagnostics for all files in the workspace after a rebuild.
     ///
     /// Groups diagnostics by file, converts them, publishes per-file, and
     /// clears stale diagnostics for files that no longer have any.
-    async fn publish_workspace_diagnostics(&self, ws: &Workspace) {
+    async fn publish_workspace_diagnostics(
+        &self,
+        diagnostics: &[asciidoc_core::types::Diagnostic],
+    ) {
         // Group diagnostics by file
         let mut diags_by_file: HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>> =
             HashMap::new();
-        for diag in &ws.diagnostics {
+        for diag in diagnostics {
             diags_by_file
                 .entry(diag.file.clone())
                 .or_default()
@@ -150,7 +164,7 @@ impl AsciiDocLsp {
 
         // Prepare all conversions without holding locks across await points
         let conversions: Vec<(Uri, Vec<Diagnostic>)> = {
-            let docs = self.documents.lock().unwrap();
+            let docs = self.documents.lock().expect("documents lock poisoned");
             diags_by_file
                 .iter()
                 .filter_map(|(path, file_diags)| {
@@ -174,7 +188,11 @@ impl AsciiDocLsp {
         }
 
         // Clear diagnostics for files that no longer have any
-        let old_published = self.published_diagnostics.lock().unwrap().clone();
+        let old_published = self
+            .published_diagnostics
+            .lock()
+            .expect("published_diagnostics lock poisoned")
+            .clone();
         for uri in &old_published {
             if !new_published.contains(uri) {
                 self.client
@@ -183,19 +201,22 @@ impl AsciiDocLsp {
             }
         }
 
-        *self.published_diagnostics.lock().unwrap() = new_published;
+        *self
+            .published_diagnostics
+            .lock()
+            .expect("published_diagnostics lock poisoned") = new_published;
     }
 
     /// Rebuild workspace from document store and publish diagnostics.
     async fn rebuild_and_publish(&self) {
-        let root = self.root.lock().unwrap().clone();
+        let root = self.root.lock().expect("root lock poisoned").clone();
         let Some(root) = root else { return };
 
         let overrides = build_content_overrides(&self.documents);
 
         if let Some(ws) = rebuild_workspace(&root, &overrides) {
-            self.publish_workspace_diagnostics(&ws).await;
-            *self.workspace.lock().unwrap() = Some(ws);
+            self.publish_workspace_diagnostics(&ws.diagnostics).await;
+            *self.workspace.lock().expect("workspace lock poisoned") = Some(ws);
         }
     }
 }
@@ -214,14 +235,14 @@ impl LanguageServer for AsciiDocLsp {
 
         if let Some(ref root) = root_path {
             let workspace_root = detect_workspace_root(root);
-            *self.root.lock().unwrap() = Some(workspace_root.clone());
+            *self.root.lock().expect("root lock poisoned") = Some(workspace_root.clone());
 
             // Build initial workspace if entry point found
             if let Some(entry) = find_entry_point(&workspace_root) {
                 let overrides = HashMap::new();
                 if let Ok(ws) = Workspace::build_with_overrides(&workspace_root, &entry, &overrides)
                 {
-                    *self.workspace.lock().unwrap() = Some(ws);
+                    *self.workspace.lock().expect("workspace lock poisoned") = Some(ws);
                 }
             }
         }
@@ -262,45 +283,12 @@ impl LanguageServer for AsciiDocLsp {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        // Collect all conversion data synchronously (no MutexGuard across await)
-        let conversions: Option<Vec<(Uri, Vec<Diagnostic>)>> = {
-            let ws_guard = self.workspace.lock().unwrap();
-            ws_guard.as_ref().map(|ws| {
-                let mut diags_by_file: HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>> =
-                    HashMap::new();
-                for diag in &ws.diagnostics {
-                    diags_by_file
-                        .entry(diag.file.clone())
-                        .or_default()
-                        .push(diag.clone());
-                }
-
-                let docs = self.documents.lock().unwrap();
-                diags_by_file
-                    .iter()
-                    .filter_map(|(path, file_diags)| {
-                        let uri = path_to_uri(path)?;
-                        let content = docs.get(&uri).map_or_else(
-                            || std::fs::read_to_string(path).unwrap_or_default(),
-                            |s| s.content.clone(),
-                        );
-                        let lsp_diags =
-                            diagnostics_convert::convert_diagnostics(file_diags, &content);
-                        Some((uri, lsp_diags))
-                    })
-                    .collect()
-            })
+        let diagnostics = {
+            let ws = self.workspace.lock().expect("workspace lock poisoned");
+            ws.as_ref().map(|ws| ws.diagnostics.clone())
         };
-
-        if let Some(conversions) = conversions {
-            let mut new_published = HashSet::new();
-            for (uri, lsp_diags) in conversions {
-                self.client
-                    .publish_diagnostics(uri.clone(), lsp_diags, None)
-                    .await;
-                new_published.insert(uri);
-            }
-            *self.published_diagnostics.lock().unwrap() = new_published;
+        if let Some(diagnostics) = diagnostics {
+            self.publish_workspace_diagnostics(&diagnostics).await;
         }
     }
 
@@ -327,7 +315,7 @@ impl LanguageServer for AsciiDocLsp {
 
         // Update document store (lock scope limited)
         {
-            let mut docs = self.documents.lock().unwrap();
+            let mut docs = self.documents.lock().expect("documents lock poisoned");
             // Version guard: discard outdated changes (DC-2)
             if let Some(existing) = docs.get(&uri) {
                 if new_version <= existing.version {
@@ -353,7 +341,10 @@ impl LanguageServer for AsciiDocLsp {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.documents.lock().unwrap().remove(&uri);
+        self.documents
+            .lock()
+            .expect("documents lock poisoned")
+            .remove(&uri);
 
         // Rebuild: uses disk content for closed file, clears stale diagnostics automatically
         self.rebuild_and_publish().await;
@@ -370,19 +361,8 @@ impl LanguageServer for AsciiDocLsp {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
 
-        // Get content from document store or disk fallback
-        let content = {
-            let docs = self.documents.lock().unwrap();
-            if let Some(state) = docs.get(uri) {
-                state.content.clone()
-            } else if let Some(path) = uri.to_file_path() {
-                match std::fs::read_to_string(path.as_ref()) {
-                    Ok(c) => c,
-                    Err(_) => return Ok(None),
-                }
-            } else {
-                return Ok(None);
-            }
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
         };
 
         // Parse and extract sections, includes, attributes
@@ -405,19 +385,8 @@ impl LanguageServer for AsciiDocLsp {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get content from document store or disk fallback
-        let content = {
-            let docs = self.documents.lock().unwrap();
-            if let Some(state) = docs.get(uri) {
-                state.content.clone()
-            } else if let Some(path) = uri.to_file_path() {
-                match std::fs::read_to_string(path.as_ref()) {
-                    Ok(c) => c,
-                    Err(_) => return Ok(None),
-                }
-            } else {
-                return Ok(None);
-            }
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
         };
 
         // Check if cursor is on an {attribute} reference
@@ -433,7 +402,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().unwrap();
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
         let value = ws
             .as_ref()
             .and_then(|ws| ws.attributes.resolve(&doc_path, &attr_name))
@@ -454,7 +423,7 @@ impl LanguageServer for AsciiDocLsp {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
-        let ws = self.workspace.lock().unwrap();
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
         let Some(ws) = ws.as_ref() else {
             return Ok(None);
         };
@@ -474,19 +443,8 @@ impl LanguageServer for AsciiDocLsp {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get content from document store or disk fallback
-        let content = {
-            let docs = self.documents.lock().unwrap();
-            if let Some(state) = docs.get(uri) {
-                state.content.clone()
-            } else if let Some(path) = uri.to_file_path() {
-                match std::fs::read_to_string(path.as_ref()) {
-                    Ok(c) => c,
-                    Err(_) => return Ok(None),
-                }
-            } else {
-                return Ok(None);
-            }
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
         };
 
         let doc_path = match uri.to_file_path() {
@@ -494,7 +452,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().unwrap();
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
         let result =
             navigation::resolve_goto_definition(&content, position, &doc_path, ws.as_ref());
         // Drop the lock before building response
@@ -530,19 +488,8 @@ impl LanguageServer for AsciiDocLsp {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // Get content from document store or disk fallback
-        let content = {
-            let docs = self.documents.lock().unwrap();
-            if let Some(state) = docs.get(uri) {
-                state.content.clone()
-            } else if let Some(path) = uri.to_file_path() {
-                match std::fs::read_to_string(path.as_ref()) {
-                    Ok(c) => c,
-                    Err(_) => return Ok(None),
-                }
-            } else {
-                return Ok(None);
-            }
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
         };
 
         let doc_path = match uri.to_file_path() {
@@ -552,7 +499,7 @@ impl LanguageServer for AsciiDocLsp {
 
         let include_declaration = params.context.include_declaration;
 
-        let ws = self.workspace.lock().unwrap();
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
         let results = navigation::resolve_references(
             &content,
             position,
@@ -591,19 +538,8 @@ impl LanguageServer for AsciiDocLsp {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // Get content from document store or disk fallback
-        let content = {
-            let docs = self.documents.lock().unwrap();
-            if let Some(state) = docs.get(uri) {
-                state.content.clone()
-            } else if let Some(path) = uri.to_file_path() {
-                match std::fs::read_to_string(path.as_ref()) {
-                    Ok(c) => c,
-                    Err(_) => return Ok(None),
-                }
-            } else {
-                return Ok(None);
-            }
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
         };
 
         // Detect completion context from cursor position
@@ -616,7 +552,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().unwrap();
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
         let items = completion::resolve_completions(ctx, &doc_path, ws.as_ref());
 
         if items.is_empty() {
@@ -1018,14 +954,13 @@ fn rebuild_workspace(root: &Path, overrides: &HashMap<PathBuf, String>) -> Optio
 fn build_content_overrides(
     documents: &Mutex<HashMap<Uri, DocumentState>>,
 ) -> HashMap<PathBuf, String> {
-    let docs = documents.lock().unwrap();
-    let mut overrides = HashMap::new();
-    for (uri, state) in docs.iter() {
-        if let Some(path) = uri.to_file_path() {
-            overrides.insert(path.into_owned(), state.content.clone());
-        }
-    }
-    overrides
+    let docs = documents.lock().expect("documents lock poisoned");
+    docs.iter()
+        .filter_map(|(uri, state)| {
+            uri.to_file_path()
+                .map(|path| (path.into_owned(), state.content.clone()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

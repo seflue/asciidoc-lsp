@@ -318,7 +318,10 @@ fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == kind {
-            return Some(child.utf8_text(source).unwrap_or_default().to_string());
+            return child
+                .utf8_text(source)
+                .ok()
+                .map(std::string::ToString::to_string);
         }
     }
     None

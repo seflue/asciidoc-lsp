@@ -52,12 +52,12 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
         let ws = Workspace::build(&root, &cli.path)?;
-        let entry_canonical = cli.path.canonicalize().unwrap_or(cli.path.clone());
+        let entry_canonical = cli.path.canonicalize()?;
         let tree = ws
             .include_graph
             .to_include_tree(&entry_canonical, &ws.documents);
         // end::workspace-setup[]
-        print_include_tree(&tree, "", true, cli.all);
+        print_include_tree(&tree, cli.all);
     } else {
         // Single-file mode: parse and extract everything
         let source = std::fs::read_to_string(&cli.path)?;
@@ -148,7 +148,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Print include tree with Unicode box-drawing characters
-fn print_include_tree(tree: &IncludeTree, _prefix: &str, _is_last: bool, show_all: bool) {
+fn print_include_tree(tree: &IncludeTree, show_all: bool) {
     // Root node
     println!("{}", format_tree_node(tree, show_all));
     for (i, child) in tree.includes.iter().enumerate() {
@@ -181,7 +181,7 @@ fn print_tree_child(tree: &IncludeTree, prefix: &str, is_last: bool, show_all: b
 fn format_tree_node(tree: &IncludeTree, show_all: bool) -> String {
     let file_display = tree.file.file_name().map_or_else(
         || tree.file.display().to_string(),
-        |f| f.to_string_lossy().to_string(),
+        |f| f.to_string_lossy().into_owned(),
     );
 
     let section_info = if tree.sections.is_empty() {
@@ -191,13 +191,14 @@ fn format_tree_node(tree: &IncludeTree, show_all: bool) -> String {
     };
 
     let inline_info = if show_all {
-        let mut parts = Vec::new();
-        if !tree.xrefs.is_empty() {
-            parts.push(format!("{} xrefs", tree.xrefs.len()));
-        }
-        if !tree.anchors.is_empty() {
-            parts.push(format!("{} anchors", tree.anchors.len()));
-        }
+        let parts: Vec<_> = [
+            (!tree.xrefs.is_empty()).then(|| format!("{} xrefs", tree.xrefs.len())),
+            (!tree.anchors.is_empty()).then(|| format!("{} anchors", tree.anchors.len())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
         if parts.is_empty() {
             String::new()
         } else {

@@ -15,11 +15,8 @@ use crate::positions;
 
 /// A static catalog entry for `AsciiDoc` syntax completions.
 struct SyntaxEntry {
-    /// Display name (e.g. "`image::`", "NOTE:", "toc", "kbd")
     name: &'static str,
-    /// Snippet with tabstops (LSP snippet syntax)
     snippet: &'static str,
-    /// Short description shown in completion detail
     detail: &'static str,
 }
 
@@ -222,7 +219,7 @@ const INLINE_MACROS: &[SyntaxEntry] = &[
 
 /// Classification of a completion trigger context.
 #[derive(Debug, PartialEq)]
-pub enum CompletionContext {
+pub(crate) enum CompletionContext {
     /// `<<prefix` — cross-reference to an anchor
     Xref { prefix: String },
     /// `include::prefix` — include path completion
@@ -250,7 +247,7 @@ pub enum CompletionContext {
 /// the current line backwards from the cursor.
 ///
 /// Priority: `include::` (longest prefix) > `xref:` > `<<` > `{`
-pub fn detect_completion_context(content: &str, pos: Position) -> Option<CompletionContext> {
+pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<CompletionContext> {
     let line_str = content.lines().nth(pos.line as usize)?;
 
     // Convert UTF-16 offset (LSP spec) to byte offset for safe string slicing
@@ -410,7 +407,10 @@ pub fn detect_completion_context(content: &str, pos: Position) -> Option<Complet
 /// - `kind`: Reference
 /// - `detail`: filename + anchor kind
 /// - `insert_text`: `anchor_id>>` (appends closing `>>`)
-pub fn resolve_xref_completions(prefix: &str, ws: Option<&Workspace>) -> Vec<CompletionItem> {
+pub(crate) fn resolve_xref_completions(
+    prefix: &str,
+    ws: Option<&Workspace>,
+) -> Vec<CompletionItem> {
     let Some(ws) = ws else {
         return Vec::new();
     };
@@ -535,7 +535,7 @@ pub fn resolve_include_completions(
 /// - `kind`: Variable
 /// - `detail`: resolved attribute value
 /// - `insert_text`: `attr_name}` (appends closing `}`)
-pub fn resolve_attribute_completions(
+pub(crate) fn resolve_attribute_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
@@ -550,9 +550,9 @@ pub fn resolve_attribute_completions(
         .into_iter()
         .filter(|(name, _)| name.starts_with(prefix))
         .map(|(name, value)| CompletionItem {
-            label: name.clone(),
+            label: name.to_string(),
             kind: Some(CompletionItemKind::VARIABLE),
-            detail: Some(value),
+            detail: Some(value.to_string()),
             insert_text: Some(format!("{name}}}")),
             ..Default::default()
         })
@@ -660,7 +660,7 @@ fn resolve_syntax_catalog(
 /// - `Xref` → `resolve_xref_completions`
 /// - `IncludePath` → `resolve_include_completions` (uses `doc_path` for relative listing)
 /// - `Attribute` → `resolve_attribute_completions`
-pub fn resolve_completions(
+pub(crate) fn resolve_completions(
     ctx: CompletionContext,
     doc_path: &Path,
     ws: Option<&Workspace>,

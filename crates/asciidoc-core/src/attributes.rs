@@ -105,20 +105,20 @@ impl AttributeRegistry {
     /// Return all attributes merged across layers with priority: `per_file` > config > builtin.
     /// Later layers override earlier ones for the same key.
     #[must_use]
-    pub fn all_attributes(&self, file: &Path) -> Vec<(String, String)> {
-        let mut merged: HashMap<String, String> = self
+    pub fn all_attributes(&self, file: &Path) -> Vec<(&str, &str)> {
+        let mut merged: HashMap<&str, &str> = self
             .builtin
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
         for (k, entry) in &self.config {
-            merged.insert(k.clone(), entry.value.clone());
+            merged.insert(k.as_str(), entry.value.as_str());
         }
 
         if let Some(file_attrs) = self.per_file.get(file) {
             for (k, entry) in file_attrs {
-                merged.insert(k.clone(), entry.value.clone());
+                merged.insert(k.as_str(), entry.value.as_str());
             }
         }
 
@@ -449,7 +449,7 @@ mod tests {
         registry.register_file_attributes(file, &attrs);
 
         let all = registry.all_attributes(file);
-        let map: HashMap<&str, &str> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let map: HashMap<&str, &str> = all.into_iter().collect();
 
         // Builtin present
         assert_eq!(map.get("docdir"), Some(&"/root"));
@@ -539,7 +539,7 @@ mod tests {
         let registry = AttributeRegistry::new(Path::new("/tmp"));
         let file = Path::new("/tmp/doc.adoc");
         let all = registry.all_attributes(file);
-        let map: HashMap<&str, &str> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let map: HashMap<&str, &str> = all.into_iter().collect();
 
         // Only builtin docdir
         assert_eq!(map.len(), 1);

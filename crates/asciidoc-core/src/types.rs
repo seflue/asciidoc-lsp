@@ -54,11 +54,8 @@ pub struct IncludeTree {
 }
 
 // --- Semantic Layer types (adoc-0010) ---
-// allow(dead_code): These types are used incrementally as phases are implemented.
-// The allow will be removed once all modules reference them.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorKind {
     Explicit,
     ImplicitSection,
@@ -66,7 +63,6 @@ pub enum AnchorKind {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct AnchorLocation {
     pub file: PathBuf,
     pub line: usize,
@@ -74,7 +70,6 @@ pub struct AnchorLocation {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IncludeEdge {
     pub target: PathBuf,
     pub line: usize,
@@ -82,7 +77,6 @@ pub struct IncludeEdge {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DocumentModel {
     pub path: PathBuf,
     pub sections: Vec<Section>,
@@ -94,7 +88,6 @@ pub struct DocumentModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DiagnosticKind {
     BrokenXref { target: String },
     BrokenInclude { path: String },
@@ -127,7 +120,6 @@ impl fmt::Display for DiagnosticKind {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Diagnostic {
     pub file: PathBuf,
     pub line: usize,
@@ -136,7 +128,6 @@ pub struct Diagnostic {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ResolvedXref {
     pub file: PathBuf,
     pub line: usize,

@@ -8,7 +8,7 @@ use crate::positions;
 
 /// Classification of a node found at a cursor position.
 #[derive(Debug, PartialEq)]
-pub enum NodeKind {
+pub(crate) enum NodeKind {
     /// `include::path[]` block macro
     Include { path: String },
     /// `xref:target#anchor[text]` inline macro
@@ -27,7 +27,7 @@ pub enum NodeKind {
 
 /// Information about a recognized node at a cursor position.
 #[derive(Debug)]
-pub struct NodeInfo {
+pub(crate) struct NodeInfo {
     pub kind: NodeKind,
     pub line: usize, // 1-indexed
 }
@@ -427,7 +427,10 @@ fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == kind {
-            return Some(child.utf8_text(source).unwrap_or_default().to_string());
+            return child
+                .utf8_text(source)
+                .ok()
+                .map(std::string::ToString::to_string);
         }
     }
     None

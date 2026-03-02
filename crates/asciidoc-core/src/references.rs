@@ -33,16 +33,8 @@ impl ReferenceIndex {
             .or_default()
             .push(id.to_string());
 
-        if let Some(existing) = self.anchors.get(id) {
-            self.duplicates.push((
-                id.to_string(),
-                AnchorLocation {
-                    file: location.file.clone(),
-                    line: location.line,
-                    kind: location.kind.clone(),
-                },
-            ));
-            let _ = existing; // first definition stays
+        if self.anchors.contains_key(id) {
+            self.duplicates.push((id.to_string(), location));
         } else {
             self.anchors.insert(id.to_string(), location);
         }
@@ -117,32 +109,28 @@ impl ReferenceIndex {
                         .is_some_and(|f| f.to_string_lossy() == file_ref)
             });
 
-            match target_file {
-                Some(path) => {
-                    if let Some(anchor_id) = anchor_part {
-                        // Look up anchor in that specific file
-                        if let Some(loc) = self.anchors.get(anchor_id) {
-                            if loc.file == *path {
-                                return Ok(ResolvedXref {
-                                    file: path.clone(),
-                                    line: loc.line,
-                                });
-                            }
-                        }
-                        Err(DiagnosticKind::BrokenXref {
-                            target: xref.target.clone(),
-                        })
-                    } else {
-                        // File reference without anchor → line 1
-                        Ok(ResolvedXref {
-                            file: path.clone(),
-                            line: 1,
-                        })
-                    }
-                }
-                None => Err(DiagnosticKind::BrokenXref {
-                    target: xref.target.clone(),
-                }),
+            let path = target_file.ok_or_else(|| DiagnosticKind::BrokenXref {
+                target: xref.target.clone(),
+            })?;
+
+            if let Some(anchor_id) = anchor_part {
+                // Look up anchor in that specific file
+                self.anchors
+                    .get(anchor_id)
+                    .filter(|loc| loc.file == *path)
+                    .map(|loc| ResolvedXref {
+                        file: path.clone(),
+                        line: loc.line,
+                    })
+                    .ok_or_else(|| DiagnosticKind::BrokenXref {
+                        target: xref.target.clone(),
+                    })
+            } else {
+                // File reference without anchor → line 1
+                Ok(ResolvedXref {
+                    file: path.clone(),
+                    line: 1,
+                })
             }
         } else if let Some(anchor_id) = anchor_part {
             // Anchor-only: workspace-wide lookup

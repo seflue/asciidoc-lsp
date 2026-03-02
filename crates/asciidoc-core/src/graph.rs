@@ -184,19 +184,7 @@ fn walk(
     // Register file attributes
     registry.register_file_attributes(&canonical, &file_attrs);
 
-    // Store DocumentModel
-    let doc = DocumentModel {
-        path: canonical.clone(),
-        sections,
-        includes: includes_raw.clone(),
-        xrefs,
-        anchors,
-        attributes: file_attrs,
-        attribute_refs,
-    };
-    documents.insert(canonical.clone(), doc);
-
-    // Process includes: add edges and recurse
+    // Process includes: add edges and recurse (before storing DocumentModel so we can move includes_raw)
     let base_dir = canonical.parent().unwrap_or(Path::new("."));
     for inc in &includes_raw {
         let resolved_path = registry.substitute(&canonical, &inc.path);
@@ -214,6 +202,18 @@ fn walk(
 
         walk(&full_path, registry, graph, documents, visited, overrides);
     }
+
+    // Store DocumentModel (move includes_raw instead of clone)
+    let doc = DocumentModel {
+        path: canonical.clone(),
+        sections,
+        includes: includes_raw,
+        xrefs,
+        anchors,
+        attributes: file_attrs,
+        attribute_refs,
+    };
+    documents.insert(canonical.clone(), doc);
 }
 
 #[cfg(test)]
