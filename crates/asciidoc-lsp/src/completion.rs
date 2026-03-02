@@ -151,16 +151,35 @@ pub fn resolve_xref_completions(prefix: &str, ws: Option<&Workspace>) -> Vec<Com
 /// - `label`: filename or dirname (dirs end with `/`)
 /// - `kind`: `File` for `.adoc` files, `Folder` for directories
 /// - `insert_text`: relative path + `[]` for files, path + `/` for dirs
-pub fn resolve_include_completions(prefix: &str, doc_path: &Path) -> Vec<CompletionItem> {
-    // Split prefix into directory part and filename filter part
-    // e.g. "chapters/" → list_dir = doc_path/chapters, filter = ""
-    // e.g. "chap"      → list_dir = doc_path, filter = "chap"
-    let (dir_prefix, filter) = match prefix.rfind('/') {
+pub fn resolve_include_completions(
+    prefix: &str,
+    doc_path: &Path,
+    ws: Option<&Workspace>,
+) -> Vec<CompletionItem> {
+    let base = doc_path.parent().unwrap_or(doc_path);
+
+    // Attribute substitution: resolve {attr} references in prefix
+    let resolved_prefix = match ws {
+        Some(ws) => ws.attributes.substitute(doc_path, prefix),
+        None => prefix.to_string(),
+    };
+
+    // Bail on unresolved attributes (still contains `{`)
+    if resolved_prefix.contains('{') {
+        return Vec::new();
+    }
+
+    // Split ORIGINAL prefix for insert_text, RESOLVED prefix for filesystem lookup
+    let (original_dir_prefix, _) = match prefix.rfind('/') {
         Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
         None => ("", prefix),
     };
+    let (resolved_dir, filter) = match resolved_prefix.rfind('/') {
+        Some(idx) => (&resolved_prefix[..=idx], &resolved_prefix[idx + 1..]),
+        None => ("", resolved_prefix.as_str()),
+    };
 
-    let list_dir = doc_path.join(dir_prefix);
+    let list_dir = base.join(resolved_dir);
 
     let entries = match std::fs::read_dir(&list_dir) {
         Ok(entries) => entries,
@@ -181,7 +200,7 @@ pub fn resolve_include_completions(prefix: &str, doc_path: &Path) -> Vec<Complet
                 Some(CompletionItem {
                     label: dir_name.clone(),
                     kind: Some(CompletionItemKind::FOLDER),
-                    insert_text: Some(format!("{}{}", dir_prefix, dir_name)),
+                    insert_text: Some(format!("{}{}", original_dir_prefix, dir_name)),
                     ..Default::default()
                 })
             } else if name.ends_with(".adoc") {
@@ -191,7 +210,7 @@ pub fn resolve_include_completions(prefix: &str, doc_path: &Path) -> Vec<Complet
                 Some(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FILE),
-                    insert_text: Some(format!("{}{}[]", dir_prefix, name)),
+                    insert_text: Some(format!("{}{}[]", original_dir_prefix, name)),
                     ..Default::default()
                 })
             } else {
@@ -254,8 +273,7 @@ pub fn resolve_completions(
     match ctx {
         CompletionContext::Xref { prefix } => resolve_xref_completions(&prefix, ws),
         CompletionContext::IncludePath { prefix } => {
-            let base = doc_path.parent().unwrap_or(doc_path);
-            resolve_include_completions(&prefix, base)
+            resolve_include_completions(&prefix, doc_path, ws)
         }
         CompletionContext::Attribute { prefix } => {
             resolve_attribute_completions(&prefix, doc_path, ws)
@@ -623,7 +641,8 @@ mod tests {
     #[test]
     fn test_include_completions_files() {
         let dir = setup_include_dir();
-        let items = resolve_include_completions("", dir.path());
+        let doc_file = dir.path().join("dummy.adoc");
+        let items = resolve_include_completions("", &doc_file, None);
         // Should contain a.adoc, b.adoc, and chapters/
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"a.adoc"), "missing a.adoc in {:?}", labels);
@@ -648,7 +667,8 @@ mod tests {
     #[test]
     fn test_include_completions_prefix_filter() {
         let dir = setup_include_dir();
-        let items = resolve_include_completions("chap", dir.path());
+        let doc_file = dir.path().join("dummy.adoc");
+        let items = resolve_include_completions("chap", &doc_file, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "chapters/");
     }
@@ -656,12 +676,103 @@ mod tests {
     #[test]
     fn test_include_completions_subdir() {
         let dir = setup_include_dir();
-        let items = resolve_include_completions("chapters/", dir.path());
+        let doc_file = dir.path().join("dummy.adoc");
+        let items = resolve_include_completions("chapters/", &doc_file, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "intro.adoc");
         assert_eq!(
             items[0].insert_text.as_ref().unwrap(),
             "chapters/intro.adoc[]"
+        );
+    }
+
+    // --- Phase 3b: resolve_include_completions with attribute substitution ---
+
+    /// Helper: create a tempdir with .asciidoctorconfig, src/ subdir with .adoc files,
+    /// and a doc file at root level. Returns (TempDir, Workspace, PathBuf of doc_file).
+    fn setup_include_attr_dir() -> (TempDir, Workspace, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        // Config: :source-dir: src
+        std::fs::write(dir.path().join(".asciidoctorconfig"), ":source-dir: src\n").unwrap();
+        // Create src/ with .adoc files
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/module-a.adoc"), "= Module A\n").unwrap();
+        std::fs::write(dir.path().join("src/module-b.adoc"), "= Module B\n").unwrap();
+        // Doc file at root
+        let doc_file = dir.path().join("index.adoc");
+        std::fs::write(&doc_file, "= Index\n").unwrap();
+
+        let mut attrs = AttributeRegistry::new(dir.path());
+        attrs.load_config(dir.path());
+
+        let ws = Workspace {
+            root: dir.path().to_path_buf(),
+            attributes: attrs,
+            include_graph: IncludeGraph::new(),
+            reference_index: ReferenceIndex::new(),
+            documents: HashMap::new(),
+            diagnostics: Vec::new(),
+        };
+        (dir, ws, doc_file)
+    }
+
+    #[test]
+    fn test_include_completions_with_resolved_attr() {
+        let (_dir, ws, doc_file) = setup_include_attr_dir();
+        let items = resolve_include_completions("{source-dir}/", &doc_file, Some(&ws));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"module-a.adoc"),
+            "missing module-a.adoc in {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"module-b.adoc"),
+            "missing module-b.adoc in {:?}",
+            labels
+        );
+        // insert_text preserves original {source-dir}/ prefix
+        let a_item = items.iter().find(|i| i.label == "module-a.adoc").unwrap();
+        assert_eq!(
+            a_item.insert_text.as_ref().unwrap(),
+            "{source-dir}/module-a.adoc[]"
+        );
+    }
+
+    #[test]
+    fn test_include_completions_with_unresolved_attr() {
+        let (_dir, ws, doc_file) = setup_include_attr_dir();
+        let items = resolve_include_completions("{unknown}/", &doc_file, Some(&ws));
+        assert!(items.is_empty(), "expected empty, got {:?}", items);
+    }
+
+    #[test]
+    fn test_include_completions_attr_with_filter() {
+        let (_dir, ws, doc_file) = setup_include_attr_dir();
+        let items = resolve_include_completions("{source-dir}/module-a", &doc_file, Some(&ws));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "module-a.adoc");
+        assert_eq!(
+            items[0].insert_text.as_ref().unwrap(),
+            "{source-dir}/module-a.adoc[]"
+        );
+    }
+
+    #[test]
+    fn test_include_completions_no_attr_with_workspace() {
+        let (_dir, ws, doc_file) = setup_include_attr_dir();
+        // No attribute in prefix — should work like before, even with workspace present
+        let items = resolve_include_completions("src/", &doc_file, Some(&ws));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"module-a.adoc"),
+            "missing module-a.adoc in {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"module-b.adoc"),
+            "missing module-b.adoc in {:?}",
+            labels
         );
     }
 
