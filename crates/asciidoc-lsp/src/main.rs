@@ -2104,7 +2104,16 @@ mod tests {
             "target should be .asciidoctorconfig, got: {:?}",
             target
         );
-        assert_eq!(line, 3, "docdir is on line 3 of .asciidoctorconfig");
+        // Verify the line actually contains the docdir attribute definition
+        let config_path = target;
+        let config_content = std::fs::read_to_string(&config_path).unwrap();
+        let config_line = config_content.lines().nth(line - 1).unwrap_or("");
+        assert!(
+            config_line.contains(":docdir:"),
+            "line {} of .asciidoctorconfig should contain :docdir:, got: {:?}",
+            line,
+            config_line
+        );
     }
 
     // --- rebuild_workspace tests (adoc-0016: Live Diagnostics) ---

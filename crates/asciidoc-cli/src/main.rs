@@ -44,6 +44,7 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     } else if cli.tree {
+        // tag::workspace-setup[]
         // Include-tree mode via Workspace -> Graph -> Tree
         let root = cli
             .path
@@ -55,6 +56,7 @@ fn main() -> anyhow::Result<()> {
         let tree = ws
             .include_graph
             .to_include_tree(&entry_canonical, &ws.documents);
+        // end::workspace-setup[]
         print_include_tree(&tree, "", true, cli.all);
     } else {
         // Single-file mode: parse and extract everything

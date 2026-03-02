@@ -12,7 +12,7 @@ The following code snippet shows the workspace initialization logic:
 
 [source,rust]
 ----
-include::{source-dir}/main.rs[tags=workspace-setup]
+include::{cli-source-dir}/main.rs[tags=workspace-setup]
 ----
 
 As the user edits documents, the Workspace Manager receives `textDocument/didChange` notifications and incrementally updates the affected syntax trees.

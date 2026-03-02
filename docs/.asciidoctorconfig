@@ -1,3 +1,7 @@
 :imagesdir: images
-:source-dir: ../src
-:docdir: .
+:project-dir: {asciidoctorconfigdir}/..
+:cli-source-dir: {asciidoctorconfigdir}/../crates/asciidoc-cli/src
+:lsp-source-dir: {asciidoctorconfigdir}/../crates/asciidoc-lsp/src
+:core-source-dir: {asciidoctorconfigdir}/../crates/asciidoc-lsp/src
+:docdir: {asciidoctorconfigdir}
+:source-highlighter: highlight.js
