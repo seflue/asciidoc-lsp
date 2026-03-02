@@ -1,4 +1,4 @@
-:imagesdir: images
+:imagesdir: {asciidoctorconfigdir}/images
 :project-dir: {asciidoctorconfigdir}/..
 :cli-source-dir: {asciidoctorconfigdir}/../crates/asciidoc-cli/src
 :lsp-source-dir: {asciidoctorconfigdir}/../crates/asciidoc-lsp/src

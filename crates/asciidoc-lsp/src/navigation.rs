@@ -21,6 +21,8 @@ pub enum NodeKind {
     AttributeDef { name: String },
     /// `[[id]]` anchor / ID assignment
     Anchor { id: String },
+    /// `image::path[]` block macro
+    Image { path: String },
 }
 
 /// Information about a recognized node at a cursor position.
@@ -128,6 +130,29 @@ pub fn resolve_goto_definition(
             let source = ws.attributes.resolve_source(doc_path, name)?;
             Some((source.file, source.line))
         }
+        NodeKind::Image { ref path } => {
+            let doc_dir = doc_path.parent()?;
+            let resolved_path = if let Some(ws) = workspace {
+                ws.attributes.substitute(doc_path, path)
+            } else {
+                path.clone()
+            };
+            let imagesdir_raw = workspace
+                .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
+                .unwrap_or("");
+            let imagesdir = if let Some(ws) = workspace {
+                ws.attributes.substitute(doc_path, imagesdir_raw)
+            } else {
+                imagesdir_raw.to_string()
+            };
+            let target = if imagesdir.is_empty() {
+                doc_dir.join(&resolved_path)
+            } else {
+                doc_dir.join(imagesdir).join(&resolved_path)
+            };
+            let target_canon = target.canonicalize().ok()?;
+            Some((target_canon, 1))
+        }
         NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => {
             // Already on the definition — goto-definition is a no-op
             None
@@ -203,6 +228,10 @@ pub fn resolve_references(
             }
             r
         }
+        NodeKind::Image { .. } => {
+            // Images have no references semantics — find-references is a no-op
+            return None;
+        }
     };
 
     // Deduplicate results (same file+line can appear from multiple sources)
@@ -236,6 +265,13 @@ fn classify_block_node(
                     let path = find_child_text(n, "target", source).unwrap_or_default();
                     return Some(NodeInfo {
                         kind: NodeKind::Include { path },
+                        line: n.start_position().row + 1,
+                    });
+                }
+                if macro_name == "image" {
+                    let path = find_child_text(n, "target", source).unwrap_or_default();
+                    return Some(NodeInfo {
+                        kind: NodeKind::Image { path },
                         line: n.start_position().row + 1,
                     });
                 }
@@ -1375,5 +1411,135 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
                 name: "source-dir".into()
             }
         );
+    }
+
+    // --- adoc-0033 Task 1.1: find_node_at_position for image block macro ---
+
+    #[test]
+    fn test_find_node_image() {
+        let content = "= Title\n\nimage::images/diagram.png[Alt]\n\nSome text.\n";
+        // "image::..." is on line index 2 (0-based), cursor inside the macro
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::Image {
+                path: "images/diagram.png".into()
+            }
+        );
+        assert_eq!(info.line, 3); // 1-indexed
+    }
+
+    #[test]
+    fn test_find_node_image_at_start() {
+        let content = "= Title\n\nimage::logo.png[]\n";
+        let pos = Position {
+            line: 2,
+            character: 0,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::Image {
+                path: "logo.png".into()
+            }
+        );
+    }
+
+    // --- adoc-0033 Task 2.1: resolve_goto_definition for image ---
+
+    #[test]
+    fn test_goto_def_image_simple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let img = tmp.path().join("diagram.png");
+
+        fs::write(&a, "= Doc A\n\nimage::diagram.png[Alt]\n").unwrap();
+        fs::write(&img, "fake-png-data").unwrap();
+
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, None).unwrap();
+        assert_eq!(target, img.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_image_with_imagesdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = tmp.path().join("images");
+        fs::create_dir(&images).unwrap();
+
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: images\n",
+        )
+        .unwrap();
+
+        let a = tmp.path().join("a.adoc");
+        let img = images.join("diagram.png");
+        fs::write(&a, "= Doc A\n\nimage::diagram.png[Alt]\n").unwrap();
+        fs::write(&img, "fake-png-data").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(target, img.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_image_with_attr_in_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mydir = tmp.path().join("assets");
+        fs::create_dir(&mydir).unwrap();
+
+        fs::write(tmp.path().join(".asciidoctorconfig"), ":mydir: assets\n").unwrap();
+
+        let a = tmp.path().join("a.adoc");
+        let img = mydir.join("logo.png");
+        fs::write(&a, "= Doc A\n\nimage::{mydir}/logo.png[Logo]\n").unwrap();
+        fs::write(&img, "fake-png-data").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor after the attribute ref (on "/logo.png" part)
+        let pos = Position {
+            line: 2,
+            character: 20,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(target, img.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_image_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nimage::nonexistent.png[Alt]\n").unwrap();
+
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        assert!(resolve_goto_definition(&content, pos, &a, None).is_none());
     }
 }
