@@ -35,6 +35,14 @@ pub struct Anchor {
     pub line: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct AttributeRef {
+    pub name: String,
+    pub line: usize,      // 1-based
+    pub start_col: usize, // byte-offset of opening {
+    pub end_col: usize,   // byte-offset of closing }
+}
+
 #[derive(Debug)]
 pub struct IncludeTree {
     pub file: PathBuf,
@@ -82,6 +90,7 @@ pub struct DocumentModel {
     pub xrefs: Vec<Xref>,
     pub anchors: Vec<Anchor>,
     pub attributes: Vec<AttributeDef>,
+    pub attribute_refs: Vec<AttributeRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,5 +182,23 @@ mod tests {
         };
         assert!(d4.to_string().contains("duplicate anchor 'my-id'"));
         assert!(d4.to_string().contains("/a/b.adoc"));
+    }
+
+    #[test]
+    fn test_attribute_ref_struct() {
+        let attr_ref = AttributeRef {
+            name: "imagesdir".to_string(),
+            line: 5,
+            start_col: 10,
+            end_col: 21,
+        };
+        assert_eq!(attr_ref.name, "imagesdir");
+        assert_eq!(attr_ref.line, 5);
+        assert_eq!(attr_ref.start_col, 10);
+        assert_eq!(attr_ref.end_col, 21);
+
+        // Debug + Clone work
+        let _debug = format!("{:?}", attr_ref);
+        let _clone = attr_ref.clone();
     }
 }

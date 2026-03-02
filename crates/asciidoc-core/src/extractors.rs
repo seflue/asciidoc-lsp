@@ -1,4 +1,4 @@
-use crate::types::{Anchor, AttributeDef, IncludeMacro, Section, Xref};
+use crate::types::{Anchor, AttributeDef, AttributeRef, IncludeMacro, Section, Xref};
 
 // --- Block-level extractors (work on block parse tree) ---
 
@@ -31,6 +31,57 @@ pub fn extract_anchors(node: tree_sitter::Node, source: &[u8]) -> Vec<Anchor> {
 pub fn extract_xrefs(node: tree_sitter::Node, source: &[u8]) -> Vec<Xref> {
     let mut results = Vec::new();
     walk_for_xrefs(node, source, &mut results);
+    results
+}
+
+// --- Attribute reference extraction (byte-based, no tree-sitter) ---
+
+/// Extract all `{name}` attribute references from source text.
+///
+/// Scans each line for `{name}` patterns using byte-based scanning.
+/// Skips escaped references (`\{name}`), empty braces (`{}`), and
+/// names containing whitespace (`{with spaces}`).
+pub fn extract_attribute_refs(source: &str) -> Vec<AttributeRef> {
+    let mut results = Vec::new();
+
+    for (line_idx, line_str) in source.lines().enumerate() {
+        let bytes = line_str.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                // Check for escaped brace: \{
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
+
+                let brace_start = i;
+                let name_start = i + 1;
+                let mut end = name_start;
+                let mut valid = true;
+                while end < bytes.len() && bytes[end] != b'}' {
+                    if bytes[end] == b' ' || bytes[end] == b'\t' {
+                        valid = false;
+                        break;
+                    }
+                    end += 1;
+                }
+                if valid && end < bytes.len() && bytes[end] == b'}' && end > name_start {
+                    let name = &line_str[name_start..end];
+                    results.push(AttributeRef {
+                        name: name.to_string(),
+                        line: line_idx + 1, // 1-based
+                        start_col: brace_start,
+                        end_col: end + 1, // exclusive end for LSP half-open ranges
+                    });
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
     results
 }
 
@@ -452,6 +503,61 @@ mod tests {
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].target, "my-section");
         assert_eq!(xrefs[0].display_text.as_deref(), Some("Section Title"));
+    }
+
+    // --- extract_attribute_refs tests ---
+
+    #[test]
+    fn test_extract_attribute_refs_basic() {
+        let source = "= Title\n\nThe {imagesdir} is here.\n";
+        let refs = extract_attribute_refs(source);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "imagesdir");
+        assert_eq!(refs[0].line, 3); // 1-based
+        assert_eq!(refs[0].start_col, 4); // byte-offset of {
+        assert_eq!(refs[0].end_col, 15); // exclusive end (after })
+    }
+
+    #[test]
+    fn test_extract_attribute_refs_multiple_per_line() {
+        let source = "Text {a} und {b} here.\n";
+        let refs = extract_attribute_refs(source);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name, "a");
+        assert_eq!(refs[1].name, "b");
+    }
+
+    #[test]
+    fn test_extract_attribute_refs_in_definition_line() {
+        // :name: {other} → only {other} is a reference, :name: is a definition
+        let source = ":name: {other}\n";
+        let refs = extract_attribute_refs(source);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "other");
+    }
+
+    #[test]
+    fn test_extract_attribute_refs_escaped() {
+        // \{name} should be ignored
+        let source = "Text \\{name} here.\n";
+        let refs = extract_attribute_refs(source);
+        assert!(
+            refs.is_empty(),
+            "Escaped attribute refs must be ignored, got: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_extract_attribute_refs_empty_and_spaces() {
+        // {} and {with spaces} should be ignored
+        let source = "Text {} and {with spaces} here.\n";
+        let refs = extract_attribute_refs(source);
+        assert!(
+            refs.is_empty(),
+            "Empty/space-containing refs must be ignored, got: {:?}",
+            refs
+        );
     }
 
     #[test]

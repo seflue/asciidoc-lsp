@@ -103,6 +103,7 @@ mod tests {
                 }],
                 anchors: vec![],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -134,6 +135,7 @@ mod tests {
                 xrefs: vec![],
                 anchors: vec![],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -162,6 +164,7 @@ mod tests {
                     line: 1,
                 }],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
         documents.insert(
@@ -176,6 +179,7 @@ mod tests {
                     line: 10,
                 }],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -220,6 +224,7 @@ mod tests {
                 xrefs: vec![],
                 anchors: vec![],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -260,6 +265,7 @@ mod tests {
                     line: 3,
                 }],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -277,6 +283,7 @@ mod tests {
                 }],
                 anchors: vec![],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -294,6 +301,7 @@ mod tests {
                 xrefs: vec![],
                 anchors: vec![],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 
@@ -334,6 +342,7 @@ mod tests {
                     line: 5,
                 }],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
         // File with xref to that anchor
@@ -350,6 +359,7 @@ mod tests {
                 }],
                 anchors: vec![],
                 attributes: vec![],
+                attribute_refs: vec![],
             },
         );
 

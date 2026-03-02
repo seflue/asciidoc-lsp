@@ -17,6 +17,10 @@ pub enum NodeKind {
     ShorthandXref { target: String },
     /// `{name}` attribute reference
     AttributeRef { name: String },
+    /// `:name: value` attribute definition
+    AttributeDef { name: String },
+    /// `[[id]]` anchor / ID assignment
+    Anchor { id: String },
 }
 
 /// Information about a recognized node at a cursor position.
@@ -40,6 +44,11 @@ pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
     // This must come before tree-sitter so that e.g. include::{attr}/file.adoc[]
     // resolves to the attribute when cursor is on {attr}.
     if let Some(info) = find_attribute_ref_at_position(content, line_1, byte_col) {
+        return Some(info);
+    }
+
+    // Check :name: value attribute definitions — cursor anywhere on the line.
+    if let Some(info) = find_attribute_def_at_position(content, line_1) {
         return Some(info);
     }
 
@@ -119,6 +128,91 @@ pub fn resolve_goto_definition(
             let source = ws.attributes.resolve_source(doc_path, name)?;
             Some((source.file, source.line))
         }
+        NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => {
+            // Already on the definition — goto-definition is a no-op
+            None
+        }
+    }
+}
+
+/// Resolve a find-references request to a list of reference locations.
+///
+/// Returns `(file_path, line_1indexed, start_col, end_col)` for each reference.
+/// When `include_declaration` is true and cursor is on a `{name}` reference,
+/// the definition location is included in the results.
+pub fn resolve_references(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+    include_declaration: bool,
+) -> Option<Vec<(PathBuf, usize, usize, usize)>> {
+    let node_info = find_node_at_position(content, pos)?;
+    let ws = workspace?;
+
+    let mut results = match &node_info.kind {
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+            let mut r = ws.find_all_attribute_usages(name);
+            if include_declaration && matches!(node_info.kind, NodeKind::AttributeRef { .. }) {
+                if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
+                    r.push((source.file, source.line, 0, 0));
+                }
+            }
+            r
+        }
+        NodeKind::Include { path } => {
+            let doc_dir = doc_path.parent()?;
+            let resolved_path = ws.attributes.substitute(doc_path, path);
+            let target = doc_dir.join(&resolved_path);
+            let target_canonical = target.canonicalize().ok()?;
+            let filename = target_canonical
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("");
+
+            let mut r = ws.find_all_include_references(&target_canonical);
+            r.extend(ws.find_all_file_xrefs(filename));
+            r
+        }
+        NodeKind::Anchor { id } => {
+            let mut r = ws.find_all_anchor_references(id);
+            if include_declaration {
+                if let Some(loc) = ws.reference_index.lookup(id) {
+                    r.push((loc.file.clone(), loc.line, 0, 0));
+                }
+            }
+            r
+        }
+        NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
+            // Extract anchor part from xref target
+            let anchor_id = if let Some((_file, anchor)) = target.split_once('#') {
+                if anchor.is_empty() {
+                    return None;
+                }
+                anchor
+            } else if target.contains('.') {
+                return None; // file-only xref, no anchor to find references for
+            } else {
+                target.as_str()
+            };
+            let mut r = ws.find_all_anchor_references(anchor_id);
+            if include_declaration {
+                if let Some(loc) = ws.reference_index.lookup(anchor_id) {
+                    r.push((loc.file.clone(), loc.line, 0, 0));
+                }
+            }
+            r
+        }
+    };
+
+    // Deduplicate results (same file+line can appear from multiple sources)
+    results.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    results.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
     }
 }
 
@@ -188,12 +282,62 @@ fn classify_inline_node(
                     });
                 }
             }
+            "id_assignment" => {
+                // [[anchor-id]] — the `id` child node contains the anchor text
+                if let Some(id) = find_child_text(n, "id", source) {
+                    return Some(NodeInfo {
+                        kind: NodeKind::Anchor { id },
+                        line: n.start_position().row + 1,
+                    });
+                }
+            }
             _ => {}
         }
         current = n.parent();
     }
 
     None
+}
+
+/// Detect `:name: value` attribute definitions on the current line.
+/// Returns NodeInfo if the line matches the `:name: value` pattern.
+fn find_attribute_def_at_position(content: &str, line_1: usize) -> Option<NodeInfo> {
+    let line_0 = line_1.saturating_sub(1);
+    let line_str = content.lines().nth(line_0)?;
+    let bytes = line_str.as_bytes();
+
+    // Pattern: ^:([a-zA-Z0-9_-]+):\s+ or ^:([a-zA-Z0-9_-]+):$
+    if bytes.first() != Some(&b':') {
+        return None;
+    }
+
+    let mut end = 1;
+    while end < bytes.len() && bytes[end] != b':' {
+        let b = bytes[end];
+        if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return None;
+        }
+        end += 1;
+    }
+
+    // Must have closing `:` and name must be non-empty
+    if end >= bytes.len() || end <= 1 {
+        return None;
+    }
+
+    // After closing `:` must be end-of-line or whitespace
+    let after_colon = end + 1;
+    if after_colon < bytes.len() && bytes[after_colon] != b' ' && bytes[after_colon] != b'\t' {
+        return None;
+    }
+
+    let name = &line_str[1..end];
+    Some(NodeInfo {
+        kind: NodeKind::AttributeDef {
+            name: name.to_string(),
+        },
+        line: line_1,
+    })
 }
 
 /// Detect `{attribute-name}` references on the current line using regex-like scanning.
@@ -685,6 +829,550 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             info.unwrap().kind,
             NodeKind::Xref {
                 target: "05_building_block_view.adoc#building-blocks".into()
+            }
+        );
+    }
+
+    // --- Task 2.2: find_node_at_position for attribute definitions ---
+
+    #[test]
+    fn test_find_node_attribute_def() {
+        let content = "= Title\n:imagesdir: images\n\nContent.\n";
+        // Cursor on "imagesdir" in the definition line (line 1, 0-indexed)
+        let pos = Position {
+            line: 1,
+            character: 5,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::AttributeDef {
+                name: "imagesdir".into()
+            }
+        );
+    }
+
+    // --- adoc-0025: resolve_references for attribute references ---
+
+    #[test]
+    fn test_references_from_attribute_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: images\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        fs::write(
+            &a,
+            "= Doc A\n\nImages in {imagesdir} folder.\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "== Chapter B\n\nAlso {imagesdir} here.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on {imagesdir} in a.adoc — "Images in {imagesdir}" line 2 (0-indexed)
+        // '{' is at byte 10, 'i' at 11
+        let pos = Position {
+            line: 2,
+            character: 11,
+        };
+
+        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        assert_eq!(results.len(), 2, "Expected 2 usages, got: {:?}", results);
+    }
+
+    #[test]
+    fn test_references_from_attribute_def() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n:myattr: value\n\nUsing {myattr} here.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on :myattr: definition, line 1 (0-indexed), character 3
+        let pos = Position {
+            line: 1,
+            character: 3,
+        };
+
+        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        assert_eq!(results.len(), 1, "Expected 1 usage, got: {:?}", results);
+    }
+
+    #[test]
+    fn test_references_include_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: images\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on {imagesdir}
+        let pos = Position {
+            line: 2,
+            character: 11,
+        };
+
+        // Without includeDeclaration — just usages
+        let without = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        assert_eq!(without.len(), 1);
+
+        // With includeDeclaration — usages + definition
+        let with = resolve_references(&content, pos, &a, Some(&ws), true).unwrap();
+        assert_eq!(
+            with.len(),
+            2,
+            "Expected usage + declaration, got: {:?}",
+            with
+        );
+
+        // The declaration should point to .asciidoctorconfig
+        let config_path = tmp
+            .path()
+            .join(".asciidoctorconfig")
+            .canonicalize()
+            .unwrap();
+        let has_config = with.iter().any(|(p, _, _, _)| *p == config_path);
+        assert!(
+            has_config,
+            "Declaration from .asciidoctorconfig should be included"
+        );
+    }
+
+    // --- adoc-0025 Task 4.1: Integration test — gr on {attr} in .adoc ---
+
+    #[test]
+    fn test_integration_references_attribute_usage() {
+        // Multi-file workspace: config defines attribute, 3 .adoc files use it.
+        // references() on {source-dir} in chapter should find all usages across workspace.
+        let tmp = tempfile::tempdir().unwrap();
+        let chapters = tmp.path().join("chapters");
+        fs::create_dir(&chapters).unwrap();
+
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":source-dir: ../src\n:imagesdir: images\n",
+        )
+        .unwrap();
+
+        let index = tmp.path().join("index.adoc");
+        fs::write(
+            &index,
+            "= Architecture\n\ninclude::chapters/concepts.adoc[]\n\ninclude::chapters/building.adoc[]\n",
+        )
+        .unwrap();
+
+        fs::write(
+            chapters.join("concepts.adoc"),
+            "== Concepts\n\nSource code is in {source-dir} directory.\n",
+        )
+        .unwrap();
+
+        fs::write(
+            chapters.join("building.adoc"),
+            "== Building Blocks\n\nSee {source-dir}/main.rs for entry point.\n\nImages in {imagesdir}.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &index).unwrap();
+
+        // Cursor on {source-dir} in concepts.adoc, line 2 (0-indexed)
+        let concepts_content = fs::read_to_string(chapters.join("concepts.adoc")).unwrap();
+        let concepts_path = chapters.join("concepts.adoc").canonicalize().unwrap();
+        let pos = Position {
+            line: 2,
+            character: 19, // inside {source-dir}
+        };
+
+        let results =
+            resolve_references(&concepts_content, pos, &concepts_path, Some(&ws), false).unwrap();
+        // {source-dir} is used in concepts.adoc (line 3) and building.adoc (line 3)
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected 2 usages of {{source-dir}}, got: {:?}",
+            results
+        );
+
+        // Verify both files are represented
+        let building_path = chapters.join("building.adoc").canonicalize().unwrap();
+        let files: Vec<_> = results.iter().map(|(p, _, _, _)| p.clone()).collect();
+        assert!(
+            files.contains(&concepts_path),
+            "concepts.adoc should be in results"
+        );
+        assert!(
+            files.contains(&building_path),
+            "building.adoc should be in results"
+        );
+    }
+
+    // --- adoc-0025 Task 4.2: Integration test — gr on definition in .asciidoctorconfig ---
+
+    #[test]
+    fn test_integration_references_from_config() {
+        // Cursor on :source-dir: ../src in .asciidoctorconfig.
+        // references() should find all {source-dir} usages in .adoc files.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join(".asciidoctorconfig");
+        fs::write(&config_path, ":source-dir: ../src\n:imagesdir: images\n").unwrap();
+
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        fs::write(
+            &a,
+            "= Doc A\n\nCode in {source-dir} folder.\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "== Chapter B\n\nAlso see {source-dir}/lib.rs.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+
+        // Read .asciidoctorconfig content and place cursor on :source-dir:
+        let config_content = fs::read_to_string(&config_path).unwrap();
+        let pos = Position {
+            line: 0,
+            character: 5, // inside "source-dir" in ":source-dir: ../src"
+        };
+
+        let results =
+            resolve_references(&config_content, pos, &config_path, Some(&ws), false).unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected 2 usages of {{source-dir}} from config, got: {:?}",
+            results
+        );
+    }
+
+    // --- adoc-0026 Task 1.1: find_node_at_position for anchors ---
+
+    #[test]
+    fn test_find_node_anchor() {
+        let content = "= Title\n\n[[my-anchor]]\n== Section\n\nContent.\n";
+        // Cursor on "my-anchor" inside [[my-anchor]], line 2 (0-indexed)
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::Anchor {
+                id: "my-anchor".into()
+            }
+        );
+        assert_eq!(info.line, 3); // 1-indexed
+    }
+
+    #[test]
+    fn test_find_node_anchor_in_context() {
+        // Anchor before a section heading
+        let content = "= Title\n\n[[intro]]\n== Introduction\n\nSome text.\n";
+        let pos = Position {
+            line: 2,
+            character: 3,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(info.kind, NodeKind::Anchor { id: "intro".into() });
+    }
+
+    // --- adoc-0026 Task 2.1: resolve_references for includes ---
+
+    #[test]
+    fn test_references_from_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        let c = tmp.path().join("c.adoc");
+
+        fs::write(&a, "= Doc A\n\ninclude::b.adoc[]\n\ninclude::c.adoc[]\n").unwrap();
+        fs::write(&b, "== Chapter B\n\nContent.\n").unwrap();
+        fs::write(&c, "== Chapter C\n\ninclude::b.adoc[]\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on include::b.adoc[]
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        // b.adoc is included from a.adoc (line 3) and c.adoc (line 3)
+        assert_eq!(results.len(), 2, "Expected 2 refs, got: {:?}", results);
+    }
+
+    #[test]
+    fn test_references_from_include_with_xrefs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\ninclude::b.adoc[]\n\nSee xref:b.adoc#anchor[link].\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[anchor]]\n== Chapter B\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on include::b.adoc[]
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        // include ref + xref to b.adoc
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected 2 refs (include + xref), got: {:?}",
+            results
+        );
+    }
+
+    // --- adoc-0026 Task 2.2: resolve_references for anchors ---
+
+    #[test]
+    fn test_references_from_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\n[[my-id]]\n== Section\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "== Chapter B\n\nSee <<my-id>>.\n\nAlso xref:a.adoc#my-id[link].\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on [[my-id]]
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        assert_eq!(results.len(), 2, "Expected 2 refs, got: {:?}", results);
+    }
+
+    #[test]
+    fn test_references_from_anchor_include_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\n[[my-id]]\n== Section\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "== Chapter B\n\nSee <<my-id>>.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on [[my-id]]
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        // Without includeDeclaration
+        let without = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        assert_eq!(without.len(), 1, "Expected 1 ref without declaration");
+
+        // With includeDeclaration — should include anchor definition
+        let with = resolve_references(&content, pos, &a, Some(&ws), true).unwrap();
+        assert_eq!(
+            with.len(),
+            2,
+            "Expected 2 refs with declaration, got: {:?}",
+            with
+        );
+    }
+
+    // --- adoc-0026 Task 2.3: resolve_references for xrefs ---
+
+    #[test]
+    fn test_references_from_xref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\n[[target]]\n== Section\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "== Chapter B\n\nSee xref:a.adoc#target[link].\n\nAlso <<target>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &b).unwrap();
+        let content = fs::read_to_string(&b).unwrap();
+        // cursor on xref:a.adoc#target[link]
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        let results = resolve_references(&content, pos, &b, Some(&ws), false).unwrap();
+        // Both xref and shorthand xref reference "target"
+        assert_eq!(results.len(), 2, "Expected 2 co-refs, got: {:?}", results);
+    }
+
+    #[test]
+    fn test_references_from_shorthand_xref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\n[[anchor]]\n== Section\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "== Chapter B\n\nSee <<anchor>>.\n\nAlso xref:a.adoc#anchor[link].\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &b).unwrap();
+        let content = fs::read_to_string(&b).unwrap();
+        // cursor on <<anchor>>
+        let pos = Position {
+            line: 2,
+            character: 7,
+        };
+
+        let results = resolve_references(&content, pos, &b, Some(&ws), false).unwrap();
+        assert_eq!(results.len(), 2, "Expected 2 co-refs, got: {:?}", results);
+    }
+
+    // --- adoc-0026 Task 3.1: Integration test — gr auf Include (Multi-File) ---
+
+    #[test]
+    fn test_integration_include_references_multi_file() {
+        // arc42-like structure: index includes intro + concepts, concepts xrefs intro
+        let tmp = tempfile::tempdir().unwrap();
+        let chapters = tmp.path().join("chapters");
+        fs::create_dir(&chapters).unwrap();
+
+        let index = tmp.path().join("index.adoc");
+        fs::write(
+            &index,
+            "= Architecture\n\ninclude::chapters/intro.adoc[]\n\ninclude::chapters/concepts.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(
+            chapters.join("intro.adoc"),
+            "[[intro]]\n== Introduction\n\nWelcome.\n",
+        )
+        .unwrap();
+        fs::write(
+            chapters.join("concepts.adoc"),
+            "== Concepts\n\nSee xref:intro.adoc#intro[Introduction].\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &index).unwrap();
+        let content = fs::read_to_string(&index).unwrap();
+        // cursor on include::chapters/intro.adoc[]
+        let pos = Position {
+            line: 2,
+            character: 15,
+        };
+
+        let results = resolve_references(&content, pos, &index, Some(&ws), false).unwrap();
+        // Should find: 1 include ref (from index.adoc) + 1 xref (from concepts.adoc)
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected 2 refs (include + xref), got: {:?}",
+            results
+        );
+    }
+
+    // --- adoc-0026 Task 3.2: Integration test — gr auf Anchor (Multi-File) ---
+
+    #[test]
+    fn test_integration_anchor_references_multi_file() {
+        // a.adoc defines [[my-anchor]], b.adoc and c.adoc reference it
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        let c = tmp.path().join("c.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\n[[my-anchor]]\n== Section\n\ninclude::b.adoc[]\n\ninclude::c.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "== Chapter B\n\nSee xref:a.adoc#my-anchor[link].\n").unwrap();
+        fs::write(&c, "== Chapter C\n\nAlso <<my-anchor>>.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on [[my-anchor]]
+        let pos = Position {
+            line: 2,
+            character: 5,
+        };
+
+        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        // Should find 2 refs: xref in b.adoc + shorthand xref in c.adoc
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected 2 anchor refs from 2 files, got: {:?}",
+            results
+        );
+
+        // Verify both files are represented
+        let b_canon = b.canonicalize().unwrap();
+        let c_canon = c.canonicalize().unwrap();
+        let files: Vec<_> = results.iter().map(|(p, _, _, _)| p.clone()).collect();
+        assert!(files.contains(&b_canon), "b.adoc should be in results");
+        assert!(files.contains(&c_canon), "c.adoc should be in results");
+    }
+
+    #[test]
+    fn test_find_node_attribute_def_not_on_prefix() {
+        let content = "= Title\n:source-dir: ../src\n\nContent.\n";
+        // Cursor on the leading `:` (character 0) — should still detect
+        let pos = Position {
+            line: 1,
+            character: 0,
+        };
+
+        let info = find_node_at_position(content, pos).unwrap();
+        assert_eq!(
+            info.kind,
+            NodeKind::AttributeDef {
+                name: "source-dir".into()
             }
         );
     }

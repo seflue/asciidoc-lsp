@@ -177,6 +177,9 @@ fn walk(
     let inline_ranges = crate::extractors::collect_inline_ranges(root_node);
     let (xrefs, anchors) = crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
 
+    // Extract attribute references ({name} patterns) via byte-scanning
+    let attribute_refs = crate::extractors::extract_attribute_refs(&source);
+
     // Register file attributes
     registry.register_file_attributes(&canonical, &file_attrs);
 
@@ -188,6 +191,7 @@ fn walk(
         xrefs,
         anchors,
         attributes: file_attrs,
+        attribute_refs,
     };
     documents.insert(canonical.clone(), doc);
 
@@ -417,5 +421,31 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Circular"));
+    }
+
+    #[test]
+    fn test_document_model_has_attribute_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("doc.adoc");
+        fs::write(
+            &file,
+            "= Title\n:imagesdir: images\n\nSee {imagesdir} and {source-dir}.\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(tmp.path());
+        let (_, documents) = build_graph(&file, &mut registry);
+
+        let canon = file.canonicalize().unwrap();
+        let doc = documents.get(&canon).unwrap();
+        assert_eq!(
+            doc.attribute_refs.len(),
+            2,
+            "Expected 2 attribute refs, got: {:?}",
+            doc.attribute_refs
+        );
+        assert_eq!(doc.attribute_refs[0].name, "imagesdir");
+        assert_eq!(doc.attribute_refs[1].name, "source-dir");
+        assert_eq!(doc.attribute_refs[0].line, 4); // 1-based
     }
 }

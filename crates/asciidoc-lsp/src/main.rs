@@ -234,6 +234,7 @@ impl LanguageServer for AsciiDocLsp {
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
@@ -513,6 +514,68 @@ impl LanguageServer for AsciiDocLsp {
                 end: target_pos,
             },
         })))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // Get content from document store or disk fallback
+        let content = {
+            let docs = self.documents.lock().unwrap();
+            if let Some(state) = docs.get(uri) {
+                state.content.clone()
+            } else if let Some(path) = uri.to_file_path() {
+                match std::fs::read_to_string(path.as_ref()) {
+                    Ok(c) => c,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                return Ok(None);
+            }
+        };
+
+        let doc_path = match uri.to_file_path() {
+            Some(p) => p.into_owned(),
+            None => return Ok(None),
+        };
+
+        let include_declaration = params.context.include_declaration;
+
+        let ws = self.workspace.lock().unwrap();
+        let results = navigation::resolve_references(
+            &content,
+            position,
+            &doc_path,
+            ws.as_ref(),
+            include_declaration,
+        );
+        drop(ws);
+
+        let refs = match results {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let locations: Vec<Location> = refs
+            .into_iter()
+            .filter_map(|(path, line, start_col, end_col)| {
+                let target_uri = Uri::from_file_path(&path)?;
+                let file_content = std::fs::read_to_string(&path).unwrap_or_default();
+                let start = positions::to_lsp_position(line, start_col, &file_content);
+                let end = positions::to_lsp_position(line, end_col, &file_content);
+                Some(Location {
+                    uri: target_uri,
+                    range: Range { start, end },
+                })
+            })
+            .collect();
+
+        if locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(locations))
+        }
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {

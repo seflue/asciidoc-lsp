@@ -54,9 +54,21 @@ impl AttributeRegistry {
 
         // Merge from root to leaf (later entries = closer to file = override)
         for (config_dir, content) in config_contents.iter().rev() {
+            // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
+            self.config.insert(
+                "asciidoctorconfigdir".into(),
+                AttributeEntry {
+                    value: config_dir.display().to_string(),
+                    source: None,
+                },
+            );
+
             let config_file = config_dir.join(".asciidoctorconfig");
+            let dummy = Path::new("");
             for (key, value, line) in parse_asciidoctorconfig(content) {
-                let resolved = canonicalize_path_value(&value, config_dir);
+                // Substitute attribute references (e.g. {asciidoctorconfigdir})
+                let substituted = self.substitute(dummy, &value);
+                let resolved = canonicalize_path_value(&substituted, config_dir);
                 self.config.insert(
                     key,
                     AttributeEntry {
@@ -202,6 +214,11 @@ fn canonicalize_path_value(value: &str, config_dir: &Path) -> String {
             Ok(canonical) => canonical.display().to_string(),
             // Path doesn't exist yet — normalize without canonicalize
             Err(_) => resolved.display().to_string(),
+        }
+    } else if Path::new(value).is_absolute() && value.contains("..") {
+        match Path::new(value).canonicalize() {
+            Ok(canonical) => canonical.display().to_string(),
+            Err(_) => value.to_string(),
         }
     } else {
         value.to_string()
@@ -436,6 +453,81 @@ mod tests {
         assert_eq!(map.get("imagesdir"), Some(&"img"));
         // Per-file attribute present
         assert_eq!(map.get("author"), Some(&"Alice"));
+    }
+
+    // --- {asciidoctorconfigdir} tests ---
+
+    #[test]
+    fn test_asciidoctorconfigdir_injected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("project").join("docs");
+        let src = tmp.path().join("project").join("src");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&src).unwrap();
+
+        fs::write(
+            docs.join(".asciidoctorconfig"),
+            ":source-dir: {asciidoctorconfigdir}/../src\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(&docs);
+        registry.load_config(&docs);
+
+        let dummy = Path::new("any.adoc");
+        let canonical_docs = docs.canonicalize().unwrap();
+        let canonical_src = src.canonicalize().unwrap();
+
+        assert_eq!(
+            registry.resolve(dummy, "asciidoctorconfigdir"),
+            Some(canonical_docs.display().to_string()).as_deref()
+        );
+        assert_eq!(
+            registry.resolve(dummy, "source-dir"),
+            Some(canonical_src.display().to_string()).as_deref()
+        );
+    }
+
+    #[test]
+    fn test_asciidoctorconfigdir_hierarchy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        fs::write(
+            parent.join(".asciidoctorconfig"),
+            ":parent-dir: {asciidoctorconfigdir}/data\n",
+        )
+        .unwrap();
+        fs::write(
+            child.join(".asciidoctorconfig"),
+            ":child-dir: {asciidoctorconfigdir}/output\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(&child);
+        registry.load_config(&child);
+
+        let dummy = Path::new("any.adoc");
+        let canonical_parent = parent.canonicalize().unwrap();
+        let canonical_child = child.canonicalize().unwrap();
+
+        // parent-dir uses parent's {asciidoctorconfigdir}
+        assert_eq!(
+            registry.resolve(dummy, "parent-dir"),
+            Some(format!("{}/data", canonical_parent.display())).as_deref()
+        );
+        // child-dir uses child's {asciidoctorconfigdir}
+        assert_eq!(
+            registry.resolve(dummy, "child-dir"),
+            Some(format!("{}/output", canonical_child.display())).as_deref()
+        );
+        // Final {asciidoctorconfigdir} is the leaf config's dir
+        assert_eq!(
+            registry.resolve(dummy, "asciidoctorconfigdir"),
+            Some(canonical_child.display().to_string()).as_deref()
+        );
     }
 
     #[test]
