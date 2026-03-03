@@ -389,30 +389,17 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        // Check if cursor is on an {attribute} reference
-        let Some(attr_name) =
-            find_attribute_at_position(&content, position.line, position.character)
-        else {
-            return Ok(None);
-        };
-
-        // Resolve the attribute value from the workspace
         let doc_path = match uri.to_file_path() {
             Some(p) => p.into_owned(),
             None => return Ok(None),
         };
 
         let ws = self.workspace.lock().expect("workspace lock poisoned");
-        let value = ws
-            .as_ref()
-            .and_then(|ws| ws.attributes.resolve(&doc_path, &attr_name))
-            .map(std::string::ToString::to_string);
+        let hover_text = navigation::resolve_hover(&content, position, &doc_path, ws.as_ref());
 
-        match value {
-            Some(val) => Ok(Some(Hover {
-                contents: HoverContents::Scalar(MarkedString::String(format!(
-                    ":{attr_name}: {val}"
-                ))),
+        match hover_text {
+            Some(text) => Ok(Some(Hover {
+                contents: HoverContents::Scalar(MarkedString::String(text)),
                 range: None,
             })),
             None => Ok(None),
@@ -561,44 +548,6 @@ impl LanguageServer for AsciiDocLsp {
             Ok(Some(CompletionResponse::Array(items)))
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Hover: attribute detection (V-8: extracted for testability)
-// ---------------------------------------------------------------------------
-
-/// Find the attribute name at the given LSP position.
-///
-/// Looks for `{attribute_name}` patterns by scanning the line at the cursor
-/// position for enclosing braces. Returns the attribute name if the cursor
-/// is inside a `{name}` reference (including on the braces themselves).
-fn find_attribute_at_position(content: &str, line: u32, character: u32) -> Option<String> {
-    let line_text = content.lines().nth(line as usize)?;
-
-    // Convert UTF-16 character offset to byte offset
-    let pos = Position { line, character };
-    let (_, byte_col) = positions::from_lsp_position(pos, content);
-
-    if byte_col >= line_text.len() {
-        return None;
-    }
-
-    // Find the nearest '{' at or before cursor position
-    let open_pos = line_text[..=byte_col].rfind('{')?;
-
-    // Find the nearest '}' at or after cursor position
-    let close_relative = line_text[byte_col..].find('}')?;
-    let close_pos = byte_col + close_relative;
-
-    // Extract the content between braces
-    let name = &line_text[open_pos + 1..close_pos];
-
-    // Reject if empty or contains nested braces
-    if name.is_empty() || name.contains('{') || name.contains('}') {
-        return None;
-    }
-
-    Some(name.to_string())
 }
 
 /// Rebuild workspace: detect root, find entry point, build with overrides.
@@ -893,98 +842,6 @@ mod tests {
         // Verify the override content was used
         let b_doc = ws.documents.get(&b_canon).unwrap();
         assert_eq!(b_doc.sections[0].title, "Modified Chapter B");
-    }
-
-    // --- Hover: find_attribute_at_position tests (V-8) ---
-
-    #[test]
-    fn test_find_attr_basic() {
-        let content = "The value is {imagesdir} here.";
-        // Cursor on 'i' of 'imagesdir' (position 14)
-        assert_eq!(
-            find_attribute_at_position(content, 0, 14),
-            Some("imagesdir".into())
-        );
-    }
-
-    #[test]
-    fn test_find_attr_at_open_brace() {
-        let content = "The value is {imagesdir} here.";
-        // Cursor on '{' (position 13)
-        assert_eq!(
-            find_attribute_at_position(content, 0, 13),
-            Some("imagesdir".into())
-        );
-    }
-
-    #[test]
-    fn test_find_attr_at_close_brace() {
-        let content = "The value is {imagesdir} here.";
-        // '}' is at position 23
-        assert_eq!(
-            find_attribute_at_position(content, 0, 23),
-            Some("imagesdir".into())
-        );
-    }
-
-    #[test]
-    fn test_find_attr_not_in_braces() {
-        let content = "Just plain text.";
-        assert_eq!(find_attribute_at_position(content, 0, 5), None);
-    }
-
-    #[test]
-    fn test_find_attr_after_close_brace() {
-        let content = "The value is {imagesdir} here.";
-        // Position 24 = space after '}'
-        assert_eq!(find_attribute_at_position(content, 0, 24), None);
-    }
-
-    #[test]
-    fn test_find_attr_empty_braces() {
-        let content = "Empty {} here.";
-        // Cursor on '}' at position 7 — between the braces is empty
-        assert_eq!(find_attribute_at_position(content, 0, 7), None);
-    }
-
-    #[test]
-    fn test_find_attr_multiline() {
-        let content = "= Title\n\nSee {chapdir} for details.";
-        // 'chapdir' is on line 2 (0-indexed)
-        assert_eq!(
-            find_attribute_at_position(content, 2, 5),
-            Some("chapdir".into())
-        );
-    }
-
-    #[test]
-    fn test_find_attr_cursor_past_line_end() {
-        let content = "short";
-        assert_eq!(find_attribute_at_position(content, 0, 100), None);
-    }
-
-    #[test]
-    fn test_find_attr_invalid_line() {
-        let content = "one line";
-        assert_eq!(find_attribute_at_position(content, 5, 0), None);
-    }
-
-    #[test]
-    fn test_find_attr_between_two_refs() {
-        // Cursor between two attribute references should return None
-        let content = "Text {foo} middle {bar} end";
-        // Position 11 = 'm' of 'middle' (between the two refs)
-        assert_eq!(find_attribute_at_position(content, 0, 11), None);
-    }
-
-    #[test]
-    fn test_find_attr_second_of_two() {
-        let content = "Text {foo} middle {bar} end";
-        // Position 19 = 'b' of 'bar'
-        assert_eq!(
-            find_attribute_at_position(content, 0, 19),
-            Some("bar".into())
-        );
     }
 
     // -----------------------------------------------------------------------

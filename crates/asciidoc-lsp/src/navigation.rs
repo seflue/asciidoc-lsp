@@ -245,6 +245,142 @@ pub fn resolve_references(
     }
 }
 
+/// Resolve a hover request to a formatted Markdown string.
+///
+/// Returns hover content for the node at the cursor position:
+/// - `AttributeRef`: value + definition location
+/// - `AttributeDef`: resolved value
+/// - `Xref`/`ShorthandXref`: section title + file
+/// - `Include`: resolved path + file info
+pub fn resolve_hover(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> Option<String> {
+    use std::fmt::Write;
+
+    let node_info = find_node_at_position(content, pos)?;
+
+    match &node_info.kind {
+        NodeKind::AttributeRef { name } => {
+            let ws = workspace?;
+            let value = ws.attributes.resolve(doc_path, name)?;
+            let mut text = format!(":{name}: {value}");
+            if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
+                let display_path = file_display_name(&source.file);
+                let _ = write!(text, "\n\nDefined in {display_path}:{}", source.line);
+            }
+            Some(text)
+        }
+        NodeKind::AttributeDef { name } => {
+            let ws = workspace?;
+            let value = ws.attributes.resolve(doc_path, name)?;
+            Some(format!(":{name}: {value}"))
+        }
+        NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
+            let ws = workspace?;
+            let xref = asciidoc_core::types::Xref {
+                target: target.clone(),
+                display_text: None,
+                line: node_info.line,
+            };
+            let resolved = ws
+                .reference_index
+                .resolve_xref(&xref, doc_path, &ws.include_graph, &ws.documents)
+                .ok()?;
+
+            // Find section title at the resolved location
+            let section_title = ws.documents.get(&resolved.file).and_then(|doc| {
+                doc.sections
+                    .iter()
+                    .find(|s| s.line == resolved.line)
+                    .map(|s| s.title.clone())
+            });
+
+            let display_path = file_display_name(&resolved.file);
+
+            if let Some(title) = section_title {
+                Some(format!(
+                    "\u{2192} {title}\n\n{display_path}:{}",
+                    resolved.line
+                ))
+            } else {
+                // Anchor without section (explicit anchor)
+                let anchor_id = target.rsplit('#').next().unwrap_or(target);
+                Some(format!(
+                    "[[{anchor_id}]]\n\n{display_path}:{}",
+                    resolved.line
+                ))
+            }
+        }
+        NodeKind::Include { path } => {
+            let doc_dir = doc_path.parent()?;
+            let resolved_path = if let Some(ws) = workspace {
+                ws.attributes.substitute(doc_path, path)
+            } else {
+                path.clone()
+            };
+            let target = doc_dir.join(&resolved_path);
+
+            let mut text = format!("include::{resolved_path}[]");
+            if target.exists() {
+                let section_count = workspace
+                    .and_then(|ws| ws.documents.get(&target.canonicalize().ok()?))
+                    .map_or(0, |doc| doc.sections.len());
+                let _ = write!(text, "\n\n\u{2713} File exists | {section_count} sections");
+            } else {
+                text.push_str("\n\n\u{2717} File not found");
+            }
+            Some(text)
+        }
+        NodeKind::Image { path } => {
+            let doc_dir = doc_path.parent()?;
+            let resolved_path = if let Some(ws) = workspace {
+                ws.attributes.substitute(doc_path, path)
+            } else {
+                path.clone()
+            };
+            let imagesdir_raw = workspace
+                .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
+                .unwrap_or("");
+            let imagesdir = if let Some(ws) = workspace {
+                ws.attributes.substitute(doc_path, imagesdir_raw)
+            } else {
+                imagesdir_raw.to_string()
+            };
+            let target = if imagesdir.is_empty() {
+                doc_dir.join(&resolved_path)
+            } else {
+                doc_dir.join(&imagesdir).join(&resolved_path)
+            };
+
+            let display = if imagesdir.is_empty() {
+                resolved_path.clone()
+            } else {
+                format!("{imagesdir}/{resolved_path}")
+            };
+
+            let mut text = format!("image::{display}[]");
+            if target.exists() {
+                text.push_str("\n\n\u{2713} File exists");
+            } else {
+                text.push_str("\n\n\u{2717} File not found");
+            }
+            Some(text)
+        }
+        NodeKind::Anchor { .. } => None,
+    }
+}
+
+/// Extract a display-friendly filename from a path.
+fn file_display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |f| f.to_string_lossy().into_owned(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Internal classification helpers
 // ---------------------------------------------------------------------------
@@ -1530,6 +1666,350 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(target, img.canonicalize().unwrap());
         assert_eq!(line, 1);
     }
+
+    // --- adoc-0030: resolve_hover tests ---
+
+    #[test]
+    fn test_hover_attribute_ref_with_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: images\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 11,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(hover.contains(":imagesdir: images"), "Should show value");
+        assert!(
+            hover.contains("Defined in .asciidoctorconfig:1"),
+            "Should show source, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_ref_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nSee {nonexistent} here.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 5,
+        };
+
+        assert!(resolve_hover(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    #[test]
+    fn test_hover_attribute_def() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n:myattr: hello world\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 1,
+            character: 3,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(hover, ":myattr: hello world");
+    }
+
+    #[test]
+    fn test_hover_attribute_builtin_no_source() {
+        // Builtin attributes like {docdir} have a value but no source location
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n:custom: val\n\nSee {custom}.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 5,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(hover.contains(":custom: val"));
+        // Source location should be present since it's defined in the doc header
+        assert!(hover.contains("Defined in"));
+    }
+
+    #[test]
+    fn test_hover_xref_with_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(
+            &a,
+            "= Doc A\n\nSee xref:b.adoc#my-anchor[link].\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        // Anchor is on line 1 which is [[my-anchor]], not a section line.
+        // The section "Chapter B" is on line 2 — but resolved.line points to the anchor line.
+        assert!(
+            hover.contains("b.adoc:1"),
+            "Should show file + line, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_shorthand_xref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(&a, "= Doc A\n\nSee <<my-anchor>>.\n\ninclude::b.adoc[]\n").unwrap();
+        fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.contains("b.adoc:1"),
+            "Should show file + line, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_xref_broken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nSee <<nonexistent>>.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        assert!(resolve_hover(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    #[test]
+    fn test_hover_include_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("sub.adoc");
+
+        fs::write(&a, "= Doc A\n\ninclude::sub.adoc[]\n").unwrap();
+        fs::write(&b, "== Sub Chapter\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.contains("include::sub.adoc[]"),
+            "Should show include path, got: {hover}"
+        );
+        assert!(
+            hover.contains("\u{2713} File exists"),
+            "Should confirm existence, got: {hover}"
+        );
+        assert!(
+            hover.contains("1 sections"),
+            "Should show section count, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_include_with_attr_substitution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chapters = tmp.path().join("chapters");
+        fs::create_dir(&chapters).unwrap();
+
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":chapdir: chapters\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\ninclude::{chapdir}/intro.adoc[]\n").unwrap();
+        fs::write(chapters.join("intro.adoc"), "== Introduction\n\nWelcome.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on the include path, after the attribute ref
+        let pos = Position {
+            line: 2,
+            character: 25,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.contains("include::chapters/intro.adoc[]"),
+            "Should show resolved path, got: {hover}"
+        );
+        assert!(
+            hover.contains("\u{2713} File exists"),
+            "Should confirm existence, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_include_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\ninclude::nonexistent.adoc[]\n").unwrap();
+
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, None).unwrap();
+        assert!(
+            hover.contains("include::nonexistent.adoc[]"),
+            "Should show path, got: {hover}"
+        );
+        assert!(
+            hover.contains("\u{2717} File not found"),
+            "Should show not found, got: {hover}"
+        );
+    }
+
+    // --- Image hover tests ---
+
+    #[test]
+    fn test_hover_image_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let img = tmp.path().join("photo.png");
+
+        fs::write(&a, "= Doc A\n\nimage::photo.png[My Photo]\n").unwrap();
+        fs::write(&img, "fake-png-data").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.contains("image::photo.png[]"),
+            "Should show image path, got: {hover}"
+        );
+        assert!(
+            hover.contains("\u{2713} File exists"),
+            "Should confirm existence, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_image_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nimage::missing.png[Alt]\n").unwrap();
+
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, None).unwrap();
+        assert!(
+            hover.contains("image::missing.png[]"),
+            "Should show path, got: {hover}"
+        );
+        assert!(
+            hover.contains("\u{2717} File not found"),
+            "Should show not found, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_image_with_imagesdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = tmp.path().join("assets").join("img");
+        fs::create_dir_all(&images).unwrap();
+
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":imagesdir: assets/img\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\nimage::logo.png[Logo]\n").unwrap();
+        fs::write(images.join("logo.png"), "fake-png-data").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.contains("image::assets/img/logo.png[]"),
+            "Should show resolved path with imagesdir, got: {hover}"
+        );
+        assert!(
+            hover.contains("\u{2713} File exists"),
+            "Should confirm existence, got: {hover}"
+        );
+    }
+
+    #[test]
+    fn test_hover_anchor_returns_none() {
+        let content = "= Title\n\n[[my-anchor]]\n== Section\n";
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+        assert!(resolve_hover(content, pos, Path::new("test.adoc"), None).is_none());
+    }
+
+    #[test]
+    fn test_hover_plain_text_returns_none() {
+        let content = "= Title\n\nJust plain text.\n";
+        let pos = Position {
+            line: 2,
+            character: 5,
+        };
+        assert!(resolve_hover(content, pos, Path::new("test.adoc"), None).is_none());
+    }
+
+    // --- adoc-0033: image tests (unchanged) ---
 
     #[test]
     fn test_goto_def_image_missing_file() {

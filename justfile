@@ -58,6 +58,10 @@ lsp:
 lint-warn:
     cargo clippy --workspace 2>&1 | grep -E "^(warning|error)\[" | sort | uniq -c | sort -rn
 
+# Reset manual test plan (checkboxes + renamed test data)
+reset-testplan:
+    git checkout -- docs/appendix/manual-test-plan.adoc
+
 # Remove build artifacts
 clean:
     cargo clean

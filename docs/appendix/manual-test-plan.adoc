@@ -348,50 +348,98 @@ xyz
 
 ---
 
-=== Test Results Summary
+=== T3: Hover
 
-[cols="1,4,1,1", options="header"]
-|===
-| ID | Description | PASS | FAIL
+`K` (or your hover keymap) on references shows contextual information.
 
-| T1.1 | gd on image:: with imagesdir | |
-| T1.2 | gd on non-existent image | |
-| T2.1a | Block macro: include:: | |
-| T2.1b | Block macro: image:: | |
-| T2.1c | Block macro: video:: | |
-| T2.1d | Block macro: audio:: | |
-| T2.1e | Block macro: toc:: | |
-| T2.1f | Block macro: ifdef:: | |
-| T2.1g | Block macro: ifndef:: | |
-| T2.1h | Block macro: endif:: | |
-| T2.1i | Block macro: ifeval:: | |
-| T2.2a | Admonition: NOTE | |
-| T2.2b | Admonition: TIP | |
-| T2.2c | Admonition: IMPORTANT | |
-| T2.2d | Admonition: WARNING | |
-| T2.2e | Admonition: CAUTION | |
-| T2.3a | Doc attr: toc | |
-| T2.3b | Doc attr: icons | |
-| T2.3c | Doc attr: source-highlighter | |
-| T2.3d | Doc attr: doctype | |
-| T2.3e | Doc attr: imagesdir | |
-| T2.3f | Doc attr: numbered | |
-| T2.3g | Doc attr: experimental | |
-| T2.3h | Doc attr: data-uri | |
-| T2.3i | Doc attr: sectnums | |
-| T2.3j | Doc attr: sectanchors | |
-| T2.3k | Doc attr: sectlinks | |
-| T2.3l | Doc attr: stem | |
-| T2.3m | Doc attr: toclevels | |
-| T2.3n | Doc attr: hardbreaks-option | |
-| T2.4a | Inline macro: kbd | |
-| T2.4b | Inline macro: btn | |
-| T2.4c | Inline macro: menu | |
-| T2.4d | Inline macro: link | |
-| T2.4e | Inline macro: image (inline) | |
-| T2.4f | Inline macro: footnote | |
-| T2.4g | Inline macro: pass | |
-| T2.5a | Priority: include:: → path completion | |
-| T2.5b | Priority: include::{docdir}/ | |
-| T2.6 | No false positives in prose | |
-|===
+==== T3.1: Attribute Reference hover
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on `{imagesdir}` below and trigger hover (`K`):
+
+The images are in {imagesdir} somewhere.
+
+// Expected: Hover shows value (e.g. `images/`) and definition location (e.g. `.asciidoctorconfig:3`)
+
+==== T3.2: Attribute Definition hover
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the `:imagesdir:` definition in `.asciidoctorconfig` and trigger hover.
+// Expected: Hover shows the resolved value.
+
+==== T3.3: Xref hover — cross-reference with anchor
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the xref below and trigger hover:
+
+See xref:01_introduction_and_goals.adoc#_introduction_and_goals[Introduction].
+
+// Expected: Hover shows section title + file (e.g. `→ Introduction and Goals` / `01_introduction_and_goals.adoc:1`)
+
+==== T3.4: Shorthand Xref hover
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the shorthand xref below and trigger hover:
+
+Refer to <<_introduction_and_goals>>.
+
+// Expected: Hover shows section title (e.g. `→ Introduction and Goals`)
+
+==== T3.5: Xref hover — broken reference
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the xref below and trigger hover:
+
+See xref:nonexistent.adoc#nope[Broken].
+
+// Expected: No hover content (None). No crash. LSP stays attached.
+
+==== T3.6: Include hover — existing file
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the include below and trigger hover:
+
+include::../chapters/01_introduction_and_goals.adoc[]
+
+// Expected: Hover shows resolved path + file info (e.g. `✓ File exists | N sections`)
+
+==== T3.7: Include hover — with attribute substitution
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the include below and trigger hover:
+
+include::{docdir}/chapters/01_introduction_and_goals.adoc[]
+
+// Expected: Hover shows resolved path with substituted attribute value
+
+==== T3.8: Include hover — non-existent file
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the include below and trigger hover:
+
+include::this-file-does-not-exist.adoc[]
+
+// Expected: Hover shows path (even though file doesn't exist). No crash.
+
+==== T3.9: Image hover — existing file
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the image macro below and trigger hover:
+
+image::test-placeholder.png[Test Placeholder]
+
+// Expected: Hover shows resolved path + existence info, e.g.:
+//   image::test-placeholder.png[]
+//   ✓ File exists
+// If file does not exist:
+//   image::test-placeholder.png[]
+//   ✗ File not found
+// With :imagesdir: set, the resolved path includes the imagesdir prefix.
+
+==== T3.10: No hover on plain text
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on a plain word in this paragraph and trigger hover.
+// Expected: Neovim shows "No information available" (normal LSP behavior when server returns null). LSP stays attached.
+
+---
