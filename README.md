@@ -1,121 +1,151 @@
 # asciidoc-lsp
 
-A tree-sitter based AsciiDoc parser that extracts structural information from `.adoc` files. Built as a proof-of-concept for an AsciiDoc language server.
+A language server for [AsciiDoc](https://asciidoc.org/), built with Rust and [tree-sitter](https://tree-sitter.github.io/).
 
-## What it does
+Provides navigation, diagnostics, completions, and refactoring for AsciiDoc projects — with full workspace awareness including `include::` resolution, cross-references, and `.asciidoctorconfig` support.
 
-Parses AsciiDoc files using a **dual-grammar approach** (block + inline tree-sitter grammars) and extracts:
+## Features
 
-- **Sections** — headings with nesting level and line numbers
-- **Includes** — `include::` directives with attributes
-- **Attributes** — document attribute definitions (`:key: value`)
-- **Xrefs** — cross-references (`<<target>>`, `xref:target[]`)
-- **Anchors** — anchor definitions (`[[id]]`)
+### Navigation
 
-In `--tree` mode, it recursively follows `include::` directives and displays the full document structure as a tree. Attribute substitution in include paths (e.g. `{docdir}`) is supported via `.asciidoctorconfig`.
+- **Go to Definition** (`gd`) — jump to targets of `include::`, `xref:`, `<<anchor>>`, `image::`, and `{attribute}` references
+- **Find References** (`gr`) — find all usages of attributes, includes, and anchors across the workspace
+- **Document Symbols** — nested section outline for the current file
+- **Workspace Symbols** — search sections, attributes, and includes across all files
 
-## Build
+### Diagnostics
+
+- Broken cross-references (`xref:` / `<<>>` pointing to non-existent anchors)
+- Broken includes (missing target files)
+- Duplicate anchor detection
+- Live updates on every edit
+- Workspace-wide analysis on open and save
+
+### Completions
+
+- **Semantic** — attribute references (`{attr}`), include paths with attribute substitution, xref targets, anchor IDs
+- **Syntax** — block macros (`include::`, `image::`, `video::`), admonitions (`NOTE`, `WARNING`, ...), document attributes (`:toc:`, `:sectnums:`, ...), inline formatting (`kbd:`, `btn:`, ...)
+
+### Hover
+
+- Attribute definitions and resolved values
+- Include target paths
+- Xref and anchor context
+- Image paths
+
+### Refactoring
+
+- **Rename** (`vim.lsp.buf.rename()`) — rename anchors and attributes across the entire workspace, with `prepareRename` validation
+
+### Workspace Intelligence
+
+- Automatic workspace root detection (`.asciidoctorconfig` → `.git` → fallback)
+- `.asciidoctorconfig` attribute loading and substitution
+- Synthetic `{asciidoctorconfigdir}` attribute
+- Recursive include-tree resolution with attribute expansion
+- Incremental workspace rebuild on file changes
+
+## Installation
+
+### From source
+
+Requires Rust 1.70+.
+
+```sh
+git clone https://github.com/TODO/asciidoc-lsp.git
+cd asciidoc-lsp
+cargo install --path crates/asciidoc-lsp
+```
+
+Or build without installing:
 
 ```sh
 cargo build --release
+# Binary: target/release/asciidoc-lsp
 ```
 
-## Usage
+## Editor Setup
 
+### Neovim (nvim-lspconfig)
+
+```lua
+local lspconfig = require('lspconfig')
+local configs = require('lspconfig.configs')
+
+if not configs.asciidoc_lsp then
+  configs.asciidoc_lsp = {
+    default_config = {
+      cmd = { 'asciidoc-lsp' },
+      filetypes = { 'asciidoc', 'asciidoctor' },
+      root_dir = lspconfig.util.root_pattern('.asciidoctorconfig', '.git'),
+    },
+  }
+end
+
+lspconfig.asciidoc_lsp.setup {}
 ```
-asciidoc-lsp [OPTIONS] <PATH>
 
-Arguments:
-  <PATH>  Path to AsciiDoc file
+Recommended companion plugins:
 
-Options:
-      --tree  Show include tree
-      --all   Show all extracted information (sections, includes, xrefs, attributes, anchors)
-  -h, --help  Print help
-```
+- [trouble.nvim](https://github.com/folke/trouble.nvim) — workspace-wide diagnostics view
+- [live-rename.nvim](https://github.com/saecki/live-rename.nvim) — inline rename preview (works with `prepareRename`)
 
-### Single-file mode
+### Other editors
 
-Parse one file and show sections, includes, and attributes:
+asciidoc-lsp communicates via LSP over stdio. Any editor with LSP support can use it — configure the client to run the `asciidoc-lsp` binary.
+
+## CLI
+
+The project also includes `asciidoc-cli`, a command-line tool for inspecting AsciiDoc document structure:
 
 ```sh
-$ asciidoc-lsp docs/index.adoc
-File: docs/index.adoc
+cargo install --path crates/asciidoc-cli
 
-Sections (1):
-  L0: asciidoc-lsp Architecture Documentation (line 1)
+# Parse a file and show sections, includes, attributes
+asciidoc-cli docs/index.adoc
 
-Includes (6):
-  chapters/01_introduction_and_goals.adoc (line 10)
-  chapters/04_solution_strategy.adoc (line 12)
-  chapters/05_building_block_view.adoc (line 14)
-  chapters/08_concepts.adoc (line 16)
-  chapters/09_architecture_decisions.adoc (line 18)
-  {docdir}/appendix/glossary.adoc (line 20)
+# Recursively walk include tree
+asciidoc-cli --tree docs/index.adoc
 
-Attributes (4):
-  :toc: left (line 2)
-  :toclevels: 3 (line 3)
-  :sectnums:  (line 4)
-  :icons: font (line 5)
+# Include xrefs and anchors in output
+asciidoc-cli --tree --all docs/index.adoc
 ```
 
-Add `--all` to include xrefs and anchors in the output.
+## Architecture
 
-### Include tree mode
+```
+crates/
+  asciidoc-core/    # Parser, extractors, workspace model, diagnostics
+  asciidoc-lsp/     # LSP server (tower-lsp)
+  asciidoc-cli/     # CLI for inspection and debugging
+```
 
-Recursively walk all `include::` directives and display the document structure:
+**Dual-grammar parsing:** Two tree-sitter grammars cover different levels of AsciiDoc syntax:
+
+- **Block** (`tree-sitter-asciidoc`) — document structure: sections, includes, attributes
+- **Inline** (`tree-sitter-asciidoc-inline`) — inline content: xrefs, anchors
+
+## Development
+
+Requires [just](https://github.com/casey/just).
 
 ```sh
-$ asciidoc-lsp --tree docs/index.adoc
-index.adoc (1 sections)
-├── 01_introduction_and_goals.adoc (4 sections)
-├── 04_solution_strategy.adoc (5 sections)
-├── 05_building_block_view.adoc (3 sections)
-│   ├── transport_layer.adoc (1 sections)
-│   ├── workspace_manager.adoc (1 sections)
-│   │   └── main.rs ⚠ Cannot resolve path: No such file or directory (os error 2)
-│   └── semantic_layer.adoc (4 sections)
-├── 08_concepts.adoc (6 sections)
-├── 09_architecture_decisions.adoc (4 sections)
-└── glossary.adoc (1 sections)
+just build          # Debug build
+just test           # Run all tests (300+)
+just lint           # Clippy with -D warnings (pedantic)
+just fmt-check      # Check formatting
+just ci             # All checks: fmt-check + lint + test
+just lsp            # Start the LSP server (for manual testing)
 ```
 
-Add `--all` to also show xref/anchor counts per file:
+## Status
 
-```sh
-$ asciidoc-lsp --tree --all docs/index.adoc
-index.adoc (1 sections)
-├── 01_introduction_and_goals.adoc (4 sections) [1 xrefs, 1 anchors]
-├── 04_solution_strategy.adoc (5 sections) [1 xrefs]
-├── 05_building_block_view.adoc (3 sections) [1 anchors]
-│   ├── transport_layer.adoc (1 sections) [1 anchors]
-│   ...
-```
+Pre-release (`v0.1.0-dev`). Functional and tested with 300+ tests, but API and configuration may change.
 
-## Project structure
+## Contributing
 
-```
-src/
-  main.rs        — CLI entry point, output formatting
-  parser.rs      — tree-sitter parser initialization (block + inline)
-  extractors.rs  — extract sections, includes, xrefs, anchors, attributes from CST
-  walker.rs      — recursive include-tree walker with attribute substitution
-  types.rs       — data types (Section, IncludeMacro, Xref, Anchor, IncludeTree)
-tests/
-  fixtures/      — AsciiDoc test fixtures for edge cases
-docs/
-  index.adoc     — arc42 architecture documentation
-```
-
-## Dependencies
-
-- [tree-sitter](https://tree-sitter.github.io/) — incremental parsing
-- [tree-sitter-asciidoc](https://github.com/cathaysia/tree-sitter-asciidoc) — block-level AsciiDoc grammar
-- [tree-sitter-asciidoc-inline](https://github.com/cathaysia/tree-sitter-asciidoc) — inline-level AsciiDoc grammar
-- [clap](https://docs.rs/clap) — CLI argument parsing
-- [anyhow](https://docs.rs/anyhow) — error handling
+Contributions welcome. Please run `just ci` before submitting changes.
 
 ## License
 
-MIT
+TBD
