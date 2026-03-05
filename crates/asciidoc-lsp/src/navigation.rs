@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::Position;
 
+use asciidoc_core::types::AnchorKind;
 use asciidoc_core::workspace::Workspace;
 
 use crate::positions;
@@ -515,14 +517,14 @@ fn find_attribute_def_at_position(content: &str, line_1: usize) -> Option<NodeIn
 /// Detect `{attribute-name}` references on the current line using regex-like scanning.
 /// Returns `NodeInfo` if the cursor is inside a valid `{name}` pattern
 /// (no spaces allowed in attribute names).
-fn find_attribute_ref_at_position(
-    content: &str,
-    line_1: usize,
-    byte_col: usize,
-) -> Option<NodeInfo> {
-    let line_0 = line_1.saturating_sub(1);
-    let line_str = content.lines().nth(line_0)?;
-
+/// Find the `{name}` attribute reference span containing `byte_col` on `line_str`.
+///
+/// Returns `(brace_start, name_start, name_end, brace_end)` where:
+/// - `brace_start` = index of `{`
+/// - `name_start` = index of first char of the name (`brace_start` + 1)
+/// - `name_end` = index past last char of the name
+/// - `brace_end` = index of `}`
+fn find_attr_ref_span(line_str: &str, byte_col: usize) -> Option<(usize, usize, usize, usize)> {
     let bytes = line_str.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -538,15 +540,8 @@ fn find_attribute_ref_at_position(
                 end += 1;
             }
             if valid && end < bytes.len() && bytes[end] == b'}' && end > start {
-                // {name} found from byte i to end (inclusive)
                 if byte_col >= i && byte_col <= end {
-                    let name = &line_str[start..end];
-                    return Some(NodeInfo {
-                        kind: NodeKind::AttributeRef {
-                            name: name.to_string(),
-                        },
-                        line: line_1,
-                    });
+                    return Some((i, start, end, end));
                 }
                 i = end + 1;
                 continue;
@@ -554,8 +549,25 @@ fn find_attribute_ref_at_position(
         }
         i += 1;
     }
-
     None
+}
+
+fn find_attribute_ref_at_position(
+    content: &str,
+    line_1: usize,
+    byte_col: usize,
+) -> Option<NodeInfo> {
+    let line_0 = line_1.saturating_sub(1);
+    let line_str = content.lines().nth(line_0)?;
+
+    let (_, name_start, name_end, _) = find_attr_ref_span(line_str, byte_col)?;
+    let name = &line_str[name_start..name_end];
+    Some(NodeInfo {
+        kind: NodeKind::AttributeRef {
+            name: name.to_string(),
+        },
+        line: line_1,
+    })
 }
 
 /// Find the first child with the given kind and return its text.
@@ -570,6 +582,325 @@ fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Rename support (adoc-0036)
+// ---------------------------------------------------------------------------
+
+/// Map of file path → list of `(line, start_col, end_col)` edits per file.
+type RenameEdits = HashMap<PathBuf, Vec<(usize, usize, usize)>>;
+
+/// Result of a prepare-rename check: the symbol's placeholder text and its range on the line.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PrepareRenameResult {
+    pub placeholder: String,
+    pub line: usize,      // 1-indexed
+    pub start_col: usize, // byte offset
+    pub end_col: usize,   // byte offset (exclusive)
+}
+
+/// Check whether the cursor is on a rename-able symbol and return its range.
+///
+/// Returns `None` for non-renameable nodes (includes, images, implicit section anchors).
+pub fn prepare_rename(
+    content: &str,
+    pos: Position,
+    _doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> Option<PrepareRenameResult> {
+    let node_info = find_node_at_position(content, pos)?;
+    let line_0 = node_info.line.saturating_sub(1);
+    let line_text = content.lines().nth(line_0)?;
+
+    match &node_info.kind {
+        NodeKind::Anchor { id } => {
+            // Reject implicit section IDs
+            if let Some(ws) = workspace {
+                if let Some(loc) = ws.reference_index.lookup(id) {
+                    if loc.kind == AnchorKind::ImplicitSection {
+                        return None;
+                    }
+                }
+            }
+            let (start, end) = find_anchor_def_columns(line_text, id)?;
+            Some(PrepareRenameResult {
+                placeholder: id.clone(),
+                line: node_info.line,
+                start_col: start,
+                end_col: end,
+            })
+        }
+        NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
+            let anchor_id = if let Some((_file, anchor)) = target.split_once('#') {
+                if anchor.is_empty() {
+                    return None;
+                }
+                anchor
+            } else if target.contains('.') {
+                return None; // file-only xref
+            } else {
+                target.as_str()
+            };
+            // Reject implicit section IDs
+            if let Some(ws) = workspace {
+                if let Some(loc) = ws.reference_index.lookup(anchor_id) {
+                    if loc.kind == AnchorKind::ImplicitSection {
+                        return None;
+                    }
+                }
+            }
+            let (start, end) = find_anchor_ref_columns(line_text, anchor_id)?;
+            Some(PrepareRenameResult {
+                placeholder: anchor_id.to_string(),
+                line: node_info.line,
+                start_col: start,
+                end_col: end,
+            })
+        }
+        NodeKind::AttributeRef { name } => {
+            let (_, byte_col) = positions::from_lsp_position(pos, content);
+            let line_str = content.lines().nth(line_0)?;
+            let (_, start, end, _) = find_attr_ref_span(line_str, byte_col)?;
+            if &line_str[start..end] != name {
+                return None;
+            }
+            Some(PrepareRenameResult {
+                placeholder: name.clone(),
+                line: node_info.line,
+                start_col: start,
+                end_col: end,
+            })
+        }
+        NodeKind::AttributeDef { name } => {
+            let (start, end) = find_attr_def_columns(line_text, name)?;
+            Some(PrepareRenameResult {
+                placeholder: name.clone(),
+                line: node_info.line,
+                start_col: start,
+                end_col: end,
+            })
+        }
+        NodeKind::Include { .. } | NodeKind::Image { .. } => None,
+    }
+}
+
+/// Resolve a rename request: find all locations of the symbol and return edits.
+///
+/// Returns a map of file path → list of `(line, start_col, end_col)` for each edit.
+/// The caller converts this to a `WorkspaceEdit`.
+pub fn resolve_rename(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+    overrides: &HashMap<PathBuf, String>,
+) -> Option<RenameEdits> {
+    let node_info = find_node_at_position(content, pos)?;
+    let ws = workspace?;
+
+    match &node_info.kind {
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+            let mut edits: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
+
+            // Attribute references: {name} → start_col+1 to end_col-1 (inside braces)
+            let refs = ws.find_all_attribute_usages(name);
+            for (path, line, start_col, end_col) in refs {
+                edits
+                    .entry(path)
+                    .or_default()
+                    .push((line, start_col + 1, end_col - 1));
+            }
+
+            // Attribute definition: :name: → find columns via text search
+            if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
+                let file_content = read_content(&source.file, overrides);
+                let def_line = file_content
+                    .lines()
+                    .nth(source.line.saturating_sub(1))
+                    .unwrap_or_default();
+                if let Some((start, end)) = find_attr_def_columns(def_line, name) {
+                    edits
+                        .entry(source.file)
+                        .or_default()
+                        .push((source.line, start, end));
+                }
+            }
+
+            if edits.is_empty() {
+                None
+            } else {
+                Some(edits)
+            }
+        }
+        NodeKind::Anchor { id } => resolve_rename_anchor(id, ws, overrides),
+        NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
+            let anchor_id = if let Some((_file, anchor)) = target.split_once('#') {
+                if anchor.is_empty() {
+                    return None;
+                }
+                anchor
+            } else if target.contains('.') {
+                return None;
+            } else {
+                target.as_str()
+            };
+            resolve_rename_anchor(anchor_id, ws, overrides)
+        }
+        NodeKind::Include { .. } | NodeKind::Image { .. } => None,
+    }
+}
+
+/// Rename all occurrences of an anchor (definition + all references + duplicates).
+fn resolve_rename_anchor(
+    anchor_id: &str,
+    ws: &Workspace,
+    overrides: &HashMap<PathBuf, String>,
+) -> Option<RenameEdits> {
+    let mut edits: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
+    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+
+    // Anchor definition
+    if let Some(loc) = ws.reference_index.lookup(anchor_id) {
+        let file_content = read_file_cached(&mut file_cache, &loc.file, overrides);
+        let line_text = file_content
+            .lines()
+            .nth(loc.line.saturating_sub(1))
+            .unwrap_or_default();
+        if let Some((start, end)) = find_anchor_def_columns(line_text, anchor_id) {
+            edits
+                .entry(loc.file.clone())
+                .or_default()
+                .push((loc.line, start, end));
+        }
+    }
+
+    // Duplicate anchor definitions
+    for (dup_id, dup_loc) in &ws.reference_index.duplicates {
+        if dup_id == anchor_id {
+            let file_content = read_file_cached(&mut file_cache, &dup_loc.file, overrides);
+            let line_text = file_content
+                .lines()
+                .nth(dup_loc.line.saturating_sub(1))
+                .unwrap_or_default();
+            if let Some((start, end)) = find_anchor_def_columns(line_text, anchor_id) {
+                edits
+                    .entry(dup_loc.file.clone())
+                    .or_default()
+                    .push((dup_loc.line, start, end));
+            }
+        }
+    }
+
+    // Anchor references (xrefs)
+    let refs = ws.find_all_anchor_references(anchor_id);
+    for (path, line, _start_col, _end_col) in refs {
+        let file_content = read_file_cached(&mut file_cache, &path, overrides);
+        let line_text = file_content
+            .lines()
+            .nth(line.saturating_sub(1))
+            .unwrap_or_default();
+        if let Some((start, end)) = find_anchor_ref_columns(line_text, anchor_id) {
+            edits.entry(path).or_default().push((line, start, end));
+        }
+    }
+
+    if edits.is_empty() {
+        None
+    } else {
+        Some(edits)
+    }
+}
+
+/// Read file content, preferring in-memory overrides over disk.
+fn read_content(path: &Path, overrides: &HashMap<PathBuf, String>) -> String {
+    if let Some(content) = overrides.get(path) {
+        return content.clone();
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!("failed to read file for rename: {}: {e}", path.display());
+            String::new()
+        }
+    }
+}
+
+/// Read a file, caching the result. Prefers in-memory overrides over disk.
+fn read_file_cached<'a>(
+    cache: &'a mut HashMap<PathBuf, String>,
+    path: &Path,
+    overrides: &HashMap<PathBuf, String>,
+) -> &'a str {
+    cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| read_content(path, overrides))
+}
+
+// ---------------------------------------------------------------------------
+// Column-finder helpers (adoc-0036, Task 2.1)
+// ---------------------------------------------------------------------------
+
+/// Find the byte offsets of `id` inside `[[id]]` on a line.
+/// Returns `(start, end)` byte offsets of the id (exclusive end).
+fn find_anchor_def_columns(line_text: &str, id: &str) -> Option<(usize, usize)> {
+    let pattern = format!("[[{id}]]");
+    let pos = line_text.find(&pattern)?;
+    let start = pos + 2; // skip `[[`
+    Some((start, start + id.len()))
+}
+
+/// Find the byte offsets of `id` in an xref reference on a line.
+///
+/// Searches in priority:
+/// 1. `xref:...#id[` (cross-doc) → offset of `id` after `#`
+/// 2. `xref:id[` (same-doc) → offset of `id` after `xref:`
+/// 3. `<<id` (shorthand) → offset of `id` after `<<`
+fn find_anchor_ref_columns(line_text: &str, id: &str) -> Option<(usize, usize)> {
+    // 1. xref:...#id[ — search all occurrences to find the right one
+    let hash_pattern = format!("#{id}");
+    let mut search_from = 0;
+    while let Some(rel_pos) = line_text[search_from..].find(&hash_pattern) {
+        let hash_pos = search_from + rel_pos;
+        // Find the closest preceding xref: for this specific #
+        let before = &line_text[..hash_pos];
+        if let Some(xref_start) = before.rfind("xref:") {
+            // Ensure no '[' between xref: and # (which would mean a different, closed xref)
+            let between = &line_text[xref_start + 5..hash_pos];
+            if !between.contains('[') {
+                let start = hash_pos + 1; // skip #
+                return Some((start, start + id.len()));
+            }
+        }
+        search_from = hash_pos + 1;
+    }
+
+    // 2. xref:id[
+    let xref_pattern = format!("xref:{id}[");
+    if let Some(xref_pos) = line_text.find(&xref_pattern) {
+        let start = xref_pos + 5; // skip "xref:"
+        return Some((start, start + id.len()));
+    }
+
+    // 3. <<id (shorthand)
+    let shorthand_pattern = format!("<<{id}");
+    if let Some(sh_pos) = line_text.find(&shorthand_pattern) {
+        let start = sh_pos + 2; // skip "<<"
+        return Some((start, start + id.len()));
+    }
+
+    None
+}
+
+/// Find the byte offsets of `name` inside `:name:` at the start of a line.
+/// Returns `(start, end)` byte offsets of the name (exclusive end).
+fn find_attr_def_columns(line_text: &str, name: &str) -> Option<(usize, usize)> {
+    let pattern = format!(":{name}:");
+    if line_text.starts_with(&pattern) {
+        Some((1, 1 + name.len()))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2024,5 +2355,672 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         assert!(resolve_goto_definition(&content, pos, &a, None).is_none());
+    }
+
+    // --- adoc-0036: Column-finder helpers ---
+
+    #[test]
+    fn test_find_anchor_def_columns() {
+        assert_eq!(
+            find_anchor_def_columns("[[my-anchor]]", "my-anchor"),
+            Some((2, 11))
+        );
+        assert_eq!(find_anchor_def_columns("[[a]]", "a"), Some((2, 3)));
+        assert_eq!(
+            find_anchor_def_columns("some text [[id]] more", "id"),
+            Some((12, 14))
+        );
+        assert_eq!(find_anchor_def_columns("no anchor here", "id"), None);
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_xref_cross_doc() {
+        // xref:file.adoc#my-id[text]
+        let line = "See xref:file.adoc#my-id[text] for details.";
+        assert_eq!(find_anchor_ref_columns(line, "my-id"), Some((19, 24)));
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_xref_same_doc() {
+        // xref:my-id[text]
+        let line = "See xref:my-id[text] for details.";
+        assert_eq!(find_anchor_ref_columns(line, "my-id"), Some((9, 14)));
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_shorthand() {
+        // <<my-id>>
+        let line = "See <<my-id>> for details.";
+        assert_eq!(find_anchor_ref_columns(line, "my-id"), Some((6, 11)));
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_shorthand_with_text() {
+        // <<my-id,display text>>
+        let line = "See <<my-id,display text>> for details.";
+        assert_eq!(find_anchor_ref_columns(line, "my-id"), Some((6, 11)));
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_no_match() {
+        assert_eq!(find_anchor_ref_columns("plain text", "id"), None);
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_hash_id_not_in_xref() {
+        // #my-id appears after a closed xref — should not match
+        let line = "See xref:other#foo[text] and some #my-id note.";
+        assert_eq!(find_anchor_ref_columns(line, "my-id"), None);
+    }
+
+    #[test]
+    fn test_find_anchor_ref_columns_two_xrefs_second_match() {
+        // Two xrefs on same line — should find the correct one
+        let line = "See xref:a.adoc#foo[x] and xref:b.adoc#bar[y].";
+        assert_eq!(find_anchor_ref_columns(line, "bar"), Some((39, 42)));
+    }
+
+    #[test]
+    fn test_find_attr_def_columns() {
+        assert_eq!(
+            find_attr_def_columns(":author: Alice", "author"),
+            Some((1, 7))
+        );
+        assert_eq!(find_attr_def_columns(":a:", "a"), Some((1, 2)));
+        assert_eq!(find_attr_def_columns("not a def", "x"), None);
+        assert_eq!(find_attr_def_columns("text :name: value", "name"), None); // not at start
+    }
+
+    // --- adoc-0036: prepare_rename tests ---
+
+    #[test]
+    fn test_prepare_rename_anchor_explicit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n\n[[my-anchor]]\n== Section\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let result = prepare_rename(&content, pos, &a, Some(&ws));
+        assert!(result.is_some(), "explicit anchor should be renameable");
+        let r = result.unwrap();
+        assert_eq!(r.placeholder, "my-anchor");
+        assert_eq!(r.start_col, 2);
+        assert_eq!(r.end_col, 11);
+    }
+
+    #[test]
+    fn test_prepare_rename_anchor_implicit_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        // Implicit section IDs are generated from section titles.
+        // We need a section without explicit anchor — the implicit ID is _section_title.
+        fs::write(&a, "= Title\n\n== Section Title\n\n<<_section_title>>\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on <<_section_title>> (shorthand xref to implicit ID)
+        let pos = Position {
+            line: 4,
+            character: 5,
+        };
+
+        let result = prepare_rename(&content, pos, &a, Some(&ws));
+        assert!(result.is_none(), "implicit section ID should be rejected");
+    }
+
+    #[test]
+    fn test_prepare_rename_attribute_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n:author: Alice\n\nBy {author}.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on {author} — line 3 (0-indexed), character 4 = inside "author"
+        let pos = Position {
+            line: 3,
+            character: 5,
+        };
+
+        let result = prepare_rename(&content, pos, &a, Some(&ws));
+        assert!(result.is_some(), "attribute ref should be renameable");
+        let r = result.unwrap();
+        assert_eq!(r.placeholder, "author");
+    }
+
+    #[test]
+    fn test_prepare_rename_include_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        fs::write(&a, "= Title\n\ninclude::b.adoc[]\n").unwrap();
+        fs::write(&b, "== Chapter\n").unwrap();
+
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let result = prepare_rename(&content, pos, &a, None);
+        assert!(result.is_none(), "include should not be renameable");
+    }
+
+    // --- adoc-0036: resolve_rename tests ---
+
+    #[test]
+    fn test_resolve_rename_anchor_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Title\n\n[[my-anchor]]\n== Section\n\nSee <<my-anchor>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let result = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new());
+        assert!(result.is_some());
+        let edits = result.unwrap();
+        let a_canon = a.canonicalize().unwrap();
+        let file_edits = edits.get(&a_canon).unwrap();
+        // Should have 2 edits: definition [[my-anchor]] and reference <<my-anchor>>
+        assert_eq!(file_edits.len(), 2, "expected 2 edits, got: {file_edits:?}");
+    }
+
+    #[test]
+    fn test_resolve_rename_anchor_cross_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        fs::write(
+            &a,
+            "= Title\n\nSee xref:b.adoc#target[link].\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[target]]\n== Target Section\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on xref target
+        let pos = Position {
+            line: 2,
+            character: 18,
+        };
+
+        let result = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new());
+        assert!(result.is_some());
+        let edits = result.unwrap();
+        // Should have edits in both files
+        assert!(
+            edits.len() >= 2,
+            "expected edits in 2 files, got: {}",
+            edits.len()
+        );
+    }
+
+    #[test]
+    fn test_resolve_rename_anchor_with_file_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        fs::write(
+            &a,
+            "= Title\n\nSee xref:b.adoc#my-id[link].\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[my-id]]\n== Section\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 20,
+        };
+
+        let result = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new());
+        assert!(result.is_some());
+        let edits = result.unwrap();
+        let a_canon = a.canonicalize().unwrap();
+        let a_edits = edits.get(&a_canon).unwrap();
+        // Verify the xref edit targets only the anchor part after #
+        let (_, start, end) = a_edits[0];
+        let a_content = fs::read_to_string(&a).unwrap();
+        let line_text = a_content.lines().nth(2).unwrap(); // line 3 (0-indexed line 2)
+        assert_eq!(&line_text[start..end], "my-id");
+    }
+
+    #[test]
+    fn test_resolve_rename_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n:myattr: value\n\nUsing {myattr} here.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on {myattr}
+        let pos = Position {
+            line: 3,
+            character: 8,
+        };
+
+        let result = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new());
+        assert!(result.is_some());
+        let edits = result.unwrap();
+        let a_canon = a.canonicalize().unwrap();
+        let file_edits = edits.get(&a_canon).unwrap();
+        // Should have 2 edits: definition :myattr: and reference {myattr}
+        assert_eq!(file_edits.len(), 2, "expected 2 edits, got: {file_edits:?}");
+    }
+
+    #[test]
+    fn test_resolve_rename_attribute_cross_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".asciidoctorconfig"),
+            ":shared-attr: hello\n",
+        )
+        .unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n\nValue is {shared-attr}.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let result = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new());
+        assert!(result.is_some());
+        let edits = result.unwrap();
+        // Should have edits in both .asciidoctorconfig and a.adoc
+        assert!(
+            edits.len() >= 2,
+            "expected edits in 2 files, got: {}",
+            edits.len()
+        );
+    }
+
+    // --- Bug investigation: prepare_rename end-to-end column check ---
+
+    #[test]
+    fn test_prepare_rename_anchor_lsp_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n\n[[my-anchor]]\n== Section\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let r = prepare_rename(&content, pos, &a, Some(&ws)).unwrap();
+        // Check raw PrepareRenameResult
+        assert_eq!(r.placeholder, "my-anchor");
+        assert_eq!(r.line, 3); // 1-indexed
+        assert_eq!(r.start_col, 2); // after [[
+        assert_eq!(r.end_col, 11); // end of "my-anchor"
+
+        // Simulate what main.rs handler does
+        let start = crate::positions::to_lsp_position(r.line, r.start_col, &content);
+        let end = crate::positions::to_lsp_position(r.line, r.end_col, &content);
+
+        assert_eq!(start.line, 2, "start line should be 0-indexed line 2");
+        assert_eq!(
+            start.character, 2,
+            "start character should be 2 (after [[), got {}",
+            start.character
+        );
+        assert_eq!(end.line, 2, "end line should be 0-indexed line 2");
+        assert_eq!(
+            end.character, 11,
+            "end character should be 11, got {}",
+            end.character
+        );
+
+        // Verify the text at the range matches the placeholder
+        let line_text = content.lines().nth(2).unwrap();
+        assert_eq!(
+            &line_text[start.character as usize..end.character as usize],
+            "my-anchor"
+        );
+    }
+
+    #[test]
+    fn test_prepare_rename_attr_def_lsp_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n:author: Alice\n\nBy {author}.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on :author: definition
+        let pos = Position {
+            line: 1,
+            character: 3,
+        };
+
+        let r = prepare_rename(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(r.placeholder, "author");
+
+        let start = crate::positions::to_lsp_position(r.line, r.start_col, &content);
+        let end = crate::positions::to_lsp_position(r.line, r.end_col, &content);
+
+        assert_eq!(start.line, 1);
+        assert_ne!(start.character, 0, "start character must not be 0");
+        assert_eq!(
+            start.character, 1,
+            "start should be 1 (after leading colon)"
+        );
+        assert_eq!(end.character, 7, "end should be 7 (after 'author')");
+
+        let line_text = content.lines().nth(1).unwrap();
+        assert_eq!(
+            &line_text[start.character as usize..end.character as usize],
+            "author"
+        );
+    }
+
+    #[test]
+    fn test_prepare_rename_attr_ref_lsp_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n:author: Alice\n\nBy {author}.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on {author} reference — line 3 (0-indexed), character 5
+        let pos = Position {
+            line: 3,
+            character: 5,
+        };
+
+        let r = prepare_rename(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(r.placeholder, "author");
+
+        let start = crate::positions::to_lsp_position(r.line, r.start_col, &content);
+        let end = crate::positions::to_lsp_position(r.line, r.end_col, &content);
+
+        assert_eq!(start.line, 3);
+        assert_ne!(start.character, 0, "start character must not be 0");
+
+        let line_text = content.lines().nth(3).unwrap();
+        assert_eq!(
+            &line_text[start.character as usize..end.character as usize],
+            "author",
+            "range should cover exactly the attribute name"
+        );
+    }
+
+    #[test]
+    fn test_prepare_rename_xref_shorthand_lsp_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Title\n\n[[my-anchor]]\n== Section\n\nSee <<my-anchor>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on <<my-anchor>> — line 5 (0-indexed), character 7
+        let pos = Position {
+            line: 5,
+            character: 7,
+        };
+
+        let r = prepare_rename(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(r.placeholder, "my-anchor");
+
+        let start = crate::positions::to_lsp_position(r.line, r.start_col, &content);
+        let end = crate::positions::to_lsp_position(r.line, r.end_col, &content);
+
+        assert_eq!(start.line, 5);
+        assert_ne!(start.character, 0, "start character must not be 0");
+
+        let line_text = content.lines().nth(5).unwrap();
+        assert_eq!(
+            &line_text[start.character as usize..end.character as usize],
+            "my-anchor",
+            "range should cover exactly the anchor id in the xref"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rename_anchor_edit_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Title\n\n[[my-anchor]]\n== Section\n\nSee <<my-anchor>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let edits = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new()).unwrap();
+        let a_canon = a.canonicalize().unwrap();
+        let file_edits = edits.get(&a_canon).unwrap();
+        assert_eq!(file_edits.len(), 2);
+
+        let file_content = fs::read_to_string(&a_canon).unwrap();
+        for (line, start_col, end_col) in file_edits {
+            let start = crate::positions::to_lsp_position(*line, *start_col, &file_content);
+            let end = crate::positions::to_lsp_position(*line, *end_col, &file_content);
+
+            assert_ne!(
+                start.character, 0,
+                "edit start must not be column 0, line {line}"
+            );
+            assert_ne!(
+                start.character, end.character,
+                "edit range must not be empty, line {line}"
+            );
+
+            let line_text = file_content.lines().nth(start.line as usize).unwrap();
+            assert_eq!(
+                &line_text[start.character as usize..end.character as usize],
+                "my-anchor",
+                "edit should cover exactly the anchor id, line {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_rename_attribute_edit_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Title\n:myattr: value\n\nUsing {myattr} here.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // Cursor on {myattr}
+        let pos = Position {
+            line: 3,
+            character: 8,
+        };
+
+        let edits = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new()).unwrap();
+        let a_canon = a.canonicalize().unwrap();
+        let file_edits = edits.get(&a_canon).unwrap();
+        assert_eq!(
+            file_edits.len(),
+            2,
+            "expected 2 edits (def + ref), got: {file_edits:?}"
+        );
+
+        let file_content = fs::read_to_string(&a_canon).unwrap();
+        for (line, start_col, end_col) in file_edits {
+            let start = crate::positions::to_lsp_position(*line, *start_col, &file_content);
+            let end = crate::positions::to_lsp_position(*line, *end_col, &file_content);
+
+            assert_ne!(
+                start.character, 0,
+                "edit start must not be column 0, line {line}"
+            );
+            assert_ne!(
+                start.character, end.character,
+                "edit range must not be empty, line {line}"
+            );
+
+            let line_text = file_content.lines().nth(start.line as usize).unwrap();
+            assert_eq!(
+                &line_text[start.character as usize..end.character as usize],
+                "myattr",
+                "edit should cover exactly the attribute name, line {line}"
+            );
+        }
+    }
+
+    // --- Document-Store desync regression tests ---
+
+    #[test]
+    fn test_resolve_rename_anchor_uses_overrides_not_disk() {
+        // After a rename, disk still has old content but the editor buffer
+        // (overrides) has the new content. A second rename must use the
+        // override content, not stale disk content.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+
+        // Disk: original content with "old-id"
+        fs::write(&a, "= Title\n\n[[old-id]]\n== Section\n\nSee <<old-id>>.\n").unwrap();
+
+        // Simulate post-rename state: workspace rebuilt with new content
+        let new_content = "= Title\n\n[[new-id]]\n== Section\n\nSee <<new-id>>.\n";
+        let a_canon = a.canonicalize().unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(a_canon.clone(), new_content.to_string());
+
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        // Without overrides: would fail because disk has "old-id" but we search "new-id"
+        let result_no_override =
+            resolve_rename(new_content, pos, &a_canon, Some(&ws), &HashMap::new());
+        assert!(
+            result_no_override.is_none(),
+            "without overrides, stale disk content should cause column search to miss"
+        );
+
+        // With overrides: should find both definition and reference
+        let result = resolve_rename(new_content, pos, &a_canon, Some(&ws), &overrides);
+        assert!(result.is_some(), "with overrides, rename should succeed");
+        let edits = result.unwrap();
+        let file_edits = edits.get(&a_canon).unwrap();
+        assert_eq!(
+            file_edits.len(),
+            2,
+            "expected 2 edits (def + ref), got: {file_edits:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rename_anchor_cross_file_uses_overrides() {
+        // Cross-file rename after first rename — other file has new content
+        // in editor but old content on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        // Disk: original content
+        fs::write(
+            &a,
+            "= Title\n\nSee xref:b.adoc#old-id[link].\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[old-id]]\n== Target Section\n").unwrap();
+
+        // Simulate post-rename: editor buffers have new content
+        let a_canon = a.canonicalize().unwrap();
+        let b_canon = b.canonicalize().unwrap();
+        let new_a = "= Title\n\nSee xref:b.adoc#new-id[link].\n\ninclude::b.adoc[]\n";
+        let new_b = "[[new-id]]\n== Target Section\n";
+
+        let mut overrides = HashMap::new();
+        overrides.insert(a_canon.clone(), new_a.to_string());
+        overrides.insert(b_canon.clone(), new_b.to_string());
+
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+
+        // Cursor on xref target in a.adoc
+        let pos = Position {
+            line: 2,
+            character: 20,
+        };
+
+        let result = resolve_rename(new_a, pos, &a_canon, Some(&ws), &overrides);
+        assert!(
+            result.is_some(),
+            "cross-file rename with overrides should work"
+        );
+        let edits = result.unwrap();
+
+        // Should have edits in both files
+        let a_edits = edits.get(&a_canon).expect("should have edits for a.adoc");
+        let b_edits = edits.get(&b_canon).expect("should have edits for b.adoc");
+        assert_eq!(a_edits.len(), 1, "a.adoc: 1 xref reference");
+        assert_eq!(b_edits.len(), 1, "b.adoc: 1 anchor definition");
+    }
+
+    #[test]
+    fn test_resolve_rename_attribute_uses_overrides() {
+        // Attribute rename with stale disk content.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+
+        // Disk: original content
+        fs::write(&a, "= Title\n:old-attr: value\n\nText {old-attr} here.\n").unwrap();
+
+        // Simulate post-rename
+        let new_content = "= Title\n:new-attr: value\n\nText {new-attr} here.\n";
+        let a_canon = a.canonicalize().unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(a_canon.clone(), new_content.to_string());
+
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+
+        // Cursor on attribute reference
+        let pos = Position {
+            line: 3,
+            character: 7,
+        };
+
+        let result = resolve_rename(new_content, pos, &a_canon, Some(&ws), &overrides);
+        assert!(
+            result.is_some(),
+            "attribute rename with overrides should work"
+        );
+        let edits = result.unwrap();
+        let file_edits = edits.get(&a_canon).unwrap();
+        assert_eq!(
+            file_edits.len(),
+            2,
+            "expected 2 edits (def + ref), got: {file_edits:?}"
+        );
     }
 }

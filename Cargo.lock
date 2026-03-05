@@ -93,9 +93,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asciidoc-core",
+ "serde_json",
  "tempfile",
  "tokio",
  "tower-lsp-server",
+ "tracing",
  "tree-sitter",
 ]
 

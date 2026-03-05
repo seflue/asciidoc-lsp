@@ -15,9 +15,10 @@ use tower_lsp_server::ls_types::{
     DidSaveTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, Location, MarkedString, MessageType,
-    OneOf, Position, Range, ReferenceParams, SaveOptions, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    OneOf, Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
+    SaveOptions, ServerCapabilities, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -268,6 +269,10 @@ impl LanguageServer for AsciiDocLsp {
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "<".into(), // << xref
@@ -519,6 +524,115 @@ impl LanguageServer for AsciiDocLsp {
         } else {
             Ok(Some(locations))
         }
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = &params.text_document.uri;
+        let position = params.position;
+
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
+        };
+
+        let doc_path = match uri.to_file_path() {
+            Some(p) => p.into_owned(),
+            None => return Ok(None),
+        };
+
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let result = navigation::prepare_rename(&content, position, &doc_path, ws.as_ref());
+        drop(ws);
+
+        let Some(r) = result else {
+            tracing::debug!("prepare_rename: no result for position {position:?}");
+            return Ok(None);
+        };
+
+        tracing::debug!(
+            "prepare_rename: placeholder={:?} line={} start_col={} end_col={}",
+            r.placeholder,
+            r.line,
+            r.start_col,
+            r.end_col
+        );
+
+        let start = positions::to_lsp_position(r.line, r.start_col, &content);
+        let end = positions::to_lsp_position(r.line, r.end_col, &content);
+
+        tracing::debug!(
+            "prepare_rename: LSP range start=({},{}) end=({},{})",
+            start.line,
+            start.character,
+            end.line,
+            end.character
+        );
+
+        Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: Range { start, end },
+            placeholder: r.placeholder,
+        }))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
+        };
+
+        let doc_path = match uri.to_file_path() {
+            Some(p) => p.into_owned(),
+            None => return Ok(None),
+        };
+
+        let overrides = build_content_overrides(&self.documents);
+
+        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let result =
+            navigation::resolve_rename(&content, position, &doc_path, ws.as_ref(), &overrides);
+        drop(ws);
+
+        let Some(file_edits) = result else {
+            return Ok(None);
+        };
+
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        for (path, edits) in file_edits {
+            let Some(file_uri) = Uri::from_file_path(&path) else {
+                continue;
+            };
+            let file_content = overrides.get(&path).cloned().unwrap_or_else(|| {
+                std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "failed to read file for rename edit: {}: {e}",
+                        path.display()
+                    );
+                    String::new()
+                })
+            });
+            let text_edits: Vec<TextEdit> = edits
+                .into_iter()
+                .map(|(line, start_col, end_col)| {
+                    let start = positions::to_lsp_position(line, start_col, &file_content);
+                    let end = positions::to_lsp_position(line, end_col, &file_content);
+                    TextEdit {
+                        range: Range { start, end },
+                        new_text: new_name.clone(),
+                    }
+                })
+                .collect();
+            changes.insert(file_uri, text_edits);
+        }
+
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -1121,6 +1235,58 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("broken-ref")),
             "Expected diagnostic for broken xref from override"
+        );
+    }
+
+    #[test]
+    fn test_prepare_rename_response_json_serialization() {
+        // Simulate what the handler produces for [[my-anchor]] on line 3
+        let response = PrepareRenameResponse::RangeWithPlaceholder {
+            range: Range {
+                start: Position {
+                    line: 2,
+                    character: 2,
+                },
+                end: Position {
+                    line: 2,
+                    character: 11,
+                },
+            },
+            placeholder: "my-anchor".to_string(),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        let obj = json.as_object().unwrap();
+
+        // Verify the JSON has "range" and "placeholder" fields
+        assert!(
+            obj.contains_key("range"),
+            "JSON must have 'range' field: {json}"
+        );
+        assert!(
+            obj.contains_key("placeholder"),
+            "JSON must have 'placeholder' field: {json}"
+        );
+
+        let range = obj.get("range").unwrap().as_object().unwrap();
+        let start = range.get("start").unwrap().as_object().unwrap();
+        let end = range.get("end").unwrap().as_object().unwrap();
+
+        assert_eq!(start.get("line").unwrap().as_u64().unwrap(), 2);
+        assert_eq!(
+            start.get("character").unwrap().as_u64().unwrap(),
+            2,
+            "start.character must be 2, not 0"
+        );
+        assert_eq!(end.get("line").unwrap().as_u64().unwrap(), 2);
+        assert_eq!(
+            end.get("character").unwrap().as_u64().unwrap(),
+            11,
+            "end.character must be 11"
+        );
+        assert_eq!(
+            obj.get("placeholder").unwrap().as_str().unwrap(),
+            "my-anchor"
         );
     }
 }

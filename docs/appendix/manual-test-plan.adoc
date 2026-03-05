@@ -443,3 +443,59 @@ image::test-placeholder.png[Test Placeholder]
 // Expected: Neovim shows "No information available" (normal LSP behavior when server returns null). LSP stays attached.
 
 ---
+
+=== T4: Rename
+
+`gR` (or your rename keymap) on anchors and attributes renames all references workspace-wide.
+
+==== T4.1: Rename explicit anchor
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on `my-test-anchor` in the anchor below and press `gR`:
+
+[[my-test-anchor]]
+This paragraph is anchored.
+
+See xref:my-test-anchor[the anchor].
+
+// Expected: Rename prompt appears with `my-test-anchor` pre-filled.
+// After renaming to e.g. `new-anchor`: both `[[new-anchor]]` and `xref:new-anchor[]` are updated.
+
+==== T4.2: Rename attribute
+
+:test-rename-attr: some-value
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on `test-rename-attr` in the definition above and press `gR`:
+
+This references {test-rename-attr} inline.
+
+// Expected: Rename prompt appears with `test-rename-attr` pre-filled.
+// After renaming: both `:new-name: some-value` and `{new-name}` are updated.
+
+==== T4.3: Rename attribute reference
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on `{test-rename-attr}` in the paragraph above and press `gR`:
+
+// Expected: Same as T4.2 — rename works from both definition and reference side.
+
+==== T4.4: Rename rejected — implicit section ID
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the section title below and press `gR`:
+
+===== Implicit Section For Rename Test
+
+// Expected: Rename is rejected (prepare_rename returns error). LSP stays attached.
+
+==== T4.5: Rename rejected — include
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on the include path below and press `gR`:
+
+include::../chapters/01_introduction_and_goals.adoc[]
+
+// Expected: Rename is rejected. LSP stays attached.
+
+---
