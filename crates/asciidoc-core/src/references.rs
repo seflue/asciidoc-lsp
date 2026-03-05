@@ -322,6 +322,7 @@ mod tests {
                 ],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
         documents.insert(
@@ -343,6 +344,7 @@ mod tests {
                 ],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
 
@@ -369,6 +371,7 @@ mod tests {
                 anchors: vec![],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
 
@@ -394,6 +397,7 @@ mod tests {
                 }],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
         documents.insert(
@@ -409,6 +413,7 @@ mod tests {
                 }],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
 
@@ -438,6 +443,7 @@ mod tests {
                 }],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
 
@@ -474,6 +480,7 @@ mod tests {
                 anchors: vec![],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
 
@@ -525,6 +532,7 @@ mod tests {
                 anchors: vec![],
                 attributes: vec![],
                 attribute_refs: vec![],
+                conditionals: vec![],
             },
         );
 

@@ -7,7 +7,7 @@ Open it in Neovim with asciidoc-lsp attached, place the cursor on each stub, tri
 === Prerequisites
 
 . Build the LSP: `just -f asciidoc-lsp/justfile build`
-. Open this file in Neovim from the `docs/` directory
+. Open this file in Neovim from the `tests/` directory
 . Verify LSP is attached: `:LspInfo` should show `asciidoc-lsp`
 . Completion trigger: `Ctrl+Space` or auto-trigger depending on your config
 
@@ -24,7 +24,7 @@ Open it in Neovim with asciidoc-lsp attached, place the cursor on each stub, tri
 
 image::test-placeholder.png[Test Placeholder]
 
-// Expected: Jumps to `docs/images/test-placeholder.png`
+// Expected: Jumps to `tests/images/test-placeholder.png`
 
 ==== T1.2: Image — non-existent file
 
@@ -37,10 +37,9 @@ image::does-not-exist.png[Missing]
 
 ==== T1.3: Image in another document (reference)
 
-// Note: Previously tested via docs/chapters/05_building_block_view.adoc.
-// T1.1 above covers the same code path with a stub directly in this file.
-// If you want to verify cross-file: open that file, find `image::building-block-view.puml`, press `gd`.
-// Expected: Jumps to `docs/images/building-block-view.puml`
+// Note: T1.1 above covers the image go-to-definition code path with a stub directly in this file.
+// To verify cross-file: open `chapters/introduction.adoc`, add an `image::` macro, press `gd`.
+// This is optional — T1.1 is the primary test.
 
 ---
 
@@ -372,9 +371,9 @@ The images are in {imagesdir} somewhere.
 // [ ] PASS  [ ] FAIL
 // Place cursor on the xref below and trigger hover:
 
-See xref:01_introduction_and_goals.adoc#_introduction_and_goals[Introduction].
+See xref:chapters/introduction.adoc#_introduction_and_goals[Introduction].
 
-// Expected: Hover shows section title + file (e.g. `→ Introduction and Goals` / `01_introduction_and_goals.adoc:1`)
+// Expected: Hover shows section title + file (e.g. `-> Introduction and Goals` / `chapters/introduction.adoc:1`)
 
 ==== T3.4: Shorthand Xref hover
 
@@ -383,7 +382,7 @@ See xref:01_introduction_and_goals.adoc#_introduction_and_goals[Introduction].
 
 Refer to <<_introduction_and_goals>>.
 
-// Expected: Hover shows section title (e.g. `→ Introduction and Goals`)
+// Expected: Hover shows section title (e.g. `-> Introduction and Goals`)
 
 ==== T3.5: Xref hover — broken reference
 
@@ -399,7 +398,7 @@ See xref:nonexistent.adoc#nope[Broken].
 // [ ] PASS  [ ] FAIL
 // Place cursor on the include below and trigger hover:
 
-include::../chapters/01_introduction_and_goals.adoc[]
+include::chapters/introduction.adoc[]
 
 // Expected: Hover shows resolved path + file info (e.g. `✓ File exists | N sections`)
 
@@ -408,7 +407,7 @@ include::../chapters/01_introduction_and_goals.adoc[]
 // [ ] PASS  [ ] FAIL
 // Place cursor on the include below and trigger hover:
 
-include::{docdir}/chapters/01_introduction_and_goals.adoc[]
+include::{docdir}/chapters/introduction.adoc[]
 
 // Expected: Hover shows resolved path with substituted attribute value
 
@@ -494,8 +493,102 @@ This references {test-rename-attr} inline.
 // [ ] PASS  [ ] FAIL
 // Place cursor on the include path below and press `gR`:
 
-include::../chapters/01_introduction_and_goals.adoc[]
+include::chapters/introduction.adoc[]
 
 // Expected: Rename is rejected. LSP stays attached.
+
+---
+
+=== T5: Cycle Detection Diagnostics
+
+The LSP detects circular includes and publishes WARNING diagnostics.
+Test fixtures are in the same `tests/` directory (alongside this file).
+
+==== T5.1: Circular include (A → B → A)
+
+// [ ] PASS  [ ] FAIL
+// Open `tests/cycle-a.adoc` in Neovim with asciidoc-lsp attached.
+
+// Expected: WARNING diagnostic on the `include::cycle-b.adoc[]` line indicating a circular include.
+// cycle-b.adoc should also show a WARNING on its `include::cycle-a.adoc[]` line.
+
+==== T5.2: Self-include (A → A)
+
+// [ ] PASS  [ ] FAIL
+// Open `tests/cycle-self.adoc` in Neovim with asciidoc-lsp attached.
+
+// Expected: WARNING diagnostic on the `include::cycle-self.adoc[]` line indicating a self-referencing include.
+
+==== T5.3: No cycle (linear chain)
+
+// [x] PASS  [ ] FAIL
+// Open `tests/linear-include.adoc` in Neovim with asciidoc-lsp attached.
+
+// Expected: No cycle-related WARNING diagnostics appear.
+// `linear-include.adoc` includes `chapters/introduction.adoc` — a simple linear chain, no cycles.
+
+---
+
+=== T6: Conditional Block Diagnostics
+
+The LSP checks `ifdef::`/`ifndef::` attributes against known definitions (from `:attr:` in the document and `.asciidoctorconfig`).
+Attributes defined in `.asciidoctorconfig`: `imagesdir`, `docdir`, `source-highlighter`, `project-name`.
+
+==== T6.1: ifdef with undefined attribute
+
+// [x] PASS  [ ] FAIL
+// Place cursor on the ifdef below (or just observe diagnostics after file open):
+
+ifdef::undefined-attr[]
+This content is conditional.
+endif::undefined-attr[]
+
+// Expected: WARNING diagnostic on the `ifdef::undefined-attr[]` line — attribute `undefined-attr` is not defined.
+
+==== T6.2: ifdef with defined attribute
+
+// [x] PASS  [ ] FAIL
+// Observe diagnostics for the ifdef below:
+
+ifdef::imagesdir[]
+Images directory is set.
+endif::imagesdir[]
+
+// Expected: No WARNING diagnostic — `imagesdir` is defined in `.asciidoctorconfig`.
+
+==== T6.3: ifndef with undefined attribute
+
+// [x] PASS  [ ] FAIL
+// Observe diagnostics for the ifndef below:
+
+ifndef::also-undefined[]
+Fallback content.
+endif::also-undefined[]
+
+// Expected: WARNING diagnostic on the `ifndef::also-undefined[]` line — attribute `also-undefined` is not defined.
+// Note: ifndef triggers on undefined attrs — the diagnostic warns that the attribute never exists,
+// so the block is always included (likely unintentional).
+
+==== T6.4: Multi-attribute AND — one undefined
+
+// [x] PASS  [ ] FAIL
+// Observe diagnostics for the ifdef below:
+
+ifdef::imagesdir+missing-attr[]
+Both must be defined.
+endif::imagesdir+missing-attr[]
+
+// Expected: WARNING diagnostic for `missing-attr` (undefined). No warning for `imagesdir` (defined).
+
+==== T6.5: Multi-attribute OR — at least one defined
+
+// [x] PASS  [ ] FAIL
+// Observe diagnostics for the ifdef below:
+
+ifdef::no-such-attr,imagesdir[]
+At least one must be defined.
+endif::no-such-attr,imagesdir[]
+
+// Expected: No WARNING diagnostic — `imagesdir` is defined, satisfying the OR condition.
 
 ---

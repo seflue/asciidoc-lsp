@@ -1,0 +1,3 @@
+= Self-Include Test
+
+include::cycle-self.adoc[]

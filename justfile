@@ -60,7 +60,7 @@ lint-warn:
 
 # Reset manual test plan (checkboxes + renamed test data)
 reset-testplan:
-    git checkout -- docs/appendix/manual-test-plan.adoc
+    git checkout -- tests/manual-test-plan.adoc
 
 # Remove build artifacts
 clean:

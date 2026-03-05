@@ -1,0 +1,5 @@
+// Workspace root marker for asciidoc-lsp tests
+:imagesdir: {asciidoctorconfigdir}/images
+:docdir: {asciidoctorconfigdir}
+:source-highlighter: rouge
+:project-name: asciidoc-lsp-tests

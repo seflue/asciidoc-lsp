@@ -1,0 +1,3 @@
+= Cycle Test A
+
+include::cycle-b.adoc[]

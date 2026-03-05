@@ -49,6 +49,44 @@ impl IncludeGraph {
         self.reverse.get(file).map_or(&EMPTY, |v| v.as_slice())
     }
 
+    /// Detect cycles in the include graph using DFS with 3-color marking.
+    /// Returns back-edges as `(source_file, include_line, target_file)`.
+    #[must_use]
+    pub fn detect_cycles(&self) -> Vec<(PathBuf, usize, PathBuf)> {
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut back_edges = Vec::new();
+
+        for start in self.forward.keys() {
+            if !visited.contains(start) {
+                self.dfs_cycle(start, &mut visiting, &mut visited, &mut back_edges);
+            }
+        }
+
+        back_edges
+    }
+
+    fn dfs_cycle(
+        &self,
+        node: &Path,
+        visiting: &mut HashSet<PathBuf>,
+        visited: &mut HashSet<PathBuf>,
+        back_edges: &mut Vec<(PathBuf, usize, PathBuf)>,
+    ) {
+        visiting.insert(node.to_path_buf());
+
+        for edge in self.includes_of(node) {
+            if visiting.contains(&edge.target) {
+                back_edges.push((node.to_path_buf(), edge.line, edge.target.clone()));
+            } else if !visited.contains(&edge.target) {
+                self.dfs_cycle(&edge.target, visiting, visited, back_edges);
+            }
+        }
+
+        visiting.remove(node);
+        visited.insert(node.to_path_buf());
+    }
+
     /// Generate an `IncludeTree` from the graph for CLI --tree output.
     /// Breaks cycles by tracking visited nodes.
     #[must_use]
@@ -181,6 +219,9 @@ fn walk(
     // Extract attribute references ({name} patterns) via byte-scanning
     let attribute_refs = crate::extractors::extract_attribute_refs(&source);
 
+    // Extract conditional directives (ifdef/ifndef) via byte-scanning
+    let conditionals = crate::extractors::extract_conditionals(&source);
+
     // Register file attributes
     registry.register_file_attributes(&canonical, &file_attrs);
 
@@ -212,6 +253,7 @@ fn walk(
         anchors,
         attributes: file_attrs,
         attribute_refs,
+        conditionals,
     };
     documents.insert(canonical.clone(), doc);
 }
@@ -422,6 +464,157 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Circular"));
+    }
+
+    // --- Cycle detection tests ---
+
+    #[test]
+    fn test_detect_cycles_direct() {
+        let mut graph = IncludeGraph::new();
+        let a = PathBuf::from("/a.adoc");
+        let b = PathBuf::from("/b.adoc");
+
+        graph.add_edge(
+            &a,
+            IncludeEdge {
+                target: b.clone(),
+                line: 3,
+                attributes: vec![],
+            },
+        );
+        graph.add_edge(
+            &b,
+            IncludeEdge {
+                target: a.clone(),
+                line: 5,
+                attributes: vec![],
+            },
+        );
+
+        let cycles = graph.detect_cycles();
+        assert_eq!(cycles.len(), 1, "Expected 1 cycle edge, got: {cycles:?}");
+        // Back-edge is either A→B or B→A depending on DFS start order
+        let (src, _, tgt) = &cycles[0];
+        assert!(
+            (src == &a && tgt == &b) || (src == &b && tgt == &a),
+            "Expected cycle between a and b, got: {cycles:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_cycles_indirect() {
+        let mut graph = IncludeGraph::new();
+        let a = PathBuf::from("/a.adoc");
+        let b = PathBuf::from("/b.adoc");
+        let c = PathBuf::from("/c.adoc");
+
+        graph.add_edge(
+            &a,
+            IncludeEdge {
+                target: b.clone(),
+                line: 3,
+                attributes: vec![],
+            },
+        );
+        graph.add_edge(
+            &b,
+            IncludeEdge {
+                target: c.clone(),
+                line: 5,
+                attributes: vec![],
+            },
+        );
+        graph.add_edge(
+            &c,
+            IncludeEdge {
+                target: a.clone(),
+                line: 7,
+                attributes: vec![],
+            },
+        );
+
+        let cycles = graph.detect_cycles();
+        assert_eq!(cycles.len(), 1, "Expected 1 cycle edge, got: {cycles:?}");
+        // Back-edge closes the cycle — exact edge depends on DFS start order
+        let (src, _, tgt) = &cycles[0];
+        let nodes = [&a, &b, &c];
+        assert!(
+            nodes.contains(&src) && nodes.contains(&tgt),
+            "Expected cycle among a/b/c, got: {cycles:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_cycles_none() {
+        let mut graph = IncludeGraph::new();
+        let a = PathBuf::from("/a.adoc");
+        let b = PathBuf::from("/b.adoc");
+        let c = PathBuf::from("/c.adoc");
+
+        graph.add_edge(
+            &a,
+            IncludeEdge {
+                target: b.clone(),
+                line: 3,
+                attributes: vec![],
+            },
+        );
+        graph.add_edge(
+            &b,
+            IncludeEdge {
+                target: c.clone(),
+                line: 5,
+                attributes: vec![],
+            },
+        );
+
+        let cycles = graph.detect_cycles();
+        assert!(cycles.is_empty(), "Expected no cycles, got: {cycles:?}");
+    }
+
+    #[test]
+    fn test_detect_cycles_self() {
+        let mut graph = IncludeGraph::new();
+        let a = PathBuf::from("/a.adoc");
+
+        graph.add_edge(
+            &a,
+            IncludeEdge {
+                target: a.clone(),
+                line: 2,
+                attributes: vec![],
+            },
+        );
+
+        let cycles = graph.detect_cycles();
+        assert_eq!(cycles.len(), 1, "Expected 1 cycle edge, got: {cycles:?}");
+        assert_eq!(cycles[0].0, a.clone());
+        assert_eq!(cycles[0].1, 2);
+        assert_eq!(cycles[0].2, a);
+    }
+
+    #[test]
+    fn test_document_model_has_conditionals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("doc.adoc");
+        fs::write(
+            &file,
+            "= Title\n\nifdef::backend[]\nHTML output.\nendif::backend[]\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(tmp.path());
+        let (_, documents) = build_graph(&file, &mut registry);
+
+        let canon = file.canonicalize().unwrap();
+        let doc = documents.get(&canon).unwrap();
+        assert_eq!(
+            doc.conditionals.len(),
+            1,
+            "Expected 1 conditional, got: {:?}",
+            doc.conditionals
+        );
+        assert_eq!(doc.conditionals[0].attributes, vec!["backend"]);
     }
 
     #[test]

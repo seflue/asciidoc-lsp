@@ -1,0 +1,5 @@
+= Linear Include Test
+
+This file includes another file without cycles.
+
+include::chapters/introduction.adoc[]

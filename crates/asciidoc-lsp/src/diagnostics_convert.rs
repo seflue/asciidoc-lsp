@@ -25,7 +25,9 @@ fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
         DiagnosticKind::BrokenInclude { .. } => ls_types::DiagnosticSeverity::ERROR,
         DiagnosticKind::BrokenXref { .. }
         | DiagnosticKind::DuplicateAnchor { .. }
-        | DiagnosticKind::UndefinedAttribute { .. } => ls_types::DiagnosticSeverity::WARNING,
+        | DiagnosticKind::UndefinedAttribute { .. }
+        | DiagnosticKind::CircularInclude { .. }
+        | DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::WARNING,
     };
 
     ls_types::Diagnostic::new(
@@ -120,6 +122,50 @@ mod tests {
                 name: "undefined".into(),
             },
             message: "Undefined attribute: {undefined}".into(),
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
+        );
+    }
+
+    #[test]
+    fn test_convert_circular_include_is_warning() {
+        let content = "= Title\n\ninclude::b.adoc[]\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 3,
+            kind: DiagnosticKind::CircularInclude {
+                path: "b.adoc".into(),
+                cycle_through: PathBuf::from("/b.adoc"),
+            },
+            message: "Circular include: b.adoc creates a cycle".into(),
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
+        );
+    }
+
+    #[test]
+    fn test_convert_undefined_conditional_attr_is_warning() {
+        let content = "= Title\n\nifdef::missing[]\nContent.\nendif::[]\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 3,
+            kind: DiagnosticKind::UndefinedConditionalAttr {
+                name: "missing".into(),
+                directive: "ifdef".into(),
+            },
+            message: "ifdef::missing references undefined attribute".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);

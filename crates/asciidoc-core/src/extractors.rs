@@ -1,4 +1,7 @@
-use crate::types::{Anchor, AttributeDef, AttributeRef, IncludeMacro, Section, Xref};
+use crate::types::{
+    Anchor, AttributeDef, AttributeRef, ConditionalDirective, ConditionalKind, ConditionalOperator,
+    IncludeMacro, Section, Xref,
+};
 
 // --- Block-level extractors (work on block parse tree) ---
 
@@ -85,6 +88,62 @@ pub fn extract_attribute_refs(source: &str) -> Vec<AttributeRef> {
                 }
             }
             i += 1;
+        }
+    }
+
+    results
+}
+
+// --- Conditional directive extraction (byte-based, no tree-sitter) ---
+
+/// Extract `ifdef::name[` and `ifndef::name[` directives from source text.
+///
+/// Only matches directives at the start of a line (`AsciiDoc` spec requirement).
+/// Ignores `endif::`, multi-attribute forms, and `ifeval::`.
+#[must_use]
+pub fn extract_conditionals(source: &str) -> Vec<ConditionalDirective> {
+    let mut results = Vec::new();
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let (kind, rest) = if let Some(rest) = line.strip_prefix("ifdef::") {
+            (ConditionalKind::Ifdef, rest)
+        } else if let Some(rest) = line.strip_prefix("ifndef::") {
+            (ConditionalKind::Ifndef, rest)
+        } else {
+            continue;
+        };
+
+        if let Some(bracket_pos) = rest.find('[') {
+            let name = &rest[..bracket_pos];
+            if name.is_empty() {
+                continue;
+            }
+
+            let is_valid_part = |p: &str| {
+                !p.is_empty()
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            };
+
+            let (parts, operator) = if name.contains('+') {
+                (
+                    name.split('+').collect::<Vec<_>>(),
+                    ConditionalOperator::And,
+                )
+            } else if name.contains(',') {
+                (name.split(',').collect::<Vec<_>>(), ConditionalOperator::Or)
+            } else {
+                (vec![name], ConditionalOperator::Single)
+            };
+
+            if parts.iter().all(|p| is_valid_part(p)) {
+                results.push(ConditionalDirective {
+                    kind,
+                    attributes: parts.iter().map(std::string::ToString::to_string).collect(),
+                    operator,
+                    line: line_idx + 1,
+                });
+            }
         }
     }
 
@@ -569,6 +628,96 @@ mod tests {
             "Empty/space-containing refs must be ignored, got: {:?}",
             refs
         );
+    }
+
+    // --- extract_conditionals tests (adoc-0062) ---
+
+    #[test]
+    fn test_extract_conditionals_ifdef() {
+        let source = "= Title\n\nifdef::backend[]\nSome content.\nendif::backend[]\n";
+        let result = extract_conditionals(source);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifdef);
+        assert_eq!(result[0].attributes[0], "backend");
+        assert_eq!(result[0].line, 3);
+    }
+
+    #[test]
+    fn test_extract_conditionals_ifndef() {
+        let source = "= Title\n\nifndef::source-dir[]\nFallback.\nendif::source-dir[]\n";
+        let result = extract_conditionals(source);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifndef);
+        assert_eq!(result[0].attributes[0], "source-dir");
+        assert_eq!(result[0].line, 3);
+    }
+
+    #[test]
+    fn test_extract_conditionals_mixed() {
+        let source = "ifdef::backend[]\nContent.\nendif::[]\nifndef::icons[]\nMore.\nendif::[]\n";
+        let result = extract_conditionals(source);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifdef);
+        assert_eq!(result[0].attributes[0], "backend");
+        assert_eq!(result[1].kind, crate::types::ConditionalKind::Ifndef);
+        assert_eq!(result[1].attributes[0], "icons");
+    }
+
+    #[test]
+    fn test_extract_conditionals_and_operator() {
+        let source = "ifdef::backend+icons[]\nContent.\nendif::[]\n";
+        let result = extract_conditionals(source);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].attributes, vec!["backend", "icons"]);
+        assert_eq!(result[0].operator, crate::types::ConditionalOperator::And);
+        assert_eq!(result[0].line, 1);
+    }
+
+    #[test]
+    fn test_extract_conditionals_or_operator() {
+        let source = "ifndef::backend,icons[]\nFallback.\nendif::[]\n";
+        let result = extract_conditionals(source);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].attributes, vec!["backend", "icons"]);
+        assert_eq!(result[0].operator, crate::types::ConditionalOperator::Or);
+        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifndef);
+    }
+
+    #[test]
+    fn test_extract_conditionals_and_three_attrs() {
+        let source = "ifdef::a+b+c[]\nendif::[]\n";
+        let result = extract_conditionals(source);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].attributes, vec!["a", "b", "c"]);
+        assert_eq!(result[0].operator, crate::types::ConditionalOperator::And);
+    }
+
+    #[test]
+    fn test_extract_conditionals_invalid_multi_attr() {
+        // Empty part after split should be rejected
+        let source = "ifdef::backend+[]\n";
+        let result = extract_conditionals(source);
+        assert!(
+            result.is_empty(),
+            "Invalid multi-attr must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_conditionals_not_at_line_start() {
+        let source = "Some text ifdef::attr[]\n";
+        let result = extract_conditionals(source);
+        assert!(
+            result.is_empty(),
+            "ifdef not at line start must be ignored, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_conditionals_ignores_endif() {
+        let source = "endif::attr[]\n";
+        let result = extract_conditionals(source);
+        assert!(result.is_empty(), "endif must be ignored, got: {result:?}");
     }
 
     #[test]

@@ -85,14 +85,32 @@ pub struct DocumentModel {
     pub anchors: Vec<Anchor>,
     pub attributes: Vec<AttributeDef>,
     pub attribute_refs: Vec<AttributeRef>,
+    pub conditionals: Vec<ConditionalDirective>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagnosticKind {
-    BrokenXref { target: String },
-    BrokenInclude { path: String },
-    UndefinedAttribute { name: String },
-    DuplicateAnchor { id: String, first_file: PathBuf },
+    BrokenXref {
+        target: String,
+    },
+    BrokenInclude {
+        path: String,
+    },
+    UndefinedAttribute {
+        name: String,
+    },
+    DuplicateAnchor {
+        id: String,
+        first_file: PathBuf,
+    },
+    CircularInclude {
+        path: String,
+        cycle_through: PathBuf,
+    },
+    UndefinedConditionalAttr {
+        name: String,
+        directive: String,
+    },
 }
 
 impl fmt::Display for DiagnosticKind {
@@ -115,6 +133,20 @@ impl fmt::Display for DiagnosticKind {
                     first_file.display()
                 )
             }
+            DiagnosticKind::CircularInclude {
+                path,
+                cycle_through,
+            } => {
+                write!(
+                    f,
+                    "circular include: {} creates cycle through {}",
+                    path,
+                    cycle_through.display()
+                )
+            }
+            DiagnosticKind::UndefinedConditionalAttr { name, directive } => {
+                write!(f, "{directive}::{name} references undefined attribute")
+            }
         }
     }
 }
@@ -125,6 +157,27 @@ pub struct Diagnostic {
     pub line: usize,
     pub kind: DiagnosticKind,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalKind {
+    Ifdef,
+    Ifndef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalOperator {
+    Single,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConditionalDirective {
+    pub kind: ConditionalKind,
+    pub attributes: Vec<String>,
+    pub operator: ConditionalOperator,
+    pub line: usize,
 }
 
 #[derive(Debug)]
@@ -173,6 +226,46 @@ mod tests {
         };
         assert!(d4.to_string().contains("duplicate anchor 'my-id'"));
         assert!(d4.to_string().contains("/a/b.adoc"));
+    }
+
+    #[test]
+    fn test_circular_include_display() {
+        let d = DiagnosticKind::CircularInclude {
+            path: "b.adoc".into(),
+            cycle_through: PathBuf::from("/project/a.adoc"),
+        };
+        let s = d.to_string();
+        assert!(s.contains("circular include"), "got: {s}");
+        assert!(s.contains("b.adoc"), "got: {s}");
+        assert!(s.contains("a.adoc"), "got: {s}");
+    }
+
+    #[test]
+    fn test_conditional_directive_struct() {
+        let ifdef = ConditionalDirective {
+            kind: ConditionalKind::Ifdef,
+            attributes: vec!["backend".to_string()],
+            operator: ConditionalOperator::Single,
+            line: 5,
+        };
+        assert_eq!(ifdef.attributes, vec!["backend"]);
+        assert_eq!(ifdef.kind, ConditionalKind::Ifdef);
+        assert_eq!(ifdef.operator, ConditionalOperator::Single);
+        assert_eq!(ifdef.line, 5);
+
+        let ifndef = ConditionalDirective {
+            kind: ConditionalKind::Ifndef,
+            attributes: vec!["source-dir".to_string()],
+            operator: ConditionalOperator::Single,
+            line: 10,
+        };
+        assert_eq!(ifndef.kind, ConditionalKind::Ifndef);
+
+        // Debug + Clone work
+        let _debug = format!("{:?}", ifdef);
+        let _clone = ifdef.clone();
+        assert_ne!(ConditionalKind::Ifdef, ConditionalKind::Ifndef);
+        assert_ne!(ConditionalOperator::And, ConditionalOperator::Or);
     }
 
     #[test]

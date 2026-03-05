@@ -18,5 +18,3 @@ include::chapters/08_concepts.adoc[]
 include::chapters/09_architecture_decisions.adoc[]
 
 include::{docdir}/appendix/glossary.adoc[]
-
-include::{docdir}/appendix/manual-test-plan.adoc[]

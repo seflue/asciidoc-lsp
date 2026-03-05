@@ -1,0 +1,21 @@
+== Introduction and Goals
+
+This chapter describes the introduction and goals of the test project.
+
+=== Requirements Overview
+
+The system should provide AsciiDoc language support for Neovim.
+
+=== Quality Goals
+
+|===
+| Priority | Goal | Description
+
+| 1 | Correctness | Parse AsciiDoc accurately
+| 2 | Performance | Low-latency completions
+|===
+
+=== Stakeholders
+
+* Developers using Neovim
+* AsciiDoc authors
