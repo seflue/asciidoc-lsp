@@ -36,6 +36,17 @@ impl IncludeGraph {
             .push(from.to_path_buf());
     }
 
+    /// Remove all forward edges originating from `file` and their reverse entries.
+    pub fn remove_edges_from(&mut self, file: &Path) {
+        if let Some(edges) = self.forward.remove(file) {
+            for edge in &edges {
+                if let Some(parents) = self.reverse.get_mut(&edge.target) {
+                    parents.retain(|p| p != file);
+                }
+            }
+        }
+    }
+
     #[must_use]
     pub fn includes_of(&self, file: &Path) -> &[IncludeEdge] {
         static EMPTY: Vec<IncludeEdge> = Vec::new();
@@ -172,38 +183,25 @@ pub fn build_graph_with_overrides(
     (graph, documents)
 }
 
-fn walk(
-    file: &Path,
+/// Parse a single file and return its `DocumentModel` plus resolved include edges.
+///
+/// This is the shared parse core used by both `walk()` (graph building) and
+/// `Workspace::ensure_file()` (on-demand standalone parsing).
+/// Returns `None` if the file cannot be read or parsed.
+pub fn parse_single_file(
+    canonical: &Path,
     registry: &mut AttributeRegistry,
-    graph: &mut IncludeGraph,
-    documents: &mut HashMap<PathBuf, DocumentModel>,
-    visited: &mut HashSet<PathBuf>,
     overrides: &HashMap<PathBuf, String>,
-) {
-    let Ok(canonical) = file.canonicalize() else {
-        return; // File doesn't exist — edge in graph is enough for diagnostics
-    };
-
-    if !visited.insert(canonical.clone()) {
-        return; // Already parsed → dedup
-    }
-
-    // Read file: prefer override content, fall back to disk (V-2)
-    let source = match overrides.get(&canonical) {
+) -> Option<(DocumentModel, Vec<IncludeEdge>)> {
+    // Read file: prefer override content, fall back to disk
+    let source = match overrides.get(canonical) {
         Some(content) => content.clone(),
-        None => match std::fs::read_to_string(&canonical) {
-            Ok(s) => s,
-            Err(_) => return,
-        },
+        None => std::fs::read_to_string(canonical).ok()?,
     };
 
     // Parse with block parser
-    let Ok(mut block_parser) = crate::parser::init_block_parser() else {
-        return;
-    };
-    let Ok(block_tree) = crate::parser::parse(&mut block_parser, &source) else {
-        return;
-    };
+    let mut block_parser = crate::parser::init_block_parser().ok()?;
+    let block_tree = crate::parser::parse(&mut block_parser, &source).ok()?;
 
     let root_node = block_tree.root_node();
     let sections = crate::extractors::extract_sections(root_node, source.as_bytes());
@@ -228,30 +226,26 @@ fn walk(
     }
 
     // Register file attributes
-    registry.register_file_attributes(&canonical, &file_attrs);
+    registry.register_file_attributes(canonical, &file_attrs);
 
-    // Process includes: add edges and recurse (before storing DocumentModel so we can move includes_raw)
+    // Resolve include paths to edges
     let base_dir = canonical.parent().unwrap_or(Path::new("."));
-    for inc in &includes_raw {
-        let resolved_path = registry.substitute(&canonical, &inc.path);
-        let full_path = base_dir.join(&resolved_path);
-        let target_canonical = full_path.canonicalize().unwrap_or(full_path.clone());
-
-        graph.add_edge(
-            &canonical,
+    let edges: Vec<IncludeEdge> = includes_raw
+        .iter()
+        .map(|inc| {
+            let resolved_path = registry.substitute(canonical, &inc.path);
+            let full_path = base_dir.join(&resolved_path);
+            let target_canonical = full_path.canonicalize().unwrap_or(full_path);
             IncludeEdge {
-                target: target_canonical.clone(),
+                target: target_canonical,
                 line: inc.line,
                 attributes: inc.attributes.clone(),
-            },
-        );
+            }
+        })
+        .collect();
 
-        walk(&full_path, registry, graph, documents, visited, overrides);
-    }
-
-    // Store DocumentModel (move includes_raw instead of clone)
     let doc = DocumentModel {
-        path: canonical.clone(),
+        path: canonical.to_path_buf(),
         sections,
         includes: includes_raw,
         xrefs,
@@ -260,7 +254,37 @@ fn walk(
         attribute_refs,
         conditionals,
     };
-    documents.insert(canonical.clone(), doc);
+
+    Some((doc, edges))
+}
+
+fn walk(
+    file: &Path,
+    registry: &mut AttributeRegistry,
+    graph: &mut IncludeGraph,
+    documents: &mut HashMap<PathBuf, DocumentModel>,
+    visited: &mut HashSet<PathBuf>,
+    overrides: &HashMap<PathBuf, String>,
+) {
+    let Ok(canonical) = file.canonicalize() else {
+        return; // File doesn't exist — edge in graph is enough for diagnostics
+    };
+
+    if !visited.insert(canonical.clone()) {
+        return; // Already parsed → dedup
+    }
+
+    let Some((doc, edges)) = parse_single_file(&canonical, registry, overrides) else {
+        return;
+    };
+
+    // Add edges to graph and recurse into includes
+    for edge in &edges {
+        graph.add_edge(&canonical, edge.clone());
+        walk(&edge.target, registry, graph, documents, visited, overrides);
+    }
+
+    documents.insert(canonical, doc);
 }
 
 #[cfg(test)]
@@ -620,6 +644,58 @@ mod tests {
             doc.conditionals
         );
         assert_eq!(doc.conditionals[0].attributes, vec!["backend"]);
+    }
+
+    #[test]
+    fn test_parse_single_file_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("single.adoc");
+        fs::write(
+            &file,
+            "= Title\n:myattr: myvalue\n\nSome content with {myattr}.\n",
+        )
+        .unwrap();
+
+        let canonical = file.canonicalize().unwrap();
+        let mut registry = AttributeRegistry::new(tmp.path());
+        let overrides = HashMap::new();
+
+        let result = parse_single_file(&canonical, &mut registry, &overrides);
+        assert!(result.is_some(), "parse_single_file should return Some");
+
+        let (doc, edges) = result.unwrap();
+        assert_eq!(doc.path, canonical);
+        assert!(
+            !doc.sections.is_empty(),
+            "Should have at least a title section"
+        );
+        assert_eq!(doc.attributes.len(), 1, "Should have 1 attribute def");
+        assert_eq!(doc.attributes[0].name, "myattr");
+        assert_eq!(doc.attribute_refs.len(), 1, "Should have 1 attribute ref");
+        assert_eq!(doc.attribute_refs[0].name, "myattr");
+        assert!(edges.is_empty(), "No includes → no edges");
+    }
+
+    #[test]
+    fn test_parse_single_file_with_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+        fs::write(&a, "= A\n\ninclude::b.adoc[]\n").unwrap();
+        fs::write(&b, "== B\n\nContent.\n").unwrap();
+
+        let canonical = a.canonicalize().unwrap();
+        let mut registry = AttributeRegistry::new(tmp.path());
+        let overrides = HashMap::new();
+
+        let result = parse_single_file(&canonical, &mut registry, &overrides);
+        assert!(result.is_some());
+
+        let (doc, edges) = result.unwrap();
+        assert_eq!(doc.includes.len(), 1, "Should have 1 include");
+        assert_eq!(edges.len(), 1, "Should have 1 edge");
+        let b_canon = b.canonicalize().unwrap();
+        assert_eq!(edges[0].target, b_canon);
     }
 
     #[test]

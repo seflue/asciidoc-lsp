@@ -6,15 +6,15 @@ use crate::graph::IncludeGraph;
 use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
 
-/// Collect all diagnostics across the workspace.
+/// Collect all diagnostics across the workspace, grouped by file.
 #[must_use]
 pub fn collect_diagnostics(
     documents: &HashMap<PathBuf, DocumentModel>,
     graph: &IncludeGraph,
     ref_index: &ReferenceIndex,
     registry: &AttributeRegistry,
-) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
+) -> HashMap<PathBuf, Vec<Diagnostic>> {
+    let mut diags: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
 
     for (path, doc) in documents {
         // 1. Broken xrefs
@@ -23,7 +23,7 @@ pub fn collect_diagnostics(
                 .resolve_xref(xref, path, graph, documents)
                 .is_err()
             {
-                diags.push(Diagnostic {
+                diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: xref.line,
                     kind: DiagnosticKind::BrokenXref {
@@ -41,7 +41,7 @@ pub fn collect_diagnostics(
             let target_path = base_dir.join(&resolved_path);
             let target_canonical = target_path.canonicalize().unwrap_or(target_path.clone());
             if !documents.contains_key(&target_canonical) && !target_path.exists() {
-                diags.push(Diagnostic {
+                diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: inc.line,
                     kind: DiagnosticKind::BrokenInclude {
@@ -56,20 +56,23 @@ pub fn collect_diagnostics(
     // 3. Duplicate anchors
     for (id, dup_loc) in &ref_index.duplicates {
         if let Some(first_loc) = ref_index.anchors.get(id) {
-            diags.push(Diagnostic {
-                file: dup_loc.file.clone(),
-                line: dup_loc.line,
-                kind: DiagnosticKind::DuplicateAnchor {
-                    id: id.clone(),
-                    first_file: first_loc.file.clone(),
-                },
-                message: format!(
-                    "Duplicate anchor '{}', first defined in {}:{}",
-                    id,
-                    first_loc.file.display(),
-                    first_loc.line
-                ),
-            });
+            diags
+                .entry(dup_loc.file.clone())
+                .or_default()
+                .push(Diagnostic {
+                    file: dup_loc.file.clone(),
+                    line: dup_loc.line,
+                    kind: DiagnosticKind::DuplicateAnchor {
+                        id: id.clone(),
+                        first_file: first_loc.file.clone(),
+                    },
+                    message: format!(
+                        "Duplicate anchor '{}', first defined in {}:{}",
+                        id,
+                        first_loc.file.display(),
+                        first_loc.line
+                    ),
+                });
         }
     }
 
@@ -88,10 +91,9 @@ pub fn collect_diagnostics(
             match cond.operator {
                 crate::types::ConditionalOperator::Single
                 | crate::types::ConditionalOperator::And => {
-                    // Single/And: each undefined attribute gets its own diagnostic
                     for attr in &cond.attributes {
                         if registry.resolve(path, attr).is_none() {
-                            diags.push(Diagnostic {
+                            diags.entry(path.clone()).or_default().push(Diagnostic {
                                 file: path.clone(),
                                 line: cond.line,
                                 kind: DiagnosticKind::UndefinedConditionalAttr {
@@ -106,14 +108,13 @@ pub fn collect_diagnostics(
                     }
                 }
                 crate::types::ConditionalOperator::Or => {
-                    // Or: only diagnose if NONE are defined
                     let any_defined = cond
                         .attributes
                         .iter()
                         .any(|attr| registry.resolve(path, attr).is_some());
                     if !any_defined {
                         let names = cond.attributes.join(", ");
-                        diags.push(Diagnostic {
+                        diags.entry(path.clone()).or_default().push(Diagnostic {
                             file: path.clone(),
                             line: cond.line,
                             kind: DiagnosticKind::UndefinedConditionalAttr {
@@ -136,7 +137,7 @@ pub fn collect_diagnostics(
             || target.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        diags.push(Diagnostic {
+        diags.entry(source.clone()).or_default().push(Diagnostic {
             file: source.clone(),
             line,
             kind: DiagnosticKind::CircularInclude {
@@ -152,13 +153,16 @@ pub fn collect_diagnostics(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
     use crate::types::{Anchor, IncludeMacro, Section, Xref};
 
     fn make_registry() -> AttributeRegistry {
         AttributeRegistry::new(Path::new("/tmp"))
+    }
+
+    /// Flatten per-file diagnostics into a single Vec for simpler test assertions.
+    fn flatten(diags: &HashMap<PathBuf, Vec<Diagnostic>>) -> Vec<&Diagnostic> {
+        diags.values().flatten().collect()
     }
 
     #[test]
@@ -186,10 +190,11 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        assert_eq!(diags.len(), 1);
+        assert_eq!(flat.len(), 1);
         assert!(matches!(
-            &diags[0].kind,
+            &flat[0].kind,
             DiagnosticKind::BrokenXref { target } if target == "nonexistent"
         ));
     }
@@ -220,13 +225,51 @@ mod tests {
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
 
-        assert!(diags
+        let flat = flatten(&diags);
+        assert!(flat
             .iter()
             .any(|d| matches!(&d.kind, DiagnosticKind::BrokenInclude { .. })));
     }
 
     #[test]
-    fn test_duplicate_anchor_diagnostic() {
+    fn test_duplicate_anchor_diagnostic_same_file() {
+        let registry = make_registry();
+        let mut documents = HashMap::new();
+        documents.insert(
+            PathBuf::from("/a.adoc"),
+            DocumentModel {
+                path: PathBuf::from("/a.adoc"),
+                sections: vec![],
+                includes: vec![],
+                xrefs: vec![],
+                anchors: vec![
+                    Anchor {
+                        id: "dup".into(),
+                        line: 1,
+                    },
+                    Anchor {
+                        id: "dup".into(),
+                        line: 10,
+                    },
+                ],
+                attributes: vec![],
+                attribute_refs: vec![],
+                conditionals: vec![],
+            },
+        );
+
+        let graph = IncludeGraph::new();
+        let ref_index = ReferenceIndex::build(&documents, &registry);
+        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+
+        let flat = flatten(&diags);
+        assert!(flat
+            .iter()
+            .any(|d| matches!(&d.kind, DiagnosticKind::DuplicateAnchor { id, .. } if id == "dup")));
+    }
+
+    #[test]
+    fn test_no_duplicate_anchor_diagnostic_cross_file() {
         let registry = make_registry();
         let mut documents = HashMap::new();
         documents.insert(
@@ -237,7 +280,7 @@ mod tests {
                 includes: vec![],
                 xrefs: vec![],
                 anchors: vec![Anchor {
-                    id: "dup".into(),
+                    id: "context".into(),
                     line: 1,
                 }],
                 attributes: vec![],
@@ -253,8 +296,8 @@ mod tests {
                 includes: vec![],
                 xrefs: vec![],
                 anchors: vec![Anchor {
-                    id: "dup".into(),
-                    line: 10,
+                    id: "context".into(),
+                    line: 1,
                 }],
                 attributes: vec![],
                 attribute_refs: vec![],
@@ -266,9 +309,10 @@ mod tests {
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
 
-        assert!(diags
+        let flat = flatten(&diags);
+        assert!(!flat
             .iter()
-            .any(|d| matches!(&d.kind, DiagnosticKind::DuplicateAnchor { id, .. } if id == "dup")));
+            .any(|d| matches!(&d.kind, DiagnosticKind::DuplicateAnchor { .. })));
     }
 
     #[test]
@@ -333,8 +377,9 @@ mod tests {
 
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let circular: Vec<_> = diags
+        let circular: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::CircularInclude { .. }))
             .collect();
@@ -385,8 +430,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let broken_includes: Vec<_> = diags
+        let broken_includes: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::BrokenInclude { .. }))
             .collect();
@@ -466,15 +512,14 @@ mod tests {
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
 
-        // Diagnostics must cover multiple files, not just one
-        let files_with_diags: HashSet<_> = diags.iter().map(|d| &d.file).collect();
+        // Diagnostics must cover multiple files — HashMap keys are the files
         assert!(
-            files_with_diags.len() >= 2,
+            diags.len() >= 2,
             "Expected diagnostics for at least 2 files, got {:?}",
-            files_with_diags
+            diags.keys().collect::<Vec<_>>()
         );
-        assert!(files_with_diags.contains(&PathBuf::from("/a.adoc")));
-        assert!(files_with_diags.contains(&PathBuf::from("/b.adoc")));
+        assert!(diags.contains_key(&PathBuf::from("/a.adoc")));
+        assert!(diags.contains_key(&PathBuf::from("/b.adoc")));
     }
 
     // --- Conditional attribute diagnostics (adoc-0062) ---
@@ -505,8 +550,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let cond_diags: Vec<_> = diags
+        let cond_diags: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
@@ -560,8 +606,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let cond_diags: Vec<_> = diags
+        let cond_diags: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
@@ -597,8 +644,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let cond_diags: Vec<_> = diags
+        let cond_diags: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
@@ -636,8 +684,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let cond_diags: Vec<_> = diags
+        let cond_diags: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
@@ -690,8 +739,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let cond_diags: Vec<_> = diags
+        let cond_diags: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
@@ -728,8 +778,9 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        let cond_diags: Vec<_> = diags
+        let cond_diags: Vec<_> = flat
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
@@ -789,11 +840,8 @@ mod tests {
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let flat = flatten(&diags);
 
-        assert!(
-            diags.is_empty(),
-            "Expected no diagnostics, got: {:?}",
-            diags
-        );
+        assert!(flat.is_empty(), "Expected no diagnostics, got: {:?}", flat);
     }
 }

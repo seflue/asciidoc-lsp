@@ -5,7 +5,7 @@ mod positions;
 mod symbols;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tower_lsp_server::jsonrpc::Result;
@@ -33,79 +33,6 @@ use asciidoc_core::workspace::Workspace;
 struct DocumentState {
     content: String,
     version: i32,
-}
-
-// ---------------------------------------------------------------------------
-// Entry-Point Heuristic (V-3, V-8: extracted for testability)
-// ---------------------------------------------------------------------------
-
-/// Find the entry point for a workspace.
-///
-/// Strategy:
-/// 1. Look for `index.adoc` directly in root
-/// 2. Look for `index.adoc` in immediate subdirectories (e.g. `docs/index.adoc` in arc42)
-/// 3. Fallback: first `.adoc` file found in the root directory
-fn find_entry_point(root: &Path) -> Option<PathBuf> {
-    // First: look for index.adoc directly in root
-    let root_index = root.join("index.adoc");
-    if root_index.exists() {
-        return Some(root_index);
-    }
-
-    // Second: look for index.adoc in immediate subdirectories (e.g. docs/index.adoc)
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let sub_index = path.join("index.adoc");
-                if sub_index.exists() {
-                    return Some(sub_index);
-                }
-            }
-        }
-    }
-
-    // Fallback: first .adoc file in root directory
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "adoc" {
-                        return Some(path);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Detect the workspace root from the given URI.
-///
-/// Strategy:
-/// 1. Look for `.asciidoctorconfig` upward
-/// 2. Look for `.git` upward
-/// 3. Fallback to the given root
-fn detect_workspace_root(root: &Path) -> PathBuf {
-    let mut current = Some(root);
-    while let Some(dir) = current {
-        if dir.join(".asciidoctorconfig").exists() {
-            return dir.to_path_buf();
-        }
-        current = dir.parent();
-    }
-
-    let mut current = Some(root);
-    while let Some(dir) = current {
-        if dir.join(".git").exists() {
-            return dir.to_path_buf();
-        }
-        current = dir.parent();
-    }
-
-    root.to_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -145,28 +72,19 @@ impl AsciiDocLsp {
         }
     }
 
-    /// Publish diagnostics for all files in the workspace after a rebuild.
+    /// Publish diagnostics for all files in the workspace.
     ///
-    /// Groups diagnostics by file, converts them, publishes per-file, and
-    /// clears stale diagnostics for files that no longer have any.
+    /// Takes pre-grouped diagnostics, converts them to LSP format,
+    /// publishes per-file, and clears stale diagnostics for files
+    /// that no longer have any.
     async fn publish_workspace_diagnostics(
         &self,
-        diagnostics: &[asciidoc_core::types::Diagnostic],
+        diagnostics: &HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>,
     ) {
-        // Group diagnostics by file
-        let mut diags_by_file: HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>> =
-            HashMap::new();
-        for diag in diagnostics {
-            diags_by_file
-                .entry(diag.file.clone())
-                .or_default()
-                .push(diag.clone());
-        }
-
         // Prepare all conversions without holding locks across await points
         let conversions: Vec<(Uri, Vec<Diagnostic>)> = {
             let docs = self.documents.lock().expect("documents lock poisoned");
-            diags_by_file
+            diagnostics
                 .iter()
                 .filter_map(|(path, file_diags)| {
                     let uri = symbols::path_to_uri(path)?;
@@ -207,19 +125,6 @@ impl AsciiDocLsp {
             .lock()
             .expect("published_diagnostics lock poisoned") = new_published;
     }
-
-    /// Rebuild workspace from document store and publish diagnostics.
-    async fn rebuild_and_publish(&self) {
-        let root = self.root.lock().expect("root lock poisoned").clone();
-        let Some(root) = root else { return };
-
-        let overrides = build_content_overrides(&self.documents);
-
-        if let Some(ws) = rebuild_workspace(&root, &overrides) {
-            self.publish_workspace_diagnostics(&ws.diagnostics).await;
-            *self.workspace.lock().expect("workspace lock poisoned") = Some(ws);
-        }
-    }
 }
 
 impl LanguageServer for AsciiDocLsp {
@@ -235,17 +140,13 @@ impl LanguageServer for AsciiDocLsp {
             .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
         if let Some(ref root) = root_path {
-            let workspace_root = detect_workspace_root(root);
-            *self.root.lock().expect("root lock poisoned") = Some(workspace_root.clone());
+            *self.root.lock().expect("root lock poisoned") = Some(root.clone());
 
-            // Build initial workspace if entry point found
-            if let Some(entry) = find_entry_point(&workspace_root) {
-                let overrides = HashMap::new();
-                if let Ok(ws) = Workspace::build_with_overrides(&workspace_root, &entry, &overrides)
-                {
-                    *self.workspace.lock().expect("workspace lock poisoned") = Some(ws);
-                }
-            }
+            // Create workspace and scan for all .adoc files
+            let mut ws = Workspace::new(root);
+            ws.scan_workspace();
+            ws.recalculate_diagnostics();
+            *self.workspace.lock().expect("workspace lock poisoned") = Some(ws);
         }
 
         self.client
@@ -309,9 +210,34 @@ impl LanguageServer for AsciiDocLsp {
         self.documents
             .lock()
             .unwrap()
-            .insert(uri, DocumentState { content, version });
+            .insert(uri.clone(), DocumentState { content, version });
 
-        self.rebuild_and_publish().await;
+        // Per-file: ensure only this file, then recalculate diagnostics
+        if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
+            if let Ok(canonical) = path.canonicalize() {
+                let overrides = build_content_overrides(&self.documents);
+                let diagnostics = {
+                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    if let Some(ws) = ws.as_mut() {
+                        // Use update_file if already indexed (e.g. from background scan)
+                        // to apply editor content over disk content.
+                        // Use ensure_file for new files not yet in the workspace.
+                        if ws.documents.contains_key(&canonical) {
+                            ws.update_file(&canonical, &overrides);
+                        } else {
+                            ws.ensure_file(&canonical, &overrides);
+                        }
+                        ws.recalculate_diagnostics();
+                        Some(ws.diagnostics.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(diagnostics) = diagnostics {
+                    self.publish_workspace_diagnostics(&diagnostics).await;
+                }
+            }
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -331,7 +257,7 @@ impl LanguageServer for AsciiDocLsp {
             // Full sync: take the last content change (TextDocumentSyncKind::FULL)
             if let Some(change) = params.content_changes.into_iter().last() {
                 docs.insert(
-                    uri,
+                    uri.clone(),
                     DocumentState {
                         content: change.text,
                         version: new_version,
@@ -340,8 +266,25 @@ impl LanguageServer for AsciiDocLsp {
             }
         }
 
-        // Rebuild workspace and publish diagnostics (DC-5: Live diagnostics on change)
-        self.rebuild_and_publish().await;
+        // Per-file: update only this file, then recalculate diagnostics
+        if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
+            if let Ok(canonical) = path.canonicalize() {
+                let overrides = build_content_overrides(&self.documents);
+                let diagnostics = {
+                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    if let Some(ws) = ws.as_mut() {
+                        ws.update_file(&canonical, &overrides);
+                        ws.recalculate_diagnostics();
+                        Some(ws.diagnostics.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(diagnostics) = diagnostics {
+                    self.publish_workspace_diagnostics(&diagnostics).await;
+                }
+            }
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -351,13 +294,47 @@ impl LanguageServer for AsciiDocLsp {
             .expect("documents lock poisoned")
             .remove(&uri);
 
-        // Rebuild: uses disk content for closed file, clears stale diagnostics automatically
-        self.rebuild_and_publish().await;
+        // Re-index file from disk so gd/gr still work for closed files
+        if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
+            if let Ok(canonical) = path.canonicalize() {
+                let diagnostics = {
+                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    if let Some(ws) = ws.as_mut() {
+                        ws.update_file(&canonical, &HashMap::new());
+                        ws.recalculate_diagnostics();
+                        Some(ws.diagnostics.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(diagnostics) = diagnostics {
+                    self.publish_workspace_diagnostics(&diagnostics).await;
+                }
+            }
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let _ = params;
-        self.rebuild_and_publish().await;
+        // Re-parse from disk content (editor may have saved changes not sent via did_change)
+        let uri = params.text_document.uri;
+        if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
+            if let Ok(canonical) = path.canonicalize() {
+                let overrides = build_content_overrides(&self.documents);
+                let diagnostics = {
+                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    if let Some(ws) = ws.as_mut() {
+                        ws.update_file(&canonical, &overrides);
+                        ws.recalculate_diagnostics();
+                        Some(ws.diagnostics.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(diagnostics) = diagnostics {
+                    self.publish_workspace_diagnostics(&diagnostics).await;
+                }
+            }
+        }
     }
 
     async fn document_symbol(
@@ -664,14 +641,6 @@ impl LanguageServer for AsciiDocLsp {
     }
 }
 
-/// Rebuild workspace: detect root, find entry point, build with overrides.
-/// Returns None if no entry point found or build fails.
-fn rebuild_workspace(root: &Path, overrides: &HashMap<PathBuf, String>) -> Option<Workspace> {
-    let workspace_root = detect_workspace_root(root);
-    let entry = find_entry_point(&workspace_root)?;
-    Workspace::build_with_overrides(&workspace_root, &entry, overrides).ok()
-}
-
 /// Build a `HashMap` of file path -> content for all open documents.
 /// Used as overrides so the semantic layer reads in-memory content
 /// instead of stale disk content.
@@ -710,85 +679,8 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::str::FromStr;
-
-    // --- Entry-Point Heuristic tests (V-3, V-8) ---
-
-    #[test]
-    fn test_find_entry_point_index_in_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = tmp.path().join("index.adoc");
-        fs::write(&index, "= Title\n").unwrap();
-
-        let result = find_entry_point(tmp.path());
-        assert_eq!(result, Some(index));
-    }
-
-    #[test]
-    fn test_find_entry_point_index_in_subdir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let docs = tmp.path().join("docs");
-        fs::create_dir(&docs).unwrap();
-        let index = docs.join("index.adoc");
-        fs::write(&index, "= Title\n").unwrap();
-
-        let result = find_entry_point(tmp.path());
-        assert_eq!(result, Some(index));
-    }
-
-    #[test]
-    fn test_find_entry_point_fallback_first_adoc() {
-        let tmp = tempfile::tempdir().unwrap();
-        let adoc = tmp.path().join("readme.adoc");
-        fs::write(&adoc, "= Readme\n").unwrap();
-
-        let result = find_entry_point(tmp.path());
-        assert_eq!(result, Some(adoc));
-    }
-
-    #[test]
-    fn test_find_entry_point_no_adoc_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("readme.md"), "# Title\n").unwrap();
-
-        let result = find_entry_point(tmp.path());
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_find_entry_point_prefers_index_over_other() {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = tmp.path().join("index.adoc");
-        fs::write(&index, "= Index\n").unwrap();
-        fs::write(tmp.path().join("other.adoc"), "= Other\n").unwrap();
-
-        let result = find_entry_point(tmp.path());
-        assert_eq!(result, Some(index));
-    }
-
-    // --- Workspace Root Detection tests ---
-
-    #[test]
-    fn test_detect_workspace_root_asciidoctorconfig() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
-        let sub = root.join("docs");
-        fs::create_dir(&sub).unwrap();
-
-        let result = detect_workspace_root(&sub);
-        assert_eq!(result, root.to_path_buf());
-    }
-
-    #[test]
-    fn test_detect_workspace_root_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sub = tmp.path().join("some").join("deep").join("dir");
-        fs::create_dir_all(&sub).unwrap();
-
-        let result = detect_workspace_root(&sub);
-        assert_eq!(result, sub);
-    }
 
     // --- Document Lifecycle tests ---
 
@@ -978,29 +870,10 @@ mod tests {
     #[test]
     fn test_integration_arc42_initialize() {
         let ws_root = workspace_root();
-
-        // Entry-point heuristic should find docs/index.adoc
-        let entry = find_entry_point(&ws_root);
-        assert!(entry.is_some(), "should find entry point in arc42 fixture");
-
-        let entry = entry.unwrap();
-        assert!(
-            entry.ends_with("docs/index.adoc"),
-            "entry should be docs/index.adoc, got: {:?}",
-            entry
-        );
-
-        // Workspace root detection: .asciidoctorconfig is in docs/,
-        // .git is at the repo root — detect_workspace_root should find it
-        let detected_root = detect_workspace_root(&ws_root);
-        assert!(
-            detected_root.join("Cargo.toml").exists(),
-            "detected workspace root should contain Cargo.toml: {:?}",
-            detected_root
-        );
+        let entry = arc42_docs_dir().join("index.adoc");
 
         // Workspace::build should succeed with the arc42 fixture
-        let ws = Workspace::build(&detected_root, &entry);
+        let ws = Workspace::build(&ws_root, &entry);
         assert!(
             ws.is_ok(),
             "workspace build should succeed for arc42: {:?}",
@@ -1033,7 +906,7 @@ mod tests {
     #[test]
     fn test_integration_arc42_diagnostics() {
         let ws_root = workspace_root();
-        let entry = find_entry_point(&ws_root).unwrap();
+        let entry = arc42_docs_dir().join("index.adoc");
 
         let ws = Workspace::build(&ws_root, &entry).unwrap();
 
@@ -1044,14 +917,15 @@ mod tests {
         // We don't assert exact count since the fixture may evolve, but we verify:
         // - No excessive false positives (< 10)
         // - Each diagnostic has correct metadata
+        let all_diags = ws.all_diagnostics();
         assert!(
-            ws.diagnostics.len() < 10,
+            all_diags.len() < 10,
             "should not have excessive false-positive diagnostics, found: {}",
-            ws.diagnostics.len()
+            all_diags.len()
         );
 
         // Convert diagnostics for each file and verify structure
-        for diag in &ws.diagnostics {
+        for diag in &all_diags {
             let content = fs::read_to_string(&diag.file).unwrap_or_default();
             let lsp_diags = diagnostics_convert::convert_diagnostics(&[diag.clone()], &content);
 
@@ -1113,8 +987,7 @@ mod tests {
         let content = fs::read_to_string(&index).unwrap();
 
         let ws_root = workspace_root();
-        let detected_root = detect_workspace_root(&ws_root);
-        let ws = Workspace::build(&detected_root, &index).unwrap();
+        let ws = Workspace::build(&ws_root, &index).unwrap();
 
         // Line 20 in index.adoc: include::{docdir}/appendix/glossary.adoc[]
         // {docdir} is at columns 9..16 (0-indexed LSP line 19)
@@ -1147,94 +1020,121 @@ mod tests {
         );
     }
 
-    // --- rebuild_workspace tests (adoc-0016: Live Diagnostics) ---
+    // --- Workspace lifecycle tests (adoc-0016: Live Diagnostics) ---
 
     #[test]
-    fn test_rebuild_workspace_returns_workspace() {
+    fn test_new_workspace_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        // Entry file with a broken xref
-        fs::write(root.join("index.adoc"), "= Title\n\n<<nonexistent>>\n").unwrap();
-
-        let documents: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
-        let overrides = build_content_overrides(&documents);
-
-        let result = rebuild_workspace(root, &overrides);
-
-        assert!(result.is_some());
-        let ws = result.unwrap();
-        // Workspace must have at least one diagnostic (broken xref)
-        assert!(!ws.diagnostics.is_empty());
+        // Workspace::new creates an empty workspace — files added via ensure_file
+        let ws = Workspace::new(root);
+        assert!(ws.documents.is_empty(), "Rebuild returns empty workspace");
     }
 
     #[test]
-    fn test_did_change_rebuild_updates_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        // Setup: file with valid content on disk
-        fs::write(
-            root.join("index.adoc"),
-            "= Title\n\n[[anchor]]\n== Section\n\n<<anchor>>\n",
-        )
-        .unwrap();
-
-        // Simulate did_change: Document Store with modified content
-        let uri = Uri::from_str(&format!(
-            "file://{}",
-            root.join("index.adoc").canonicalize().unwrap().display()
-        ))
-        .unwrap();
-        let documents: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
-        documents.lock().unwrap().insert(
-            uri,
-            DocumentState {
-                content: "= Title\n\n<<broken-xref>>\n".into(),
-                version: 2,
-            },
-        );
-
-        // Rebuild with overrides from Document Store
-        let overrides = build_content_overrides(&documents);
-        let result = rebuild_workspace(root, &overrides);
-
-        assert!(result.is_some());
-        let ws = result.unwrap();
-        // Override content must produce diagnostic for broken xref
-        assert!(
-            ws.diagnostics
-                .iter()
-                .any(|d| d.message.contains("broken-xref")),
-            "Expected diagnostic from did_change content override"
-        );
-    }
-
-    #[test]
-    fn test_rebuild_workspace_uses_overrides() {
+    fn test_ensure_file_with_overrides_uses_override_content() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
         // Disk: valid xref
+        let index = root.join("index.adoc");
         fs::write(
-            root.join("index.adoc"),
+            &index,
             "= Title\n\n[[valid-anchor]]\n== Section\n\n<<valid-anchor>>\n",
         )
         .unwrap();
 
         // Override: broken xref (simulates unsaved edit)
-        let index_path = root.join("index.adoc").canonicalize().unwrap();
+        let index_canon = index.canonicalize().unwrap();
         let mut overrides = HashMap::new();
-        overrides.insert(index_path, "= Title\n\n<<broken-ref>>\n".to_string());
+        overrides.insert(
+            index_canon.clone(),
+            "= Title\n\n<<broken-ref>>\n".to_string(),
+        );
 
-        let result = rebuild_workspace(root, &overrides);
-        assert!(result.is_some());
-        let ws = result.unwrap();
+        let mut ws = Workspace::new(root);
+        ws.ensure_file(&index_canon, &overrides);
+
+        // Verify override content was used (doc has broken xref, not valid anchor)
+        let doc = ws.documents.get(&index_canon).unwrap();
         assert!(
-            ws.diagnostics
-                .iter()
-                .any(|d| d.message.contains("broken-ref")),
-            "Expected diagnostic for broken xref from override"
+            doc.xrefs.iter().any(|x| x.target == "broken-ref"),
+            "Override content should be used"
+        );
+    }
+
+    #[test]
+    fn test_new_workspace_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let ws = Workspace::new(root);
+        assert!(ws.documents.is_empty(), "Empty workspace has no documents");
+        assert!(
+            ws.diagnostics.is_empty(),
+            "Empty workspace has no diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_preserves_standalone_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let standalone = root.join("standalone.adoc");
+        fs::write(&standalone, "= Standalone\n:myattr: val\n\nText.\n").unwrap();
+
+        let overrides = HashMap::new();
+        let mut ws = Workspace::new(root);
+        assert!(ws.documents.is_empty(), "Rebuild starts empty");
+
+        // Simulate did_open: ensure standalone is added
+        let standalone_canon = standalone.canonicalize().unwrap();
+        ws.ensure_file(&standalone_canon, &overrides);
+        assert_eq!(ws.documents.len(), 1, "Standalone added");
+
+        // Simulate rebuild (e.g. after did_change on another file)
+        let mut ws2 = Workspace::new(root);
+        assert!(ws2.documents.is_empty(), "Rebuild starts empty again");
+
+        // Re-ensure standalone after workspace recreation
+        ws2.ensure_file(&standalone_canon, &overrides);
+        assert_eq!(ws2.documents.len(), 1, "Standalone preserved after rebuild");
+        assert!(ws2.documents.contains_key(&standalone_canon));
+    }
+
+    #[test]
+    fn test_did_open_standalone_file() {
+        // Simulates what did_open does: rebuild + ensure_file for opened file
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let tests_dir = root.join("tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        let standalone = tests_dir.join("standalone.adoc");
+        fs::write(
+            &standalone,
+            "= Standalone\n:myattr: val\n\nText with {myattr}.\n",
+        )
+        .unwrap();
+
+        let overrides = HashMap::new();
+        let mut ws = Workspace::new(root);
+
+        // did_open calls ensure_file for the opened file
+        let standalone_canon = standalone.canonicalize().unwrap();
+        ws.ensure_file(&standalone_canon, &overrides);
+
+        assert_eq!(ws.documents.len(), 1);
+        let doc = ws.documents.get(&standalone_canon).unwrap();
+        assert_eq!(doc.attributes.len(), 1);
+        assert_eq!(doc.attribute_refs.len(), 1);
+
+        // Config chain should be loaded
+        assert_eq!(
+            ws.attributes.resolve(&standalone_canon, "myattr"),
+            Some("val")
         );
     }
 
@@ -1287,6 +1187,30 @@ mod tests {
         assert_eq!(
             obj.get("placeholder").unwrap().as_str().unwrap(),
             "my-anchor"
+        );
+    }
+
+    // --- adoc-0072 Phase 1: Workspace-Root from LSP root_uri ---
+
+    #[test]
+    fn test_workspace_root_from_lsp_root_uri() {
+        // Setup: .asciidoctorconfig in parent dir, LSP root_uri points to subdir.
+        // The workspace root should be EXACTLY the root_uri, not walked up.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path();
+        fs::write(parent.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
+
+        let sub = parent.join("docs");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("index.adoc"), "= Title\n").unwrap();
+
+        // Workspace::new receives the root_uri from LSP.
+        // It should use this path directly as workspace root.
+        let ws = Workspace::new(&sub);
+        assert_eq!(
+            ws.root,
+            sub.canonicalize().unwrap(),
+            "Workspace root must be the LSP root_uri, not walked up to .asciidoctorconfig"
         );
     }
 }

@@ -35,10 +35,11 @@ fn main() -> anyhow::Result<()> {
             .to_path_buf();
         let ws = Workspace::build(&root, &cli.path)?;
 
-        if ws.diagnostics.is_empty() {
+        let all_diags = ws.all_diagnostics();
+        if all_diags.is_empty() {
             println!("No diagnostics found.");
         } else {
-            for d in &ws.diagnostics {
+            for d in &all_diags {
                 println!("{}:{}: {}", d.file.display(), d.line, d.message);
             }
             std::process::exit(1);

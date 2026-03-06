@@ -33,8 +33,12 @@ impl ReferenceIndex {
             .or_default()
             .push(id.to_string());
 
-        if self.anchors.contains_key(id) {
-            self.duplicates.push((id.to_string(), location));
+        if let Some(existing) = self.anchors.get(id) {
+            if existing.file == location.file {
+                // Duplicate within same file — real duplicate
+                self.duplicates.push((id.to_string(), location));
+            }
+            // Different files — not a duplicate (section IDs are per-document in AsciiDoc)
         } else {
             self.anchors.insert(id.to_string(), location);
         }
@@ -44,6 +48,67 @@ impl ReferenceIndex {
     #[must_use]
     pub fn lookup(&self, id: &str) -> Option<&AnchorLocation> {
         self.anchors.get(id)
+    }
+
+    /// Add a single file's anchors and implicit section IDs to the index.
+    ///
+    /// Call `remove_file()` first if the file was already indexed.
+    pub fn add_file(&mut self, path: &Path, doc: &DocumentModel, registry: &AttributeRegistry) {
+        // Explicit anchors
+        for anchor in &doc.anchors {
+            self.add_anchor(
+                &anchor.id,
+                AnchorLocation {
+                    file: path.to_path_buf(),
+                    line: anchor.line,
+                    kind: AnchorKind::Explicit,
+                },
+            );
+        }
+
+        // Implicit section IDs
+        let prefix = registry.resolve(path, "idprefix").unwrap_or("_");
+        let separator = registry.resolve(path, "idseparator").unwrap_or("_");
+        for section in &doc.sections {
+            let id = generate_section_id(&section.title, prefix, separator);
+            self.add_anchor(
+                &id,
+                AnchorLocation {
+                    file: path.to_path_buf(),
+                    line: section.line,
+                    kind: AnchorKind::ImplicitSection,
+                },
+            );
+        }
+    }
+
+    /// Remove all anchors belonging to a file from the index.
+    ///
+    /// Handles duplicates: if the removed file owned a primary anchor entry
+    /// and a duplicate exists from another file, the duplicate is promoted.
+    pub fn remove_file(&mut self, path: &Path) {
+        let Some(ids) = self.by_file.remove(path) else {
+            return;
+        };
+
+        for id in &ids {
+            // Check if this file owns the primary entry
+            if let Some(loc) = self.anchors.get(id) {
+                if loc.file == path {
+                    self.anchors.remove(id);
+
+                    // Promote a duplicate if one exists
+                    if let Some(pos) = self.duplicates.iter().position(|(did, _)| did == id) {
+                        let (dup_id, dup_loc) = self.duplicates.remove(pos);
+                        self.anchors.insert(dup_id, dup_loc);
+                    }
+                }
+            }
+
+            // Remove any remaining duplicates from this file
+            self.duplicates
+                .retain(|(did, dloc)| !(did == id && dloc.file == path));
+        }
     }
 
     /// Build the reference index from all parsed documents.
@@ -56,32 +121,7 @@ impl ReferenceIndex {
         let mut index = Self::new();
 
         for (path, doc) in documents {
-            // Explicit anchors
-            for anchor in &doc.anchors {
-                index.add_anchor(
-                    &anchor.id,
-                    AnchorLocation {
-                        file: path.clone(),
-                        line: anchor.line,
-                        kind: AnchorKind::Explicit,
-                    },
-                );
-            }
-
-            // Implicit section IDs
-            let prefix = registry.resolve(path, "idprefix").unwrap_or("_");
-            let separator = registry.resolve(path, "idseparator").unwrap_or("_");
-            for section in &doc.sections {
-                let id = generate_section_id(&section.title, prefix, separator);
-                index.add_anchor(
-                    &id,
-                    AnchorLocation {
-                        file: path.clone(),
-                        line: section.line,
-                        kind: AnchorKind::ImplicitSection,
-                    },
-                );
-            }
+            index.add_file(path, doc, registry);
         }
 
         index
@@ -380,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_index_duplicate_anchor() {
+    fn test_same_anchor_in_different_files_is_not_duplicate() {
         let registry = AttributeRegistry::new(Path::new("/tmp"));
         let mut documents = HashMap::new();
 
@@ -392,7 +432,7 @@ mod tests {
                 includes: vec![],
                 xrefs: vec![],
                 anchors: vec![Anchor {
-                    id: "dup".into(),
+                    id: "context".into(),
                     line: 1,
                 }],
                 attributes: vec![],
@@ -408,7 +448,7 @@ mod tests {
                 includes: vec![],
                 xrefs: vec![],
                 anchors: vec![Anchor {
-                    id: "dup".into(),
+                    id: "context".into(),
                     line: 5,
                 }],
                 attributes: vec![],
@@ -418,8 +458,39 @@ mod tests {
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
-        // First wins, duplicate recorded
-        assert_eq!(index.anchors.len(), 1);
+        // Same anchor ID in different files is NOT a duplicate
+        assert!(index.duplicates.is_empty());
+    }
+
+    #[test]
+    fn test_same_anchor_in_same_file_is_duplicate() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut documents = HashMap::new();
+
+        documents.insert(
+            PathBuf::from("/a.adoc"),
+            DocumentModel {
+                path: PathBuf::from("/a.adoc"),
+                sections: vec![],
+                includes: vec![],
+                xrefs: vec![],
+                anchors: vec![
+                    Anchor {
+                        id: "dup".into(),
+                        line: 1,
+                    },
+                    Anchor {
+                        id: "dup".into(),
+                        line: 10,
+                    },
+                ],
+                attributes: vec![],
+                attribute_refs: vec![],
+                conditionals: vec![],
+            },
+        );
+
+        let index = ReferenceIndex::build(&documents, &registry);
         assert_eq!(index.duplicates.len(), 1);
         assert_eq!(index.duplicates[0].0, "dup");
     }
@@ -549,5 +620,233 @@ mod tests {
             .unwrap();
         assert_eq!(result.file, PathBuf::from("/target.adoc"));
         assert_eq!(result.line, 1);
+    }
+
+    // --- Incremental updates (add_file / remove_file) ---
+
+    #[test]
+    fn test_reference_index_add_file() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut index = ReferenceIndex::new();
+
+        let file_a = PathBuf::from("/a.adoc");
+        let doc_a = DocumentModel {
+            path: file_a.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![Anchor {
+                id: "foo".into(),
+                line: 1,
+            }],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+
+        index.add_file(&file_a, &doc_a, &registry);
+
+        assert_eq!(index.anchors.len(), 1);
+        assert!(index.anchors.contains_key("foo"));
+        assert_eq!(index.by_file.get(&file_a).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_reference_index_remove_file() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut index = ReferenceIndex::new();
+
+        let file_a = PathBuf::from("/a.adoc");
+        let doc_a = DocumentModel {
+            path: file_a.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![
+                Anchor {
+                    id: "a1".into(),
+                    line: 1,
+                },
+                Anchor {
+                    id: "a2".into(),
+                    line: 5,
+                },
+            ],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+
+        index.add_file(&file_a, &doc_a, &registry);
+        assert_eq!(index.anchors.len(), 2);
+
+        index.remove_file(&file_a);
+        assert!(index.anchors.is_empty());
+        assert!(index.by_file.get(&file_a).is_none());
+    }
+
+    #[test]
+    fn test_reference_index_incremental_update() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut index = ReferenceIndex::new();
+
+        let file_a = PathBuf::from("/a.adoc");
+        let file_b = PathBuf::from("/b.adoc");
+
+        // Add file A with anchor "foo"
+        let doc_a = DocumentModel {
+            path: file_a.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![Anchor {
+                id: "foo".into(),
+                line: 1,
+            }],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+        index.add_file(&file_a, &doc_a, &registry);
+
+        // Add file B with anchor "bar"
+        let doc_b = DocumentModel {
+            path: file_b.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![Anchor {
+                id: "bar".into(),
+                line: 1,
+            }],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+        index.add_file(&file_b, &doc_b, &registry);
+
+        assert_eq!(index.anchors.len(), 2);
+        assert!(index.lookup("foo").is_some());
+        assert!(index.lookup("bar").is_some());
+
+        // Remove file B — only "foo" remains
+        index.remove_file(&file_b);
+        assert_eq!(index.anchors.len(), 1);
+        assert!(index.lookup("foo").is_some());
+        assert!(index.lookup("bar").is_none());
+    }
+
+    #[test]
+    fn test_reference_index_remove_file_same_id_cross_file() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut index = ReferenceIndex::new();
+
+        let file_a = PathBuf::from("/a.adoc");
+        let file_b = PathBuf::from("/b.adoc");
+
+        // Both files define "context" — not a duplicate (cross-file)
+        let doc_a = DocumentModel {
+            path: file_a.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![Anchor {
+                id: "context".into(),
+                line: 1,
+            }],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+        let doc_b = DocumentModel {
+            path: file_b.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![Anchor {
+                id: "context".into(),
+                line: 5,
+            }],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+
+        index.add_file(&file_a, &doc_a, &registry);
+        index.add_file(&file_b, &doc_b, &registry);
+
+        // Cross-file: no duplicates, first file wins in anchors lookup
+        assert!(index.duplicates.is_empty());
+        assert_eq!(index.anchors.get("context").unwrap().file, file_a);
+
+        // Remove file A — anchor entry gone, by_file cleaned
+        index.remove_file(&file_a);
+        assert!(index.anchors.get("context").is_none());
+        assert!(index.by_file.get(&file_a).is_none());
+    }
+
+    #[test]
+    fn test_reference_index_remove_file_with_same_file_duplicates() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut index = ReferenceIndex::new();
+
+        let file_a = PathBuf::from("/a.adoc");
+
+        // Same file, same anchor twice — real duplicate
+        let doc_a = DocumentModel {
+            path: file_a.clone(),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![
+                Anchor {
+                    id: "dup".into(),
+                    line: 1,
+                },
+                Anchor {
+                    id: "dup".into(),
+                    line: 10,
+                },
+            ],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+
+        index.add_file(&file_a, &doc_a, &registry);
+        assert_eq!(index.duplicates.len(), 1);
+
+        // Remove file — both primary and duplicate gone
+        index.remove_file(&file_a);
+        assert!(index.anchors.get("dup").is_none());
+        assert!(index.duplicates.is_empty());
+    }
+
+    #[test]
+    fn test_reference_index_add_file_with_sections() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut index = ReferenceIndex::new();
+
+        let file_a = PathBuf::from("/a.adoc");
+        let doc_a = DocumentModel {
+            path: file_a.clone(),
+            sections: vec![Section {
+                level: 1,
+                title: "My Section".into(),
+                line: 3,
+            }],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        };
+
+        index.add_file(&file_a, &doc_a, &registry);
+
+        // Implicit section ID generated
+        assert!(index.anchors.contains_key("_my_section"));
+        assert_eq!(index.by_file.get(&file_a).unwrap().len(), 1);
     }
 }

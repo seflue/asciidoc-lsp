@@ -994,7 +994,7 @@ mod tests {
             include_graph: IncludeGraph::new(),
             reference_index: index,
             documents: HashMap::new(),
-            diagnostics: Vec::new(),
+            diagnostics: HashMap::new(),
         }
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
             include_graph: IncludeGraph::new(),
             reference_index: ReferenceIndex::new(),
             documents: HashMap::new(),
-            diagnostics: Vec::new(),
+            diagnostics: HashMap::new(),
         };
         (dir, ws, doc_file)
     }
@@ -1253,7 +1253,7 @@ mod tests {
             include_graph: IncludeGraph::new(),
             reference_index: ReferenceIndex::new(),
             documents: HashMap::new(),
-            diagnostics: Vec::new(),
+            diagnostics: HashMap::new(),
         };
         (dir, ws, file)
     }
