@@ -362,7 +362,9 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     {
         let word_start = before_cursor
             .rfind(|c: char| !c.is_ascii_alphanumeric())
-            .map_or(0, |i| i + 1);
+            .map_or(0, |i| {
+                i + before_cursor[i..].chars().next().map_or(1, char::len_utf8)
+            });
         let word = &before_cursor[word_start..];
         if !word.is_empty() && INLINE_MACROS.iter().any(|e| e.name.starts_with(word)) {
             // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX.
@@ -386,7 +388,9 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
             let before_colon = &before_cursor[..colon_pos];
             let word_start = before_colon
                 .rfind(|c: char| !c.is_ascii_alphanumeric())
-                .map_or(0, |i| i + 1);
+                .map_or(0, |i| {
+                    i + before_colon[i..].chars().next().map_or(1, char::len_utf8)
+                });
             let word = &before_colon[word_start..];
             if !word.is_empty() && INLINE_MACROS.iter().any(|e| e.name == word) {
                 return Some(CompletionContext::InlineMacro {
@@ -819,6 +823,45 @@ mod tests {
             detect_completion_context(content, pos),
             Some(CompletionContext::Attribute {
                 prefix: "attr".into()
+            })
+        );
+    }
+
+    #[test]
+    fn test_inline_macro_prefix_after_multibyte_char() {
+        // ":imagesdir: Ü" followed by "kbd" — Ü is 2 bytes (U+00DC)
+        // rfind for non-alphanumeric must skip past the entire multi-byte char
+        // UTF-16: : i m a g e s d i r :   Ü k b d
+        //          1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6
+        let content = ":imagesdir: Ükbd";
+        let pos = Position {
+            line: 0,
+            character: 16,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::InlineMacroPrefix {
+                prefix: "kbd".into(),
+                line: 0,
+                word_start_col: 13,
+                cursor_col: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn test_inline_macro_after_multibyte_char() {
+        // "Ü kbd:" — Ü is 2 bytes, space separates, then "kbd:"
+        // rfind for non-alphanumeric before "kbd" must handle multi-byte correctly
+        let content = "Ü kbd:";
+        let pos = Position {
+            line: 0,
+            character: 6,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::InlineMacro {
+                macro_name: "kbd".into()
             })
         );
     }
