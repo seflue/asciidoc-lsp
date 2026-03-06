@@ -222,6 +222,11 @@ fn walk(
     // Extract conditional directives (ifdef/ifndef) via byte-scanning
     let conditionals = crate::extractors::extract_conditionals(&source);
 
+    // Ensure config chain is loaded for this file's directory
+    if let Some(dir) = canonical.parent() {
+        registry.ensure_config_for_dir(dir);
+    }
+
     // Register file attributes
     registry.register_file_attributes(&canonical, &file_attrs);
 

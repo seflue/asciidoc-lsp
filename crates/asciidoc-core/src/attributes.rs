@@ -17,8 +17,9 @@ struct AttributeEntry {
 
 pub struct AttributeRegistry {
     builtin: HashMap<String, String>,
-    config: HashMap<String, AttributeEntry>,
+    config_chains: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
     per_file: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
+    workspace_root: PathBuf,
 }
 
 impl AttributeRegistry {
@@ -28,59 +29,81 @@ impl AttributeRegistry {
         builtin.insert("docdir".into(), root.display().to_string());
         Self {
             builtin,
-            config: HashMap::new(),
+            config_chains: HashMap::new(),
             per_file: HashMap::new(),
+            workspace_root: root.to_path_buf(),
         }
     }
 
-    /// Load attributes from .asciidoctorconfig files, searching upward from root.
-    /// Configs closer to root override values from parent directories.
-    /// Path values (containing `/` or starting with `.`) are canonicalized
-    /// relative to the config file's directory.
-    pub fn load_config(&mut self, root: &Path) {
-        let Ok(start_dir) = root.canonicalize() else {
+    /// Ensure a config chain is computed and cached for the given directory.
+    ///
+    /// Walks from `workspace_root` down to `dir`, merging `.asciidoctorconfig` files
+    /// along the way. Idempotent — returns early if already cached.
+    pub fn ensure_config_for_dir(&mut self, dir: &Path) {
+        let Ok(dir) = dir.canonicalize() else {
+            return;
+        };
+        let Ok(ws_root) = self.workspace_root.canonicalize() else {
             return;
         };
 
-        let mut config_contents: Vec<(PathBuf, String)> = Vec::new();
-        let mut current = Some(start_dir.as_path());
-        while let Some(dir) = current {
-            let config_path = dir.join(".asciidoctorconfig");
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                config_contents.push((dir.to_path_buf(), content));
-            }
-            current = dir.parent();
+        // Guard: dir must be under workspace_root
+        if !dir.starts_with(&ws_root) {
+            return;
         }
 
-        // Merge from root to leaf (later entries = closer to file = override)
-        for (config_dir, content) in config_contents.iter().rev() {
-            // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
-            self.config.insert(
-                "asciidoctorconfigdir".into(),
-                AttributeEntry {
-                    value: config_dir.display().to_string(),
-                    source: None,
-                },
-            );
+        // Idempotent: already cached
+        if self.config_chains.contains_key(&dir) {
+            return;
+        }
 
-            let config_file = config_dir.join(".asciidoctorconfig");
-            let dummy = Path::new("");
-            for (key, value, line) in parse_asciidoctorconfig(content) {
-                // Substitute attribute references (e.g. {asciidoctorconfigdir})
-                let substituted = self.substitute(dummy, &value);
-                let resolved = canonicalize_path_value(&substituted, config_dir);
-                self.config.insert(
-                    key,
+        // Collect directories from workspace_root to dir (inclusive), walking upward then reversing
+        let mut chain_dirs = Vec::new();
+        let mut current = dir.clone();
+        loop {
+            chain_dirs.push(current.clone());
+            if current == ws_root {
+                break;
+            }
+            match current.parent() {
+                Some(parent) => current = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        chain_dirs.reverse(); // now root → dir order
+
+        // Merge configs from root to dir (last wins)
+        let mut merged: HashMap<String, AttributeEntry> = HashMap::new();
+        for chain_dir in &chain_dirs {
+            let config_path = chain_dir.join(".asciidoctorconfig");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
+                merged.insert(
+                    "asciidoctorconfigdir".into(),
                     AttributeEntry {
-                        value: resolved,
-                        source: Some(AttributeSource {
-                            file: config_file.clone(),
-                            line,
-                        }),
+                        value: chain_dir.display().to_string(),
+                        source: None,
                     },
                 );
+
+                for (key, value, line) in parse_asciidoctorconfig(&content) {
+                    let substituted = substitute_with(&merged, &value);
+                    let resolved = canonicalize_path_value(&substituted, chain_dir);
+                    merged.insert(
+                        key,
+                        AttributeEntry {
+                            value: resolved,
+                            source: Some(AttributeSource {
+                                file: config_path.clone(),
+                                line,
+                            }),
+                        },
+                    );
+                }
             }
         }
+
+        self.config_chains.insert(dir, merged);
     }
 
     pub fn register_file_attributes(&mut self, file: &Path, attrs: &[AttributeDef]) {
@@ -112,8 +135,12 @@ impl AttributeRegistry {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        for (k, entry) in &self.config {
-            merged.insert(k.as_str(), entry.value.as_str());
+        if let Some(dir) = file.parent() {
+            if let Some(config) = self.config_chains.get(dir) {
+                for (k, entry) in config {
+                    merged.insert(k.as_str(), entry.value.as_str());
+                }
+            }
         }
 
         if let Some(file_attrs) = self.per_file.get(file) {
@@ -132,7 +159,13 @@ impl AttributeRegistry {
             .get(file)
             .and_then(|m| m.get(name))
             .map(|e| e.value.as_str())
-            .or_else(|| self.config.get(name).map(|e| e.value.as_str()))
+            .or_else(|| {
+                let dir = file.parent()?;
+                self.config_chains
+                    .get(dir)?
+                    .get(name)
+                    .map(|e| e.value.as_str())
+            })
             .or_else(|| self.builtin.get(name).map(std::string::String::as_str))
     }
 
@@ -145,7 +178,13 @@ impl AttributeRegistry {
             .get(file)
             .and_then(|m| m.get(name))
             .and_then(|e| e.source.clone())
-            .or_else(|| self.config.get(name).and_then(|e| e.source.clone()))
+            .or_else(|| {
+                let dir = file.parent()?;
+                self.config_chains
+                    .get(dir)?
+                    .get(name)
+                    .and_then(|e| e.source.clone())
+            })
         // builtins: no source → implicitly None
     }
 
@@ -186,6 +225,45 @@ impl AttributeRegistry {
 
         result
     }
+}
+
+/// Substitute all `{attr}` references in a string using the provided attribute map.
+/// Same logic as `AttributeRegistry::substitute()`, but without `self` — works only
+/// on the given `HashMap`. Used by `ensure_config_for_dir()` for config-chain merging.
+#[must_use]
+fn substitute_with(attrs: &HashMap<String, AttributeEntry>, input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut name = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    found_close = true;
+                    break;
+                }
+                name.push(inner);
+            }
+            if found_close && !name.is_empty() {
+                if let Some(entry) = attrs.get(&name) {
+                    result.push_str(&entry.value);
+                } else {
+                    result.push('{');
+                    result.push_str(&name);
+                    result.push('}');
+                }
+            } else {
+                result.push('{');
+                result.push_str(&name);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
 }
 
 /// Parse :key: value lines from an .asciidoctorconfig file.
@@ -244,42 +322,40 @@ mod tests {
     #[test]
     fn test_config_loader_basic() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(
-            tmp.path().join(".asciidoctorconfig"),
-            ":imagesdir: images\n",
-        )
-        .unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
 
-        let mut registry = AttributeRegistry::new(tmp.path());
-        registry.load_config(tmp.path());
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
 
-        let dummy = Path::new("any.adoc");
-        assert_eq!(registry.resolve(dummy, "imagesdir"), Some("images"));
+        let dummy = root.join("any.adoc");
+        assert_eq!(registry.resolve(&dummy, "imagesdir"), Some("images"));
     }
 
     #[test]
     fn test_config_path_canonicalization() {
         let tmp = tempfile::tempdir().unwrap();
-        let docs = tmp.path().join("project").join("docs");
-        let src = tmp.path().join("project").join("src");
+        let root = tmp.path().canonicalize().unwrap();
+        let docs = root.join("project").join("docs");
+        let src = root.join("project").join("src");
         fs::create_dir_all(&docs).unwrap();
         fs::create_dir_all(&src).unwrap();
 
         fs::write(docs.join(".asciidoctorconfig"), ":source-dir: ../src\n").unwrap();
 
         let mut registry = AttributeRegistry::new(&docs);
-        registry.load_config(&docs);
+        registry.ensure_config_for_dir(&docs);
 
-        let dummy = Path::new("any.adoc");
-        let resolved = registry.resolve(dummy, "source-dir").unwrap();
-        let canonical_src = src.canonicalize().unwrap();
-        assert_eq!(resolved, canonical_src.display().to_string());
+        let dummy = docs.join("any.adoc");
+        let resolved = registry.resolve(&dummy, "source-dir").unwrap();
+        assert_eq!(resolved, src.display().to_string());
     }
 
     #[test]
     fn test_config_hierarchy() {
         let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("parent");
+        let root = tmp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
         let child = parent.join("child");
         fs::create_dir_all(&child).unwrap();
 
@@ -290,12 +366,13 @@ mod tests {
         .unwrap();
         fs::write(child.join(".asciidoctorconfig"), ":imagesdir: img\n").unwrap();
 
-        let mut registry = AttributeRegistry::new(&child);
-        registry.load_config(&child);
+        // workspace_root = parent so the walk covers parent → child
+        let mut registry = AttributeRegistry::new(&parent);
+        registry.ensure_config_for_dir(&child);
 
-        let dummy = Path::new("any.adoc");
-        assert_eq!(registry.resolve(dummy, "imagesdir"), Some("img"));
-        assert_eq!(registry.resolve(dummy, "chapdir"), Some("chapters"));
+        let dummy = child.join("any.adoc");
+        assert_eq!(registry.resolve(&dummy, "imagesdir"), Some("img"));
+        assert_eq!(registry.resolve(&dummy, "chapdir"), Some("chapters"));
     }
 
     #[test]
@@ -321,19 +398,24 @@ mod tests {
 
     #[test]
     fn test_resolve_priority() {
-        let mut registry = AttributeRegistry::new(Path::new("/root"));
-        // Built-in: docdir = /root
-        registry.config.insert(
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        // Simulate config layer via config_chains
+        let mut config_map = HashMap::new();
+        config_map.insert(
             "docdir".into(),
             AttributeEntry {
                 value: "/config".into(),
                 source: None,
             },
         );
+        registry.config_chains.insert(root.clone(), config_map);
 
-        let file = Path::new("/root/doc.adoc");
+        let file = root.join("doc.adoc");
         // Config overrides built-in
-        assert_eq!(registry.resolve(file, "docdir"), Some("/config"));
+        assert_eq!(registry.resolve(&file, "docdir"), Some("/config"));
 
         // Doc-header overrides config
         let attrs = vec![AttributeDef {
@@ -341,14 +423,14 @@ mod tests {
             value: "/header".into(),
             line: 1,
         }];
-        registry.register_file_attributes(file, &attrs);
-        assert_eq!(registry.resolve(file, "docdir"), Some("/header"));
+        registry.register_file_attributes(&file, &attrs);
+        assert_eq!(registry.resolve(&file, "docdir"), Some("/header"));
     }
 
     #[test]
     fn test_resolve_fallback() {
         let registry = AttributeRegistry::new(Path::new("/root"));
-        let file = Path::new("any.adoc");
+        let file = Path::new("/root/any.adoc");
         assert_eq!(registry.resolve(file, "docdir"), Some("/root"));
         assert_eq!(registry.resolve(file, "nonexistent"), None);
     }
@@ -356,7 +438,7 @@ mod tests {
     #[test]
     fn test_substitute_in_path() {
         let registry = AttributeRegistry::new(Path::new("/project/docs"));
-        let file = Path::new("any.adoc");
+        let file = Path::new("/project/docs/any.adoc");
         let result = registry.substitute(file, "{docdir}/file.adoc");
         assert_eq!(result, "/project/docs/file.adoc");
     }
@@ -364,12 +446,12 @@ mod tests {
     #[test]
     fn test_substitute_undefined_attr() {
         let registry = AttributeRegistry::new(Path::new("/tmp"));
-        let file = Path::new("any.adoc");
+        let file = Path::new("/tmp/any.adoc");
         let result = registry.substitute(file, "{unknown}/path");
         assert_eq!(result, "{unknown}/path");
     }
 
-    // --- Task 1.1: resolve_source() tests ---
+    // --- resolve_source() tests ---
 
     #[test]
     fn test_resolve_source_doc_header() {
@@ -390,72 +472,66 @@ mod tests {
     #[test]
     fn test_resolve_source_config() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(
-            tmp.path().join(".asciidoctorconfig"),
-            ":imagesdir: images\n",
-        )
-        .unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
 
-        let mut registry = AttributeRegistry::new(tmp.path());
-        registry.load_config(tmp.path());
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
 
-        let dummy = Path::new("any.adoc");
-        let source = registry.resolve_source(dummy, "imagesdir").unwrap();
-        let config_path = tmp
-            .path()
-            .join(".asciidoctorconfig")
-            .canonicalize()
-            .unwrap();
-        assert_eq!(source.file, config_path);
+        let dummy = root.join("any.adoc");
+        let source = registry.resolve_source(&dummy, "imagesdir").unwrap();
+        assert_eq!(source.file, root.join(".asciidoctorconfig"));
         assert_eq!(source.line, 1);
     }
 
     #[test]
     fn test_resolve_source_builtin() {
         let registry = AttributeRegistry::new(Path::new("/tmp"));
-        let dummy = Path::new("any.adoc");
-        // Builtins have no source location
+        let dummy = Path::new("/tmp/any.adoc");
         assert!(registry.resolve_source(dummy, "docdir").is_none());
     }
 
-    // --- Task 1.1: all_attributes() tests ---
+    // --- all_attributes() tests ---
 
     #[test]
     fn test_all_attributes_merges_layers() {
-        let mut registry = AttributeRegistry::new(Path::new("/root"));
-        // Config layer
-        registry.config.insert(
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        // Config layer via config_chains
+        let mut config_map = HashMap::new();
+        config_map.insert(
             "imagesdir".into(),
             AttributeEntry {
                 value: "images".into(),
                 source: None,
             },
         );
+        registry.config_chains.insert(root.clone(), config_map);
+
         // Per-file layer
-        let file = Path::new("/root/doc.adoc");
+        let file = root.join("doc.adoc");
         let attrs = vec![
             AttributeDef {
                 name: "author".into(),
                 value: "Alice".into(),
                 line: 1,
             },
-            // Override config key
             AttributeDef {
                 name: "imagesdir".into(),
                 value: "img".into(),
                 line: 2,
             },
         ];
-        registry.register_file_attributes(file, &attrs);
+        registry.register_file_attributes(&file, &attrs);
 
-        let all = registry.all_attributes(file);
+        let all = registry.all_attributes(&file);
         let map: HashMap<&str, &str> = all.into_iter().collect();
 
-        // Builtin present
-        assert_eq!(map.get("docdir"), Some(&"/root"));
-        // Per-file overrides config
+        let root_str = root.display().to_string();
+        assert_eq!(map.get("docdir"), Some(&root_str.as_str()));
         assert_eq!(map.get("imagesdir"), Some(&"img"));
-        // Per-file attribute present
         assert_eq!(map.get("author"), Some(&"Alice"));
     }
 
@@ -464,8 +540,9 @@ mod tests {
     #[test]
     fn test_asciidoctorconfigdir_injected() {
         let tmp = tempfile::tempdir().unwrap();
-        let docs = tmp.path().join("project").join("docs");
-        let src = tmp.path().join("project").join("src");
+        let root = tmp.path().canonicalize().unwrap();
+        let docs = root.join("project").join("docs");
+        let src = root.join("project").join("src");
         fs::create_dir_all(&docs).unwrap();
         fs::create_dir_all(&src).unwrap();
 
@@ -476,26 +553,25 @@ mod tests {
         .unwrap();
 
         let mut registry = AttributeRegistry::new(&docs);
-        registry.load_config(&docs);
+        registry.ensure_config_for_dir(&docs);
 
-        let dummy = Path::new("any.adoc");
-        let canonical_docs = docs.canonicalize().unwrap();
-        let canonical_src = src.canonicalize().unwrap();
+        let dummy = docs.join("any.adoc");
 
         assert_eq!(
-            registry.resolve(dummy, "asciidoctorconfigdir"),
-            Some(canonical_docs.display().to_string()).as_deref()
+            registry.resolve(&dummy, "asciidoctorconfigdir"),
+            Some(docs.display().to_string()).as_deref()
         );
         assert_eq!(
-            registry.resolve(dummy, "source-dir"),
-            Some(canonical_src.display().to_string()).as_deref()
+            registry.resolve(&dummy, "source-dir"),
+            Some(src.display().to_string()).as_deref()
         );
     }
 
     #[test]
     fn test_asciidoctorconfigdir_hierarchy() {
         let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("parent");
+        let root = tmp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
         let child = parent.join("child");
         fs::create_dir_all(&child).unwrap();
 
@@ -510,28 +586,68 @@ mod tests {
         )
         .unwrap();
 
-        let mut registry = AttributeRegistry::new(&child);
-        registry.load_config(&child);
+        // workspace_root = parent so walk covers parent → child
+        let mut registry = AttributeRegistry::new(&parent);
+        registry.ensure_config_for_dir(&child);
 
-        let dummy = Path::new("any.adoc");
-        let canonical_parent = parent.canonicalize().unwrap();
-        let canonical_child = child.canonicalize().unwrap();
+        let dummy = child.join("any.adoc");
 
-        // parent-dir uses parent's {asciidoctorconfigdir}
         assert_eq!(
-            registry.resolve(dummy, "parent-dir"),
-            Some(format!("{}/data", canonical_parent.display())).as_deref()
+            registry.resolve(&dummy, "parent-dir"),
+            Some(format!("{}/data", parent.display())).as_deref()
         );
-        // child-dir uses child's {asciidoctorconfigdir}
         assert_eq!(
-            registry.resolve(dummy, "child-dir"),
-            Some(format!("{}/output", canonical_child.display())).as_deref()
+            registry.resolve(&dummy, "child-dir"),
+            Some(format!("{}/output", child.display())).as_deref()
         );
-        // Final {asciidoctorconfigdir} is the leaf config's dir
         assert_eq!(
-            registry.resolve(dummy, "asciidoctorconfigdir"),
-            Some(canonical_child.display().to_string()).as_deref()
+            registry.resolve(&dummy, "asciidoctorconfigdir"),
+            Some(child.display().to_string()).as_deref()
         );
+    }
+
+    // --- substitute_with() tests ---
+
+    #[test]
+    fn test_substitute_with_basic() {
+        let mut attrs: HashMap<String, AttributeEntry> = HashMap::new();
+        attrs.insert(
+            "imagesdir".into(),
+            AttributeEntry {
+                value: "images".into(),
+                source: None,
+            },
+        );
+        let result = substitute_with(&attrs, "path/{imagesdir}/file.png");
+        assert_eq!(result, "path/images/file.png");
+    }
+
+    #[test]
+    fn test_substitute_with_chained() {
+        let mut attrs: HashMap<String, AttributeEntry> = HashMap::new();
+        attrs.insert(
+            "base".into(),
+            AttributeEntry {
+                value: "/root".into(),
+                source: None,
+            },
+        );
+        attrs.insert(
+            "sub".into(),
+            AttributeEntry {
+                value: "docs".into(),
+                source: None,
+            },
+        );
+        let result = substitute_with(&attrs, "{base}/{sub}/index.adoc");
+        assert_eq!(result, "/root/docs/index.adoc");
+    }
+
+    #[test]
+    fn test_substitute_with_unknown_attr() {
+        let attrs: HashMap<String, AttributeEntry> = HashMap::new();
+        let result = substitute_with(&attrs, "{unknown}/path");
+        assert_eq!(result, "{unknown}/path");
     }
 
     #[test]
@@ -541,8 +657,71 @@ mod tests {
         let all = registry.all_attributes(file);
         let map: HashMap<&str, &str> = all.into_iter().collect();
 
-        // Only builtin docdir
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("docdir"), Some(&"/tmp"));
+    }
+
+    // --- Review Corrections: Edge Case Tests ---
+
+    #[test]
+    fn test_ensure_config_for_dir_file_in_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":theme: dark\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+
+        let file = root.join("index.adoc");
+        assert_eq!(registry.resolve(&file, "theme"), Some("dark"));
+    }
+
+    #[test]
+    fn test_ensure_config_for_dir_empty_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        // No .asciidoctorconfig anywhere
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&sub);
+
+        let file = sub.join("doc.adoc");
+        // Only builtin should be available
+        assert_eq!(
+            registry.resolve(&file, "docdir"),
+            Some(root.display().to_string()).as_deref()
+        );
+        assert_eq!(registry.resolve(&file, "imagesdir"), None);
+    }
+
+    #[test]
+    fn test_ensure_config_for_dir_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":key: value\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        registry.ensure_config_for_dir(&root); // second call — idempotent
+
+        let file = root.join("doc.adoc");
+        assert_eq!(registry.resolve(&file, "key"), Some("value"));
+    }
+
+    #[test]
+    fn test_ensure_config_for_dir_outside_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let inside = root.join("inside");
+        fs::create_dir_all(&inside).unwrap();
+
+        let mut registry = AttributeRegistry::new(&inside);
+        // root is outside workspace_root (which is inside/)
+        registry.ensure_config_for_dir(&root);
+
+        // Should not have cached anything for root
+        assert!(!registry.config_chains.contains_key(&root));
     }
 }

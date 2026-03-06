@@ -1155,7 +1155,7 @@ mod tests {
         std::fs::write(&doc_file, "= Index\n").unwrap();
 
         let mut attrs = AttributeRegistry::new(dir.path());
-        attrs.load_config(dir.path());
+        attrs.ensure_config_for_dir(dir.path());
 
         let ws = Workspace {
             root: dir.path().to_path_buf(),
@@ -1233,35 +1233,35 @@ mod tests {
     use asciidoc_core::types::AttributeDef;
 
     /// Helper: build a Workspace with config (.asciidoctorconfig) + per-file attributes.
+    /// Returns (tempdir, workspace, file_path) — file_path is under the tempdir.
     fn ws_with_config_and_file_attrs(
         config_content: &str,
-        file: &Path,
         file_attrs: Vec<AttributeDef>,
-    ) -> (TempDir, Workspace) {
+    ) -> (TempDir, Workspace, PathBuf) {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join(".asciidoctorconfig"), config_content).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join(".asciidoctorconfig"), config_content).unwrap();
 
-        let mut attrs = AttributeRegistry::new(dir.path());
-        attrs.load_config(dir.path());
-        attrs.register_file_attributes(file, &file_attrs);
+        let file = root.join("doc.adoc");
+        let mut attrs = AttributeRegistry::new(&root);
+        attrs.ensure_config_for_dir(&root);
+        attrs.register_file_attributes(&file, &file_attrs);
 
         let ws = Workspace {
-            root: dir.path().to_path_buf(),
+            root: root.clone(),
             attributes: attrs,
             include_graph: IncludeGraph::new(),
             reference_index: ReferenceIndex::new(),
             documents: HashMap::new(),
             diagnostics: Vec::new(),
         };
-        (dir, ws)
+        (dir, ws, file)
     }
 
     #[test]
     fn test_attribute_completions_basic() {
-        let file = PathBuf::from("/tmp/doc.adoc");
-        let (_dir, ws) = ws_with_config_and_file_attrs(
+        let (_dir, ws, file) = ws_with_config_and_file_attrs(
             ":imagesdir: images\n",
-            &file,
             vec![AttributeDef {
                 name: "author".into(),
                 value: "Alice".into(),
@@ -1293,10 +1293,8 @@ mod tests {
 
     #[test]
     fn test_attribute_completions_prefix_filter() {
-        let file = PathBuf::from("/tmp/doc.adoc");
-        let (_dir, ws) = ws_with_config_and_file_attrs(
+        let (_dir, ws, file) = ws_with_config_and_file_attrs(
             ":imagesdir: images\n",
-            &file,
             vec![AttributeDef {
                 name: "author".into(),
                 value: "Alice".into(),
@@ -1354,10 +1352,8 @@ mod tests {
 
     #[test]
     fn test_resolve_completions_attribute() {
-        let file = PathBuf::from("/tmp/doc.adoc");
-        let (_dir, ws) = ws_with_config_and_file_attrs(
+        let (_dir, ws, file) = ws_with_config_and_file_attrs(
             ":imagesdir: images\n",
-            &file,
             vec![AttributeDef {
                 name: "author".into(),
                 value: "Alice".into(),

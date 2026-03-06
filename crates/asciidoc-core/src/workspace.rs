@@ -36,10 +36,6 @@ impl Workspace {
     /// Returns an error if the workspace cannot be constructed (currently infallible).
     pub fn build(root: &Path, entry: &Path) -> Result<Self> {
         let mut registry = AttributeRegistry::new(root);
-        // Load config from entry file's directory upward — .asciidoctorconfig
-        // typically lives next to the main document, not at the workspace root.
-        let config_start = entry.parent().unwrap_or(root);
-        registry.load_config(config_start);
         let (graph, documents) = build_graph(entry, &mut registry);
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diagnostics = collect_diagnostics(&documents, &graph, &ref_index, &registry);
@@ -168,8 +164,6 @@ impl Workspace {
         overrides: &HashMap<PathBuf, String>,
     ) -> Result<Self> {
         let mut registry = AttributeRegistry::new(root);
-        let config_start = entry.parent().unwrap_or(root);
-        registry.load_config(config_start);
         let (graph, documents) = build_graph_with_overrides(entry, &mut registry, overrides);
         let ref_index = ReferenceIndex::build(&documents, &registry);
         let diagnostics = collect_diagnostics(&documents, &graph, &ref_index, &registry);
@@ -423,5 +417,120 @@ mod tests {
 
         assert_eq!(ws.documents.len(), 2);
         assert!(ws.reference_index.anchors.contains_key("my-anchor"));
+    }
+
+    // --- adoc-0067 Phase 3: Sibling config integration tests ---
+
+    #[test]
+    fn test_sibling_dirs_get_separate_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let docs = root.join("docs");
+        let tests_dir = root.join("tests");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&tests_dir).unwrap();
+
+        fs::write(root.join(".asciidoctorconfig"), ":root-attr: root-value\n").unwrap();
+        fs::write(docs.join(".asciidoctorconfig"), ":docs-attr: docs-value\n").unwrap();
+        fs::write(
+            tests_dir.join(".asciidoctorconfig"),
+            ":tests-attr: tests-value\n",
+        )
+        .unwrap();
+
+        let main_adoc = docs.join("main.adoc");
+        let test_adoc = tests_dir.join("test.adoc");
+        fs::write(&main_adoc, "= Main Doc\n\ninclude::../tests/test.adoc[]\n").unwrap();
+        fs::write(&test_adoc, "== Test Chapter\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(&root, &main_adoc).unwrap();
+
+        let main_canon = main_adoc.canonicalize().unwrap();
+        let test_canon = test_adoc.canonicalize().unwrap();
+
+        // docs/main.adoc: has root-attr and docs-attr, but NOT tests-attr
+        assert_eq!(
+            ws.attributes.resolve(&main_canon, "root-attr"),
+            Some("root-value")
+        );
+        assert_eq!(
+            ws.attributes.resolve(&main_canon, "docs-attr"),
+            Some("docs-value")
+        );
+        assert_eq!(ws.attributes.resolve(&main_canon, "tests-attr"), None);
+
+        // tests/test.adoc: has root-attr and tests-attr, but NOT docs-attr
+        assert_eq!(
+            ws.attributes.resolve(&test_canon, "root-attr"),
+            Some("root-value")
+        );
+        assert_eq!(
+            ws.attributes.resolve(&test_canon, "tests-attr"),
+            Some("tests-value")
+        );
+        assert_eq!(ws.attributes.resolve(&test_canon, "docs-attr"), None);
+    }
+
+    #[test]
+    fn test_child_config_overrides_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":shared-attr: root-value\n",
+        )
+        .unwrap();
+        fs::write(sub.join(".asciidoctorconfig"), ":shared-attr: sub-value\n").unwrap();
+
+        let entry = sub.join("file.adoc");
+        fs::write(&entry, "= Sub Doc\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(&root, &entry).unwrap();
+        let entry_canon = entry.canonicalize().unwrap();
+
+        // Child config wins (last-wins merge)
+        assert_eq!(
+            ws.attributes.resolve(&entry_canon, "shared-attr"),
+            Some("sub-value")
+        );
+    }
+
+    #[test]
+    fn test_asciidoctorconfigdir_per_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":imagesdir: {asciidoctorconfigdir}/images\n",
+        )
+        .unwrap();
+        fs::write(
+            sub.join(".asciidoctorconfig"),
+            ":sourcedir: {asciidoctorconfigdir}/src\n",
+        )
+        .unwrap();
+
+        let entry = sub.join("file.adoc");
+        fs::write(&entry, "= Sub Doc\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(&root, &entry).unwrap();
+        let entry_canon = entry.canonicalize().unwrap();
+
+        // imagesdir uses root's {asciidoctorconfigdir} → workspace/images
+        assert_eq!(
+            ws.attributes.resolve(&entry_canon, "imagesdir"),
+            Some(format!("{}/images", root.display())).as_deref()
+        );
+        // sourcedir uses sub's {asciidoctorconfigdir} → workspace/sub/src
+        assert_eq!(
+            ws.attributes.resolve(&entry_canon, "sourcedir"),
+            Some(format!("{}/src", sub.display())).as_deref()
+        );
     }
 }
