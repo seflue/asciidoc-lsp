@@ -324,7 +324,7 @@ fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref
         // Filter out keyword tokens: the inline grammar also produces `xref` nodes
         // inside `word > macro_name > xref` when "xref" appears as plain text.
         let text = node.utf8_text(source).unwrap_or_default();
-        if text.starts_with("<<") {
+        if text.starts_with("<<") && text.ends_with(">>") {
             let inner = text.trim_start_matches("<<").trim_end_matches(">>");
             let (target, display) = match inner.split_once(',') {
                 Some((t, d)) => (t.trim().to_string(), Some(d.trim().to_string())),
@@ -718,6 +718,36 @@ mod tests {
         let source = "endif::attr[]\n";
         let result = extract_conditionals(source);
         assert!(result.is_empty(), "endif must be ignored, got: {result:?}");
+    }
+
+    #[test]
+    fn test_xref_pagebreak_not_detected() {
+        // <<< is a page break, not a cross-reference
+        let mut p = parser::init_inline_parser().unwrap();
+        let source = "<<<";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let xrefs = extract_xrefs(tree.root_node(), source.as_bytes());
+
+        assert!(
+            xrefs.is_empty(),
+            "Page break <<< must not be detected as xref, got: {:?}",
+            xrefs
+        );
+    }
+
+    #[test]
+    fn test_xref_incomplete_not_detected() {
+        // <<id without closing >> must not produce a xref
+        let mut p = parser::init_inline_parser().unwrap();
+        let source = "<<some-id";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let xrefs = extract_xrefs(tree.root_node(), source.as_bytes());
+
+        assert!(
+            xrefs.is_empty(),
+            "Incomplete xref <<id without >> must not be detected, got: {:?}",
+            xrefs
+        );
     }
 
     #[test]

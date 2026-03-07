@@ -444,7 +444,7 @@ fn classify_inline_node(
             }
             "xref" => {
                 let text = n.utf8_text(source).unwrap_or_default();
-                if text.starts_with("<<") {
+                if text.starts_with("<<") && text.ends_with(">>") {
                     let inner = text.trim_start_matches("<<").trim_end_matches(">>");
                     let target = match inner.split_once(',') {
                         Some((t, _)) => t.trim().to_string(),
@@ -1124,6 +1124,23 @@ mod tests {
         let pos = Position {
             line: 2,
             character: 8,
+        };
+
+        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    #[test]
+    fn test_goto_def_pagebreak_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n\n<<<\n\nSome content.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        // cursor on the page break line
+        let pos = Position {
+            line: 2,
+            character: 1,
         };
 
         assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
