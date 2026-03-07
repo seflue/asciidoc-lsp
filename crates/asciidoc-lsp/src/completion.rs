@@ -224,6 +224,8 @@ pub(crate) enum CompletionContext {
     Xref { prefix: String },
     /// `include::prefix` — include path completion
     IncludePath { prefix: String },
+    /// `image::prefix` — image path completion
+    ImagePath { prefix: String },
     /// `{prefix` — attribute reference (open brace, not yet closed)
     Attribute { prefix: String },
     /// `ima` at line start — block macro completion
@@ -255,7 +257,7 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     let col = byte_col.min(line_str.len());
     let before_cursor = &line_str[..col];
 
-    // Priority 1: include:: (longest trigger)
+    // Priority 1a: include:: (longest trigger)
     if let Some(idx) = before_cursor.rfind("include::") {
         let prefix_start = idx + "include::".len();
         let prefix = &before_cursor[prefix_start..];
@@ -273,6 +275,49 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         return Some(CompletionContext::IncludePath {
             prefix: prefix.to_string(),
         });
+    }
+
+    // Priority 1b: image:: (block image path)
+    if let Some(idx) = before_cursor.rfind("image::") {
+        let prefix_start = idx + "image::".len();
+        let prefix = &before_cursor[prefix_start..];
+        // If [ appears, the macro is already closed — no completion
+        if !prefix.contains('[') {
+            if let Some(brace_pos) = prefix.rfind('{') {
+                let after_brace = &prefix[brace_pos + 1..];
+                if !after_brace.contains('}') {
+                    return Some(CompletionContext::Attribute {
+                        prefix: after_brace.to_string(),
+                    });
+                }
+            }
+            return Some(CompletionContext::ImagePath {
+                prefix: prefix.to_string(),
+            });
+        }
+    }
+
+    // Priority 1c: image: (inline image path — single colon)
+    // Must come after 1b so that image:: is matched first.
+    if let Some(idx) = before_cursor.rfind("image:") {
+        let after_match = &before_cursor[idx + "image:".len()..];
+        // Guard: if the char right after "image:" is ':', this is image:: (Priority 1b)
+        if !after_match.starts_with(':') {
+            let prefix = after_match;
+            if !prefix.contains('[') {
+                if let Some(brace_pos) = prefix.rfind('{') {
+                    let after_brace = &prefix[brace_pos + 1..];
+                    if !after_brace.contains('}') {
+                        return Some(CompletionContext::Attribute {
+                            prefix: after_brace.to_string(),
+                        });
+                    }
+                }
+                return Some(CompletionContext::ImagePath {
+                    prefix: prefix.to_string(),
+                });
+            }
+        }
     }
 
     // Priority 2: xref: (long-form cross-reference)
@@ -531,6 +576,101 @@ pub fn resolve_include_completions(
     items
 }
 
+/// Image file extensions for completion filtering.
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "tif", "ico",
+];
+
+/// Resolve image path completions by listing image files from the document's
+/// `imagesdir` directory, filtered by the typed prefix.
+///
+/// Base directory is `doc_dir / imagesdir` (unlike include completions which
+/// use `doc_dir` directly). Only files with image extensions are listed.
+pub fn resolve_image_completions(
+    prefix: &str,
+    doc_path: &Path,
+    ws: Option<&Workspace>,
+) -> Vec<CompletionItem> {
+    let doc_dir = doc_path.parent().unwrap_or(doc_path);
+
+    // Resolve imagesdir from config chain
+    let imagesdir_raw = ws
+        .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
+        .unwrap_or("");
+    let imagesdir = match ws {
+        Some(ws) => ws.attributes.substitute(doc_path, imagesdir_raw),
+        None => imagesdir_raw.to_string(),
+    };
+    let base = if imagesdir.is_empty() {
+        doc_dir.to_path_buf()
+    } else {
+        doc_dir.join(&imagesdir)
+    };
+
+    // Attribute substitution in user-typed prefix
+    let resolved_prefix = match ws {
+        Some(ws) => ws.attributes.substitute(doc_path, prefix),
+        None => prefix.to_string(),
+    };
+
+    if resolved_prefix.contains('{') {
+        return Vec::new();
+    }
+
+    // Split prefix for insert vs. filesystem lookup
+    let (original_dir_prefix, _) = match prefix.rfind('/') {
+        Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
+        None => ("", prefix),
+    };
+    let (resolved_dir, filter) = match resolved_prefix.rfind('/') {
+        Some(idx) => (&resolved_prefix[..=idx], &resolved_prefix[idx + 1..]),
+        None => ("", resolved_prefix.as_str()),
+    };
+
+    let list_dir = base.join(resolved_dir);
+
+    let Ok(entries) = std::fs::read_dir(&list_dir) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<CompletionItem> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+
+            if path.is_dir() {
+                let dir_name = format!("{name}/");
+                if !dir_name.starts_with(filter) && !name.starts_with(filter) {
+                    return None;
+                }
+                Some(CompletionItem {
+                    label: dir_name.clone(),
+                    kind: Some(CompletionItemKind::FOLDER),
+                    insert_text: Some(format!("{original_dir_prefix}{dir_name}")),
+                    ..Default::default()
+                })
+            } else {
+                let is_image = Path::new(&name).extension().is_some_and(|ext| {
+                    IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+                });
+                if !is_image || !name.starts_with(filter) {
+                    return None;
+                }
+                Some(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::FILE),
+                    insert_text: Some(format!("{original_dir_prefix}{name}[]")),
+                    ..Default::default()
+                })
+            }
+        })
+        .collect();
+
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items
+}
+
 /// Resolve attribute completions by listing all attributes from the workspace's
 /// `AttributeRegistry`, filtered by prefix.
 ///
@@ -674,6 +814,7 @@ pub(crate) fn resolve_completions(
         CompletionContext::IncludePath { prefix } => {
             resolve_include_completions(&prefix, doc_path, ws)
         }
+        CompletionContext::ImagePath { prefix } => resolve_image_completions(&prefix, doc_path, ws),
         CompletionContext::Attribute { prefix } => {
             resolve_attribute_completions(&prefix, doc_path, ws)
         }
@@ -1969,5 +2110,291 @@ mod tests {
         check(ADMONITIONS, "ADMONITIONS");
         check(DOC_ATTRIBUTES, "DOC_ATTRIBUTES");
         check(INLINE_MACROS, "INLINE_MACROS");
+    }
+
+    // -----------------------------------------------------------------------
+    // image:: path detection (Task 1.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_image_path_basic() {
+        let content = "image::foto";
+        let pos = Position {
+            line: 0,
+            character: 11,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath {
+                prefix: "foto".into()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_image_path_empty() {
+        let content = "image::";
+        let pos = Position {
+            line: 0,
+            character: 7,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath { prefix: "".into() })
+        );
+    }
+
+    #[test]
+    fn test_detect_image_path_subdir() {
+        let content = "image::sub/foto";
+        let pos = Position {
+            line: 0,
+            character: 15,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath {
+                prefix: "sub/foto".into()
+            })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // image:: attribute delegation (Task 1.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_image_path_attr_ref() {
+        // image::{doc — open brace without closing } → attribute completion
+        let content = "image::{doc";
+        let pos = Position {
+            line: 0,
+            character: 11,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::Attribute {
+                prefix: "doc".into()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_image_path_resolved_attr() {
+        // image::{docdir}/foto — attribute is closed → ImagePath
+        let content = "image::{docdir}/foto";
+        let pos = Position {
+            line: 0,
+            character: 20,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath {
+                prefix: "{docdir}/foto".into()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_image_path_with_bracket() {
+        // Once [ is typed, the macro is closed — no completion
+        let content = "image::foto.png[";
+        let pos = Position {
+            line: 0,
+            character: 16,
+        };
+        assert_eq!(detect_completion_context(content, pos), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // inline image: detection (Task 3.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_inline_image_path() {
+        // image: (single colon) in running text
+        let content = "text image:foto";
+        let pos = Position {
+            line: 0,
+            character: 15,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath {
+                prefix: "foto".into()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_inline_image_empty() {
+        let content = "text image:";
+        let pos = Position {
+            line: 0,
+            character: 11,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath { prefix: "".into() })
+        );
+    }
+
+    #[test]
+    fn test_detect_inline_image_with_bracket() {
+        // Once [ is typed, the macro is closed — no completion
+        let content = "image:foto.png[";
+        let pos = Position {
+            line: 0,
+            character: 15,
+        };
+        assert_eq!(detect_completion_context(content, pos), None);
+    }
+
+    #[test]
+    fn test_detect_inline_image_attr_ref() {
+        // image:{doc — open brace without closing } → attribute completion
+        let content = "image:{doc";
+        let pos = Position {
+            line: 0,
+            character: 10,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::Attribute {
+                prefix: "doc".into()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_block_image_not_matched_by_inline() {
+        // image:: (double colon) must still be matched by Priority 1b, not 1c
+        let content = "image::foto";
+        let pos = Position {
+            line: 0,
+            character: 11,
+        };
+        assert_eq!(
+            detect_completion_context(content, pos),
+            Some(CompletionContext::ImagePath {
+                prefix: "foto".into()
+            })
+        );
+    }
+
+    // --- Image Path Resolution (Task 2.1) ---
+
+    #[test]
+    fn test_resolve_image_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let doc_file = dir.path().join("doc.adoc");
+        let items = resolve_image_completions("", &doc_file, None);
+        assert!(items.is_empty(), "empty dir should yield no completions");
+    }
+
+    #[test]
+    fn test_resolve_image_lists_images() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("foto.png"), b"").unwrap();
+        std::fs::write(dir.path().join("diag.svg"), b"").unwrap();
+        std::fs::write(dir.path().join("readme.txt"), b"").unwrap();
+        let doc_file = dir.path().join("doc.adoc");
+
+        let items = resolve_image_completions("", &doc_file, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"foto.png"),
+            "missing foto.png in {labels:?}"
+        );
+        assert!(
+            labels.contains(&"diag.svg"),
+            "missing diag.svg in {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"readme.txt"),
+            "readme.txt should be filtered out"
+        );
+        // insert_text appends []
+        let png_item = items.iter().find(|i| i.label == "foto.png").unwrap();
+        assert_eq!(png_item.insert_text.as_ref().unwrap(), "foto.png[]");
+        assert_eq!(png_item.kind, Some(CompletionItemKind::FILE));
+    }
+
+    #[test]
+    fn test_resolve_image_with_imagesdir() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
+        let images_dir = root.join("images");
+        std::fs::create_dir(&images_dir).unwrap();
+        std::fs::write(images_dir.join("logo.png"), b"").unwrap();
+        std::fs::write(images_dir.join("banner.jpg"), b"").unwrap();
+
+        let file = root.join("doc.adoc");
+        let mut attrs = AttributeRegistry::new(&root);
+        attrs.ensure_config_for_dir(&root);
+        let ws = Workspace {
+            root: root.clone(),
+            attributes: attrs,
+            include_graph: IncludeGraph::new(),
+            reference_index: ReferenceIndex::new(),
+            documents: HashMap::new(),
+            diagnostics: HashMap::new(),
+        };
+
+        let items = resolve_image_completions("", &file, Some(&ws));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"banner.jpg"),
+            "missing banner.jpg in {labels:?}"
+        );
+        assert!(
+            labels.contains(&"logo.png"),
+            "missing logo.png in {labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_subdir_prefix() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("icon.gif"), b"").unwrap();
+        let doc_file = dir.path().join("doc.adoc");
+
+        let items = resolve_image_completions("sub/", &doc_file, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "icon.gif");
+        assert_eq!(items[0].insert_text.as_ref().unwrap(), "sub/icon.gif[]");
+    }
+
+    #[test]
+    fn test_resolve_image_prefix_filter() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("foto.png"), b"").unwrap();
+        std::fs::write(dir.path().join("diagram.svg"), b"").unwrap();
+        let doc_file = dir.path().join("doc.adoc");
+
+        let items = resolve_image_completions("foto", &doc_file, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "foto.png");
+    }
+
+    // --- Image Path Dispatch (Task 2.2) ---
+
+    #[test]
+    fn test_resolve_image_no_imagesdir() {
+        // ImagePath without workspace → lists relative to document
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("screenshot.png"), b"").unwrap();
+        let doc_file = dir.path().join("doc.adoc");
+
+        let ctx = CompletionContext::ImagePath { prefix: "".into() };
+        let items = resolve_completions(ctx, &doc_file, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"screenshot.png"),
+            "missing screenshot.png in {labels:?}"
+        );
     }
 }
