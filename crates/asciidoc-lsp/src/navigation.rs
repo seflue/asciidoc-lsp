@@ -2340,6 +2340,64 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert!(resolve_hover(content, pos, Path::new("test.adoc"), None).is_none());
     }
 
+    #[test]
+    fn test_hover_asciidoctorconfigdir_in_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".asciidoctorconfig");
+        fs::write(&config, ":source-dir: {asciidoctorconfigdir}/../src\n").unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let content = fs::read_to_string(&config).unwrap();
+        // Cursor on {asciidoctorconfigdir} — starts at col 13
+        let pos = Position {
+            line: 0,
+            character: 14,
+        };
+
+        let hover = resolve_hover(&content, pos, &config, Some(&ws));
+        assert!(
+            hover.is_some(),
+            "Should resolve asciidoctorconfigdir in .asciidoctorconfig"
+        );
+        let text = hover.unwrap();
+        assert!(
+            text.contains(":asciidoctorconfigdir:"),
+            "Should show attribute name, got: {text}"
+        );
+    }
+
+    /// Regression: hover must work even when doc_path is not canonicalized
+    /// (LSP handler passes raw URI path, but config_chains keys are canonical).
+    #[test]
+    fn test_hover_asciidoctorconfigdir_non_canonical_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_root = tmp.path().canonicalize().unwrap();
+        let config = canonical_root.join(".asciidoctorconfig");
+        fs::write(&config, ":source-dir: {asciidoctorconfigdir}/../src\n").unwrap();
+        let a = canonical_root.join("a.adoc");
+        fs::write(&a, "= Doc\n").unwrap();
+
+        let ws = Workspace::build(&canonical_root, &a).unwrap();
+        let content = fs::read_to_string(&config).unwrap();
+
+        // Simulate non-canonical path (as LSP hover handler would pass it):
+        // insert a /./  segment to break exact key match
+        let non_canonical_config = canonical_root.join(".").join(".asciidoctorconfig");
+
+        let pos = Position {
+            line: 0,
+            character: 14,
+        };
+
+        let hover = resolve_hover(&content, pos, &non_canonical_config, Some(&ws));
+        assert!(
+            hover.is_some(),
+            "Should resolve asciidoctorconfigdir even with non-canonical doc_path"
+        );
+    }
+
     // --- adoc-0033: image tests (unchanged) ---
 
     #[test]

@@ -77,38 +77,41 @@ impl AttributeRegistry {
         // First: load ~/.asciidoctorconfig from home dir (lowest priority in chain)
         let mut merged: HashMap<String, AttributeEntry> = HashMap::new();
         if let Some(home_dir) = std::env::var("HOME").ok().map(PathBuf::from) {
-            let home_config = home_dir.join(".asciidoctorconfig");
-            if let Ok(content) = std::fs::read_to_string(&home_config) {
-                let canonical_home = home_dir.canonicalize().unwrap_or(home_dir);
-                merged.insert(
-                    "asciidoctorconfigdir".into(),
-                    AttributeEntry {
-                        value: canonical_home.display().to_string(),
-                        source: Some(AttributeSource {
-                            file: home_config.clone(),
-                            line: 0,
-                        }),
-                    },
-                );
-                for (key, value, line) in parse_asciidoctorconfig(&content) {
-                    let substituted = substitute_with(&merged, &value);
-                    let resolved = canonicalize_path_value(&substituted, &canonical_home);
+            if let Some(home_config) = find_config_file(&home_dir) {
+                if let Ok(content) = std::fs::read_to_string(&home_config) {
+                    let canonical_home = home_dir.canonicalize().unwrap_or(home_dir);
                     merged.insert(
-                        key,
+                        "asciidoctorconfigdir".into(),
                         AttributeEntry {
-                            value: resolved,
+                            value: canonical_home.display().to_string(),
                             source: Some(AttributeSource {
                                 file: home_config.clone(),
-                                line,
+                                line: 0,
                             }),
                         },
                     );
+                    for (key, value, line) in parse_asciidoctorconfig(&content) {
+                        let substituted = substitute_with(&merged, &value);
+                        let resolved = canonicalize_path_value(&substituted, &canonical_home);
+                        merged.insert(
+                            key,
+                            AttributeEntry {
+                                value: resolved,
+                                source: Some(AttributeSource {
+                                    file: home_config.clone(),
+                                    line,
+                                }),
+                            },
+                        );
+                    }
                 }
             }
         }
 
         for chain_dir in &chain_dirs {
-            let config_path = chain_dir.join(".asciidoctorconfig");
+            let Some(config_path) = find_config_file(chain_dir) else {
+                continue;
+            };
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
                 merged.insert(
@@ -300,6 +303,22 @@ fn substitute_with(attrs: &HashMap<String, AttributeEntry>, input: &str) -> Stri
     }
 
     result
+}
+
+/// Find the `.asciidoctorconfig` file in a directory.
+///
+/// Asciidoctor recognizes both `.asciidoctorconfig` and `.asciidoctorconfig.adoc`.
+/// The shorter name takes priority (same as Asciidoctor).
+fn find_config_file(dir: &Path) -> Option<PathBuf> {
+    let plain = dir.join(".asciidoctorconfig");
+    if plain.is_file() {
+        return Some(plain);
+    }
+    let with_ext = dir.join(".asciidoctorconfig.adoc");
+    if with_ext.is_file() {
+        return Some(with_ext);
+    }
+    None
 }
 
 /// Parse :key: value lines from an .asciidoctorconfig file.
@@ -600,6 +619,60 @@ mod tests {
         assert_eq!(
             registry.resolve(&dummy, "source-dir"),
             Some(src.display().to_string()).as_deref()
+        );
+    }
+
+    #[test]
+    fn test_asciidoctorconfig_adoc_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let docs = root.join("project").join("docs");
+        let src = root.join("project").join("src");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&src).unwrap();
+
+        // Use .asciidoctorconfig.adoc (with extension) instead of .asciidoctorconfig
+        fs::write(
+            docs.join(".asciidoctorconfig.adoc"),
+            ":source-dir: {asciidoctorconfigdir}/../src\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(&docs);
+        registry.ensure_config_for_dir(&docs);
+
+        let dummy = docs.join("any.adoc");
+
+        assert_eq!(
+            registry.resolve(&dummy, "asciidoctorconfigdir"),
+            Some(docs.display().to_string()).as_deref(),
+            ".asciidoctorconfig.adoc should be recognized"
+        );
+        assert_eq!(
+            registry.resolve(&dummy, "source-dir"),
+            Some(src.display().to_string()).as_deref(),
+            "Attributes from .asciidoctorconfig.adoc should be resolved"
+        );
+    }
+
+    #[test]
+    fn test_asciidoctorconfig_plain_takes_priority_over_adoc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(&root).unwrap();
+
+        // Both files exist — plain should win
+        fs::write(root.join(".asciidoctorconfig"), ":source: plain\n").unwrap();
+        fs::write(root.join(".asciidoctorconfig.adoc"), ":source: adoc\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+
+        let dummy = root.join("any.adoc");
+        assert_eq!(
+            registry.resolve(&dummy, "source"),
+            Some("plain"),
+            ".asciidoctorconfig (without extension) should take priority"
         );
     }
 
