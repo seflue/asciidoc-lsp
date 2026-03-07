@@ -368,6 +368,7 @@ impl LanguageServer for AsciiDocLsp {
         let position = params.text_document_position_params.position;
 
         let Some(content) = self.get_document_content(uri) else {
+            tracing::debug!(?uri, "hover: no document content");
             return Ok(None);
         };
 
@@ -377,7 +378,15 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         let ws = self.workspace.lock().expect("workspace lock poisoned");
+        tracing::debug!(
+            ?doc_path,
+            workspace_exists = ws.is_some(),
+            "hover: resolving at {}:{}",
+            position.line,
+            position.character,
+        );
         let hover_text = navigation::resolve_hover(&content, position, &doc_path, ws.as_ref());
+        tracing::debug!(?hover_text, "hover: result");
 
         match hover_text {
             Some(text) => Ok(Some(Hover {
@@ -662,6 +671,19 @@ fn build_content_overrides(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Tracing: write to stderr (LSP uses stdout for protocol).
+    // Control via ASCIIDOC_LSP_LOG env var, e.g. ASCIIDOC_LSP_LOG=debug
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
+                .with_env_var("ASCIIDOC_LSP_LOG")
+                .from_env_lossy(),
+        )
+        .init();
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
