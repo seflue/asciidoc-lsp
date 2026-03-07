@@ -26,8 +26,8 @@ fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
         DiagnosticKind::BrokenXref { .. }
         | DiagnosticKind::DuplicateAnchor { .. }
         | DiagnosticKind::UndefinedAttribute { .. }
-        | DiagnosticKind::CircularInclude { .. }
-        | DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::WARNING,
+        | DiagnosticKind::CircularInclude { .. } => ls_types::DiagnosticSeverity::WARNING,
+        DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::HINT,
     };
 
     ls_types::Diagnostic::new(
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_undefined_conditional_attr_is_warning() {
+    fn test_convert_undefined_conditional_attr_is_hint() {
         let content = "= Title\n\nifdef::missing[]\nContent.\nendif::[]\n";
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
@@ -171,10 +171,7 @@ mod tests {
         let result = convert_diagnostics(&diags, content);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].severity,
-            Some(ls_types::DiagnosticSeverity::WARNING)
-        );
+        assert_eq!(result[0].severity, Some(ls_types::DiagnosticSeverity::HINT));
     }
 
     #[test]

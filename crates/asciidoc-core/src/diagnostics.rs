@@ -77,75 +77,9 @@ pub fn collect_diagnostics(
     }
 
     // 4. Undefined conditional attributes (ifdef/ifndef)
-    for (path, doc) in documents {
-        for cond in &doc.conditionals {
-            let directive = match cond.kind {
-                crate::types::ConditionalKind::Ifdef => "ifdef",
-                crate::types::ConditionalKind::Ifndef => "ifndef",
-            };
-            let attr_expr = cond.attributes.join(match cond.operator {
-                crate::types::ConditionalOperator::And => "+",
-                _ => ",",
-            });
-
-            match cond.operator {
-                crate::types::ConditionalOperator::Single
-                | crate::types::ConditionalOperator::And => {
-                    for attr in &cond.attributes {
-                        if attr.starts_with("env-") {
-                            continue;
-                        }
-                        if registry.resolve(path, attr).is_none() {
-                            diags.entry(path.clone()).or_default().push(Diagnostic {
-                                file: path.clone(),
-                                line: cond.line,
-                                kind: DiagnosticKind::UndefinedConditionalAttr {
-                                    name: attr.clone(),
-                                    directive: directive.to_string(),
-                                },
-                                message: format!(
-                                    "{directive}::{attr_expr} — attribute '{attr}' is undefined"
-                                ),
-                            });
-                        }
-                    }
-                }
-                crate::types::ConditionalOperator::Or => {
-                    let non_env_attrs: Vec<_> = cond
-                        .attributes
-                        .iter()
-                        .filter(|attr| !attr.starts_with("env-"))
-                        .collect();
-
-                    if non_env_attrs.is_empty() {
-                        continue;
-                    }
-
-                    let any_defined = non_env_attrs
-                        .iter()
-                        .any(|attr| registry.resolve(path, attr).is_some());
-                    if !any_defined {
-                        let names = non_env_attrs
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        diags.entry(path.clone()).or_default().push(Diagnostic {
-                            file: path.clone(),
-                            line: cond.line,
-                            kind: DiagnosticKind::UndefinedConditionalAttr {
-                                name: names.clone(),
-                                directive: directive.to_string(),
-                            },
-                            message: format!(
-                                "{directive}::{attr_expr} — none of [{names}] are defined"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-    }
+    // Suppressed: ifdef/ifndef attributes are often only defined at build time,
+    // producing false-positive noise. The UndefinedConditionalAttr variant is
+    // retained in DiagnosticKind for a future typo-detector.
 
     // 5. Circular includes
     for (source, line, target) in graph.detect_cycles() {
@@ -538,10 +472,12 @@ mod tests {
         assert!(diags.contains_key(&PathBuf::from("/b.adoc")));
     }
 
-    // --- Conditional attribute diagnostics (adoc-0062) ---
+    // --- Conditional attribute diagnostics suppressed (adoc-0080) ---
+    // ifdef/ifndef attributes are not diagnosed because they are often
+    // only defined at build time, producing false-positive noise.
 
     #[test]
-    fn test_ifdef_undefined_attr_produces_diagnostic() {
+    fn test_ifdef_undefined_attr_no_diagnostic() {
         let registry = make_registry();
         let mut documents = HashMap::new();
         documents.insert(
@@ -572,70 +508,14 @@ mod tests {
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
-        assert_eq!(
-            cond_diags.len(),
-            1,
-            "Expected 1 conditional diagnostic, got: {cond_diags:?}"
-        );
-        assert_eq!(cond_diags[0].line, 5);
-    }
-
-    #[test]
-    fn test_ifdef_defined_attr_no_diagnostic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut registry = AttributeRegistry::new(tmp.path());
-        // Register an attribute in the registry
-        let file = PathBuf::from("/a.adoc");
-        registry.register_file_attributes(
-            &file,
-            &[crate::types::AttributeDef {
-                name: "backend".into(),
-                value: "html5".into(),
-                line: 2,
-            }],
-        );
-
-        let mut documents = HashMap::new();
-        documents.insert(
-            file.clone(),
-            DocumentModel {
-                path: file.clone(),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![crate::types::AttributeDef {
-                    name: "backend".into(),
-                    value: "html5".into(),
-                    line: 2,
-                }],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["backend".into()],
-                    operator: crate::types::ConditionalOperator::Single,
-                    line: 5,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
         assert!(
             cond_diags.is_empty(),
-            "Defined attr should not produce diagnostic, got: {cond_diags:?}"
+            "ifdef with undefined attr should not produce diagnostic, got: {cond_diags:?}"
         );
     }
 
     #[test]
-    fn test_ifndef_undefined_attr_produces_diagnostic() {
+    fn test_ifndef_undefined_attr_no_diagnostic() {
         let registry = make_registry();
         let mut documents = HashMap::new();
         documents.insert(
@@ -666,261 +546,9 @@ mod tests {
             .iter()
             .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
             .collect();
-        assert_eq!(
-            cond_diags.len(),
-            1,
-            "Expected 1 conditional diagnostic, got: {cond_diags:?}"
-        );
-    }
-
-    #[test]
-    fn test_ifdef_and_reports_each_undefined() {
-        // ifdef::a+b[] with both undefined → 2 diagnostics
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["backend".into(), "icons".into()],
-                    operator: crate::types::ConditionalOperator::And,
-                    line: 3,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert_eq!(
-            cond_diags.len(),
-            2,
-            "AND with 2 undefined attrs should produce 2 diagnostics, got: {cond_diags:?}"
-        );
-    }
-
-    #[test]
-    fn test_ifdef_or_no_diagnostic_when_one_defined() {
-        // ifdef::backend,icons[] with backend defined → no diagnostic
-        let tmp = tempfile::tempdir().unwrap();
-        let mut registry = AttributeRegistry::new(tmp.path());
-        let file = PathBuf::from("/a.adoc");
-        registry.register_file_attributes(
-            &file,
-            &[crate::types::AttributeDef {
-                name: "backend".into(),
-                value: "html5".into(),
-                line: 2,
-            }],
-        );
-
-        let mut documents = HashMap::new();
-        documents.insert(
-            file.clone(),
-            DocumentModel {
-                path: file.clone(),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![crate::types::AttributeDef {
-                    name: "backend".into(),
-                    value: "html5".into(),
-                    line: 2,
-                }],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["backend".into(), "icons".into()],
-                    operator: crate::types::ConditionalOperator::Or,
-                    line: 5,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
         assert!(
             cond_diags.is_empty(),
-            "OR with one defined attr should produce no diagnostic, got: {cond_diags:?}"
-        );
-    }
-
-    #[test]
-    fn test_ifdef_or_diagnostic_when_none_defined() {
-        // ifdef::backend,icons[] with none defined → 1 diagnostic
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["backend".into(), "icons".into()],
-                    operator: crate::types::ConditionalOperator::Or,
-                    line: 3,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert_eq!(
-            cond_diags.len(),
-            1,
-            "OR with none defined should produce 1 diagnostic, got: {cond_diags:?}"
-        );
-        assert!(cond_diags[0].message.contains("none of"));
-    }
-
-    // --- env-* attribute suppression (adoc-0070) ---
-
-    #[test]
-    fn test_ifdef_env_vscode_no_diagnostic() {
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["env-vscode".into()],
-                    operator: crate::types::ConditionalOperator::Single,
-                    line: 1,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert!(
-            cond_diags.is_empty(),
-            "ifdef::env-vscode[] should not produce diagnostic, got: {cond_diags:?}"
-        );
-    }
-
-    #[test]
-    fn test_ifndef_env_idea_no_diagnostic() {
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifndef,
-                    attributes: vec!["env-idea".into()],
-                    operator: crate::types::ConditionalOperator::Single,
-                    line: 2,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert!(
-            cond_diags.is_empty(),
-            "ifndef::env-idea[] should not produce diagnostic, got: {cond_diags:?}"
-        );
-    }
-
-    #[test]
-    fn test_ifdef_env_unknown_no_diagnostic() {
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["env-whatever-unknown".into()],
-                    operator: crate::types::ConditionalOperator::Single,
-                    line: 3,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert!(
-            cond_diags.is_empty(),
-            "ifdef::env-whatever-unknown[] should not produce diagnostic, got: {cond_diags:?}"
+            "ifndef with undefined attr should not produce diagnostic, got: {cond_diags:?}"
         );
     }
 
@@ -931,90 +559,6 @@ mod tests {
         assert!(
             registry.resolve(file, "env-asciidoc-lsp").is_some(),
             "env-asciidoc-lsp should be a builtin attribute"
-        );
-    }
-
-    #[test]
-    fn test_ifdef_non_env_still_warns() {
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["wirklich-undefined".into()],
-                    operator: crate::types::ConditionalOperator::Single,
-                    line: 5,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert_eq!(
-            cond_diags.len(),
-            1,
-            "Non-env undefined attr should still warn, got: {cond_diags:?}"
-        );
-    }
-
-    #[test]
-    fn test_ifdef_or_env_mixed() {
-        // ifdef::env-vscode,undefined-attr[] → warning only for undefined-attr
-        let registry = make_registry();
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
-                    kind: crate::types::ConditionalKind::Ifdef,
-                    attributes: vec!["env-vscode".into(), "undefined-attr".into()],
-                    operator: crate::types::ConditionalOperator::Or,
-                    line: 7,
-                }],
-            },
-        );
-
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
-        let flat = flatten(&diags);
-
-        let cond_diags: Vec<_> = flat
-            .iter()
-            .filter(|d| matches!(&d.kind, DiagnosticKind::UndefinedConditionalAttr { .. }))
-            .collect();
-        assert_eq!(
-            cond_diags.len(),
-            1,
-            "OR with env-vscode + undefined-attr should warn for undefined-attr only, got: {cond_diags:?}"
-        );
-        assert!(
-            cond_diags[0].message.contains("undefined-attr"),
-            "Warning should mention undefined-attr, got: {}",
-            cond_diags[0].message
         );
     }
 
