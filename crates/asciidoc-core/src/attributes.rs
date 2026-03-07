@@ -27,6 +27,7 @@ impl AttributeRegistry {
     pub fn new(root: &Path) -> Self {
         let mut builtin = HashMap::new();
         builtin.insert("docdir".into(), root.display().to_string());
+        builtin.insert("env-asciidoc-lsp".into(), String::new());
         Self {
             builtin,
             config_chains: HashMap::new(),
@@ -83,7 +84,10 @@ impl AttributeRegistry {
                     "asciidoctorconfigdir".into(),
                     AttributeEntry {
                         value: canonical_home.display().to_string(),
-                        source: None,
+                        source: Some(AttributeSource {
+                            file: home_config.clone(),
+                            line: 0,
+                        }),
                     },
                 );
                 for (key, value, line) in parse_asciidoctorconfig(&content) {
@@ -111,7 +115,10 @@ impl AttributeRegistry {
                     "asciidoctorconfigdir".into(),
                     AttributeEntry {
                         value: chain_dir.display().to_string(),
-                        source: None,
+                        source: Some(AttributeSource {
+                            file: config_path.clone(),
+                            line: 0,
+                        }),
                     },
                 );
 
@@ -686,8 +693,9 @@ mod tests {
         let all = registry.all_attributes(file);
         let map: HashMap<&str, &str> = all.into_iter().collect();
 
-        assert_eq!(map.len(), 1);
+        assert_eq!(map.len(), 2);
         assert_eq!(map.get("docdir"), Some(&"/tmp"));
+        assert_eq!(map.get("env-asciidoc-lsp"), Some(&""));
     }
 
     // --- Review Corrections: Edge Case Tests ---
@@ -882,6 +890,25 @@ mod tests {
             Some(val) => std::env::set_var("HOME", val),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // --- resolve_source() for asciidoctorconfigdir ---
+
+    #[test]
+    fn test_resolve_source_asciidoctorconfigdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+
+        let dummy = root.join("any.adoc");
+        let source = registry
+            .resolve_source(&dummy, "asciidoctorconfigdir")
+            .expect("asciidoctorconfigdir should have a source");
+        assert_eq!(source.file, root.join(".asciidoctorconfig"));
+        assert_eq!(source.line, 0, "synthetic attribute should use line 0");
     }
 
     // --- adoc-0072: Config-Chain with LSP root_uri ---
