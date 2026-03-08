@@ -465,8 +465,8 @@ pub(crate) fn resolve_xref_completions(
     };
 
     let mut items: Vec<CompletionItem> = ws
-        .reference_index
-        .anchors
+        .reference_index()
+        .anchors()
         .iter()
         .filter(|(id, _)| id.starts_with(prefix))
         .map(|(id, loc)| {
@@ -523,7 +523,7 @@ fn resolve_path_completions(
 ) -> Vec<CompletionItem> {
     // Attribute substitution: resolve {attr} references in prefix
     let resolved_prefix = match ws {
-        Some(ws) => ws.attributes.substitute(doc_path, prefix),
+        Some(ws) => ws.attributes().substitute(doc_path, prefix),
         None => prefix.to_string(),
     };
 
@@ -595,7 +595,7 @@ fn resolve_path_completions(
 
 /// Resolve include-path completions by listing `.adoc` files and subdirectories
 /// relative to the document's parent directory, filtered by prefix.
-pub fn resolve_include_completions(
+pub(crate) fn resolve_include_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
@@ -606,7 +606,7 @@ pub fn resolve_include_completions(
 
 /// Resolve image path completions by listing image files from the document's
 /// `imagesdir` directory, filtered by the typed prefix.
-pub fn resolve_image_completions(
+pub(crate) fn resolve_image_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
@@ -633,7 +633,7 @@ pub(crate) fn resolve_attribute_completions(
     };
 
     let mut items: Vec<CompletionItem> = ws
-        .attributes
+        .attributes()
         .all_attributes(doc_path)
         .into_iter()
         .filter(|(name, _)| name.starts_with(prefix))
@@ -1073,14 +1073,14 @@ mod tests {
         for (id, loc) in anchors {
             index.add_anchor(id, loc);
         }
-        Workspace {
-            root: PathBuf::from("/tmp"),
-            attributes: AttributeRegistry::new(Path::new("/tmp")),
-            include_graph: IncludeGraph::new(),
-            reference_index: index,
-            documents: HashMap::new(),
-            diagnostics: HashMap::new(),
-        }
+        Workspace::new_with(
+            PathBuf::from("/tmp"),
+            AttributeRegistry::new(Path::new("/tmp")),
+            IncludeGraph::new(),
+            index,
+            HashMap::new(),
+            HashMap::new(),
+        )
     }
 
     #[test]
@@ -1242,14 +1242,14 @@ mod tests {
         let mut attrs = AttributeRegistry::new(dir.path());
         attrs.ensure_config_for_dir(dir.path());
 
-        let ws = Workspace {
-            root: dir.path().to_path_buf(),
-            attributes: attrs,
-            include_graph: IncludeGraph::new(),
-            reference_index: ReferenceIndex::new(),
-            documents: HashMap::new(),
-            diagnostics: HashMap::new(),
-        };
+        let ws = Workspace::new_with(
+            dir.path().to_path_buf(),
+            attrs,
+            IncludeGraph::new(),
+            ReferenceIndex::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
         (dir, ws, doc_file)
     }
 
@@ -1332,14 +1332,14 @@ mod tests {
         attrs.ensure_config_for_dir(&root);
         attrs.register_file_attributes(&file, &file_attrs);
 
-        let ws = Workspace {
-            root: root.clone(),
-            attributes: attrs,
-            include_graph: IncludeGraph::new(),
-            reference_index: ReferenceIndex::new(),
-            documents: HashMap::new(),
-            diagnostics: HashMap::new(),
-        };
+        let ws = Workspace::new_with(
+            root.clone(),
+            attrs,
+            IncludeGraph::new(),
+            ReferenceIndex::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
         (dir, ws, file)
     }
 
@@ -2277,14 +2277,14 @@ mod tests {
         let file = root.join("doc.adoc");
         let mut attrs = AttributeRegistry::new(&root);
         attrs.ensure_config_for_dir(&root);
-        let ws = Workspace {
-            root: root.clone(),
-            attributes: attrs,
-            include_graph: IncludeGraph::new(),
-            reference_index: ReferenceIndex::new(),
-            documents: HashMap::new(),
-            diagnostics: HashMap::new(),
-        };
+        let ws = Workspace::new_with(
+            root.clone(),
+            attrs,
+            IncludeGraph::new(),
+            ReferenceIndex::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
 
         let items = resolve_image_completions("", &file, Some(&ws));
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();

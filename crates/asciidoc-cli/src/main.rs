@@ -55,8 +55,8 @@ fn main() -> anyhow::Result<()> {
         let ws = Workspace::build(&root, &cli.path);
         let entry_canonical = cli.path.canonicalize()?;
         let tree = ws
-            .include_graph
-            .to_include_tree(&entry_canonical, &ws.documents);
+            .include_graph()
+            .to_include_tree(&entry_canonical, ws.documents());
         // end::workspace-setup[]
         print_include_tree(&tree, cli.all);
     } else {

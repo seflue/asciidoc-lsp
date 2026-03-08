@@ -6,8 +6,8 @@ use crate::attributes::AttributeRegistry;
 use crate::types::{DocumentModel, IncludeEdge, IncludeTree};
 
 pub struct IncludeGraph {
-    pub forward: HashMap<PathBuf, Vec<IncludeEdge>>,
-    pub reverse: HashMap<PathBuf, Vec<PathBuf>>,
+    pub(crate) forward: HashMap<PathBuf, Vec<IncludeEdge>>,
+    pub(crate) reverse: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Default for IncludeGraph {

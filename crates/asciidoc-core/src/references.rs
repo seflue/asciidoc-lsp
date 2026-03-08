@@ -6,9 +6,9 @@ use crate::graph::IncludeGraph;
 use crate::types::{AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, ResolvedXref, Xref};
 
 pub struct ReferenceIndex {
-    pub anchors: HashMap<String, AnchorLocation>,
-    pub duplicates: Vec<(String, AnchorLocation)>,
-    pub by_file: HashMap<PathBuf, Vec<String>>,
+    pub(crate) anchors: HashMap<String, AnchorLocation>,
+    pub(crate) duplicates: Vec<(String, AnchorLocation)>,
+    pub(crate) by_file: HashMap<PathBuf, Vec<String>>,
 }
 
 impl Default for ReferenceIndex {
@@ -18,6 +18,18 @@ impl Default for ReferenceIndex {
 }
 
 impl ReferenceIndex {
+    /// All anchors keyed by ID.
+    #[must_use]
+    pub fn anchors(&self) -> &HashMap<String, AnchorLocation> {
+        &self.anchors
+    }
+
+    /// Duplicate anchors (same ID within the same file).
+    #[must_use]
+    pub fn duplicates(&self) -> &[(String, AnchorLocation)] {
+        &self.duplicates
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {

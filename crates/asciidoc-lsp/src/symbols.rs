@@ -260,7 +260,7 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
     let mut symbols = Vec::new();
     let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
 
-    for (path, doc) in &ws.documents {
+    for (path, doc) in ws.documents() {
         let Some(uri) = path_to_uri(path) else {
             continue;
         };
@@ -312,7 +312,7 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
     }
 
     // Anchors from ReferenceIndex
-    for (id, loc) in &ws.reference_index.anchors {
+    for (id, loc) in ws.reference_index().anchors() {
         if !query_lower.is_empty() && !id.to_lowercase().contains(&query_lower) {
             continue;
         }

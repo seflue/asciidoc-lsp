@@ -38,14 +38,13 @@ fn find_adoc_files(root: &Path) -> Vec<PathBuf> {
     results
 }
 
-#[allow(dead_code)] // Fields are public API for LSP consumers
 pub struct Workspace {
-    pub root: PathBuf,
-    pub attributes: AttributeRegistry,
-    pub include_graph: IncludeGraph,
-    pub reference_index: ReferenceIndex,
-    pub documents: HashMap<PathBuf, DocumentModel>,
-    pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    pub(crate) root: PathBuf,
+    pub(crate) attributes: AttributeRegistry,
+    pub(crate) include_graph: IncludeGraph,
+    pub(crate) reference_index: ReferenceIndex,
+    pub(crate) documents: HashMap<PathBuf, DocumentModel>,
+    pub(crate) diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
 }
 
 impl std::fmt::Debug for Workspace {
@@ -62,6 +61,67 @@ impl std::fmt::Debug for Workspace {
 }
 
 impl Workspace {
+    // --- Accessors ---
+
+    /// Workspace root directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Attribute registry for resolving document attributes.
+    #[must_use]
+    pub fn attributes(&self) -> &AttributeRegistry {
+        &self.attributes
+    }
+
+    /// Include graph (forward and reverse edges).
+    #[must_use]
+    pub fn include_graph(&self) -> &IncludeGraph {
+        &self.include_graph
+    }
+
+    /// Cross-reference / anchor index.
+    #[must_use]
+    pub fn reference_index(&self) -> &ReferenceIndex {
+        &self.reference_index
+    }
+
+    /// Parsed document models keyed by canonical path.
+    #[must_use]
+    pub fn documents(&self) -> &HashMap<PathBuf, DocumentModel> {
+        &self.documents
+    }
+
+    /// Diagnostics keyed by file path.
+    #[must_use]
+    pub fn diagnostics_map(&self) -> &HashMap<PathBuf, Vec<Diagnostic>> {
+        &self.diagnostics
+    }
+
+    /// Construct a workspace with explicit field values.
+    ///
+    /// Used by tests in downstream crates that need custom
+    /// `ReferenceIndex` or `AttributeRegistry` configurations.
+    #[must_use]
+    pub fn new_with(
+        root: PathBuf,
+        attributes: AttributeRegistry,
+        include_graph: IncludeGraph,
+        reference_index: ReferenceIndex,
+        documents: HashMap<PathBuf, DocumentModel>,
+        diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    ) -> Self {
+        Self {
+            root,
+            attributes,
+            include_graph,
+            reference_index,
+            documents,
+            diagnostics,
+        }
+    }
+
     /// Create a new workspace with no documents or graph edges.
     ///
     /// Files are added later via `ensure_file()`. This is the primary

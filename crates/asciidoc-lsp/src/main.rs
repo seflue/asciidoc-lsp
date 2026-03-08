@@ -191,7 +191,7 @@ impl LanguageServer for AsciiDocLsp {
     async fn initialized(&self, _: InitializedParams) {
         let diagnostics = {
             let ws = self.workspace.lock().expect("workspace lock poisoned");
-            ws.as_ref().map(|ws| ws.diagnostics.clone())
+            ws.as_ref().map(|ws| ws.diagnostics_map().clone())
         };
         if let Some(diagnostics) = diagnostics {
             self.publish_workspace_diagnostics(&diagnostics).await;
@@ -225,13 +225,13 @@ impl LanguageServer for AsciiDocLsp {
                         // Use update_file if already indexed (e.g. from background scan)
                         // to apply editor content over disk content.
                         // Use ensure_file for new files not yet in the workspace.
-                        if ws.documents.contains_key(&canonical) {
+                        if ws.documents().contains_key(&canonical) {
                             ws.update_file(&canonical, &overrides);
                         } else {
                             ws.ensure_file(&canonical, &overrides);
                         }
                         ws.recalculate_diagnostics();
-                        Some(ws.diagnostics.clone())
+                        Some(ws.diagnostics_map().clone())
                     } else {
                         None
                     }
@@ -278,7 +278,7 @@ impl LanguageServer for AsciiDocLsp {
                     if let Some(ws) = ws.as_mut() {
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
-                        Some(ws.diagnostics.clone())
+                        Some(ws.diagnostics_map().clone())
                     } else {
                         None
                     }
@@ -305,7 +305,7 @@ impl LanguageServer for AsciiDocLsp {
                     if let Some(ws) = ws.as_mut() {
                         ws.update_file(&canonical, &HashMap::new());
                         ws.recalculate_diagnostics();
-                        Some(ws.diagnostics.clone())
+                        Some(ws.diagnostics_map().clone())
                     } else {
                         None
                     }
@@ -328,7 +328,7 @@ impl LanguageServer for AsciiDocLsp {
                     if let Some(ws) = ws.as_mut() {
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
-                        Some(ws.diagnostics.clone())
+                        Some(ws.diagnostics_map().clone())
                     } else {
                         None
                     }
@@ -874,7 +874,7 @@ mod tests {
         let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
         // Verify the override content was used
-        let b_doc = ws.documents.get(&b_canon).unwrap();
+        let b_doc = ws.documents().get(&b_canon).unwrap();
         assert_eq!(b_doc.sections[0].title, "Modified Chapter B");
     }
 
@@ -904,21 +904,21 @@ mod tests {
 
         // Should have found multiple documents (index + included chapters)
         assert!(
-            ws.documents.len() >= 6,
+            ws.documents().len() >= 6,
             "workspace should have at least 6 documents (arc42 has ~10), found: {}",
-            ws.documents.len()
+            ws.documents().len()
         );
 
         // The entry point file should be in the documents
         let entry_canon = entry.canonicalize().unwrap();
         assert!(
-            ws.documents.contains_key(&entry_canon),
+            ws.documents().contains_key(&entry_canon),
             "workspace should contain entry file"
         );
 
         // Reference index should have anchors from the fixture
         assert!(
-            !ws.reference_index.anchors.is_empty(),
+            !ws.reference_index().anchors().is_empty(),
             "arc42 fixture should have anchors (e.g. [[project-goals]])"
         );
     }
@@ -1049,7 +1049,7 @@ mod tests {
 
         // Workspace::new creates an empty workspace — files added via ensure_file
         let ws = Workspace::new(root);
-        assert!(ws.documents.is_empty(), "Rebuild returns empty workspace");
+        assert!(ws.documents().is_empty(), "Rebuild returns empty workspace");
     }
 
     #[test]
@@ -1077,7 +1077,7 @@ mod tests {
         ws.ensure_file(&index_canon, &overrides);
 
         // Verify override content was used (doc has broken xref, not valid anchor)
-        let doc = ws.documents.get(&index_canon).unwrap();
+        let doc = ws.documents().get(&index_canon).unwrap();
         assert!(
             doc.xrefs.iter().any(|x| x.target == "broken-ref"),
             "Override content should be used"
@@ -1090,9 +1090,12 @@ mod tests {
         let root = tmp.path();
 
         let ws = Workspace::new(root);
-        assert!(ws.documents.is_empty(), "Empty workspace has no documents");
         assert!(
-            ws.diagnostics.is_empty(),
+            ws.documents().is_empty(),
+            "Empty workspace has no documents"
+        );
+        assert!(
+            ws.diagnostics_map().is_empty(),
             "Empty workspace has no diagnostics"
         );
     }
@@ -1107,21 +1110,25 @@ mod tests {
 
         let overrides = HashMap::new();
         let mut ws = Workspace::new(root);
-        assert!(ws.documents.is_empty(), "Rebuild starts empty");
+        assert!(ws.documents().is_empty(), "Rebuild starts empty");
 
         // Simulate did_open: ensure standalone is added
         let standalone_canon = standalone.canonicalize().unwrap();
         ws.ensure_file(&standalone_canon, &overrides);
-        assert_eq!(ws.documents.len(), 1, "Standalone added");
+        assert_eq!(ws.documents().len(), 1, "Standalone added");
 
         // Simulate rebuild (e.g. after did_change on another file)
         let mut ws2 = Workspace::new(root);
-        assert!(ws2.documents.is_empty(), "Rebuild starts empty again");
+        assert!(ws2.documents().is_empty(), "Rebuild starts empty again");
 
         // Re-ensure standalone after workspace recreation
         ws2.ensure_file(&standalone_canon, &overrides);
-        assert_eq!(ws2.documents.len(), 1, "Standalone preserved after rebuild");
-        assert!(ws2.documents.contains_key(&standalone_canon));
+        assert_eq!(
+            ws2.documents().len(),
+            1,
+            "Standalone preserved after rebuild"
+        );
+        assert!(ws2.documents().contains_key(&standalone_canon));
     }
 
     #[test]
@@ -1146,14 +1153,14 @@ mod tests {
         let standalone_canon = standalone.canonicalize().unwrap();
         ws.ensure_file(&standalone_canon, &overrides);
 
-        assert_eq!(ws.documents.len(), 1);
-        let doc = ws.documents.get(&standalone_canon).unwrap();
+        assert_eq!(ws.documents().len(), 1);
+        let doc = ws.documents().get(&standalone_canon).unwrap();
         assert_eq!(doc.attributes.len(), 1);
         assert_eq!(doc.attribute_refs.len(), 1);
 
         // Config chain should be loaded
         assert_eq!(
-            ws.attributes.resolve(&standalone_canon, "myattr"),
+            ws.attributes().resolve(&standalone_canon, "myattr"),
             Some("val")
         );
     }
@@ -1228,7 +1235,7 @@ mod tests {
         // It should use this path directly as workspace root.
         let ws = Workspace::new(&sub);
         assert_eq!(
-            ws.root,
+            ws.root().to_path_buf(),
             sub.canonicalize().unwrap(),
             "Workspace root must be the LSP root_uri, not walked up to .asciidoctorconfig"
         );

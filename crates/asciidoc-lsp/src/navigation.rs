@@ -39,7 +39,7 @@ pub(crate) struct NodeInfo {
 /// Find and classify the semantic node at the given LSP position.
 ///
 /// Tries block grammar first (for includes), then inline grammar (for xrefs).
-pub fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
+pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<NodeInfo> {
     let (line_1, byte_col) = positions::from_lsp_position(pos, content);
     let point = tree_sitter::Point {
         row: line_1.saturating_sub(1),
@@ -108,7 +108,7 @@ pub fn resolve_goto_definition(
         NodeKind::Include { ref path } => {
             let doc_dir = doc_path.parent()?;
             let resolved_path = if let Some(ws) = workspace {
-                ws.attributes.substitute(doc_path, path)
+                ws.attributes().substitute(doc_path, path)
             } else {
                 path.clone()
             };
@@ -124,14 +124,14 @@ pub fn resolve_goto_definition(
                 line: node_info.line,
             };
             let resolved = ws
-                .reference_index
-                .resolve_xref(&xref, doc_path, &ws.include_graph, &ws.documents)
+                .reference_index()
+                .resolve_xref(&xref, doc_path, ws.include_graph(), ws.documents())
                 .ok()?;
             Some((resolved.file, resolved.line))
         }
         NodeKind::AttributeRef { ref name } => {
             let ws = workspace?;
-            let source = ws.attributes.resolve_source(doc_path, name)?;
+            let source = ws.attributes().resolve_source(doc_path, name)?;
             Some((source.file, source.line))
         }
         NodeKind::Image { ref path } => {
@@ -164,7 +164,7 @@ pub fn resolve_references(
         NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
             let mut r = ws.find_all_attribute_usages(name);
             if include_declaration && matches!(node_info.kind, NodeKind::AttributeRef { .. }) {
-                if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
+                if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
                     r.push(FileLocation::new(source.file, source.line, 0, 0));
                 }
             }
@@ -172,7 +172,7 @@ pub fn resolve_references(
         }
         NodeKind::Include { path } => {
             let doc_dir = doc_path.parent()?;
-            let resolved_path = ws.attributes.substitute(doc_path, path);
+            let resolved_path = ws.attributes().substitute(doc_path, path);
             let target = doc_dir.join(&resolved_path);
             let target_canonical = target.canonicalize().ok()?;
             let filename = target_canonical
@@ -187,7 +187,7 @@ pub fn resolve_references(
         NodeKind::Anchor { id } => {
             let mut r = ws.find_all_anchor_references(id);
             if include_declaration {
-                if let Some(loc) = ws.reference_index.lookup(id) {
+                if let Some(loc) = ws.reference_index().lookup(id) {
                     r.push(FileLocation::new(loc.file.clone(), loc.line, 0, 0));
                 }
             }
@@ -207,7 +207,7 @@ pub fn resolve_references(
             };
             let mut r = ws.find_all_anchor_references(anchor_id);
             if include_declaration {
-                if let Some(loc) = ws.reference_index.lookup(anchor_id) {
+                if let Some(loc) = ws.reference_index().lookup(anchor_id) {
                     r.push(FileLocation::new(loc.file.clone(), loc.line, 0, 0));
                 }
             }
@@ -250,9 +250,9 @@ pub fn resolve_hover(
     match &node_info.kind {
         NodeKind::AttributeRef { name } => {
             let ws = workspace?;
-            let value = ws.attributes.resolve(doc_path, name)?;
+            let value = ws.attributes().resolve(doc_path, name)?;
             let mut text = format!(":{name}: {value}");
-            if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
+            if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
                 let display_path = file_display_name(&source.file);
                 let _ = write!(text, "\n\nDefined in {display_path}:{}", source.line);
             }
@@ -260,7 +260,7 @@ pub fn resolve_hover(
         }
         NodeKind::AttributeDef { name } => {
             let ws = workspace?;
-            let value = ws.attributes.resolve(doc_path, name)?;
+            let value = ws.attributes().resolve(doc_path, name)?;
             Some(format!(":{name}: {value}"))
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
@@ -271,12 +271,12 @@ pub fn resolve_hover(
                 line: node_info.line,
             };
             let resolved = ws
-                .reference_index
-                .resolve_xref(&xref, doc_path, &ws.include_graph, &ws.documents)
+                .reference_index()
+                .resolve_xref(&xref, doc_path, ws.include_graph(), ws.documents())
                 .ok()?;
 
             // Find section title at the resolved location
-            let section_title = ws.documents.get(&resolved.file).and_then(|doc| {
+            let section_title = ws.documents().get(&resolved.file).and_then(|doc| {
                 doc.sections
                     .iter()
                     .find(|s| s.line == resolved.line)
@@ -302,7 +302,7 @@ pub fn resolve_hover(
         NodeKind::Include { path } => {
             let doc_dir = doc_path.parent()?;
             let resolved_path = if let Some(ws) = workspace {
-                ws.attributes.substitute(doc_path, path)
+                ws.attributes().substitute(doc_path, path)
             } else {
                 path.clone()
             };
@@ -311,7 +311,7 @@ pub fn resolve_hover(
             let mut text = format!("include::{resolved_path}[]");
             if target.exists() {
                 let section_count = workspace
-                    .and_then(|ws| ws.documents.get(&target.canonicalize().ok()?))
+                    .and_then(|ws| ws.documents().get(&target.canonicalize().ok()?))
                     .map_or(0, |doc| doc.sections.len());
                 let _ = write!(text, "\n\n\u{2713} File exists | {section_count} sections");
             } else {
@@ -343,10 +343,10 @@ pub(crate) fn resolve_image_base_dir(
 ) -> (PathBuf, String) {
     let doc_dir = doc_path.parent().unwrap_or(doc_path);
     let imagesdir_raw = workspace
-        .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
+        .and_then(|ws| ws.attributes().resolve(doc_path, "imagesdir"))
         .unwrap_or("");
     let imagesdir = if let Some(ws) = workspace {
-        ws.attributes.substitute(doc_path, imagesdir_raw)
+        ws.attributes().substitute(doc_path, imagesdir_raw)
     } else {
         imagesdir_raw.to_string()
     };
@@ -370,7 +370,7 @@ fn resolve_image_target(
     workspace: Option<&Workspace>,
 ) -> (PathBuf, String, String) {
     let resolved_path = if let Some(ws) = workspace {
-        ws.attributes.substitute(doc_path, image_path)
+        ws.attributes().substitute(doc_path, image_path)
     } else {
         image_path.to_string()
     };
@@ -612,7 +612,7 @@ pub fn prepare_rename(
         NodeKind::Anchor { id } => {
             // Reject implicit section IDs
             if let Some(ws) = workspace {
-                if let Some(loc) = ws.reference_index.lookup(id) {
+                if let Some(loc) = ws.reference_index().lookup(id) {
                     if loc.kind == AnchorKind::ImplicitSection {
                         return None;
                     }
@@ -639,7 +639,7 @@ pub fn prepare_rename(
             };
             // Reject implicit section IDs
             if let Some(ws) = workspace {
-                if let Some(loc) = ws.reference_index.lookup(anchor_id) {
+                if let Some(loc) = ws.reference_index().lookup(anchor_id) {
                     if loc.kind == AnchorKind::ImplicitSection {
                         return None;
                     }
@@ -708,7 +708,7 @@ pub fn resolve_rename(
             }
 
             // Attribute definition: :name: → find columns via text search
-            if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
+            if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
                 let file_content = read_content(&source.file, overrides);
                 let def_line = file_content
                     .lines()
@@ -756,7 +756,7 @@ fn resolve_rename_anchor(
     let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
 
     // Anchor definition
-    if let Some(loc) = ws.reference_index.lookup(anchor_id) {
+    if let Some(loc) = ws.reference_index().lookup(anchor_id) {
         let file_content = read_file_cached(&mut file_cache, &loc.file, overrides);
         let line_text = file_content
             .lines()
@@ -771,7 +771,7 @@ fn resolve_rename_anchor(
     }
 
     // Duplicate anchor definitions
-    for (dup_id, dup_loc) in &ws.reference_index.duplicates {
+    for (dup_id, dup_loc) in ws.reference_index().duplicates() {
         if dup_id == anchor_id {
             let file_content = read_file_cached(&mut file_cache, &dup_loc.file, overrides);
             let line_text = file_content
