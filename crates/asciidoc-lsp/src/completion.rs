@@ -495,20 +495,32 @@ pub(crate) fn resolve_xref_completions(
     items
 }
 
-/// Resolve include-path completions by listing `.adoc` files and subdirectories
-/// relative to the document's parent directory, filtered by prefix.
+/// File extension filter for path completions.
+#[derive(Clone, Copy)]
+enum PathCompletionFilter {
+    /// Only `.adoc` files
+    Adoc,
+    /// Only image files (png, jpg, svg, ...)
+    Image,
+}
+
+/// Image file extensions for completion filtering.
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "tif", "ico",
+];
+
+/// Generic path completion resolver for `include::` and `image::` macros.
 ///
-/// Returns `CompletionItem`s with:
-/// - `label`: filename or dirname (dirs end with `/`)
-/// - `kind`: `File` for `.adoc` files, `Folder` for directories
-/// - `insert_text`: relative path + `[]` for files, path + `/` for dirs
-pub fn resolve_include_completions(
+/// Differences between include and image completion are parameterized:
+/// - `base_dir`: starting directory for filesystem listing
+/// - `filter`: which file extensions to include
+fn resolve_path_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
+    base_dir: &Path,
+    ext_filter: PathCompletionFilter,
 ) -> Vec<CompletionItem> {
-    let base = doc_path.parent().unwrap_or(doc_path);
-
     // Attribute substitution: resolve {attr} references in prefix
     let resolved_prefix = match ws {
         Some(ws) => ws.attributes.substitute(doc_path, prefix),
@@ -530,7 +542,7 @@ pub fn resolve_include_completions(
         None => ("", resolved_prefix.as_str()),
     };
 
-    let list_dir = base.join(resolved_dir);
+    let list_dir = base_dir.join(resolved_dir);
 
     let Ok(entries) = std::fs::read_dir(&list_dir) else {
         return Vec::new();
@@ -553,11 +565,18 @@ pub fn resolve_include_completions(
                     insert_text: Some(format!("{original_dir_prefix}{dir_name}")),
                     ..Default::default()
                 })
-            } else if std::path::Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc"))
-            {
-                if !name.starts_with(filter) {
+            } else {
+                let matches_filter = match ext_filter {
+                    PathCompletionFilter::Adoc => Path::new(&name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc")),
+                    PathCompletionFilter::Image => {
+                        Path::new(&name).extension().is_some_and(|ext| {
+                            IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+                        })
+                    }
+                };
+                if !matches_filter || !name.starts_with(filter) {
                     return None;
                 }
                 Some(CompletionItem {
@@ -566,8 +585,6 @@ pub fn resolve_include_completions(
                     insert_text: Some(format!("{original_dir_prefix}{name}[]")),
                     ..Default::default()
                 })
-            } else {
-                None
             }
         })
         .collect();
@@ -576,99 +593,26 @@ pub fn resolve_include_completions(
     items
 }
 
-/// Image file extensions for completion filtering.
-const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "tif", "ico",
-];
+/// Resolve include-path completions by listing `.adoc` files and subdirectories
+/// relative to the document's parent directory, filtered by prefix.
+pub fn resolve_include_completions(
+    prefix: &str,
+    doc_path: &Path,
+    ws: Option<&Workspace>,
+) -> Vec<CompletionItem> {
+    let base = doc_path.parent().unwrap_or(doc_path).to_path_buf();
+    resolve_path_completions(prefix, doc_path, ws, &base, PathCompletionFilter::Adoc)
+}
 
 /// Resolve image path completions by listing image files from the document's
 /// `imagesdir` directory, filtered by the typed prefix.
-///
-/// Base directory is `doc_dir / imagesdir` (unlike include completions which
-/// use `doc_dir` directly). Only files with image extensions are listed.
 pub fn resolve_image_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
-    let doc_dir = doc_path.parent().unwrap_or(doc_path);
-
-    // Resolve imagesdir from config chain
-    let imagesdir_raw = ws
-        .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
-        .unwrap_or("");
-    let imagesdir = match ws {
-        Some(ws) => ws.attributes.substitute(doc_path, imagesdir_raw),
-        None => imagesdir_raw.to_string(),
-    };
-    let base = if imagesdir.is_empty() {
-        doc_dir.to_path_buf()
-    } else {
-        doc_dir.join(&imagesdir)
-    };
-
-    // Attribute substitution in user-typed prefix
-    let resolved_prefix = match ws {
-        Some(ws) => ws.attributes.substitute(doc_path, prefix),
-        None => prefix.to_string(),
-    };
-
-    if resolved_prefix.contains('{') {
-        return Vec::new();
-    }
-
-    // Split prefix for insert vs. filesystem lookup
-    let (original_dir_prefix, _) = match prefix.rfind('/') {
-        Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
-        None => ("", prefix),
-    };
-    let (resolved_dir, filter) = match resolved_prefix.rfind('/') {
-        Some(idx) => (&resolved_prefix[..=idx], &resolved_prefix[idx + 1..]),
-        None => ("", resolved_prefix.as_str()),
-    };
-
-    let list_dir = base.join(resolved_dir);
-
-    let Ok(entries) = std::fs::read_dir(&list_dir) else {
-        return Vec::new();
-    };
-
-    let mut items: Vec<CompletionItem> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let path = entry.path();
-
-            if path.is_dir() {
-                let dir_name = format!("{name}/");
-                if !dir_name.starts_with(filter) && !name.starts_with(filter) {
-                    return None;
-                }
-                Some(CompletionItem {
-                    label: dir_name.clone(),
-                    kind: Some(CompletionItemKind::FOLDER),
-                    insert_text: Some(format!("{original_dir_prefix}{dir_name}")),
-                    ..Default::default()
-                })
-            } else {
-                let is_image = Path::new(&name).extension().is_some_and(|ext| {
-                    IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
-                });
-                if !is_image || !name.starts_with(filter) {
-                    return None;
-                }
-                Some(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::FILE),
-                    insert_text: Some(format!("{original_dir_prefix}{name}[]")),
-                    ..Default::default()
-                })
-            }
-        })
-        .collect();
-
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items
+    let (base, _) = super::navigation::resolve_image_base_dir(doc_path, ws);
+    resolve_path_completions(prefix, doc_path, ws, &base, PathCompletionFilter::Image)
 }
 
 /// Resolve attribute completions by listing all attributes from the workspace's

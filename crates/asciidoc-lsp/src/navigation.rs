@@ -133,25 +133,7 @@ pub fn resolve_goto_definition(
             Some((source.file, source.line))
         }
         NodeKind::Image { ref path } => {
-            let doc_dir = doc_path.parent()?;
-            let resolved_path = if let Some(ws) = workspace {
-                ws.attributes.substitute(doc_path, path)
-            } else {
-                path.clone()
-            };
-            let imagesdir_raw = workspace
-                .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
-                .unwrap_or("");
-            let imagesdir = if let Some(ws) = workspace {
-                ws.attributes.substitute(doc_path, imagesdir_raw)
-            } else {
-                imagesdir_raw.to_string()
-            };
-            let target = if imagesdir.is_empty() {
-                doc_dir.join(&resolved_path)
-            } else {
-                doc_dir.join(imagesdir).join(&resolved_path)
-            };
+            let (target, _, _) = resolve_image_target(path, doc_path, workspace);
             let target_canon = target.canonicalize().ok()?;
             Some((target_canon, 1))
         }
@@ -337,32 +319,7 @@ pub fn resolve_hover(
             Some(text)
         }
         NodeKind::Image { path } => {
-            let doc_dir = doc_path.parent()?;
-            let resolved_path = if let Some(ws) = workspace {
-                ws.attributes.substitute(doc_path, path)
-            } else {
-                path.clone()
-            };
-            let imagesdir_raw = workspace
-                .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
-                .unwrap_or("");
-            let imagesdir = if let Some(ws) = workspace {
-                ws.attributes.substitute(doc_path, imagesdir_raw)
-            } else {
-                imagesdir_raw.to_string()
-            };
-            let target = if imagesdir.is_empty() {
-                doc_dir.join(&resolved_path)
-            } else {
-                doc_dir.join(&imagesdir).join(&resolved_path)
-            };
-
-            let display = if imagesdir.is_empty() {
-                resolved_path.clone()
-            } else {
-                format!("{imagesdir}/{resolved_path}")
-            };
-
+            let (target, _, display) = resolve_image_target(path, doc_path, workspace);
             let mut text = format!("image::{display}[]");
             if target.exists() {
                 text.push_str("\n\n\u{2713} File exists");
@@ -373,6 +330,57 @@ pub fn resolve_hover(
         }
         NodeKind::Anchor { .. } => None,
     }
+}
+
+/// Resolve the base directory and imagesdir for image paths.
+///
+/// Returns `(base_dir, resolved_imagesdir)` where `base_dir` is `doc_dir / imagesdir`
+/// (or just `doc_dir` if imagesdir is empty/unset).
+pub(crate) fn resolve_image_base_dir(
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> (PathBuf, String) {
+    let doc_dir = doc_path.parent().unwrap_or(doc_path);
+    let imagesdir_raw = workspace
+        .and_then(|ws| ws.attributes.resolve(doc_path, "imagesdir"))
+        .unwrap_or("");
+    let imagesdir = if let Some(ws) = workspace {
+        ws.attributes.substitute(doc_path, imagesdir_raw)
+    } else {
+        imagesdir_raw.to_string()
+    };
+    let base = if imagesdir.is_empty() {
+        doc_dir.to_path_buf()
+    } else {
+        doc_dir.join(&imagesdir)
+    };
+    (base, imagesdir)
+}
+
+/// Resolve an image macro's path to a filesystem target.
+///
+/// Returns `(target_path, resolved_relative_path, display_path)`.
+/// - `target_path`: absolute path to the image file
+/// - `resolved_relative_path`: path after attribute substitution
+/// - `display_path`: human-readable path including imagesdir
+fn resolve_image_target(
+    image_path: &str,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> (PathBuf, String, String) {
+    let resolved_path = if let Some(ws) = workspace {
+        ws.attributes.substitute(doc_path, image_path)
+    } else {
+        image_path.to_string()
+    };
+    let (base, imagesdir) = resolve_image_base_dir(doc_path, workspace);
+    let target = base.join(&resolved_path);
+    let display = if imagesdir.is_empty() {
+        resolved_path.clone()
+    } else {
+        format!("{imagesdir}/{resolved_path}")
+    };
+    (target, resolved_path, display)
 }
 
 /// Extract a display-friendly filename from a path.
@@ -1078,7 +1086,7 @@ mod tests {
         .unwrap();
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // character 12 = inside "b.adoc#my-anchor"
         let pos = Position {
@@ -1100,7 +1108,7 @@ mod tests {
         fs::write(&a, "= Doc A\n\nSee <<my-anchor>>.\n\ninclude::b.adoc[]\n").unwrap();
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // character 8 = inside "my-anchor"
         let pos = Position {
@@ -1119,7 +1127,7 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nSee <<nonexistent-anchor>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -1135,7 +1143,7 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\n<<<\n\nSome content.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on the page break line
         let pos = Position {
@@ -1154,7 +1162,7 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n:author: Alice\n\nWritten by {author}.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // character 12 = 'a' in "{author}" on line 3 (0-indexed)
         let pos = Position {
@@ -1178,7 +1186,7 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // character 11 = 'i' in "{imagesdir}" on line 2 (0-indexed)
         let pos = Position {
@@ -1202,7 +1210,7 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nSee {nonexistent} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -1395,7 +1403,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "== Chapter B\n\nAlso {imagesdir} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on {imagesdir} in a.adoc — "Images in {imagesdir}" line 2 (0-indexed)
         // '{' is at byte 10, 'i' at 11
@@ -1414,7 +1422,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n:myattr: value\n\nUsing {myattr} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on :myattr: definition, line 1 (0-indexed), character 3
         let pos = Position {
@@ -1437,7 +1445,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on {imagesdir}
         let pos = Position {
@@ -1506,7 +1514,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &index).unwrap();
+        let ws = Workspace::build(tmp.path(), &index);
 
         // Cursor on {source-dir} in concepts.adoc, line 2 (0-indexed)
         let concepts_content = fs::read_to_string(chapters.join("concepts.adoc")).unwrap();
@@ -1558,7 +1566,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "== Chapter B\n\nAlso see {source-dir}/lib.rs.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
 
         // Read .asciidoctorconfig content and place cursor on :source-dir:
         let config_content = fs::read_to_string(&config_path).unwrap();
@@ -1624,7 +1632,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&b, "== Chapter B\n\nContent.\n").unwrap();
         fs::write(&c, "== Chapter C\n\ninclude::b.adoc[]\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on include::b.adoc[]
         let pos = Position {
@@ -1650,7 +1658,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "[[anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on include::b.adoc[]
         let pos = Position {
@@ -1687,7 +1695,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on [[my-id]]
         let pos = Position {
@@ -1712,7 +1720,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "== Chapter B\n\nSee <<my-id>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on [[my-id]]
         let pos = Position {
@@ -1753,7 +1761,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &b).unwrap();
+        let ws = Workspace::build(tmp.path(), &b);
         let content = fs::read_to_string(&b).unwrap();
         // cursor on xref:a.adoc#target[link]
         let pos = Position {
@@ -1783,7 +1791,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &b).unwrap();
+        let ws = Workspace::build(tmp.path(), &b);
         let content = fs::read_to_string(&b).unwrap();
         // cursor on <<anchor>>
         let pos = Position {
@@ -1821,7 +1829,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &index).unwrap();
+        let ws = Workspace::build(tmp.path(), &index);
         let content = fs::read_to_string(&index).unwrap();
         // cursor on include::chapters/intro.adoc[]
         let pos = Position {
@@ -1857,7 +1865,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&b, "== Chapter B\n\nSee xref:a.adoc#my-anchor[link].\n").unwrap();
         fs::write(&c, "== Chapter C\n\nAlso <<my-anchor>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // cursor on [[my-anchor]]
         let pos = Position {
@@ -1977,7 +1985,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\nimage::diagram.png[Alt]\n").unwrap();
         fs::write(&img, "fake-png-data").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2002,7 +2010,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\nimage::{mydir}/logo.png[Logo]\n").unwrap();
         fs::write(&img, "fake-png-data").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor after the attribute ref (on "/logo.png" part)
         let pos = Position {
@@ -2028,7 +2036,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2049,7 +2057,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nSee {nonexistent} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2065,7 +2073,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n:myattr: hello world\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 1,
@@ -2083,7 +2091,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n:custom: val\n\nSee {custom}.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 3,
@@ -2109,7 +2117,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2134,7 +2142,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\nSee <<my-anchor>>.\n\ninclude::b.adoc[]\n").unwrap();
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2154,7 +2162,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nSee <<nonexistent>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2173,7 +2181,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\ninclude::sub.adoc[]\n").unwrap();
         fs::write(&b, "== Sub Chapter\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2210,7 +2218,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\ninclude::{chapdir}/intro.adoc[]\n").unwrap();
         fs::write(chapters.join("intro.adoc"), "== Introduction\n\nWelcome.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on the include path, after the attribute ref
         let pos = Position {
@@ -2263,7 +2271,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\nimage::photo.png[My Photo]\n").unwrap();
         fs::write(&img, "fake-png-data").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2319,7 +2327,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         fs::write(&a, "= Doc A\n\nimage::logo.png[Logo]\n").unwrap();
         fs::write(images.join("logo.png"), "fake-png-data").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2365,7 +2373,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&config).unwrap();
         // Cursor on {asciidoctorconfigdir} — starts at col 13
         let pos = Position {
@@ -2396,7 +2404,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = canonical_root.join("a.adoc");
         fs::write(&a, "= Doc\n").unwrap();
 
-        let ws = Workspace::build(&canonical_root, &a).unwrap();
+        let ws = Workspace::build(&canonical_root, &a);
         let content = fs::read_to_string(&config).unwrap();
 
         // Simulate non-canonical path (as LSP hover handler would pass it):
@@ -2514,7 +2522,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n\n[[my-anchor]]\n== Section\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2537,7 +2545,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         // We need a section without explicit anchor — the implicit ID is _section_title.
         fs::write(&a, "= Title\n\n== Section Title\n\n<<_section_title>>\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on <<_section_title>> (shorthand xref to implicit ID)
         let pos = Position {
@@ -2555,7 +2563,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n:author: Alice\n\nBy {author}.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on {author} — line 3 (0-indexed), character 4 = inside "author"
         let pos = Position {
@@ -2599,7 +2607,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2627,7 +2635,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "[[target]]\n== Target Section\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on xref target
         let pos = Position {
@@ -2658,7 +2666,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(&b, "[[my-id]]\n== Section\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2683,7 +2691,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n:myattr: value\n\nUsing {myattr} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on {myattr}
         let pos = Position {
@@ -2711,7 +2719,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n\nValue is {shared-attr}.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2737,7 +2745,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n\n[[my-anchor]]\n== Section\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2782,7 +2790,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n:author: Alice\n\nBy {author}.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on :author: definition
         let pos = Position {
@@ -2817,7 +2825,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n:author: Alice\n\nBy {author}.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on {author} reference — line 3 (0-indexed), character 5
         let pos = Position {
@@ -2852,7 +2860,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on <<my-anchor>> — line 5 (0-indexed), character 7
         let pos = Position {
@@ -2887,7 +2895,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         let pos = Position {
             line: 2,
@@ -2928,7 +2936,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Title\n:myattr: value\n\nUsing {myattr} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&a).unwrap();
         // Cursor on {myattr}
         let pos = Position {
@@ -2987,7 +2995,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let mut overrides = HashMap::new();
         overrides.insert(a_canon.clone(), new_content.to_string());
 
-        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
         let pos = Position {
             line: 2,
@@ -3040,7 +3048,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         overrides.insert(a_canon.clone(), new_a.to_string());
         overrides.insert(b_canon.clone(), new_b.to_string());
 
-        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
         // Cursor on xref target in a.adoc
         let pos = Position {
@@ -3077,7 +3085,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let mut overrides = HashMap::new();
         overrides.insert(a_canon.clone(), new_content.to_string());
 
-        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
         // Cursor on attribute reference
         let pos = Position {
