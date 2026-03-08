@@ -73,74 +73,8 @@ impl AttributeRegistry {
         }
         chain_dirs.reverse(); // now root → dir order
 
-        // Merge configs from root to dir (last wins)
-        // First: load ~/.asciidoctorconfig from home dir (lowest priority in chain)
-        let mut merged: HashMap<String, AttributeEntry> = HashMap::new();
-        if let Some(home_dir) = std::env::var("HOME").ok().map(PathBuf::from) {
-            if let Some(home_config) = find_config_file(&home_dir) {
-                if let Ok(content) = std::fs::read_to_string(&home_config) {
-                    let canonical_home = home_dir.canonicalize().unwrap_or(home_dir);
-                    merged.insert(
-                        "asciidoctorconfigdir".into(),
-                        AttributeEntry {
-                            value: canonical_home.display().to_string(),
-                            source: Some(AttributeSource {
-                                file: home_config.clone(),
-                                line: 0,
-                            }),
-                        },
-                    );
-                    for (key, value, line) in parse_asciidoctorconfig(&content) {
-                        let substituted = substitute_with(&merged, &value);
-                        let resolved = canonicalize_path_value(&substituted, &canonical_home);
-                        merged.insert(
-                            key,
-                            AttributeEntry {
-                                value: resolved,
-                                source: Some(AttributeSource {
-                                    file: home_config.clone(),
-                                    line,
-                                }),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        for chain_dir in &chain_dirs {
-            let Some(config_path) = find_config_file(chain_dir) else {
-                continue;
-            };
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
-                merged.insert(
-                    "asciidoctorconfigdir".into(),
-                    AttributeEntry {
-                        value: chain_dir.display().to_string(),
-                        source: Some(AttributeSource {
-                            file: config_path.clone(),
-                            line: 0,
-                        }),
-                    },
-                );
-
-                for (key, value, line) in parse_asciidoctorconfig(&content) {
-                    let substituted = substitute_with(&merged, &value);
-                    let resolved = canonicalize_path_value(&substituted, chain_dir);
-                    merged.insert(
-                        key,
-                        AttributeEntry {
-                            value: resolved,
-                            source: Some(AttributeSource {
-                                file: config_path.clone(),
-                                line,
-                            }),
-                        },
-                    );
-                }
-            }
-        }
+        let mut merged = load_home_config();
+        merge_config_chain(&chain_dirs, &mut merged);
 
         self.config_chains.insert(dir, merged);
     }
@@ -231,6 +165,83 @@ impl AttributeRegistry {
     #[must_use]
     pub fn substitute(&self, file: &Path, input: &str) -> String {
         substitute_inner(input, |name| self.resolve(file, name))
+    }
+}
+
+/// Load `~/.asciidoctorconfig` from the user's home directory (lowest priority in chain).
+fn load_home_config() -> HashMap<String, AttributeEntry> {
+    let mut merged = HashMap::new();
+    if let Some(home_dir) = std::env::var("HOME").ok().map(PathBuf::from) {
+        if let Some(home_config) = find_config_file(&home_dir) {
+            if let Ok(content) = std::fs::read_to_string(&home_config) {
+                let canonical_home = home_dir.canonicalize().unwrap_or(home_dir);
+                merged.insert(
+                    "asciidoctorconfigdir".into(),
+                    AttributeEntry {
+                        value: canonical_home.display().to_string(),
+                        source: Some(AttributeSource {
+                            file: home_config.clone(),
+                            line: 0,
+                        }),
+                    },
+                );
+                for (key, value, line) in parse_asciidoctorconfig(&content) {
+                    let substituted = substitute_with(&merged, &value);
+                    let resolved = canonicalize_path_value(&substituted, &canonical_home);
+                    merged.insert(
+                        key,
+                        AttributeEntry {
+                            value: resolved,
+                            source: Some(AttributeSource {
+                                file: home_config.clone(),
+                                line,
+                            }),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Merge `.asciidoctorconfig` files from root to leaf directory into `merged`.
+///
+/// Walks `chain_dirs` (expected in root → leaf order), loading each config file
+/// and merging its attributes. Later directories override earlier ones.
+fn merge_config_chain(chain_dirs: &[PathBuf], merged: &mut HashMap<String, AttributeEntry>) {
+    for chain_dir in chain_dirs {
+        let Some(config_path) = find_config_file(chain_dir) else {
+            continue;
+        };
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
+            merged.insert(
+                "asciidoctorconfigdir".into(),
+                AttributeEntry {
+                    value: chain_dir.display().to_string(),
+                    source: Some(AttributeSource {
+                        file: config_path.clone(),
+                        line: 0,
+                    }),
+                },
+            );
+
+            for (key, value, line) in parse_asciidoctorconfig(&content) {
+                let substituted = substitute_with(merged, &value);
+                let resolved = canonicalize_path_value(&substituted, chain_dir);
+                merged.insert(
+                    key,
+                    AttributeEntry {
+                        value: resolved,
+                        source: Some(AttributeSource {
+                            file: config_path.clone(),
+                            line,
+                        }),
+                    },
+                );
+            }
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use crate::attributes::AttributeRegistry;
 use crate::diagnostics::collect_diagnostics;
 use crate::graph::{build_graph, build_graph_with_overrides, parse_single_file, IncludeGraph};
 use crate::references::ReferenceIndex;
-use crate::types::{Diagnostic, DocumentModel};
+use crate::types::{Diagnostic, DocumentModel, FileLocation};
 
 /// Recursively find all `.adoc` files under a directory.
 /// Tracks visited canonical paths to avoid infinite loops from symlinks.
@@ -100,15 +100,14 @@ impl Workspace {
 
     /// Find all usages of an attribute `{name}` across the workspace.
     ///
-    /// Returns a Vec of (`file_path`, line, `start_col`, `end_col`) for each reference.
     /// Only returns usages (references), not definitions.
     #[must_use]
-    pub fn find_all_attribute_usages(&self, name: &str) -> Vec<(PathBuf, usize, usize, usize)> {
+    pub fn find_all_attribute_usages(&self, name: &str) -> Vec<FileLocation> {
         let mut results = Vec::new();
         for doc in self.documents.values() {
             for attr_ref in &doc.attribute_refs {
                 if attr_ref.name == name {
-                    results.push((
+                    results.push(FileLocation::new(
                         doc.path.clone(),
                         attr_ref.line,
                         attr_ref.start_col,
@@ -121,18 +120,13 @@ impl Workspace {
     }
 
     /// Find all include statements that reference the given target file.
-    ///
-    /// Returns `(source_file, line, 0, 0)` for each `include::target[]` found.
     #[must_use]
-    pub fn find_all_include_references(
-        &self,
-        target: &Path,
-    ) -> Vec<(PathBuf, usize, usize, usize)> {
+    pub fn find_all_include_references(&self, target: &Path) -> Vec<FileLocation> {
         let mut results = Vec::new();
         for (source_file, edges) in &self.include_graph.forward {
             for edge in edges {
                 if edge.target == target {
-                    results.push((source_file.clone(), edge.line, 0, 0));
+                    results.push(FileLocation::new(source_file.clone(), edge.line, 0, 0));
                 }
             }
         }
@@ -140,10 +134,8 @@ impl Workspace {
     }
 
     /// Find all xrefs that reference the given filename (file part of xref target).
-    ///
-    /// Returns `(doc_path, line, 0, 0)` for each matching xref.
     #[must_use]
-    pub fn find_all_file_xrefs(&self, filename: &str) -> Vec<(PathBuf, usize, usize, usize)> {
+    pub fn find_all_file_xrefs(&self, filename: &str) -> Vec<FileLocation> {
         let mut results = Vec::new();
         for doc in self.documents.values() {
             for xref in &doc.xrefs {
@@ -161,7 +153,7 @@ impl Workspace {
                     || file_part.ends_with(&format!("/{filename}"))
                     || filename.ends_with(&format!("/{file_part}"))
                 {
-                    results.push((doc.path.clone(), xref.line, 0, 0));
+                    results.push(FileLocation::new(doc.path.clone(), xref.line, 0, 0));
                 }
             }
         }
@@ -171,12 +163,8 @@ impl Workspace {
     /// Find all xrefs that reference the given anchor ID.
     ///
     /// Matches xrefs with targets like `file.adoc#anchor`, `#anchor`, or `anchor`.
-    /// Returns `(doc_path, line, 0, 0)` for each matching xref.
     #[must_use]
-    pub fn find_all_anchor_references(
-        &self,
-        anchor_id: &str,
-    ) -> Vec<(PathBuf, usize, usize, usize)> {
+    pub fn find_all_anchor_references(&self, anchor_id: &str) -> Vec<FileLocation> {
         let mut results = Vec::new();
         for doc in self.documents.values() {
             for xref in &doc.xrefs {
@@ -192,7 +180,7 @@ impl Workspace {
                     xref.target.as_str()
                 };
                 if xref_anchor == anchor_id {
-                    results.push((doc.path.clone(), xref.line, 0, 0));
+                    results.push(FileLocation::new(doc.path.clone(), xref.line, 0, 0));
                 }
             }
         }

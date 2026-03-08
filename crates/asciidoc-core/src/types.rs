@@ -108,6 +108,10 @@ pub enum DiagnosticKind {
         path: String,
         cycle_through: PathBuf,
     },
+    /// Reserved for future typo detection (Levenshtein against known attributes).
+    /// Currently unused: ifdef/ifndef attributes are build-time-dependent,
+    /// so the LSP cannot verify them.
+    #[allow(dead_code)]
     UndefinedConditionalAttr {
         name: String,
         directive: String,
@@ -183,6 +187,29 @@ pub struct ConditionalDirective {
     pub attributes: Vec<String>,
     pub operator: ConditionalOperator,
     pub line: usize,
+}
+
+/// A location within a file, used for reference results.
+///
+/// Replaces `(PathBuf, usize, usize, usize)` tuples throughout the codebase.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileLocation {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+    pub end_col: usize,
+}
+
+impl FileLocation {
+    #[must_use]
+    pub fn new(path: PathBuf, line: usize, col: usize, end_col: usize) -> Self {
+        Self {
+            path,
+            line,
+            col,
+            end_col,
+        }
+    }
 }
 
 #[derive(Debug)]

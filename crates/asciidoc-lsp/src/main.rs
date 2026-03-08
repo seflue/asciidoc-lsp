@@ -493,11 +493,11 @@ impl LanguageServer for AsciiDocLsp {
 
         let locations: Vec<Location> = refs
             .into_iter()
-            .filter_map(|(path, line, start_col, end_col)| {
-                let target_uri = Uri::from_file_path(&path)?;
-                let file_content = std::fs::read_to_string(&path).unwrap_or_default();
-                let start = positions::to_lsp_position(line, start_col, &file_content);
-                let end = positions::to_lsp_position(line, end_col, &file_content);
+            .filter_map(|loc| {
+                let target_uri = Uri::from_file_path(&loc.path)?;
+                let file_content = std::fs::read_to_string(&loc.path).unwrap_or_default();
+                let start = positions::to_lsp_position(loc.line, loc.col, &file_content);
+                let end = positions::to_lsp_position(loc.line, loc.end_col, &file_content);
                 Some(Location {
                     uri: target_uri,
                     range: Range { start, end },

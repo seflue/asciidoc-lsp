@@ -373,7 +373,7 @@ fn walk_for_inline_ranges(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter:
 // --- Helpers ---
 
 /// Find the first child with the given kind and return its text.
-fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option<String> {
+pub fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == kind {

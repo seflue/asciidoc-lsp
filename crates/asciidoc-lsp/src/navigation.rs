@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::Position;
 
-use asciidoc_core::types::AnchorKind;
+use asciidoc_core::extractors::find_child_text;
+use asciidoc_core::types::{AnchorKind, FileLocation};
 use asciidoc_core::workspace::Workspace;
 
 use crate::positions;
@@ -146,7 +147,6 @@ pub fn resolve_goto_definition(
 
 /// Resolve a find-references request to a list of reference locations.
 ///
-/// Returns `(file_path, line_1indexed, start_col, end_col)` for each reference.
 /// When `include_declaration` is true and cursor is on a `{name}` reference,
 /// the definition location is included in the results.
 pub fn resolve_references(
@@ -155,7 +155,7 @@ pub fn resolve_references(
     doc_path: &Path,
     workspace: Option<&Workspace>,
     include_declaration: bool,
-) -> Option<Vec<(PathBuf, usize, usize, usize)>> {
+) -> Option<Vec<FileLocation>> {
     let node_info = find_node_at_position(content, pos)?;
     let ws = workspace?;
 
@@ -164,7 +164,7 @@ pub fn resolve_references(
             let mut r = ws.find_all_attribute_usages(name);
             if include_declaration && matches!(node_info.kind, NodeKind::AttributeRef { .. }) {
                 if let Some(source) = ws.attributes.resolve_source(doc_path, name) {
-                    r.push((source.file, source.line, 0, 0));
+                    r.push(FileLocation::new(source.file, source.line, 0, 0));
                 }
             }
             r
@@ -187,7 +187,7 @@ pub fn resolve_references(
             let mut r = ws.find_all_anchor_references(id);
             if include_declaration {
                 if let Some(loc) = ws.reference_index.lookup(id) {
-                    r.push((loc.file.clone(), loc.line, 0, 0));
+                    r.push(FileLocation::new(loc.file.clone(), loc.line, 0, 0));
                 }
             }
             r
@@ -207,7 +207,7 @@ pub fn resolve_references(
             let mut r = ws.find_all_anchor_references(anchor_id);
             if include_declaration {
                 if let Some(loc) = ws.reference_index.lookup(anchor_id) {
-                    r.push((loc.file.clone(), loc.line, 0, 0));
+                    r.push(FileLocation::new(loc.file.clone(), loc.line, 0, 0));
                 }
             }
             r
@@ -219,8 +219,8 @@ pub fn resolve_references(
     };
 
     // Deduplicate results (same file+line can appear from multiple sources)
-    results.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    results.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    results.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    results.dedup_by(|a, b| a.path == b.path && a.line == b.line);
 
     if results.is_empty() {
         None
@@ -578,20 +578,6 @@ fn find_attribute_ref_at_position(
     })
 }
 
-/// Find the first child with the given kind and return its text.
-fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return child
-                .utf8_text(source)
-                .ok()
-                .map(std::string::ToString::to_string);
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Rename support (adoc-0036)
 // ---------------------------------------------------------------------------
@@ -713,11 +699,11 @@ pub fn resolve_rename(
 
             // Attribute references: {name} → start_col+1 to end_col-1 (inside braces)
             let refs = ws.find_all_attribute_usages(name);
-            for (path, line, start_col, end_col) in refs {
+            for loc in refs {
                 edits
-                    .entry(path)
+                    .entry(loc.path)
                     .or_default()
-                    .push((line, start_col + 1, end_col - 1));
+                    .push((loc.line, loc.col + 1, loc.end_col - 1));
             }
 
             // Attribute definition: :name: → find columns via text search
@@ -802,14 +788,17 @@ fn resolve_rename_anchor(
 
     // Anchor references (xrefs)
     let refs = ws.find_all_anchor_references(anchor_id);
-    for (path, line, _start_col, _end_col) in refs {
-        let file_content = read_file_cached(&mut file_cache, &path, overrides);
+    for loc in refs {
+        let file_content = read_file_cached(&mut file_cache, &loc.path, overrides);
         let line_text = file_content
             .lines()
-            .nth(line.saturating_sub(1))
+            .nth(loc.line.saturating_sub(1))
             .unwrap_or_default();
         if let Some((start, end)) = find_anchor_ref_columns(line_text, anchor_id) {
-            edits.entry(path).or_default().push((line, start, end));
+            edits
+                .entry(loc.path)
+                .or_default()
+                .push((loc.line, start, end));
         }
     }
 
@@ -1472,7 +1461,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             .join(".asciidoctorconfig")
             .canonicalize()
             .unwrap();
-        let has_config = with.iter().any(|(p, _, _, _)| *p == config_path);
+        let has_config = with.iter().any(|loc| loc.path == config_path);
         assert!(
             has_config,
             "Declaration from .asciidoctorconfig should be included"
@@ -1536,7 +1525,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         // Verify both files are represented
         let building_path = chapters.join("building.adoc").canonicalize().unwrap();
-        let files: Vec<_> = results.iter().map(|(p, _, _, _)| p.clone()).collect();
+        let files: Vec<_> = results.iter().map(|loc| loc.path.clone()).collect();
         assert!(
             files.contains(&concepts_path),
             "concepts.adoc should be in results"
@@ -1885,7 +1874,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         // Verify both files are represented
         let b_canon = b.canonicalize().unwrap();
         let c_canon = c.canonicalize().unwrap();
-        let files: Vec<_> = results.iter().map(|(p, _, _, _)| p.clone()).collect();
+        let files: Vec<_> = results.iter().map(|loc| loc.path.clone()).collect();
         assert!(files.contains(&b_canon), "b.adoc should be in results");
         assert!(files.contains(&c_canon), "c.adoc should be in results");
     }
