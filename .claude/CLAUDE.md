@@ -64,7 +64,7 @@ Inline grammar: `inline_macro` (xrefs), `id_assignment` (anchors)
 ## Code Style
 
 - Rust edition 2021
-- Error handling: `anyhow::Result`
+- Error handling: `thiserror::Error` (typed `CoreError` in asciidoc-core)
 - CLI: `clap` derive macros
 - Tree-sitter walking: recursive `walk_for_*` functions in `extractors.rs`
 - No `unwrap()` in production code; `unwrap()` OK in tests
@@ -77,5 +77,5 @@ Inline grammar: `inline_macro` (xrefs), `id_assignment` (anchors)
 | `tree-sitter-asciidoc` 0.6 | Block-level AsciiDoc grammar |
 | `tree-sitter-asciidoc-inline` 0.6 | Inline-level AsciiDoc grammar |
 | `clap` 4 (derive) | CLI argument parsing |
-| `anyhow` 1 | Error handling |
+| `thiserror` 2 | Typed error handling |
 | `tempfile` 3 (dev) | Temp dirs for tests |

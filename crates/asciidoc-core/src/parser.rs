@@ -1,11 +1,12 @@
-use anyhow::Result;
 use tree_sitter::{Parser, Tree};
+
+use crate::error::CoreError;
 
 /// Initialize a tree-sitter parser for the block-level `AsciiDoc` grammar.
 ///
 /// # Errors
 /// Returns an error if the tree-sitter language fails to load.
-pub fn init_block_parser() -> Result<Parser> {
+pub fn init_block_parser() -> Result<Parser, CoreError> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_asciidoc::language())?;
     Ok(parser)
@@ -15,7 +16,7 @@ pub fn init_block_parser() -> Result<Parser> {
 ///
 /// # Errors
 /// Returns an error if the tree-sitter language fails to load.
-pub fn init_inline_parser() -> Result<Parser> {
+pub fn init_inline_parser() -> Result<Parser, CoreError> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_asciidoc_inline::language())?;
     Ok(parser)
@@ -25,10 +26,8 @@ pub fn init_inline_parser() -> Result<Parser> {
 ///
 /// # Errors
 /// Returns an error if tree-sitter fails to produce a parse tree.
-pub fn parse(parser: &mut Parser, source: &str) -> Result<Tree> {
-    parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse"))
+pub fn parse(parser: &mut Parser, source: &str) -> Result<Tree, CoreError> {
+    parser.parse(source, None).ok_or(CoreError::ParseFailed)
 }
 
 #[cfg(test)]

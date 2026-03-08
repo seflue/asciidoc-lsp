@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-
 use crate::attributes::AttributeRegistry;
 use crate::diagnostics::collect_diagnostics;
 use crate::graph::{build_graph, build_graph_with_overrides, parse_single_file, IncludeGraph};
@@ -84,10 +82,8 @@ impl Workspace {
     /// Convenience wrapper: creates a `new()` workspace, then populates it
     /// via graph walk from the entry file. Used by CLI and tests.
     /// Production LSP code uses `new()` + `ensure_file()` per opened file.
-    ///
-    /// # Errors
-    /// Returns an error if the workspace cannot be constructed (currently infallible).
-    pub fn build(root: &Path, entry: &Path) -> Result<Self> {
+    #[must_use]
+    pub fn build(root: &Path, entry: &Path) -> Self {
         let mut ws = Self::new(root);
         let (graph, documents) = build_graph(entry, &mut ws.attributes);
         ws.include_graph = graph;
@@ -99,7 +95,7 @@ impl Workspace {
             &ws.reference_index,
             &ws.attributes,
         );
-        Ok(ws)
+        ws
     }
 
     /// Find all usages of an attribute `{name}` across the workspace.
@@ -292,14 +288,12 @@ impl Workspace {
     /// Convenience wrapper: creates a `new()` workspace, then populates it
     /// via graph walk with override support. Used by tests.
     /// Production LSP code uses `new()` + `ensure_file()` per opened file.
-    ///
-    /// # Errors
-    /// Returns an error if the workspace cannot be constructed (currently infallible).
+    #[must_use]
     pub fn build_with_overrides(
         root: &Path,
         entry: &Path,
         overrides: &HashMap<PathBuf, String>,
-    ) -> Result<Self> {
+    ) -> Self {
         let mut ws = Self::new(root);
         let (graph, documents) = build_graph_with_overrides(entry, &mut ws.attributes, overrides);
         ws.include_graph = graph;
@@ -311,7 +305,7 @@ impl Workspace {
             &ws.reference_index,
             &ws.attributes,
         );
-        Ok(ws)
+        ws
     }
 }
 
@@ -361,7 +355,7 @@ mod tests {
         fs::write(&a, "= Doc A\n\ninclude::b.adoc[]\n").unwrap();
         fs::write(&b, "== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
 
         assert_eq!(ws.documents.len(), 2);
         assert!(!ws.include_graph.forward.is_empty());
@@ -395,7 +389,7 @@ mod tests {
         .unwrap();
         fs::write(&b, "== Chapter B\n\nAlso {imagesdir} here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let usages = ws.find_all_attribute_usages("imagesdir");
 
         assert_eq!(usages.len(), 2, "Expected 2 usages, got: {:?}", usages);
@@ -407,7 +401,7 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n:imagesdir: images\n\nNo refs here.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let usages = ws.find_all_attribute_usages("imagesdir");
 
         assert!(usages.is_empty(), "Expected no usages, got: {:?}", usages);
@@ -426,7 +420,7 @@ mod tests {
         fs::write(&b, "== Chapter B\n\nContent.\n").unwrap();
         fs::write(&c, "== Chapter C\n\ninclude::b.adoc[]\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let b_canon = b.canonicalize().unwrap();
         let refs = ws.find_all_include_references(&b_canon);
 
@@ -443,7 +437,7 @@ mod tests {
         fs::write(&a, "= Doc A\n\ninclude::b.adoc[]\n").unwrap();
         fs::write(&b, "== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         // a.adoc is not included by anyone
         let a_canon = a.canonicalize().unwrap();
         let refs = ws.find_all_include_references(&a_canon);
@@ -466,7 +460,7 @@ mod tests {
         .unwrap();
         fs::write(&b, "[[anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let refs = ws.find_all_file_xrefs("b.adoc");
 
         assert_eq!(refs.len(), 1, "Expected 1 file xref, got: {:?}", refs);
@@ -489,7 +483,7 @@ mod tests {
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let refs = ws.find_all_file_xrefs("b.adoc");
 
         assert_eq!(refs.len(), 2, "Expected 2 file xrefs, got: {:?}", refs);
@@ -510,7 +504,7 @@ mod tests {
         .unwrap();
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let refs = ws.find_all_anchor_references("my-anchor");
 
         assert_eq!(refs.len(), 1, "Expected 1 anchor ref, got: {:?}", refs);
@@ -529,7 +523,7 @@ mod tests {
         .unwrap();
         fs::write(&b, "== Chapter B\n\nSee <<my-anchor>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let refs = ws.find_all_anchor_references("my-anchor");
 
         assert_eq!(refs.len(), 1, "Expected 1 anchor ref, got: {:?}", refs);
@@ -550,7 +544,7 @@ mod tests {
         fs::write(&b, "== Chapter B\n\nSee xref:a.adoc#target-id[link].\n").unwrap();
         fs::write(&c, "== Chapter C\n\nAlso <<target-id>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let refs = ws.find_all_anchor_references("target-id");
 
         assert_eq!(refs.len(), 2, "Expected 2 anchor refs, got: {:?}", refs);
@@ -563,7 +557,7 @@ mod tests {
 
         fs::write(&a, "= Doc A\n\n[[my-anchor]]\n== Section\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
         let refs = ws.find_all_anchor_references("nonexistent");
 
         assert!(refs.is_empty(), "Expected no anchor refs, got: {:?}", refs);
@@ -582,7 +576,7 @@ mod tests {
         .unwrap();
         fs::write(&b, "== Chapter B\n\nSee <<my-anchor>>.\n").unwrap();
 
-        let ws = Workspace::build(tmp.path(), &a).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
 
         assert_eq!(ws.documents.len(), 2);
         assert!(ws.reference_index.anchors.contains_key("my-anchor"));
@@ -612,7 +606,7 @@ mod tests {
         fs::write(&main_adoc, "= Main Doc\n\ninclude::../tests/test.adoc[]\n").unwrap();
         fs::write(&test_adoc, "== Test Chapter\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(&root, &main_adoc).unwrap();
+        let ws = Workspace::build(&root, &main_adoc);
 
         let main_canon = main_adoc.canonicalize().unwrap();
         let test_canon = test_adoc.canonicalize().unwrap();
@@ -657,7 +651,7 @@ mod tests {
         let entry = sub.join("file.adoc");
         fs::write(&entry, "= Sub Doc\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(&root, &entry).unwrap();
+        let ws = Workspace::build(&root, &entry);
         let entry_canon = entry.canonicalize().unwrap();
 
         // Child config wins (last-wins merge)
@@ -684,7 +678,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         assert_eq!(ws.documents.len(), 1, "Only entry parsed initially");
 
         let standalone_canon = standalone.canonicalize().unwrap();
@@ -706,7 +700,7 @@ mod tests {
         fs::write(&entry, "= Main\n\nContent.\n").unwrap();
         fs::write(&standalone, "= Standalone\n\nContent.\n").unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         let standalone_canon = standalone.canonicalize().unwrap();
         let overrides = HashMap::new();
 
@@ -738,7 +732,7 @@ mod tests {
         let standalone = tests_dir.join("test.adoc");
         fs::write(&standalone, "= Test\n\nContent.\n").unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         let standalone_canon = standalone.canonicalize().unwrap();
         let overrides = HashMap::new();
         ws.ensure_file(&standalone_canon, &overrides);
@@ -763,7 +757,7 @@ mod tests {
         fs::write(&entry, "= Main\n\ninclude::chapter.adoc[]\n").unwrap();
         fs::write(&included, "== Chapter\n\nContent.\n").unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         assert_eq!(ws.documents.len(), 2);
 
         let included_canon = included.canonicalize().unwrap();
@@ -795,7 +789,7 @@ mod tests {
         let entry = sub.join("file.adoc");
         fs::write(&entry, "= Sub Doc\n\nContent.\n").unwrap();
 
-        let ws = Workspace::build(&root, &entry).unwrap();
+        let ws = Workspace::build(&root, &entry);
         let entry_canon = entry.canonicalize().unwrap();
 
         // imagesdir uses root's {asciidoctorconfigdir} → workspace/images
@@ -841,7 +835,7 @@ mod tests {
         let standalone = tests_dir.join("standalone.adoc");
         fs::write(&standalone, "= Test\n\nContent.\n").unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         let standalone_canon = standalone.canonicalize().unwrap();
         let tests_dir_canon = tests_dir.canonicalize().unwrap();
         let overrides = HashMap::new();
@@ -929,7 +923,7 @@ mod tests {
         let other = root.join("other.adoc");
         fs::write(&other, "== Other\n\nOther content.\n").unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         assert_eq!(ws.documents.len(), 1);
 
         let standalone_canon = standalone.canonicalize().unwrap();
@@ -991,7 +985,7 @@ mod tests {
         let test_file = tests_dir.join("test.adoc");
         fs::write(&test_file, "= Test\n\nContent.\n").unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         let test_canon = test_file.canonicalize().unwrap();
         let entry_canon = entry.canonicalize().unwrap();
         let overrides = HashMap::new();
@@ -1231,7 +1225,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut ws = Workspace::build(&root, &entry).unwrap();
+        let mut ws = Workspace::build(&root, &entry);
         let standalone_canon = standalone.canonicalize().unwrap();
 
         // Override: editor buffer has different content

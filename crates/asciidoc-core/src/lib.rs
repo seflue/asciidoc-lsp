@@ -1,5 +1,6 @@
 pub mod attributes;
 pub mod diagnostics;
+pub mod error;
 pub mod extractors;
 pub mod graph;
 pub mod parser;

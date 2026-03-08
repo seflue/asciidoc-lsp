@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let ws = Workspace::build(&root, &cli.path)?;
+        let ws = Workspace::build(&root, &cli.path);
 
         let all_diags = ws.all_diagnostics();
         if all_diags.is_empty() {
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let ws = Workspace::build(&root, &cli.path)?;
+        let ws = Workspace::build(&root, &cli.path);
         let entry_canonical = cli.path.canonicalize()?;
         let tree = ws
             .include_graph

@@ -865,7 +865,7 @@ mod tests {
             "== Modified Chapter B\n\nEdited content.\n".to_string(),
         );
 
-        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides).unwrap();
+        let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
         // Verify the override content was used
         let b_doc = ws.documents.get(&b_canon).unwrap();
@@ -894,15 +894,7 @@ mod tests {
         let ws_root = workspace_root();
         let entry = arc42_docs_dir().join("index.adoc");
 
-        // Workspace::build should succeed with the arc42 fixture
         let ws = Workspace::build(&ws_root, &entry);
-        assert!(
-            ws.is_ok(),
-            "workspace build should succeed for arc42: {:?}",
-            ws.err()
-        );
-
-        let ws = ws.unwrap();
 
         // Should have found multiple documents (index + included chapters)
         assert!(
@@ -930,7 +922,7 @@ mod tests {
         let ws_root = workspace_root();
         let entry = arc42_docs_dir().join("index.adoc");
 
-        let ws = Workspace::build(&ws_root, &entry).unwrap();
+        let ws = Workspace::build(&ws_root, &entry);
 
         // Arc42 fixture has exactly 2 known diagnostics:
         // 1. Broken include: {source-dir}/main.rs (attribute substitution resolves to ../src/main.rs which doesn't exist)
@@ -976,7 +968,7 @@ mod tests {
         let content = fs::read_to_string(&index).unwrap();
 
         let ws_root = workspace_root();
-        let ws = Workspace::build(&ws_root, &index).unwrap();
+        let ws = Workspace::build(&ws_root, &index);
 
         // Line 10 in index.adoc: include::chapters/01_introduction_and_goals.adoc[]
         // (0-indexed for LSP: line 9)
@@ -1009,7 +1001,7 @@ mod tests {
         let content = fs::read_to_string(&index).unwrap();
 
         let ws_root = workspace_root();
-        let ws = Workspace::build(&ws_root, &index).unwrap();
+        let ws = Workspace::build(&ws_root, &index);
 
         // Line 20 in index.adoc: include::{docdir}/appendix/glossary.adoc[]
         // {docdir} is at columns 9..16 (0-indexed LSP line 19)

@@ -543,7 +543,7 @@ mod tests {
             }
         }
         let entry = first_file.unwrap();
-        let ws = Workspace::build(tmp.path(), &entry).unwrap();
+        let ws = Workspace::build(tmp.path(), &entry);
         (tmp, ws)
     }
 
@@ -843,7 +843,7 @@ mod tests {
         let ws_root = workspace_root();
         let entry_path = ws_root.join("docs/index.adoc");
 
-        let ws = Workspace::build(&ws_root, &entry_path).unwrap();
+        let ws = Workspace::build(&ws_root, &entry_path);
 
         // All symbols (empty query)
         let all_symbols = collect_workspace_symbols(&ws, "");

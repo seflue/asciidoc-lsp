@@ -7,10 +7,11 @@ edition = "2021"
 tree-sitter = "0.25"
 tree-sitter-asciidoc = "0.6"
 tree-sitter-asciidoc-inline = "0.6"
-anyhow = "1"
+thiserror = "2"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+pretty_assertions = "1"
 tempfile = "3"
