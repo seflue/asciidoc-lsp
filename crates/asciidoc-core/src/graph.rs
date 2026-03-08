@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::attributes::AttributeRegistry;
 use crate::types::{DocumentModel, IncludeEdge, IncludeTree};
@@ -166,7 +167,7 @@ pub fn build_graph(
 pub fn build_graph_with_overrides(
     entry: &Path,
     registry: &mut AttributeRegistry,
-    overrides: &HashMap<PathBuf, String>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> (IncludeGraph, HashMap<PathBuf, DocumentModel>) {
     let mut graph = IncludeGraph::new();
     let mut documents = HashMap::new();
@@ -191,11 +192,11 @@ pub fn build_graph_with_overrides(
 pub fn parse_single_file(
     canonical: &Path,
     registry: &mut AttributeRegistry,
-    overrides: &HashMap<PathBuf, String>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Option<(DocumentModel, Vec<IncludeEdge>)> {
     // Read file: prefer override content, fall back to disk
     let source = match overrides.get(canonical) {
-        Some(content) => content.clone(),
+        Some(content) => (**content).clone(),
         None => std::fs::read_to_string(canonical).ok()?,
     };
 
@@ -264,7 +265,7 @@ fn walk(
     graph: &mut IncludeGraph,
     documents: &mut HashMap<PathBuf, DocumentModel>,
     visited: &mut HashSet<PathBuf>,
-    overrides: &HashMap<PathBuf, String>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) {
     let Ok(canonical) = file.canonicalize() else {
         return; // File doesn't exist — edge in graph is enough for diagnostics

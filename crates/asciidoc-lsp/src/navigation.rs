@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tower_lsp_server::ls_types::Position;
 
@@ -688,7 +689,7 @@ pub fn resolve_rename(
     pos: Position,
     doc_path: &Path,
     workspace: Option<&Workspace>,
-    overrides: &HashMap<PathBuf, String>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Option<RenameEdits> {
     let node_info = find_node_at_position(content, pos)?;
     let ws = workspace?;
@@ -749,7 +750,7 @@ pub fn resolve_rename(
 fn resolve_rename_anchor(
     anchor_id: &str,
     ws: &Workspace,
-    overrides: &HashMap<PathBuf, String>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Option<RenameEdits> {
     let mut edits: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
     let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
@@ -810,9 +811,9 @@ fn resolve_rename_anchor(
 }
 
 /// Read file content, preferring in-memory overrides over disk.
-fn read_content(path: &Path, overrides: &HashMap<PathBuf, String>) -> String {
+fn read_content(path: &Path, overrides: &HashMap<PathBuf, Arc<String>>) -> String {
     if let Some(content) = overrides.get(path) {
-        return content.clone();
+        return (**content).clone();
     }
     match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -827,7 +828,7 @@ fn read_content(path: &Path, overrides: &HashMap<PathBuf, String>) -> String {
 fn read_file_cached<'a>(
     cache: &'a mut HashMap<PathBuf, String>,
     path: &Path,
-    overrides: &HashMap<PathBuf, String>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> &'a str {
     cache
         .entry(path.to_path_buf())
@@ -2982,7 +2983,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let new_content = "= Title\n\n[[new-id]]\n== Section\n\nSee <<new-id>>.\n";
         let a_canon = a.canonicalize().unwrap();
         let mut overrides = HashMap::new();
-        overrides.insert(a_canon.clone(), new_content.to_string());
+        overrides.insert(a_canon.clone(), Arc::new(new_content.to_string()));
 
         let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
@@ -3034,8 +3035,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let new_b = "[[new-id]]\n== Target Section\n";
 
         let mut overrides = HashMap::new();
-        overrides.insert(a_canon.clone(), new_a.to_string());
-        overrides.insert(b_canon.clone(), new_b.to_string());
+        overrides.insert(a_canon.clone(), Arc::new(new_a.to_string()));
+        overrides.insert(b_canon.clone(), Arc::new(new_b.to_string()));
 
         let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 
@@ -3072,7 +3073,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let new_content = "= Title\n:new-attr: value\n\nText {new-attr} here.\n";
         let a_canon = a.canonicalize().unwrap();
         let mut overrides = HashMap::new();
-        overrides.insert(a_canon.clone(), new_content.to_string());
+        overrides.insert(a_canon.clone(), Arc::new(new_content.to_string()));
 
         let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
 

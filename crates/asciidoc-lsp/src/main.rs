@@ -6,7 +6,7 @@ mod symbols;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -31,7 +31,7 @@ use asciidoc_core::workspace::Workspace;
 /// State for an open document. No cached Tree (V-1: `tree_sitter::Tree` is !Send).
 #[derive(Debug)]
 struct DocumentState {
-    content: String,
+    content: Arc<String>,
     version: i32,
 }
 
@@ -61,12 +61,12 @@ impl AsciiDocLsp {
         }
     }
 
-    fn get_document_content(&self, uri: &Uri) -> Option<String> {
+    fn get_document_content(&self, uri: &Uri) -> Option<Arc<String>> {
         let docs = self.documents.lock().expect("documents lock poisoned");
         if let Some(state) = docs.get(uri) {
-            Some(state.content.clone())
+            Some(Arc::clone(&state.content))
         } else if let Some(path) = uri.to_file_path() {
-            std::fs::read_to_string(path.as_ref()).ok()
+            std::fs::read_to_string(path.as_ref()).ok().map(Arc::new)
         } else {
             None
         }
@@ -88,9 +88,9 @@ impl AsciiDocLsp {
                 .iter()
                 .filter_map(|(path, file_diags)| {
                     let uri = symbols::path_to_uri(path)?;
-                    let content = docs.get(&uri).map_or_else(
+                    let content: String = docs.get(&uri).map_or_else(
                         || std::fs::read_to_string(path).unwrap_or_default(),
-                        |s| s.content.clone(),
+                        |s| (*s.content).clone(),
                     );
                     let lsp_diags = diagnostics_convert::convert_diagnostics(file_diags, &content);
                     Some((uri, lsp_diags))
@@ -207,10 +207,13 @@ impl LanguageServer for AsciiDocLsp {
         let content = params.text_document.text;
         let version = params.text_document.version;
 
-        self.documents
-            .lock()
-            .unwrap()
-            .insert(uri.clone(), DocumentState { content, version });
+        self.documents.lock().unwrap().insert(
+            uri.clone(),
+            DocumentState {
+                content: Arc::new(content),
+                version,
+            },
+        );
 
         // Per-file: ensure only this file, then recalculate diagnostics
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
@@ -259,7 +262,7 @@ impl LanguageServer for AsciiDocLsp {
                 docs.insert(
                     uri.clone(),
                     DocumentState {
-                        content: change.text,
+                        content: Arc::new(change.text),
                         version: new_version,
                     },
                 );
@@ -592,15 +595,18 @@ impl LanguageServer for AsciiDocLsp {
             let Some(file_uri) = Uri::from_file_path(&path) else {
                 continue;
             };
-            let file_content = overrides.get(&path).cloned().unwrap_or_else(|| {
-                std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "failed to read file for rename edit: {}: {e}",
-                        path.display()
-                    );
-                    String::new()
-                })
-            });
+            let file_content = overrides.get(&path).map_or_else(
+                || {
+                    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "failed to read file for rename edit: {}: {e}",
+                            path.display()
+                        );
+                        String::new()
+                    })
+                },
+                |arc| (**arc).clone(),
+            );
             let text_edits: Vec<TextEdit> = edits
                 .into_iter()
                 .map(|(line, start_col, end_col)| {
@@ -655,12 +661,12 @@ impl LanguageServer for AsciiDocLsp {
 /// instead of stale disk content.
 fn build_content_overrides(
     documents: &Mutex<HashMap<Uri, DocumentState>>,
-) -> HashMap<PathBuf, String> {
+) -> HashMap<PathBuf, Arc<String>> {
     let docs = documents.lock().expect("documents lock poisoned");
     docs.iter()
         .filter_map(|(uri, state)| {
             uri.to_file_path()
-                .map(|path| (path.into_owned(), state.content.clone()))
+                .map(|path| (path.into_owned(), Arc::clone(&state.content)))
         })
         .collect()
 }
@@ -715,14 +721,14 @@ mod tests {
         docs.lock().unwrap().insert(
             uri.clone(),
             DocumentState {
-                content: content.clone(),
+                content: Arc::new(content.clone()),
                 version: 1,
             },
         );
 
         let stored = docs.lock().unwrap();
         let state = stored.get(&uri).unwrap();
-        assert_eq!(state.content, content);
+        assert_eq!(*state.content, content);
         assert_eq!(state.version, 1);
     }
 
@@ -735,7 +741,7 @@ mod tests {
         docs.lock().unwrap().insert(
             uri.clone(),
             DocumentState {
-                content: "old content".into(),
+                content: Arc::new("old content".into()),
                 version: 1,
             },
         );
@@ -748,7 +754,7 @@ mod tests {
             locked.insert(
                 uri.clone(),
                 DocumentState {
-                    content: "new content".into(),
+                    content: Arc::new("new content".into()),
                     version: 2,
                 },
             );
@@ -756,7 +762,7 @@ mod tests {
 
         let stored = docs.lock().unwrap();
         let state = stored.get(&uri).unwrap();
-        assert_eq!(state.content, "new content");
+        assert_eq!(*state.content, "new content");
         assert_eq!(state.version, 2);
     }
 
@@ -769,7 +775,7 @@ mod tests {
         docs.lock().unwrap().insert(
             uri.clone(),
             DocumentState {
-                content: "current content".into(),
+                content: Arc::new("current content".into()),
                 version: 5,
             },
         );
@@ -783,7 +789,7 @@ mod tests {
                 locked.insert(
                     uri.clone(),
                     DocumentState {
-                        content: "stale content".into(),
+                        content: Arc::new("stale content".into()),
                         version: old_version,
                     },
                 );
@@ -793,7 +799,7 @@ mod tests {
 
         let stored = docs.lock().unwrap();
         let state = stored.get(&uri).unwrap();
-        assert_eq!(state.content, "current content");
+        assert_eq!(*state.content, "current content");
         assert_eq!(state.version, 5);
     }
 
@@ -805,7 +811,7 @@ mod tests {
         docs.lock().unwrap().insert(
             uri.clone(),
             DocumentState {
-                content: "content".into(),
+                content: Arc::new("content".into()),
                 version: 1,
             },
         );
@@ -825,7 +831,7 @@ mod tests {
         docs.lock().unwrap().insert(
             uri,
             DocumentState {
-                content: "overridden content".into(),
+                content: Arc::new("overridden content".into()),
                 version: 1,
             },
         );
@@ -833,7 +839,7 @@ mod tests {
         let overrides = build_content_overrides(&docs);
         assert_eq!(overrides.len(), 1);
         assert_eq!(
-            overrides.get(Path::new("/tmp/test.adoc")).unwrap(),
+            overrides.get(Path::new("/tmp/test.adoc")).unwrap().as_str(),
             "overridden content"
         );
     }
@@ -862,7 +868,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             b_canon.clone(),
-            "== Modified Chapter B\n\nEdited content.\n".to_string(),
+            Arc::new("== Modified Chapter B\n\nEdited content.\n".to_string()),
         );
 
         let ws = Workspace::build_with_overrides(tmp.path(), &a, &overrides);
@@ -1064,7 +1070,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             index_canon.clone(),
-            "= Title\n\n<<broken-ref>>\n".to_string(),
+            Arc::new("= Title\n\n<<broken-ref>>\n".to_string()),
         );
 
         let mut ws = Workspace::new(root);

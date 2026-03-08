@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::attributes::AttributeRegistry;
 use crate::diagnostics::collect_diagnostics;
@@ -191,7 +192,7 @@ impl Workspace {
     ///
     /// This is idempotent: if the file is already in `documents`, it returns immediately.
     /// Include edges are registered in the graph but NOT recursively walked.
-    pub fn ensure_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, String>) {
+    pub fn ensure_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, Arc<String>>) {
         if self.documents.contains_key(file) {
             return;
         }
@@ -238,7 +239,7 @@ impl Workspace {
     /// Removes old include edges for this file, re-parses with the given overrides,
     /// and updates `documents` and `include_graph`. Does NOT rebuild diagnostics
     /// — the caller is responsible for collecting diagnostics after the update.
-    pub fn update_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, String>) {
+    pub fn update_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, Arc<String>>) {
         // Remove old edges and index entries for this file
         self.include_graph.remove_edges_from(file);
         self.reference_index.remove_file(file);
@@ -280,7 +281,7 @@ impl Workspace {
     pub fn build_with_overrides(
         root: &Path,
         entry: &Path,
-        overrides: &HashMap<PathBuf, String>,
+        overrides: &HashMap<PathBuf, Arc<String>>,
     ) -> Self {
         let mut ws = Self::new(root);
         let (graph, documents) = build_graph_with_overrides(entry, &mut ws.attributes, overrides);
@@ -1140,7 +1141,7 @@ mod tests {
         let mut overrides_new = HashMap::new();
         overrides_new.insert(
             file_a_canon.clone(),
-            "= Doc A Updated\n\nNo include anymore.\n".to_string(),
+            Arc::new("= Doc A Updated\n\nNo include anymore.\n".to_string()),
         );
         ws.update_file(&file_a_canon, &overrides_new);
 
@@ -1180,7 +1181,7 @@ mod tests {
         let mut change_overrides = HashMap::new();
         change_overrides.insert(
             file_a_canon.clone(),
-            "= Doc A Changed\n\nNew content.\n".to_string(),
+            Arc::new("= Doc A Changed\n\nNew content.\n".to_string()),
         );
         ws.update_file(&file_a_canon, &change_overrides);
 
@@ -1220,7 +1221,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             standalone_canon.clone(),
-            "= Buffer Version\n:buffer-attr: buffer-val\n\nBuffer.\n".to_string(),
+            Arc::new("= Buffer Version\n:buffer-attr: buffer-val\n\nBuffer.\n".to_string()),
         );
         ws.ensure_file(&standalone_canon, &overrides);
 
@@ -1292,7 +1293,7 @@ mod tests {
         let mut overrides_new = HashMap::new();
         overrides_new.insert(
             a_canon.clone(),
-            "[[new-anchor]]\n= Doc A Updated\n".to_string(),
+            Arc::new("[[new-anchor]]\n= Doc A Updated\n".to_string()),
         );
         ws.update_file(&a_canon, &overrides_new);
 
@@ -1401,7 +1402,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             a_canon.clone(),
-            "[[editor-anchor]]\n= Doc A Edited\n".to_string(),
+            Arc::new("[[editor-anchor]]\n= Doc A Edited\n".to_string()),
         );
         ws.update_file(&a_canon, &overrides);
 
@@ -1441,7 +1442,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             a_canon.clone(),
-            "[[editor-anchor]]\n= Doc A Edited\n".to_string(),
+            Arc::new("[[editor-anchor]]\n= Doc A Edited\n".to_string()),
         );
         ws.update_file(&a_canon, &overrides);
         ws.recalculate_diagnostics();
@@ -1502,7 +1503,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             a_canon.clone(),
-            "[[editor-target]]\n= Definitions Edited\n".to_string(),
+            Arc::new("[[editor-target]]\n= Definitions Edited\n".to_string()),
         );
         ws.update_file(&a_canon, &overrides);
 
