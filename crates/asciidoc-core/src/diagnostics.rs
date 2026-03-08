@@ -29,7 +29,6 @@ pub fn collect_diagnostics(
                     kind: DiagnosticKind::BrokenXref {
                         target: xref.target.clone(),
                     },
-                    message: format!("Broken cross-reference: {}", xref.target),
                 });
             }
         }
@@ -47,7 +46,6 @@ pub fn collect_diagnostics(
                     kind: DiagnosticKind::BrokenInclude {
                         path: inc.path.clone(),
                     },
-                    message: format!("Broken include: {}", inc.path),
                 });
             }
         }
@@ -65,13 +63,8 @@ pub fn collect_diagnostics(
                     kind: DiagnosticKind::DuplicateAnchor {
                         id: id.clone(),
                         first_file: first_loc.file.clone(),
+                        first_line: first_loc.line,
                     },
-                    message: format!(
-                        "Duplicate anchor '{}', first defined in {}:{}",
-                        id,
-                        first_loc.file.display(),
-                        first_loc.line
-                    ),
                 });
         }
     }
@@ -94,7 +87,6 @@ pub fn collect_diagnostics(
                 path: path_display.clone(),
                 cycle_through: target.clone(),
             },
-            message: format!("Circular include: {path_display} creates a cycle"),
         });
     }
 

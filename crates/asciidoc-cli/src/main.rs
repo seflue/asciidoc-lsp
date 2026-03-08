@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
             println!("No diagnostics found.");
         } else {
             for d in &all_diags {
-                println!("{}:{}: {}", d.file.display(), d.line, d.message);
+                println!("{}:{}: {}", d.file.display(), d.line, d.kind);
             }
             std::process::exit(1);
         }
@@ -72,20 +72,8 @@ fn main() -> anyhow::Result<()> {
 
         // Inline parsing for xrefs and anchors
         let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(root);
-        let (xrefs, anchors) = if inline_ranges.is_empty() {
-            (vec![], vec![])
-        } else {
-            let mut inline_parser = asciidoc_core::parser::init_inline_parser()?;
-            inline_parser
-                .set_included_ranges(&inline_ranges)
-                .map_err(|e| anyhow::anyhow!("Failed to set inline ranges: {e:?}"))?;
-            let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, &source)?;
-            let inline_root = inline_tree.root_node();
-            (
-                asciidoc_core::extractors::extract_xrefs(inline_root, source.as_bytes()),
-                asciidoc_core::extractors::extract_anchors(inline_root, source.as_bytes()),
-            )
-        };
+        let (xrefs, anchors) =
+            asciidoc_core::extractors::extract_inline_content_safe(&inline_ranges, &source);
 
         // Output
         println!("File: {}", cli.path.display());

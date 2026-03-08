@@ -35,7 +35,7 @@ fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
         Some(severity),
         None,
         Some("asciidoc-lsp".into()),
-        diag.message.clone(),
+        diag.kind.to_string(),
         None,
         None,
     )
@@ -55,7 +55,6 @@ mod tests {
             kind: DiagnosticKind::BrokenXref {
                 target: "missing".into(),
             },
-            message: "Broken cross-reference: missing".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -78,7 +77,6 @@ mod tests {
             kind: DiagnosticKind::BrokenInclude {
                 path: "missing.adoc".into(),
             },
-            message: "Broken include: missing.adoc".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -99,8 +97,8 @@ mod tests {
             kind: DiagnosticKind::DuplicateAnchor {
                 id: "dup".into(),
                 first_file: PathBuf::from("/other.adoc"),
+                first_line: 1,
             },
-            message: "Duplicate anchor 'dup'".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -121,7 +119,6 @@ mod tests {
             kind: DiagnosticKind::UndefinedAttribute {
                 name: "undefined".into(),
             },
-            message: "Undefined attribute: {undefined}".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -143,7 +140,6 @@ mod tests {
                 path: "b.adoc".into(),
                 cycle_through: PathBuf::from("/b.adoc"),
             },
-            message: "Circular include: b.adoc creates a cycle".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -165,7 +161,6 @@ mod tests {
                 name: "missing".into(),
                 directive: "ifdef".into(),
             },
-            message: "ifdef::missing references undefined attribute".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -193,7 +188,6 @@ mod tests {
             kind: DiagnosticKind::BrokenXref {
                 target: "missing".into(),
             },
-            message: "Broken cross-reference: missing".into(),
         }];
 
         let result = convert_diagnostics(&diags, content);
@@ -213,13 +207,11 @@ mod tests {
                 file: PathBuf::from("/test.adoc"),
                 line: 3,
                 kind: DiagnosticKind::BrokenXref { target: "a".into() },
-                message: "Broken cross-reference: a".into(),
             },
             CoreDiagnostic {
                 file: PathBuf::from("/test.adoc"),
                 line: 5,
                 kind: DiagnosticKind::BrokenXref { target: "b".into() },
-                message: "Broken cross-reference: b".into(),
             },
         ];
 

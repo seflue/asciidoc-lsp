@@ -102,6 +102,7 @@ pub enum DiagnosticKind {
     DuplicateAnchor {
         id: String,
         first_file: PathBuf,
+        first_line: usize,
     },
     CircularInclude {
         path: String,
@@ -117,20 +118,25 @@ impl fmt::Display for DiagnosticKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DiagnosticKind::BrokenXref { target } => {
-                write!(f, "broken cross-reference: {target}")
+                write!(f, "Broken cross-reference: {target}")
             }
             DiagnosticKind::BrokenInclude { path } => {
-                write!(f, "broken include: {path}")
+                write!(f, "Broken include: {path}")
             }
             DiagnosticKind::UndefinedAttribute { name } => {
-                write!(f, "undefined attribute: {{{name}}}")
+                write!(f, "Undefined attribute: {{{name}}}")
             }
-            DiagnosticKind::DuplicateAnchor { id, first_file } => {
+            DiagnosticKind::DuplicateAnchor {
+                id,
+                first_file,
+                first_line,
+            } => {
                 write!(
                     f,
-                    "duplicate anchor '{}', first defined in {}",
+                    "Duplicate anchor '{}', first defined in {}:{}",
                     id,
-                    first_file.display()
+                    first_file.display(),
+                    first_line
                 )
             }
             DiagnosticKind::CircularInclude {
@@ -139,7 +145,7 @@ impl fmt::Display for DiagnosticKind {
             } => {
                 write!(
                     f,
-                    "circular include: {} creates cycle through {}",
+                    "Circular include: {} creates a cycle through {}",
                     path,
                     cycle_through.display()
                 )
@@ -156,7 +162,6 @@ pub struct Diagnostic {
     pub file: PathBuf,
     pub line: usize,
     pub kind: DiagnosticKind,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,22 +261,23 @@ mod tests {
         let d1 = DiagnosticKind::BrokenXref {
             target: "missing-id".into(),
         };
-        assert_eq!(d1.to_string(), "broken cross-reference: missing-id");
+        assert_eq!(d1.to_string(), "Broken cross-reference: missing-id");
 
         let d2 = DiagnosticKind::BrokenInclude {
             path: "missing.adoc".into(),
         };
-        assert_eq!(d2.to_string(), "broken include: missing.adoc");
+        assert_eq!(d2.to_string(), "Broken include: missing.adoc");
 
         let d3 = DiagnosticKind::UndefinedAttribute { name: "foo".into() };
-        assert_eq!(d3.to_string(), "undefined attribute: {foo}");
+        assert_eq!(d3.to_string(), "Undefined attribute: {foo}");
 
         let d4 = DiagnosticKind::DuplicateAnchor {
             id: "my-id".into(),
             first_file: PathBuf::from("/a/b.adoc"),
+            first_line: 5,
         };
-        assert!(d4.to_string().contains("duplicate anchor 'my-id'"));
-        assert!(d4.to_string().contains("/a/b.adoc"));
+        assert!(d4.to_string().contains("Duplicate anchor 'my-id'"));
+        assert!(d4.to_string().contains("/a/b.adoc:5"));
     }
 
     #[test]
@@ -281,7 +287,7 @@ mod tests {
             cycle_through: PathBuf::from("/project/a.adoc"),
         };
         let s = d.to_string();
-        assert!(s.contains("circular include"), "got: {s}");
+        assert!(s.contains("Circular include"), "got: {s}");
         assert!(s.contains("b.adoc"), "got: {s}");
         assert!(s.contains("a.adoc"), "got: {s}");
     }
