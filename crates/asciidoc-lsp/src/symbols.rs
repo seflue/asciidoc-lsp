@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::{
     DocumentSymbol, Location, Range, SymbolInformation, SymbolKind, Uri,
@@ -257,12 +258,15 @@ fn make_symbol_info(
 pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<SymbolInformation> {
     let query_lower = query.to_lowercase();
     let mut symbols = Vec::new();
+    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
 
     for (path, doc) in &ws.documents {
         let Some(uri) = path_to_uri(path) else {
             continue;
         };
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let content = file_cache
+            .entry(path.clone())
+            .or_insert_with(|| std::fs::read_to_string(path).unwrap_or_default());
 
         // Sections
         for section in &doc.sections {
@@ -274,7 +278,7 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
                 SymbolKind::STRUCT,
                 &uri,
                 section.line,
-                &content,
+                content,
             ));
         }
 
@@ -288,7 +292,7 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
                 SymbolKind::FILE,
                 &uri,
                 inc.line,
-                &content,
+                content,
             ));
         }
 
@@ -302,7 +306,7 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
                 SymbolKind::VARIABLE,
                 &uri,
                 attr.line,
-                &content,
+                content,
             ));
         }
     }
@@ -316,13 +320,15 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
         let Some(uri) = path_to_uri(&loc.file) else {
             continue;
         };
-        let content = std::fs::read_to_string(&loc.file).unwrap_or_default();
+        let content = file_cache
+            .entry(loc.file.clone())
+            .or_insert_with(|| std::fs::read_to_string(&loc.file).unwrap_or_default());
         symbols.push(make_symbol_info(
             id.clone(),
             SymbolKind::CONSTANT,
             &uri,
             loc.line,
-            &content,
+            content,
         ));
     }
 
