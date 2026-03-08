@@ -1,41 +1,41 @@
 use std::fmt;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub level: usize,
     pub title: String,
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IncludeMacro {
     pub path: String,
     pub attributes: Vec<(String, String)>,
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Xref {
     pub target: String,
     pub display_text: Option<String>,
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttributeDef {
     pub name: String,
     pub value: String,
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Anchor {
     pub id: String,
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttributeRef {
     pub name: String,
     pub line: usize,      // 1-based
@@ -76,7 +76,7 @@ pub struct IncludeEdge {
     pub attributes: Vec<(String, String)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct DocumentModel {
     pub path: PathBuf,
     pub sections: Vec<Section>,
@@ -172,7 +172,7 @@ pub enum ConditionalOperator {
     Or,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConditionalDirective {
     pub kind: ConditionalKind,
     pub attributes: Vec<String>,
@@ -184,6 +184,52 @@ pub struct ConditionalDirective {
 pub struct ResolvedXref {
     pub file: PathBuf,
     pub line: usize,
+}
+
+#[cfg(test)]
+impl DocumentModel {
+    /// Creates a DocumentModel with the given path and all collections empty.
+    pub fn test(path: &str) -> Self {
+        Self {
+            path: PathBuf::from(path),
+            sections: vec![],
+            includes: vec![],
+            xrefs: vec![],
+            anchors: vec![],
+            attributes: vec![],
+            attribute_refs: vec![],
+            conditionals: vec![],
+        }
+    }
+
+    pub fn with_sections(mut self, sections: Vec<Section>) -> Self {
+        self.sections = sections;
+        self
+    }
+    pub fn with_includes(mut self, includes: Vec<IncludeMacro>) -> Self {
+        self.includes = includes;
+        self
+    }
+    pub fn with_xrefs(mut self, xrefs: Vec<Xref>) -> Self {
+        self.xrefs = xrefs;
+        self
+    }
+    pub fn with_anchors(mut self, anchors: Vec<Anchor>) -> Self {
+        self.anchors = anchors;
+        self
+    }
+    pub fn with_attributes(mut self, attributes: Vec<AttributeDef>) -> Self {
+        self.attributes = attributes;
+        self
+    }
+    pub fn with_attribute_refs(mut self, attribute_refs: Vec<AttributeRef>) -> Self {
+        self.attribute_refs = attribute_refs;
+        self
+    }
+    pub fn with_conditionals(mut self, conditionals: Vec<ConditionalDirective>) -> Self {
+        self.conditionals = conditionals;
+        self
+    }
 }
 
 #[cfg(test)]

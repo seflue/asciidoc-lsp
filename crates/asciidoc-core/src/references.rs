@@ -247,6 +247,7 @@ pub fn generate_section_id(title: &str, prefix: &str, separator: &str) -> String
 mod tests {
     use super::*;
     use crate::types::{Anchor, Section};
+    use pretty_assertions::assert_eq;
 
     // --- Section ID generation ---
 
@@ -345,47 +346,29 @@ mod tests {
 
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![
-                    Anchor {
-                        id: "a1".into(),
-                        line: 1,
-                    },
-                    Anchor {
-                        id: "a2".into(),
-                        line: 5,
-                    },
-                ],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_anchors(vec![
+                Anchor {
+                    id: "a1".into(),
+                    line: 1,
+                },
+                Anchor {
+                    id: "a2".into(),
+                    line: 5,
+                },
+            ]),
         );
         documents.insert(
             PathBuf::from("/b.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/b.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![
-                    Anchor {
-                        id: "b1".into(),
-                        line: 1,
-                    },
-                    Anchor {
-                        id: "b2".into(),
-                        line: 3,
-                    },
-                ],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/b.adoc").with_anchors(vec![
+                Anchor {
+                    id: "b1".into(),
+                    line: 1,
+                },
+                Anchor {
+                    id: "b2".into(),
+                    line: 3,
+                },
+            ]),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -399,20 +382,11 @@ mod tests {
 
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![Section {
-                    level: 1,
-                    title: "Building Block View".into(),
-                    line: 10,
-                }],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_sections(vec![Section {
+                level: 1,
+                title: "Building Block View".into(),
+                line: 10,
+            }]),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -426,35 +400,17 @@ mod tests {
 
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
-                    id: "context".into(),
-                    line: 1,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
+                id: "context".into(),
+                line: 1,
+            }]),
         );
         documents.insert(
             PathBuf::from("/b.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/b.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
-                    id: "context".into(),
-                    line: 5,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
+                id: "context".into(),
+                line: 5,
+            }]),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -469,25 +425,16 @@ mod tests {
 
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![
-                    Anchor {
-                        id: "dup".into(),
-                        line: 1,
-                    },
-                    Anchor {
-                        id: "dup".into(),
-                        line: 10,
-                    },
-                ],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_anchors(vec![
+                Anchor {
+                    id: "dup".into(),
+                    line: 1,
+                },
+                Anchor {
+                    id: "dup".into(),
+                    line: 10,
+                },
+            ]),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -503,19 +450,10 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/file.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/file.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
-                    id: "anchor".into(),
-                    line: 42,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/file.adoc").with_anchors(vec![Anchor {
+                id: "anchor".into(),
+                line: 42,
+            }]),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -539,20 +477,11 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/doc.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/doc.adoc"),
-                sections: vec![Section {
-                    level: 1,
-                    title: "My Section".into(),
-                    line: 5,
-                }],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/doc.adoc").with_sections(vec![Section {
+                level: 1,
+                title: "My Section".into(),
+                line: 5,
+            }]),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -595,16 +524,7 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/target.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/target.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/target.adoc"),
         );
 
         let index = ReferenceIndex::build(&documents, &registry);
@@ -630,19 +550,10 @@ mod tests {
         let mut index = ReferenceIndex::new();
 
         let file_a = PathBuf::from("/a.adoc");
-        let doc_a = DocumentModel {
-            path: file_a.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![Anchor {
-                id: "foo".into(),
-                line: 1,
-            }],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
+            id: "foo".into(),
+            line: 1,
+        }]);
 
         index.add_file(&file_a, &doc_a, &registry);
 
@@ -657,25 +568,16 @@ mod tests {
         let mut index = ReferenceIndex::new();
 
         let file_a = PathBuf::from("/a.adoc");
-        let doc_a = DocumentModel {
-            path: file_a.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![
-                Anchor {
-                    id: "a1".into(),
-                    line: 1,
-                },
-                Anchor {
-                    id: "a2".into(),
-                    line: 5,
-                },
-            ],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![
+            Anchor {
+                id: "a1".into(),
+                line: 1,
+            },
+            Anchor {
+                id: "a2".into(),
+                line: 5,
+            },
+        ]);
 
         index.add_file(&file_a, &doc_a, &registry);
         assert_eq!(index.anchors.len(), 2);
@@ -694,35 +596,17 @@ mod tests {
         let file_b = PathBuf::from("/b.adoc");
 
         // Add file A with anchor "foo"
-        let doc_a = DocumentModel {
-            path: file_a.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![Anchor {
-                id: "foo".into(),
-                line: 1,
-            }],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
+            id: "foo".into(),
+            line: 1,
+        }]);
         index.add_file(&file_a, &doc_a, &registry);
 
         // Add file B with anchor "bar"
-        let doc_b = DocumentModel {
-            path: file_b.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![Anchor {
-                id: "bar".into(),
-                line: 1,
-            }],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_b = DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
+            id: "bar".into(),
+            line: 1,
+        }]);
         index.add_file(&file_b, &doc_b, &registry);
 
         assert_eq!(index.anchors.len(), 2);
@@ -745,32 +629,14 @@ mod tests {
         let file_b = PathBuf::from("/b.adoc");
 
         // Both files define "context" — not a duplicate (cross-file)
-        let doc_a = DocumentModel {
-            path: file_a.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![Anchor {
-                id: "context".into(),
-                line: 1,
-            }],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
-        let doc_b = DocumentModel {
-            path: file_b.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![Anchor {
-                id: "context".into(),
-                line: 5,
-            }],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
+            id: "context".into(),
+            line: 1,
+        }]);
+        let doc_b = DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
+            id: "context".into(),
+            line: 5,
+        }]);
 
         index.add_file(&file_a, &doc_a, &registry);
         index.add_file(&file_b, &doc_b, &registry);
@@ -793,25 +659,16 @@ mod tests {
         let file_a = PathBuf::from("/a.adoc");
 
         // Same file, same anchor twice — real duplicate
-        let doc_a = DocumentModel {
-            path: file_a.clone(),
-            sections: vec![],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![
-                Anchor {
-                    id: "dup".into(),
-                    line: 1,
-                },
-                Anchor {
-                    id: "dup".into(),
-                    line: 10,
-                },
-            ],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![
+            Anchor {
+                id: "dup".into(),
+                line: 1,
+            },
+            Anchor {
+                id: "dup".into(),
+                line: 10,
+            },
+        ]);
 
         index.add_file(&file_a, &doc_a, &registry);
         assert_eq!(index.duplicates.len(), 1);
@@ -828,20 +685,11 @@ mod tests {
         let mut index = ReferenceIndex::new();
 
         let file_a = PathBuf::from("/a.adoc");
-        let doc_a = DocumentModel {
-            path: file_a.clone(),
-            sections: vec![Section {
-                level: 1,
-                title: "My Section".into(),
-                line: 3,
-            }],
-            includes: vec![],
-            xrefs: vec![],
-            anchors: vec![],
-            attributes: vec![],
-            attribute_refs: vec![],
-            conditionals: vec![],
-        };
+        let doc_a = DocumentModel::test("/a.adoc").with_sections(vec![Section {
+            level: 1,
+            title: "My Section".into(),
+            line: 3,
+        }]);
 
         index.add_file(&file_a, &doc_a, &registry);
 

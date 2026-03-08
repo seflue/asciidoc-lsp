@@ -105,6 +105,7 @@ pub fn collect_diagnostics(
 mod tests {
     use super::*;
     use crate::types::{Anchor, IncludeMacro, Section, Xref};
+    use pretty_assertions::assert_eq;
 
     fn make_registry() -> AttributeRegistry {
         AttributeRegistry::new(Path::new("/tmp"))
@@ -121,20 +122,11 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![Xref {
-                    target: "nonexistent".into(),
-                    display_text: None,
-                    line: 5,
-                }],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_xrefs(vec![Xref {
+                target: "nonexistent".into(),
+                display_text: None,
+                line: 5,
+            }]),
         );
 
         let graph = IncludeGraph::new();
@@ -155,20 +147,11 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![IncludeMacro {
-                    path: "nonexistent.adoc".into(),
-                    attributes: vec![],
-                    line: 3,
-                }],
-                xrefs: vec![],
-                anchors: vec![],
+            DocumentModel::test("/a.adoc").with_includes(vec![IncludeMacro {
+                path: "nonexistent.adoc".into(),
                 attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                line: 3,
+            }]),
         );
 
         let graph = IncludeGraph::new();
@@ -187,25 +170,16 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![
-                    Anchor {
-                        id: "dup".into(),
-                        line: 1,
-                    },
-                    Anchor {
-                        id: "dup".into(),
-                        line: 10,
-                    },
-                ],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_anchors(vec![
+                Anchor {
+                    id: "dup".into(),
+                    line: 1,
+                },
+                Anchor {
+                    id: "dup".into(),
+                    line: 10,
+                },
+            ]),
         );
 
         let graph = IncludeGraph::new();
@@ -224,35 +198,17 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
-                    id: "context".into(),
-                    line: 1,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
+                id: "context".into(),
+                line: 1,
+            }]),
         );
         documents.insert(
             PathBuf::from("/b.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/b.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
-                    id: "context".into(),
-                    line: 1,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
+                id: "context".into(),
+                line: 1,
+            }]),
         );
 
         let graph = IncludeGraph::new();
@@ -274,37 +230,19 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             a.clone(),
-            DocumentModel {
-                path: a.clone(),
-                sections: vec![],
-                includes: vec![IncludeMacro {
-                    path: "b.adoc".into(),
-                    attributes: vec![],
-                    line: 3,
-                }],
-                xrefs: vec![],
-                anchors: vec![],
+            DocumentModel::test("/a.adoc").with_includes(vec![IncludeMacro {
+                path: "b.adoc".into(),
                 attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                line: 3,
+            }]),
         );
         documents.insert(
             b.clone(),
-            DocumentModel {
-                path: b.clone(),
-                sections: vec![],
-                includes: vec![IncludeMacro {
-                    path: "a.adoc".into(),
-                    attributes: vec![],
-                    line: 5,
-                }],
-                xrefs: vec![],
-                anchors: vec![],
+            DocumentModel::test("/b.adoc").with_includes(vec![IncludeMacro {
+                path: "a.adoc".into(),
                 attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                line: 5,
+            }]),
         );
 
         let mut graph = IncludeGraph::new();
@@ -361,20 +299,11 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             parent.clone(),
-            DocumentModel {
-                path: parent.clone(),
-                sections: vec![],
-                includes: vec![IncludeMacro {
-                    path: "{docdir}/appendix/glossary.adoc".into(),
-                    attributes: vec![],
-                    line: 20,
-                }],
-                xrefs: vec![],
-                anchors: vec![],
+            DocumentModel::test(parent.to_str().unwrap()).with_includes(vec![IncludeMacro {
+                path: "{docdir}/appendix/glossary.adoc".into(),
                 attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                line: 20,
+            }]),
         );
 
         let graph = IncludeGraph::new();
@@ -401,61 +330,36 @@ mod tests {
         // Entry file (clean — no diagnostics)
         documents.insert(
             PathBuf::from("/entry.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/entry.adoc"),
-                sections: vec![Section {
+            DocumentModel::test("/entry.adoc")
+                .with_sections(vec![Section {
                     level: 1,
                     title: "Entry".into(),
                     line: 1,
-                }],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
+                }])
+                .with_anchors(vec![Anchor {
                     id: "entry-anchor".into(),
                     line: 3,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                }]),
         );
 
         // File with broken xref
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![Xref {
-                    target: "nonexistent-target".into(),
-                    display_text: None,
-                    line: 2,
-                }],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/a.adoc").with_xrefs(vec![Xref {
+                target: "nonexistent-target".into(),
+                display_text: None,
+                line: 2,
+            }]),
         );
 
         // File with broken include
         documents.insert(
             PathBuf::from("/b.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/b.adoc"),
-                sections: vec![],
-                includes: vec![IncludeMacro {
-                    path: "missing.adoc".into(),
-                    attributes: vec![],
-                    line: 4,
-                }],
-                xrefs: vec![],
-                anchors: vec![],
+            DocumentModel::test("/b.adoc").with_includes(vec![IncludeMacro {
+                path: "missing.adoc".into(),
                 attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                line: 4,
+            }]),
         );
 
         let graph = IncludeGraph::new();
@@ -482,21 +386,14 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
+            DocumentModel::test("/a.adoc").with_conditionals(vec![
+                crate::types::ConditionalDirective {
                     kind: crate::types::ConditionalKind::Ifdef,
                     attributes: vec!["nonexistent".into()],
                     operator: crate::types::ConditionalOperator::Single,
                     line: 5,
-                }],
-            },
+                },
+            ]),
         );
 
         let graph = IncludeGraph::new();
@@ -520,21 +417,14 @@ mod tests {
         let mut documents = HashMap::new();
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![crate::types::ConditionalDirective {
+            DocumentModel::test("/a.adoc").with_conditionals(vec![
+                crate::types::ConditionalDirective {
                     kind: crate::types::ConditionalKind::Ifndef,
                     attributes: vec!["unknown-attr".into()],
                     operator: crate::types::ConditionalOperator::Single,
                     line: 10,
-                }],
-            },
+                },
+            ]),
         );
 
         let graph = IncludeGraph::new();
@@ -570,41 +460,25 @@ mod tests {
         // File with valid anchor
         documents.insert(
             PathBuf::from("/a.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/a.adoc"),
-                sections: vec![Section {
+            DocumentModel::test("/a.adoc")
+                .with_sections(vec![Section {
                     level: 1,
                     title: "Valid".into(),
                     line: 1,
-                }],
-                includes: vec![],
-                xrefs: vec![],
-                anchors: vec![Anchor {
+                }])
+                .with_anchors(vec![Anchor {
                     id: "valid-anchor".into(),
                     line: 5,
-                }],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+                }]),
         );
         // File with xref to that anchor
         documents.insert(
             PathBuf::from("/b.adoc"),
-            DocumentModel {
-                path: PathBuf::from("/b.adoc"),
-                sections: vec![],
-                includes: vec![],
-                xrefs: vec![Xref {
-                    target: "valid-anchor".into(),
-                    display_text: None,
-                    line: 2,
-                }],
-                anchors: vec![],
-                attributes: vec![],
-                attribute_refs: vec![],
-                conditionals: vec![],
-            },
+            DocumentModel::test("/b.adoc").with_xrefs(vec![Xref {
+                target: "valid-anchor".into(),
+                display_text: None,
+                line: 2,
+            }]),
         );
 
         let graph = IncludeGraph::new();
