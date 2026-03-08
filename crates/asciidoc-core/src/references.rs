@@ -260,39 +260,22 @@ mod tests {
     use super::*;
     use crate::types::{Anchor, Section};
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     // --- Section ID generation ---
 
-    #[test]
-    fn test_section_id_basic() {
-        assert_eq!(
-            generate_section_id("Building Block View", "_", "_"),
-            "_building_block_view"
-        );
-    }
-
-    #[test]
-    fn test_section_id_special_chars() {
-        assert_eq!(
-            generate_section_id("What is \"Clean Code\"?", "_", "_"),
-            "_what_is_clean_code"
-        );
-    }
-
-    #[test]
-    fn test_section_id_custom_prefix() {
-        assert_eq!(
-            generate_section_id("Building Block View", "sec-", "-"),
-            "sec-building-block-view"
-        );
-    }
-
-    #[test]
-    fn test_section_id_empty_prefix() {
-        assert_eq!(
-            generate_section_id("Building Block View", "", "_"),
-            "building_block_view"
-        );
+    #[rstest]
+    #[case("Building Block View", "_", "_", "_building_block_view")]
+    #[case("What is \"Clean Code\"?", "_", "_", "_what_is_clean_code")]
+    #[case("Building Block View", "sec-", "-", "sec-building-block-view")]
+    #[case("Building Block View", "", "_", "building_block_view")]
+    fn test_generate_section_id(
+        #[case] title: &str,
+        #[case] prefix: &str,
+        #[case] separator: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(generate_section_id(title, prefix, separator), expected);
     }
 
     // --- Anchor collection ---

@@ -908,119 +908,73 @@ fn find_attr_def_columns(line_text: &str, name: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::fs;
 
     // --- Task 4.1: find_node_at_position tests ---
 
-    #[test]
-    fn test_find_node_include() {
-        let content = "= Title\n\ninclude::chapters/intro.adoc[]\n\nSome text.\n";
-        // "include::..." is on line index 2 (0-based)
-        let pos = Position {
-            line: 2,
-            character: 12,
-        };
-
+    #[rstest]
+    #[case(
+        "include with line check",
+        "= Title\n\ninclude::chapters/intro.adoc[]\n\nSome text.\n",
+        2, 12,
+        NodeKind::Include { path: "chapters/intro.adoc".into() },
+        Some(3)
+    )]
+    #[case(
+        "include at start of line",
+        "= Title\n\ninclude::sub.adoc[]\n",
+        2, 0,
+        NodeKind::Include { path: "sub.adoc".into() },
+        None
+    )]
+    #[case(
+        "include cursor on path",
+        "= Title\n\ninclude::sub.adoc[]\n",
+        2, 12,
+        NodeKind::Include { path: "sub.adoc".into() },
+        None
+    )]
+    #[case(
+        "xref long form",
+        "= Title\n\nSee xref:file.adoc#anchor[Link Text] for details.\n",
+        2, 12,
+        NodeKind::Xref { target: "file.adoc#anchor".into() },
+        None
+    )]
+    #[case(
+        "shorthand xref",
+        "= Title\n\nSee <<my-section,Section Title>> for details.\n",
+        2, 8,
+        NodeKind::ShorthandXref { target: "my-section".into() },
+        None
+    )]
+    fn test_find_node_some(
+        #[case] _name: &str,
+        #[case] content: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] expected_kind: NodeKind,
+        #[case] expected_line: Option<usize>,
+    ) {
+        let pos = Position { line, character };
         let info = find_node_at_position(content, pos).unwrap();
-        assert_eq!(
-            info.kind,
-            NodeKind::Include {
-                path: "chapters/intro.adoc".into()
-            }
-        );
-        assert_eq!(info.line, 3); // 1-indexed
+        assert_eq!(info.kind, expected_kind);
+        if let Some(exp_line) = expected_line {
+            assert_eq!(info.line, exp_line);
+        }
     }
 
-    #[test]
-    fn test_find_node_include_at_start() {
-        let content = "= Title\n\ninclude::sub.adoc[]\n";
-        let pos = Position {
-            line: 2,
-            character: 0,
-        };
-
-        let info = find_node_at_position(content, pos).unwrap();
-        assert_eq!(
-            info.kind,
-            NodeKind::Include {
-                path: "sub.adoc".into()
-            }
-        );
-    }
-
-    #[test]
-    fn test_find_node_include_on_path() {
-        let content = "= Title\n\ninclude::sub.adoc[]\n";
-        // character 12 = 's' in "sub.adoc"
-        let pos = Position {
-            line: 2,
-            character: 12,
-        };
-
-        let info = find_node_at_position(content, pos).unwrap();
-        assert_eq!(
-            info.kind,
-            NodeKind::Include {
-                path: "sub.adoc".into()
-            }
-        );
-    }
-
-    #[test]
-    fn test_find_node_xref() {
-        let content = "= Title\n\nSee xref:file.adoc#anchor[Link Text] for details.\n";
-        // character 12 = 'l' in "file.adoc"
-        let pos = Position {
-            line: 2,
-            character: 12,
-        };
-
-        let info = find_node_at_position(content, pos).unwrap();
-        assert_eq!(
-            info.kind,
-            NodeKind::Xref {
-                target: "file.adoc#anchor".into()
-            }
-        );
-    }
-
-    #[test]
-    fn test_find_node_shorthand_xref() {
-        let content = "= Title\n\nSee <<my-section,Section Title>> for details.\n";
-        // character 8 = '-' in "my-section"
-        let pos = Position {
-            line: 2,
-            character: 8,
-        };
-
-        let info = find_node_at_position(content, pos).unwrap();
-        assert_eq!(
-            info.kind,
-            NodeKind::ShorthandXref {
-                target: "my-section".into()
-            }
-        );
-    }
-
-    #[test]
-    fn test_find_node_plain_text_returns_none() {
-        let content = "= Title\n\nJust plain text.\n";
-        let pos = Position {
-            line: 2,
-            character: 5,
-        };
-
-        assert!(find_node_at_position(content, pos).is_none());
-    }
-
-    #[test]
-    fn test_find_node_section_heading_returns_none() {
-        let content = "= Title\n\n== Chapter\n";
-        let pos = Position {
-            line: 2,
-            character: 5,
-        };
-
+    #[rstest]
+    #[case("plain text", "= Title\n\nJust plain text.\n", 2, 5)]
+    #[case("section heading", "= Title\n\n== Chapter\n", 2, 5)]
+    fn test_find_node_none(
+        #[case] _name: &str,
+        #[case] content: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+    ) {
+        let pos = Position { line, character };
         assert!(find_node_at_position(content, pos).is_none());
     }
 

@@ -782,280 +782,62 @@ pub(crate) fn resolve_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_detect_xref_trigger() {
-        let content = "See <<my-pre";
-        let pos = Position {
-            line: 0,
-            character: 12,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Xref {
-                prefix: "my-pre".into()
-            })
-        );
+    #[rstest]
+    #[case("xref shorthand", "See <<my-pre", 0, 12,
+        CompletionContext::Xref { prefix: "my-pre".into() })]
+    #[case("include path", "include::chap", 0, 13,
+        CompletionContext::IncludePath { prefix: "chap".into() })]
+    #[case("attribute", "The {img", 0, 8,
+        CompletionContext::Attribute { prefix: "img".into() })]
+    #[case("xref empty prefix", "See <<", 0, 6,
+        CompletionContext::Xref { prefix: "".into() })]
+    #[case("xref multiline", "= Title\n\nSee <<my-id", 2, 11,
+        CompletionContext::Xref { prefix: "my-id".into() })]
+    #[case("xref with umlaut", "Über <<anch", 0, 11,
+        CompletionContext::Xref { prefix: "anch".into() })]
+    #[case("attribute with CJK", "中{attr", 0, 6,
+        CompletionContext::Attribute { prefix: "attr".into() })]
+    #[case("inline macro prefix after multibyte", ":imagesdir: Ükbd", 0, 16,
+        CompletionContext::InlineMacroPrefix { prefix: "kbd".into(), line: 0, word_start_col: 13, cursor_col: 16 })]
+    #[case("inline macro after multibyte", "Ü kbd:", 0, 6,
+        CompletionContext::InlineMacro { macro_name: "kbd".into() })]
+    #[case("include priority over attribute", "include::{docdir}/chap", 0, 22,
+        CompletionContext::IncludePath { prefix: "{docdir}/chap".into() })]
+    #[case("include open brace triggers attribute", "include::{snip", 0, 14,
+        CompletionContext::Attribute { prefix: "snip".into() })]
+    #[case("include closed brace stays include", "include::{snippetsdir}/file", 0, 27,
+        CompletionContext::IncludePath { prefix: "{snippetsdir}/file".into() })]
+    #[case("xref long form", "See xref:sec", 0, 12,
+        CompletionContext::Xref { prefix: "sec".into() })]
+    #[case("xref long form open attribute", "See xref:{attr", 0, 14,
+        CompletionContext::Attribute { prefix: "attr".into() })]
+    #[case("xref long form closed attribute", "See xref:{resolved}/sec", 0, 23,
+        CompletionContext::Xref { prefix: "{resolved}/sec".into() })]
+    fn test_detect_completion_some(
+        #[case] _name: &str,
+        #[case] content: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] expected: CompletionContext,
+    ) {
+        let pos = Position { line, character };
+        assert_eq!(detect_completion_context(content, pos), Some(expected));
     }
 
-    #[test]
-    fn test_detect_include_trigger() {
-        let content = "include::chap";
-        let pos = Position {
-            line: 0,
-            character: 13,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::IncludePath {
-                prefix: "chap".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_attribute_trigger() {
-        let content = "The {img";
-        let pos = Position {
-            line: 0,
-            character: 8,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Attribute {
-                prefix: "img".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_no_trigger() {
-        let content = "Just normal text here.";
-        let pos = Position {
-            line: 0,
-            character: 10,
-        };
+    #[rstest]
+    #[case("plain text", "Just normal text here.", 0, 10)]
+    #[case("closed attribute", "The {imagesdir} is set.", 0, 15)]
+    #[case("xref long form closed", "See xref:target[Link Text", 0, 25)]
+    fn test_detect_completion_none(
+        #[case] _name: &str,
+        #[case] content: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+    ) {
+        let pos = Position { line, character };
         assert_eq!(detect_completion_context(content, pos), None);
-    }
-
-    #[test]
-    fn test_detect_closed_attribute() {
-        let content = "The {imagesdir} is set.";
-        let pos = Position {
-            line: 0,
-            character: 15,
-        };
-        assert_eq!(detect_completion_context(content, pos), None);
-    }
-
-    #[test]
-    fn test_detect_xref_empty_prefix() {
-        let content = "See <<";
-        let pos = Position {
-            line: 0,
-            character: 6,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Xref { prefix: "".into() })
-        );
-    }
-
-    #[test]
-    fn test_detect_multiline() {
-        let content = "= Title\n\nSee <<my-id";
-        let pos = Position {
-            line: 2,
-            character: 11, // end of "See <<my-id" (len=11)
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Xref {
-                prefix: "my-id".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_xref_with_umlaut_prefix() {
-        // "Über" contains ü (U+00FC): 2 bytes UTF-8, 1 code unit UTF-16
-        // Line: "Über <<anch" — ü is at byte 0..2, so "<<" starts at byte 6
-        // UTF-16 positions: Ü=1, b=2, e=3, r=4, ' '=5, <=6, <=7, a=8, n=9, c=10, h=11
-        let content = "Über <<anch";
-        let pos = Position {
-            line: 0,
-            character: 11, // UTF-16 offset: end of "anch"
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Xref {
-                prefix: "anch".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_attribute_with_cjk() {
-        // CJK character 中 (U+4E2D): 3 bytes UTF-8, 1 code unit UTF-16
-        // Line: "中{attr" — 中 is at byte 0..3, { at byte 3, "attr" at byte 4..8
-        // UTF-16 positions: 中=1, {=2, a=3, t=4, t=5, r=6
-        let content = "中{attr";
-        let pos = Position {
-            line: 0,
-            character: 6, // UTF-16 offset: end of "attr"
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Attribute {
-                prefix: "attr".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_inline_macro_prefix_after_multibyte_char() {
-        // ":imagesdir: Ü" followed by "kbd" — Ü is 2 bytes (U+00DC)
-        // rfind for non-alphanumeric must skip past the entire multi-byte char
-        // UTF-16: : i m a g e s d i r :   Ü k b d
-        //          1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6
-        let content = ":imagesdir: Ükbd";
-        let pos = Position {
-            line: 0,
-            character: 16,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::InlineMacroPrefix {
-                prefix: "kbd".into(),
-                line: 0,
-                word_start_col: 13,
-                cursor_col: 16,
-            })
-        );
-    }
-
-    #[test]
-    fn test_inline_macro_after_multibyte_char() {
-        // "Ü kbd:" — Ü is 2 bytes, space separates, then "kbd:"
-        // rfind for non-alphanumeric before "kbd" must handle multi-byte correctly
-        let content = "Ü kbd:";
-        let pos = Position {
-            line: 0,
-            character: 6,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::InlineMacro {
-                macro_name: "kbd".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_include_priority_over_attribute() {
-        // include:: contains a { but attribute is closed — should detect as include
-        let content = "include::{docdir}/chap";
-        let pos = Position {
-            line: 0,
-            character: 22,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::IncludePath {
-                prefix: "{docdir}/chap".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_include_open_brace_triggers_attribute() {
-        // include::{snip — open brace without closing } → attribute completion
-        let content = "include::{snip";
-        let pos = Position {
-            line: 0,
-            character: 14,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Attribute {
-                prefix: "snip".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_include_closed_brace_stays_include() {
-        // include::{snippetsdir}/file — attribute is closed → include path completion
-        let content = "include::{snippetsdir}/file";
-        let pos = Position {
-            line: 0,
-            character: 27,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::IncludePath {
-                prefix: "{snippetsdir}/file".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_xref_long_form() {
-        // xref:sec → Xref { prefix: "sec" }
-        let content = "See xref:sec";
-        let pos = Position {
-            line: 0,
-            character: 12,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Xref {
-                prefix: "sec".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_xref_long_form_closed() {
-        // xref:target[Link Text → None (closed by [)
-        let content = "See xref:target[Link Text";
-        let pos = Position {
-            line: 0,
-            character: 25,
-        };
-        assert_eq!(detect_completion_context(content, pos), None);
-    }
-
-    #[test]
-    fn test_detect_xref_long_form_open_attribute() {
-        // xref:{attr → Attribute { prefix: "attr" } (open brace)
-        let content = "See xref:{attr";
-        let pos = Position {
-            line: 0,
-            character: 14,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Attribute {
-                prefix: "attr".into()
-            })
-        );
-    }
-
-    #[test]
-    fn test_detect_xref_long_form_closed_attribute() {
-        // xref:{resolved}/sec → Xref { prefix: "{resolved}/sec" } (closed brace)
-        let content = "See xref:{resolved}/sec";
-        let pos = Position {
-            line: 0,
-            character: 23,
-        };
-        assert_eq!(
-            detect_completion_context(content, pos),
-            Some(CompletionContext::Xref {
-                prefix: "{resolved}/sec".into()
-            })
-        );
     }
 
     // --- Phase 2: resolve_xref_completions ---
