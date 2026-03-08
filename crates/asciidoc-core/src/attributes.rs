@@ -230,49 +230,23 @@ impl AttributeRegistry {
     /// Substitute all `{attr}` references in a string using `resolve()`.
     #[must_use]
     pub fn substitute(&self, file: &Path, input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if ch == '{' {
-                let mut name = String::new();
-                let mut found_close = false;
-                for inner in chars.by_ref() {
-                    if inner == '}' {
-                        found_close = true;
-                        break;
-                    }
-                    name.push(inner);
-                }
-                if found_close && !name.is_empty() {
-                    if let Some(val) = self.resolve(file, &name) {
-                        result.push_str(val);
-                    } else {
-                        // Undefined attribute: leave as-is
-                        result.push('{');
-                        result.push_str(&name);
-                        result.push('}');
-                    }
-                } else {
-                    result.push('{');
-                    result.push_str(&name);
-                }
-            } else {
-                result.push(ch);
-            }
-        }
-
-        result
+        substitute_inner(input, |name| self.resolve(file, name))
     }
 }
 
 /// Substitute all `{attr}` references in a string using the provided attribute map.
-/// Same logic as `AttributeRegistry::substitute()`, but without `self` — works only
-/// on the given `HashMap`. Used by `ensure_config_for_dir()` for config-chain merging.
+/// Used by `ensure_config_for_dir()` for config-chain merging.
 #[must_use]
 fn substitute_with(attrs: &HashMap<String, AttributeEntry>, input: &str) -> String {
+    substitute_inner(input, |name| attrs.get(name).map(|e| e.value.as_str()))
+}
+
+/// Common `{attr}` substitution logic. Walks the input character by character,
+/// replacing `{name}` with the result of `lookup(name)`. Undefined attributes
+/// are left as-is.
+fn substitute_inner<'a>(input: &str, lookup: impl Fn(&str) -> Option<&'a str>) -> String {
     let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+    let mut chars = input.chars();
 
     while let Some(ch) = chars.next() {
         if ch == '{' {
@@ -286,8 +260,8 @@ fn substitute_with(attrs: &HashMap<String, AttributeEntry>, input: &str) -> Stri
                 name.push(inner);
             }
             if found_close && !name.is_empty() {
-                if let Some(entry) = attrs.get(&name) {
-                    result.push_str(&entry.value);
+                if let Some(val) = lookup(&name) {
+                    result.push_str(val);
                 } else {
                     result.push('{');
                     result.push_str(&name);
