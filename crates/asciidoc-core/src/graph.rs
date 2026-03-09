@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -195,9 +196,9 @@ pub fn parse_single_file(
     overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Option<(DocumentModel, Vec<IncludeEdge>)> {
     // Read file: prefer override content, fall back to disk
-    let source = match overrides.get(canonical) {
-        Some(content) => (**content).clone(),
-        None => std::fs::read_to_string(canonical).ok()?,
+    let source: Cow<str> = match overrides.get(canonical) {
+        Some(content) => Cow::Borrowed(content.as_str()),
+        None => Cow::Owned(std::fs::read_to_string(canonical).ok()?),
     };
 
     // Parse with block parser

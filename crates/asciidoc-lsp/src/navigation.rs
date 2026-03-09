@@ -813,7 +813,7 @@ fn resolve_rename_anchor(
 /// Read file content, preferring in-memory overrides over disk.
 fn read_content(path: &Path, overrides: &HashMap<PathBuf, Arc<String>>) -> String {
     if let Some(content) = overrides.get(path) {
-        return (**content).clone();
+        return content.to_string();
     }
     match std::fs::read_to_string(path) {
         Ok(content) => content,
