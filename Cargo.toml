@@ -2,6 +2,9 @@
 members = ["crates/*"]
 resolver = "2"
 
+[patch.crates-io]
+tree-sitter-asciidoc-inline = { path = "/home/sebflu/source/contributions/misc/tree-sitter-asciidoc/tree-sitter-asciidoc_inline" }
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 too_many_lines = "allow"         # 100-line limit too strict for well-structured functions

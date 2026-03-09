@@ -344,10 +344,12 @@ mod tests {
             DocumentModel::test("/a.adoc").with_anchors(vec![
                 Anchor {
                     id: "a1".into(),
+                    reftext: None,
                     line: 1,
                 },
                 Anchor {
                     id: "a2".into(),
+                    reftext: None,
                     line: 5,
                 },
             ]),
@@ -357,10 +359,12 @@ mod tests {
             DocumentModel::test("/b.adoc").with_anchors(vec![
                 Anchor {
                     id: "b1".into(),
+                    reftext: None,
                     line: 1,
                 },
                 Anchor {
                     id: "b2".into(),
+                    reftext: None,
                     line: 3,
                 },
             ]),
@@ -397,6 +401,7 @@ mod tests {
             PathBuf::from("/a.adoc"),
             DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
                 id: "context".into(),
+                reftext: None,
                 line: 1,
             }]),
         );
@@ -404,6 +409,7 @@ mod tests {
             PathBuf::from("/b.adoc"),
             DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
                 id: "context".into(),
+                reftext: None,
                 line: 5,
             }]),
         );
@@ -423,10 +429,12 @@ mod tests {
             DocumentModel::test("/a.adoc").with_anchors(vec![
                 Anchor {
                     id: "dup".into(),
+                    reftext: None,
                     line: 1,
                 },
                 Anchor {
                     id: "dup".into(),
+                    reftext: None,
                     line: 10,
                 },
             ]),
@@ -447,6 +455,7 @@ mod tests {
             PathBuf::from("/file.adoc"),
             DocumentModel::test("/file.adoc").with_anchors(vec![Anchor {
                 id: "anchor".into(),
+                reftext: None,
                 line: 42,
             }]),
         );
@@ -547,6 +556,7 @@ mod tests {
         let file_a = PathBuf::from("/a.adoc");
         let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
             id: "foo".into(),
+            reftext: None,
             line: 1,
         }]);
 
@@ -566,10 +576,12 @@ mod tests {
         let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![
             Anchor {
                 id: "a1".into(),
+                reftext: None,
                 line: 1,
             },
             Anchor {
                 id: "a2".into(),
+                reftext: None,
                 line: 5,
             },
         ]);
@@ -593,6 +605,7 @@ mod tests {
         // Add file A with anchor "foo"
         let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
             id: "foo".into(),
+            reftext: None,
             line: 1,
         }]);
         index.add_file(&file_a, &doc_a, &registry);
@@ -600,6 +613,7 @@ mod tests {
         // Add file B with anchor "bar"
         let doc_b = DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
             id: "bar".into(),
+            reftext: None,
             line: 1,
         }]);
         index.add_file(&file_b, &doc_b, &registry);
@@ -626,10 +640,12 @@ mod tests {
         // Both files define "context" — not a duplicate (cross-file)
         let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
             id: "context".into(),
+            reftext: None,
             line: 1,
         }]);
         let doc_b = DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
             id: "context".into(),
+            reftext: None,
             line: 5,
         }]);
 
@@ -657,10 +673,12 @@ mod tests {
         let doc_a = DocumentModel::test("/a.adoc").with_anchors(vec![
             Anchor {
                 id: "dup".into(),
+                reftext: None,
                 line: 1,
             },
             Anchor {
                 id: "dup".into(),
+                reftext: None,
                 line: 10,
             },
         ]);

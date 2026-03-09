@@ -165,10 +165,12 @@ mod tests {
             DocumentModel::test("/a.adoc").with_anchors(vec![
                 Anchor {
                     id: "dup".into(),
+                    reftext: None,
                     line: 1,
                 },
                 Anchor {
                     id: "dup".into(),
+                    reftext: None,
                     line: 10,
                 },
             ]),
@@ -192,6 +194,7 @@ mod tests {
             PathBuf::from("/a.adoc"),
             DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
                 id: "context".into(),
+                reftext: None,
                 line: 1,
             }]),
         );
@@ -199,6 +202,7 @@ mod tests {
             PathBuf::from("/b.adoc"),
             DocumentModel::test("/b.adoc").with_anchors(vec![Anchor {
                 id: "context".into(),
+                reftext: None,
                 line: 1,
             }]),
         );
@@ -330,6 +334,7 @@ mod tests {
                 }])
                 .with_anchors(vec![Anchor {
                     id: "entry-anchor".into(),
+                    reftext: None,
                     line: 3,
                 }]),
         );
@@ -460,6 +465,7 @@ mod tests {
                 }])
                 .with_anchors(vec![Anchor {
                     id: "valid-anchor".into(),
+                    reftext: None,
                     line: 5,
                 }]),
         );

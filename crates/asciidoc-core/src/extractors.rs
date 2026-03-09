@@ -279,12 +279,14 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
         return;
     }
 
-    // Inline parser: id_assignment > id
+    // Inline parser: id_assignment > id [> reftext]
     if node.kind() == "id_assignment" {
         let id = find_child_text(node, "id", source).unwrap_or_default();
+        let reftext = find_child_text(node, "reftext", source);
         if !id.is_empty() {
             results.push(Anchor {
                 id,
+                reftext,
                 line: node.start_position().row + 1,
             });
         }
@@ -351,7 +353,19 @@ fn walk_for_inline_ranges(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter:
     let parent_kind = node.kind();
     let is_inline_container = matches!(
         parent_kind,
-        "paragraph" | "document_title" | "title1" | "title2" | "title3" | "title4" | "title5"
+        "paragraph"
+            | "document_title"
+            | "title1"
+            | "title2"
+            | "title3"
+            | "title4"
+            | "title5"
+            | "unordered_list_item"
+            | "ordered_list_item"
+            | "checked_list_item"
+            | "callout_list_item"
+            | "block_title"
+            | "quoted_line"
     );
 
     if is_inline_container {
@@ -480,6 +494,45 @@ mod tests {
 
         // Print result regardless — helps debug if grammar doesn't parse anchors as expected
         println!("Anchors found: {:?}", anchors);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].id, "my-anchor");
+        assert_eq!(anchors[0].reftext, None);
+    }
+
+    #[test]
+    fn test_extract_anchor_with_reftext() {
+        let mut p = parser::init_inline_parser().unwrap();
+        let source = "[[my-anchor,Display Text]]";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let anchors = extract_anchors(tree.root_node(), source.as_bytes());
+
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].id, "my-anchor");
+        assert_eq!(anchors[0].reftext, Some("Display Text".to_string()));
+    }
+
+    #[test]
+    fn test_anchor_reftext_xref_e2e() {
+        let mut p = parser::init_inline_parser().unwrap();
+
+        // Anchor with reftext
+        let anchor_source = "[[my-anchor,Display Text]]";
+        let tree = parser::parse(&mut p, anchor_source).unwrap();
+        let anchors = extract_anchors(tree.root_node(), anchor_source.as_bytes());
+
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].id, "my-anchor");
+        assert_eq!(anchors[0].reftext, Some("Display Text".to_string()));
+
+        // Xref targeting that anchor
+        let xref_source = "See <<my-anchor>>";
+        let tree = parser::parse(&mut p, xref_source).unwrap();
+        let xrefs = extract_xrefs(tree.root_node(), xref_source.as_bytes());
+
+        assert_eq!(xrefs.len(), 1);
+        assert_eq!(xrefs[0].target, "my-anchor");
+        // Xref target matches anchor ID — gd works
+        assert_eq!(xrefs[0].target, anchors[0].id);
     }
 
     #[test]
@@ -494,6 +547,21 @@ mod tests {
             "Should find inline ranges in paragraphs and titles"
         );
         println!("Found {} inline ranges", ranges.len());
+    }
+
+    #[test]
+    fn test_collect_inline_ranges_includes_list_items() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Title\n\n* Item with <<anchor>>\n* Another item\n. Ordered item\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let ranges = collect_inline_ranges(tree.root_node());
+
+        // List items contain `line` nodes with inline content
+        assert!(
+            ranges.len() >= 3,
+            "Should find inline ranges in list items, got {}",
+            ranges.len()
+        );
     }
 
     // --- adoc-0013: Include-Attribute extraction ---

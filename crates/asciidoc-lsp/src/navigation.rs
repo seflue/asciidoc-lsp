@@ -1098,6 +1098,28 @@ mod tests {
         assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
     }
 
+    #[test]
+    fn test_goto_def_xref_shorthand_with_display_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let b = tmp.path().join("b.adoc");
+
+        fs::write(&a, "= Doc A\n\nSee <<my-anchor,custom text>>.\n\ninclude::b.adoc[]\n").unwrap();
+        fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        // character 8 = inside "my-anchor" before the comma
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(target, b.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
     // --- Task 3.1: resolve_goto_definition for attribute references ---
 
     #[test]

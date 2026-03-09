@@ -32,6 +32,7 @@ pub struct AttributeDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Anchor {
     pub id: String,
+    pub reftext: Option<String>,
     pub line: usize,
 }
 
