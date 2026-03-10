@@ -1,0 +1,3 @@
+[submodule "vendor/tree-sitter-asciidoc"]
+	path = vendor/tree-sitter-asciidoc
+	url = https://github.com/seflue/tree-sitter-asciidoc.git

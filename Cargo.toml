@@ -6,7 +6,8 @@ resolver = "2"
 license = "Apache-2.0"
 
 [patch.crates-io]
-tree-sitter-asciidoc-inline = { path = "/home/sebflu/source/contributions/misc/tree-sitter-asciidoc/tree-sitter-asciidoc_inline" }
+tree-sitter-asciidoc = { path = "vendor/tree-sitter-asciidoc/tree-sitter-asciidoc" }
+tree-sitter-asciidoc-inline = { path = "vendor/tree-sitter-asciidoc/tree-sitter-asciidoc_inline" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
