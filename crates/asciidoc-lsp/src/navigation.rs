@@ -1104,7 +1104,11 @@ mod tests {
         let a = tmp.path().join("a.adoc");
         let b = tmp.path().join("b.adoc");
 
-        fs::write(&a, "= Doc A\n\nSee <<my-anchor,custom text>>.\n\ninclude::b.adoc[]\n").unwrap();
+        fs::write(
+            &a,
+            "= Doc A\n\nSee <<my-anchor,custom text>>.\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
         let ws = Workspace::build(tmp.path(), &a);
