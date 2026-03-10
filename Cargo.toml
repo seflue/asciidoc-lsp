@@ -2,6 +2,9 @@
 members = ["crates/*"]
 resolver = "2"
 
+[workspace.package]
+license = "Apache-2.0"
+
 [patch.crates-io]
 tree-sitter-asciidoc-inline = { path = "/home/sebflu/source/contributions/misc/tree-sitter-asciidoc/tree-sitter-asciidoc_inline" }
 
