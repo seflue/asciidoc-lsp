@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::attributes::AttributeRegistry;
 use crate::graph::IncludeGraph;
+use crate::paths::resolve_doc_target;
 use crate::types::{AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, ResolvedXref, Xref};
 
 pub struct ReferenceIndex {
@@ -147,19 +148,35 @@ impl ReferenceIndex {
     pub fn resolve_xref(
         &self,
         xref: &Xref,
-        _source_file: &Path,
+        source_file: &Path,
         _graph: &IncludeGraph,
         documents: &HashMap<PathBuf, DocumentModel>,
+        registry: &AttributeRegistry,
     ) -> Result<ResolvedXref, DiagnosticKind> {
         let (file_part, anchor_part) = parse_xref_target(&xref.target);
 
         if let Some(file_ref) = file_part {
             // xref:file.adoc#anchor[] or xref:file.adoc[]
-            let target_file = documents.keys().find(|p| {
-                p.ends_with(file_ref)
-                    || p.file_name()
-                        .is_some_and(|f| f.to_string_lossy() == file_ref)
-            });
+            //
+            // Resolution mirrors Asciidoctor:
+            // 1. Substitute attributes + resolve relative to the source file's
+            //    directory (`paths::resolve_doc_target`). This is the primary
+            //    path — it handles `../sibling/doc.adoc`, `sub/doc.adoc`, and
+            //    `{docdir}/foo.adoc`.
+            // 2. Fall back to a workspace-wide lookup by trailing components
+            //    or bare filename, so `xref:doc.adoc[]` keeps working from any
+            //    depth.
+            let resolved_path = resolve_doc_target(source_file, file_ref, registry);
+            let target_file = resolved_path
+                .as_ref()
+                .and_then(|p| documents.keys().find(|key| *key == p))
+                .or_else(|| {
+                    documents.keys().find(|p| {
+                        p.ends_with(file_ref)
+                            || p.file_name()
+                                .is_some_and(|f| f.to_string_lossy() == file_ref)
+                    })
+                });
 
             let path = target_file.ok_or_else(|| DiagnosticKind::BrokenXref {
                 target: xref.target.clone(),
@@ -469,7 +486,7 @@ mod tests {
             line: 1,
         };
         let result = index
-            .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents)
+            .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry)
             .unwrap();
         assert_eq!(result.file, PathBuf::from("/file.adoc"));
         assert_eq!(result.line, 42);
@@ -497,7 +514,13 @@ mod tests {
             line: 1,
         };
         let result = index
-            .resolve_xref(&xref, Path::new("/other.adoc"), &graph, &documents)
+            .resolve_xref(
+                &xref,
+                Path::new("/other.adoc"),
+                &graph,
+                &documents,
+                &registry,
+            )
             .unwrap();
         assert_eq!(result.file, PathBuf::from("/doc.adoc"));
         assert_eq!(result.line, 5);
@@ -505,6 +528,7 @@ mod tests {
 
     #[test]
     fn test_resolve_xref_broken() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
         let index = ReferenceIndex::new();
         let graph = IncludeGraph::new();
         let documents = HashMap::new();
@@ -514,7 +538,8 @@ mod tests {
             display_text: None,
             line: 1,
         };
-        let result = index.resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents);
+        let result =
+            index.resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -540,10 +565,85 @@ mod tests {
             line: 1,
         };
         let result = index
-            .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents)
+            .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry)
             .unwrap();
         assert_eq!(result.file, PathBuf::from("/target.adoc"));
         assert_eq!(result.line, 1);
+    }
+
+    #[test]
+    fn test_resolve_xref_sibling_directory() {
+        // Regression: xref:../sibling/doc.adoc#anchor[] must resolve, not be reported as broken.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let source = root.join("a/src.adoc");
+        let target = root.join("b/doc.adoc");
+        std::fs::write(&source, "").unwrap();
+        std::fs::write(&target, "").unwrap();
+
+        let registry = AttributeRegistry::new(&root);
+        let mut documents = HashMap::new();
+        documents.insert(
+            target.clone(),
+            DocumentModel::test(target.to_str().unwrap()).with_anchors(vec![Anchor {
+                id: "my-anchor".into(),
+                reftext: None,
+                line: 7,
+            }]),
+        );
+
+        let index = ReferenceIndex::build(&documents, &registry);
+        let graph = IncludeGraph::new();
+
+        let xref = Xref {
+            target: "../b/doc.adoc#my-anchor".into(),
+            display_text: None,
+            line: 1,
+        };
+        let resolved = index
+            .resolve_xref(&xref, &source, &graph, &documents, &registry)
+            .unwrap();
+        assert_eq!(resolved.file, target);
+        assert_eq!(resolved.line, 7);
+    }
+
+    #[test]
+    fn test_resolve_xref_attribute_substituted_target() {
+        // xref:{docdir}/sub/doc.adoc#anchor[] must substitute {docdir} and resolve.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let source = root.join("index.adoc");
+        let target = root.join("sub/doc.adoc");
+        std::fs::write(&source, "").unwrap();
+        std::fs::write(&target, "").unwrap();
+
+        let registry = AttributeRegistry::new(&root);
+        let mut documents = HashMap::new();
+        documents.insert(
+            target.clone(),
+            DocumentModel::test(target.to_str().unwrap()).with_anchors(vec![Anchor {
+                id: "x".into(),
+                reftext: None,
+                line: 3,
+            }]),
+        );
+
+        let index = ReferenceIndex::build(&documents, &registry);
+        let graph = IncludeGraph::new();
+
+        let xref = Xref {
+            target: "{docdir}/sub/doc.adoc#x".into(),
+            display_text: None,
+            line: 1,
+        };
+        let resolved = index
+            .resolve_xref(&xref, &source, &graph, &documents, &registry)
+            .unwrap();
+        assert_eq!(resolved.file, target);
+        assert_eq!(resolved.line, 3);
     }
 
     // --- Incremental updates (add_file / remove_file) ---

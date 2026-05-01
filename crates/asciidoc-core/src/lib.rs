@@ -4,6 +4,7 @@ pub mod error;
 pub mod extractors;
 pub mod graph;
 pub mod parser;
+pub mod paths;
 pub mod references;
 pub mod types;
 pub mod workspace;

@@ -106,13 +106,12 @@ pub fn resolve_goto_definition(
 
     match node_info.kind {
         NodeKind::Include { ref path } => {
-            let doc_dir = doc_path.parent()?;
-            let resolved_path = if let Some(ws) = workspace {
-                ws.attributes().substitute(doc_path, path)
+            let target = if let Some(ws) = workspace {
+                asciidoc_core::paths::resolve_doc_target(doc_path, path, ws.attributes())?
             } else {
-                path.clone()
+                doc_path.parent()?.join(path)
             };
-            let target = doc_dir.join(&resolved_path);
+            // Require an existing on-disk file.
             let target_canon = target.canonicalize().ok()?;
             Some((target_canon, 1))
         }
@@ -125,7 +124,13 @@ pub fn resolve_goto_definition(
             };
             let resolved = ws
                 .reference_index()
-                .resolve_xref(&xref, doc_path, ws.include_graph(), ws.documents())
+                .resolve_xref(
+                    &xref,
+                    doc_path,
+                    ws.include_graph(),
+                    ws.documents(),
+                    ws.attributes(),
+                )
                 .ok()?;
             Some((resolved.file, resolved.line))
         }
@@ -171,9 +176,7 @@ pub fn resolve_references(
             r
         }
         NodeKind::Include { path } => {
-            let doc_dir = doc_path.parent()?;
-            let resolved_path = ws.attributes().substitute(doc_path, path);
-            let target = doc_dir.join(&resolved_path);
+            let target = asciidoc_core::paths::resolve_doc_target(doc_path, path, ws.attributes())?;
             let target_canonical = target.canonicalize().ok()?;
             let filename = target_canonical
                 .file_name()
@@ -272,7 +275,13 @@ pub fn resolve_hover(
             };
             let resolved = ws
                 .reference_index()
-                .resolve_xref(&xref, doc_path, ws.include_graph(), ws.documents())
+                .resolve_xref(
+                    &xref,
+                    doc_path,
+                    ws.include_graph(),
+                    ws.documents(),
+                    ws.attributes(),
+                )
                 .ok()?;
 
             // Find section title at the resolved location
@@ -300,13 +309,16 @@ pub fn resolve_hover(
             }
         }
         NodeKind::Include { path } => {
-            let doc_dir = doc_path.parent()?;
             let resolved_path = if let Some(ws) = workspace {
                 ws.attributes().substitute(doc_path, path)
             } else {
                 path.clone()
             };
-            let target = doc_dir.join(&resolved_path);
+            let target = if let Some(ws) = workspace {
+                asciidoc_core::paths::resolve_doc_target(doc_path, path, ws.attributes())?
+            } else {
+                doc_path.parent()?.join(&resolved_path)
+            };
 
             let mut text = format!("include::{resolved_path}[]");
             if target.exists() {

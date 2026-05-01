@@ -310,9 +310,8 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     // columns so resolvers can emit a TextEdit that overwrites the existing
     // label and selects a fresh `${1:label}` placeholder. Only meaningful for
     // long-form xref (`[]` closing was suppressed to "" above).
-    let xref_trailing: Option<TrailingBrackets> = after_cursor
-        .strip_prefix('[')
-        .and_then(|after_open| {
+    let xref_trailing: Option<TrailingBrackets> =
+        after_cursor.strip_prefix('[').and_then(|after_open| {
             after_open.find(']').map(|rel_idx| {
                 let end_byte = rel_idx + 2; // `[` + content + `]`
                 #[allow(clippy::cast_possible_truncation)]
@@ -611,10 +610,11 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         return Vec::new();
     }
 
-    let canonical_target = doc_path
-        .parent()
-        .map(|p| p.join(&resolved))
-        .and_then(|p| std::fs::canonicalize(&p).ok());
+    // Only keep canonical (existing-on-disk) results — downstream compares
+    // against `std::fs::canonicalize(&loc.file)` for equality.
+    let canonical_target =
+        asciidoc_core::paths::resolve_doc_target(doc_path, file, ws.attributes())
+            .and_then(|p| std::fs::canonicalize(p).ok());
 
     let resolved_path = Path::new(&resolved);
     let resolved_filename = resolved_path
@@ -1317,7 +1317,8 @@ mod tests {
         ]);
 
         let doc_path = a.clone();
-        let items = resolve_xref_cross_anchor_completions("b.adoc", "", &doc_path, Some(&ws), "[]", None);
+        let items =
+            resolve_xref_cross_anchor_completions("b.adoc", "", &doc_path, Some(&ws), "[]", None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "sec2");
         assert_eq!(items[0].insert_text.as_ref().unwrap(), "sec2[${1:label}]");
@@ -1629,7 +1630,9 @@ mod tests {
         let doc_path = Path::new("/a.adoc");
         let ctx = CompletionContext::XrefAnchor {
             prefix: "my".into(),
-            closing: ">>", trailing: None };
+            closing: ">>",
+            trailing: None,
+        };
 
         let items = resolve_completions(ctx, doc_path, Some(&ws));
         assert_eq!(items.len(), 1);
@@ -1969,7 +1972,9 @@ mod tests {
             detect_completion_context(content, pos),
             Some(CompletionContext::XrefAnchorOrPath {
                 prefix: "target".into(),
-                closing: "[]", trailing: None })
+                closing: "[]",
+                trailing: None
+            })
         );
     }
 
@@ -2475,10 +2480,7 @@ mod tests {
         );
         // insert_text uses image-snippet (cursor inside `[alt]`)
         let png_item = items.iter().find(|i| i.label == "foto.png").unwrap();
-        assert_eq!(
-            png_item.insert_text.as_ref().unwrap(),
-            "foto.png[${1:alt}]"
-        );
+        assert_eq!(png_item.insert_text.as_ref().unwrap(), "foto.png[${1:alt}]");
         assert_eq!(png_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
         assert_eq!(png_item.kind, Some(CompletionItemKind::FILE));
     }

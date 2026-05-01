@@ -705,3 +705,40 @@ Subdir: xref:chapters/
 // Actually: No asciidoc contextual results, only snippets and buffer words
 
 ---
+
+[[t8-target]]
+=== T8: Cross-directory references via `../`
+
+Verifies that `xref:` and `include::` resolve targets relative to the
+source file's directory — `../` going UP into a parent directory works
+the same as Asciidoctor.
+
+*Setup:* place cursor on the link below and press `gd` to open the
+fixture file:
+
+xref:chapters/cross-up-test.adoc[Open T8 fixture →]
+
+In the fixture, follow the inline instructions per case (T8.1–T8.3),
+then return here (`Ctrl-O` or via the cross-up xref that targets this
+anchor) and mark the result.
+
+==== T8.1: Goto via cross-up xref
+
+// [x] PASS  [ ] FAIL
+// Run T8.1 in the fixture. Expected: cursor lands here, on the
+// `[[t8-target]]` anchor at the T8 heading. No BrokenXref diagnostic
+// on the source line.
+
+==== T8.2: Hover on cross-up include
+
+// [x] PASS  [ ] FAIL
+// Run T8.2 in the fixture. Expected: hover popup shows the include
+// path and `✓ File exists | <N> sections`. Cursor does not move.
+
+==== T8.3: Broken cross-up xref
+
+// [x] PASS  [ ] FAIL
+// Run T8.3 in the fixture. Expected: `gd` does nothing, BrokenXref
+// diagnostic appears on the line, LSP stays attached.
+
+---

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::attributes::AttributeRegistry;
 use crate::graph::IncludeGraph;
+use crate::paths::resolve_doc_target;
 use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
 
@@ -20,7 +21,7 @@ pub fn collect_diagnostics(
         // 1. Broken xrefs
         for xref in &doc.xrefs {
             if ref_index
-                .resolve_xref(xref, path, graph, documents)
+                .resolve_xref(xref, path, graph, documents, registry)
                 .is_err()
             {
                 diags.entry(path.clone()).or_default().push(Diagnostic {
@@ -35,11 +36,10 @@ pub fn collect_diagnostics(
 
         // 2. Broken includes: check if include targets exist in graph
         for inc in &doc.includes {
-            let resolved_path = registry.substitute(path, &inc.path);
-            let base_dir = path.parent().unwrap_or(Path::new("."));
-            let target_path = base_dir.join(&resolved_path);
-            let target_canonical = target_path.canonicalize().unwrap_or(target_path.clone());
-            if !documents.contains_key(&target_canonical) && !target_path.exists() {
+            let Some(target_path) = resolve_doc_target(path, &inc.path, registry) else {
+                continue;
+            };
+            if !documents.contains_key(&target_path) && !target_path.exists() {
                 diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: inc.line,
@@ -98,6 +98,7 @@ mod tests {
     use super::*;
     use crate::types::{Anchor, IncludeMacro, Section, Xref};
     use pretty_assertions::assert_eq;
+    use std::path::Path;
 
     fn make_registry() -> AttributeRegistry {
         AttributeRegistry::new(Path::new("/tmp"))

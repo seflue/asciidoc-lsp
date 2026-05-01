@@ -1,0 +1,30 @@
+= Cross-Directory Reference Fixture
+
+This file lives one level below `manual-test-plan.adoc` so that `../`
+references go back UP into the parent directory — exercising
+source-relative path resolution.
+
+All targets land at the `[[t8-target]]` anchor at the T8 heading in
+the plan, so each `gd` returns you to the section where you started.
+
+== T8.1: xref `../parent.adoc#anchor`
+
+// Place cursor on the xref below, press `gd`. Expected: jump to the T8
+// heading in the plan. Mark PASS there. Return with `Ctrl-O`.
+
+See xref:../manual-test-plan.adoc#t8-target[Back to T8].
+
+== T8.2: include `../parent.adoc[]`
+
+// Place cursor on the include below, trigger hover (`K` or your map).
+// Expected: hover shows `include::../cycle-a.adoc[]` and `✓ File exists`.
+// Cursor does not move. Mark PASS in the plan.
+
+include::../cycle-a.adoc[]
+
+== T8.3: broken `../bogus.adoc#x`
+
+// Place cursor on the xref below, press `gd`. Expected: no jump, no
+// crash, BrokenXref diagnostic on this line. Mark PASS in the plan.
+
+See xref:../does-not-exist.adoc#whatever[Should be broken].

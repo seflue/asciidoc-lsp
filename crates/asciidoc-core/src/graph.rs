@@ -231,15 +231,13 @@ pub fn parse_single_file(
     registry.register_file_attributes(canonical, &file_attrs);
 
     // Resolve include paths to edges
-    let base_dir = canonical.parent().unwrap_or(Path::new("."));
     let edges: Vec<IncludeEdge> = includes_raw
         .iter()
         .map(|inc| {
-            let resolved_path = registry.substitute(canonical, &inc.path);
-            let full_path = base_dir.join(&resolved_path);
-            let target_canonical = full_path.canonicalize().unwrap_or(full_path);
+            let target = crate::paths::resolve_doc_target(canonical, &inc.path, registry)
+                .unwrap_or_else(|| PathBuf::from(&inc.path));
             IncludeEdge {
-                target: target_canonical,
+                target,
                 line: inc.line,
                 attributes: inc.attributes.clone(),
             }
