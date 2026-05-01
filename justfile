@@ -65,3 +65,7 @@ reset-testplan:
 # Remove build artifacts
 clean:
     cargo clean
+
+# Update tree-sitter-asciidoc submodule to latest upstream commit
+update-grammar:
+    git submodule update --remote vendor/tree-sitter-asciidoc

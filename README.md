@@ -52,7 +52,7 @@ Provides navigation, diagnostics, completions, and refactoring for AsciiDoc proj
 Requires Rust 1.70+.
 
 ```sh
-git clone https://github.com/TODO/asciidoc-lsp.git
+git clone --recurse-submodules https://github.com/TODO/asciidoc-lsp.git
 cd asciidoc-lsp
 cargo install --path crates/asciidoc-lsp
 ```
@@ -127,7 +127,15 @@ crates/
 
 ## Development
 
-Requires [just](https://github.com/casey/just).
+Requires [just](https://github.com/casey/just) and a Rust toolchain (1.70+).
+
+Clone with submodules:
+
+```sh
+git clone --recurse-submodules <repo-url>
+# Or if already cloned:
+git submodule update --init
+```
 
 ```sh
 just build          # Debug build
@@ -144,7 +152,9 @@ Pre-release (`v0.1.0-dev`). Functional and tested with 300+ tests, but API and c
 
 ## Contributing
 
-Contributions welcome. Please run `just ci` before submitting changes.
+Contributions welcome. The project uses a Git submodule for the tree-sitter grammar.
+After cloning, ensure submodules are initialized (`git submodule update --init`).
+Please run `just ci` before submitting changes.
 
 ## License
 
