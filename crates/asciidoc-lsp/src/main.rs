@@ -129,14 +129,23 @@ impl AsciiDocLsp {
 
 impl LanguageServer for AsciiDocLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Extract root from params
-        // root_uri is deprecated in favor of workspace_folders, but we still
-        // need it as primary source for single-root workspaces and as fallback.
+        // Extract root from params. Modern LSP clients (Neovim ≥0.11) prefer
+        // `workspace_folders` and may omit `root_uri` entirely. Fall through:
+        //   1. workspace_folders[0] (modern, multi-root capable)
+        //   2. root_uri (deprecated, but still common)
+        //   3. root_path (legacy, kept for old clients)
         #[allow(deprecated)]
         let root_path: Option<PathBuf> = params
-            .root_uri
+            .workspace_folders
             .as_ref()
-            .and_then(|uri| uri.to_file_path().map(std::borrow::Cow::into_owned))
+            .and_then(|folders| folders.first())
+            .and_then(|folder| folder.uri.to_file_path().map(std::borrow::Cow::into_owned))
+            .or_else(|| {
+                params
+                    .root_uri
+                    .as_ref()
+                    .and_then(|uri| uri.to_file_path().map(std::borrow::Cow::into_owned))
+            })
             .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
         if let Some(ref root) = root_path {
