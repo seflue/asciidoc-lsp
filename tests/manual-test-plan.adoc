@@ -592,3 +592,116 @@ endif::no-such-attr,imagesdir[]
 // Expected: No WARNING diagnostic — `imagesdir` is defined, satisfying the OR condition.
 
 ---
+
+=== T7: Cross-file Xref Navigation and Completion
+
+`gd` (or your goto-definition keymap) on cross-file xrefs jumps to the target.
+Completion suggests files and anchors based on cursor context.
+Targets: `chapters/introduction.adoc` exists with sections `Introduction and Goals`,
+`Requirements Overview`, `Quality Goals`, `Stakeholders` (implicit anchor IDs are
+`_introduction_and_goals`, `_requirements_overview`, etc.).
+
+==== T7.1: Goto — long-form xref with file + anchor
+
+// [x] PASS  [ ] FAIL
+// Place cursor anywhere on the xref below and press `gd`:
+
+See xref:chapters/introduction.adoc#_introduction_and_goals[Introduction].
+
+// Expected: Jumps to `tests/chapters/introduction.adoc` at the section `== Introduction and Goals`.
+
+==== T7.2: Goto — long-form xref with file only (no anchor)
+
+// [x] PASS  [ ] FAIL
+// Place cursor anywhere on the xref below and press `gd`:
+
+See xref:chapters/introduction.adoc[The introduction].
+
+// Expected: Jumps to `tests/chapters/introduction.adoc`, line 1.
+
+==== T7.3: Goto — shorthand xref cross-file with anchor
+
+// [x] PASS  [ ] FAIL
+// Place cursor anywhere on the shorthand xref below and press `gd`:
+
+See <<chapters/introduction.adoc#_quality_goals>>.
+
+// Expected: Jumps to `tests/chapters/introduction.adoc` at the section `=== Quality Goals`.
+
+==== T7.4: Goto — same-file xref via `#`-shorthand
+
+// [x] PASS  [ ] FAIL
+// Place cursor anywhere on the xref below and press `gd`:
+
+Refer to xref:#_t7_3_goto_shorthand_xref_cross_file_with_anchor[T7.3].
+
+// Expected: Jumps to the T7.3 section heading earlier in this file.
+// Note: implicit section ID for `==== T7.3: …` becomes `_t7_3_goto_…` (asciidoctor
+// rules: punctuation → `_`, downcased). If the LSP normalises titles differently
+// the anchor might mismatch — that's a separate bug, not a goto bug.
+
+==== T7.5: Goto — broken cross-file xref
+
+// [x] PASS  [ ] FAIL
+// Place cursor anywhere on the xref below and press `gd`:
+
+See xref:does-not-exist.adoc#whatever[Broken].
+
+// Expected: No jump (file not in workspace). No crash. LSP stays attached.
+// Diagnostic: a `BrokenXref` WARNING/ERROR should appear on this line.
+
+==== T7.6: Completion — file path after `xref:`
+
+// [x] PASS  [ ] FAIL
+// Place cursor at end of `xref:` below and trigger completion:
+
+See xref:
+// Expected: List contains `chapters/` directory and any `.adoc` files in `tests/`.
+// Items insert `[]` suffix (e.g. `cycle-a.adoc[]`). Subdir items end with `/`.
+
+==== T7.7: Completion — combined anchor + path
+
+// [x] PASS  [ ] FAIL
+// Place cursor at end of `xref:` below and trigger completion:
+
+Discovery: xref:
+// Expected: List contains BOTH workspace anchors (e.g. `_introduction_and_goals`)
+// AND `.adoc` files / subdirs. Both forms should appear so the user can discover
+// either target shape from the same trigger.
+
+==== T7.8: Completion — anchor list scoped to target file
+
+// [x] PASS  [ ] FAIL
+// Place cursor right after `#` in the line below and trigger completion:
+
+Filtered: xref:chapters/introduction.adoc#
+// Expected: Only anchors from `chapters/introduction.adoc` (e.g. `_introduction_and_goals`,
+// `_requirements_overview`, `_quality_goals`, `_stakeholders`). NO anchors from other files.
+
+==== T7.9: Completion — same-file anchors via `xref:#`
+
+// [x] PASS  [ ] FAIL
+// Place cursor right after `#` in the line below and trigger completion:
+
+Same-file: xref:#
+// Expected: Only anchors defined in THIS file (e.g. `my-test-anchor`, the implicit
+// section IDs from this manual test plan). NO anchors from other files.
+
+==== T7.10: Completion — shorthand cross-file `<<file.adoc#…>>`
+
+// [x] PASS  [ ] FAIL
+// Place cursor right after `#` in the line below and trigger completion:
+
+Shorthand: <<chapters/introduction.adoc#
+// Expected: Same anchors as T7.8. Insert text uses `>>` suffix (not `[]`).
+
+==== T7.11: Completion — subdir prefix narrows path list
+
+// [ ] PASS  [x] FAIL
+// Place cursor at end of `xref:chapters/` below and trigger completion:
+
+Subdir: xref:chapters/
+// Expected: Only files inside `chapters/` appear (e.g. `introduction.adoc[]`).
+// Actually: No asciidoc contextual results, only snippets and buffer words
+
+---
