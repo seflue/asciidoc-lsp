@@ -217,11 +217,44 @@ const INLINE_MACROS: &[SyntaxEntry] = &[
 // Completion Context
 // ---------------------------------------------------------------------------
 
+/// Range info for an existing `[…]` block immediately after the cursor.
+/// When present, anchor/path resolvers emit a `TextEdit` that swallows the
+/// existing brackets and re-emits them as a snippet `[${1:label}]`, so the
+/// `label` placeholder is selected after the user accepts the completion.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub(crate) struct TrailingBrackets {
+    pub line: u32,
+    pub cursor_col: u32, // UTF-16 column of cursor
+    pub end_col: u32,    // UTF-16 column AFTER closing `]`
+}
+
 /// Classification of a completion trigger context.
 #[derive(Debug, PartialEq)]
 pub(crate) enum CompletionContext {
-    /// `<<prefix` — cross-reference to an anchor
-    Xref { prefix: String },
+    /// `<<prefix` — cross-reference anchor (shorthand). `closing` is the suffix
+    /// appended to `insert_text` (`>>` for `<<…>>`, `[]` for `xref:…[]`).
+    XrefAnchor {
+        prefix: String,
+        closing: &'static str,
+        trailing: Option<TrailingBrackets>,
+    },
+    /// `xref:prefix` without `#` — could be either a workspace anchor or an
+    /// `.adoc` file path. Resolver dispatches to *both* and merges results to
+    /// support discovery. `closing` is `"[]"` for fresh edits, or `""` when the
+    /// brackets are already present after the cursor (avoid doubling).
+    XrefAnchorOrPath {
+        prefix: String,
+        closing: &'static str,
+        trailing: Option<TrailingBrackets>,
+    },
+    /// `xref:file.adoc#anchor_prefix` or `<<file.adoc#anchor_prefix` —
+    /// cross-file anchor. Empty `file` means same-document (e.g. `xref:#sec`).
+    XrefCrossAnchor {
+        file: String,
+        anchor_prefix: String,
+        closing: &'static str,
+        trailing: Option<TrailingBrackets>,
+    },
     /// `include::prefix` — include path completion
     IncludePath { prefix: String },
     /// `image::prefix` — image path completion
@@ -256,6 +289,41 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     let (_, byte_col) = positions::from_lsp_position(pos, content);
     let col = byte_col.min(line_str.len());
     let before_cursor = &line_str[..col];
+    let after_cursor = &line_str[col..];
+
+    // When the user is mid-edit (e.g. accepted a path-completion snippet that
+    // pre-inserted `[label]` and is now typing `#anchor` before it), the line
+    // after the cursor already contains the closing brackets. Re-emitting `[]`
+    // or `>>` would double them. Compute effective closings up-front.
+    let xref_long_close = if after_cursor.starts_with('[') {
+        ""
+    } else {
+        "[]"
+    };
+    let xref_short_close = if after_cursor.starts_with(">>") {
+        ""
+    } else {
+        ">>"
+    };
+
+    // Detect an existing `[…]` block right after the cursor and compute UTF-16
+    // columns so resolvers can emit a TextEdit that overwrites the existing
+    // label and selects a fresh `${1:label}` placeholder. Only meaningful for
+    // long-form xref (`[]` closing was suppressed to "" above).
+    let xref_trailing: Option<TrailingBrackets> = after_cursor
+        .strip_prefix('[')
+        .and_then(|after_open| {
+            after_open.find(']').map(|rel_idx| {
+                let end_byte = rel_idx + 2; // `[` + content + `]`
+                #[allow(clippy::cast_possible_truncation)]
+                let utf16_len = after_cursor[..end_byte].encode_utf16().count() as u32;
+                TrailingBrackets {
+                    line: pos.line,
+                    cursor_col: pos.character,
+                    end_col: pos.character + utf16_len,
+                }
+            })
+        });
 
     // Priority 1a: include:: (longest trigger)
     if let Some(idx) = before_cursor.rfind("include::") {
@@ -337,8 +405,19 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                     });
                 }
             }
-            return Some(CompletionContext::Xref {
+            // Split at `#` for cross-file anchor form `xref:file.adoc#anchor`.
+            if let Some(hash_pos) = prefix.find('#') {
+                return Some(CompletionContext::XrefCrossAnchor {
+                    file: prefix[..hash_pos].to_string(),
+                    anchor_prefix: prefix[hash_pos + 1..].to_string(),
+                    closing: xref_long_close,
+                    trailing: xref_trailing,
+                });
+            }
+            return Some(CompletionContext::XrefAnchorOrPath {
                 prefix: prefix.to_string(),
+                closing: xref_long_close,
+                trailing: xref_trailing,
             });
         }
     }
@@ -349,8 +428,21 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         let prefix = &before_cursor[prefix_start..];
         // If >> appears after <<, the xref is closed — no completion
         if !prefix.contains(">>") {
-            return Some(CompletionContext::Xref {
+            // Cross-file anchor form `<<file.adoc#anchor>>`
+            if let Some(hash_pos) = prefix.find('#') {
+                return Some(CompletionContext::XrefCrossAnchor {
+                    file: prefix[..hash_pos].to_string(),
+                    anchor_prefix: prefix[hash_pos + 1..].to_string(),
+                    closing: xref_short_close,
+                    // Shorthand uses `>>` not `[]`, so trailing-bracket logic
+                    // doesn't apply; existing tests assume None.
+                    trailing: None,
+                });
+            }
+            return Some(CompletionContext::XrefAnchor {
                 prefix: prefix.to_string(),
+                closing: xref_short_close,
+                trailing: None,
             });
         }
     }
@@ -448,17 +540,15 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     None
 }
 
-/// Resolve xref completions by listing all anchors from the workspace's
-/// `ReferenceIndex`, filtered by prefix.
-///
-/// Returns `CompletionItem`s with:
-/// - `label`: anchor ID
-/// - `kind`: Reference
-/// - `detail`: filename + anchor kind
-/// - `insert_text`: `anchor_id>>` (appends closing `>>`)
+/// Resolve xref anchor completions by listing all anchors from the workspace's
+/// `ReferenceIndex`, filtered by prefix. `closing` (`">>"` or `"[]"`) is
+/// appended to `insert_text`. When `trailing` is `Some`, an existing `[…]` is
+/// overwritten with a snippet so the `label` placeholder ends up selected.
 pub(crate) fn resolve_xref_completions(
     prefix: &str,
     ws: Option<&Workspace>,
+    closing: &str,
+    trailing: Option<TrailingBrackets>,
 ) -> Vec<CompletionItem> {
     let Some(ws) = ws else {
         return Vec::new();
@@ -469,30 +559,197 @@ pub(crate) fn resolve_xref_completions(
         .anchors()
         .iter()
         .filter(|(id, _)| id.starts_with(prefix))
-        .map(|(id, loc)| {
-            let filename = loc
-                .file
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let kind_label = match loc.kind {
-                asciidoc_core::types::AnchorKind::Explicit => "explicit",
-                asciidoc_core::types::AnchorKind::ImplicitSection => "section",
-                asciidoc_core::types::AnchorKind::BlockId => "block",
-            };
-
-            CompletionItem {
-                label: id.clone(),
-                kind: Some(CompletionItemKind::REFERENCE),
-                detail: Some(format!("{filename} ({kind_label})")),
-                insert_text: Some(format!("{id}>>")),
-                ..Default::default()
-            }
-        })
+        .map(|(id, loc)| anchor_completion_item(id, loc, closing, trailing))
         .collect();
 
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items
+}
+
+/// Resolve cross-file xref anchor completions: anchors filtered to a specific
+/// target file. Empty `file` means the current document.
+///
+/// File matching is layered to mirror `references::resolve_xref` semantics:
+///   1. Canonical-path equality (handles `../foo.adoc`, symlinks, when target exists)
+///   2. Path-suffix match (`subdir/foo.adoc` ends-with comparison on stored anchor path)
+///   3. Filename-only fallback (any indexed file with matching basename)
+pub(crate) fn resolve_xref_cross_anchor_completions(
+    file: &str,
+    anchor_prefix: &str,
+    doc_path: &Path,
+    ws: Option<&Workspace>,
+    closing: &str,
+    trailing: Option<TrailingBrackets>,
+) -> Vec<CompletionItem> {
+    let Some(ws) = ws else {
+        return Vec::new();
+    };
+
+    if file.is_empty() {
+        let doc_canonical =
+            std::fs::canonicalize(doc_path).unwrap_or_else(|_| doc_path.to_path_buf());
+        let mut items: Vec<CompletionItem> = ws
+            .reference_index()
+            .anchors()
+            .iter()
+            .filter(|(id, loc)| {
+                if !id.starts_with(anchor_prefix) {
+                    return false;
+                }
+                let loc_canonical =
+                    std::fs::canonicalize(&loc.file).unwrap_or_else(|_| loc.file.clone());
+                loc_canonical == doc_canonical
+            })
+            .map(|(id, loc)| anchor_completion_item(id, loc, closing, trailing))
+            .collect();
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        return items;
+    }
+
+    let resolved = ws.attributes().substitute(doc_path, file);
+    if resolved.contains('{') {
+        return Vec::new();
+    }
+
+    let canonical_target = doc_path
+        .parent()
+        .map(|p| p.join(&resolved))
+        .and_then(|p| std::fs::canonicalize(&p).ok());
+
+    let resolved_path = Path::new(&resolved);
+    let resolved_filename = resolved_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string());
+
+    let mut items: Vec<CompletionItem> = ws
+        .reference_index()
+        .anchors()
+        .iter()
+        .filter(|(id, loc)| {
+            if !id.starts_with(anchor_prefix) {
+                return false;
+            }
+            if let Some(target) = &canonical_target {
+                if let Ok(loc_canonical) = std::fs::canonicalize(&loc.file) {
+                    if loc_canonical == *target {
+                        return true;
+                    }
+                }
+            }
+            if loc.file.ends_with(resolved_path) {
+                return true;
+            }
+            if let Some(filename) = &resolved_filename {
+                if loc
+                    .file
+                    .file_name()
+                    .is_some_and(|f| f.to_string_lossy() == *filename)
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .map(|(id, loc)| anchor_completion_item(id, loc, closing, trailing))
+        .collect();
+
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items
+}
+
+/// Resolve xref path completions: `.adoc` files relative to `doc_path`'s parent.
+/// Reuses `resolve_path_completions` (which appends `[]` to file entries).
+pub(crate) fn resolve_xref_path_completions(
+    prefix: &str,
+    doc_path: &Path,
+    ws: Option<&Workspace>,
+    closing: &str,
+) -> Vec<CompletionItem> {
+    let base = doc_path.parent().unwrap_or(doc_path).to_path_buf();
+    // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
+    // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
+    // When brackets already follow the cursor (`closing == ""`): drop the bracket
+    // snippet entirely; cursor lands at the end of the inserted path.
+    let file_snippet = if closing == "[]" {
+        "${1}[${2:label}]"
+    } else {
+        ""
+    };
+    resolve_path_completions(
+        prefix,
+        doc_path,
+        ws,
+        &base,
+        PathCompletionFilter::Adoc,
+        file_snippet,
+    )
+}
+
+fn anchor_completion_item(
+    id: &str,
+    loc: &asciidoc_core::types::AnchorLocation,
+    closing: &str,
+    trailing: Option<TrailingBrackets>,
+) -> CompletionItem {
+    let filename = loc
+        .file
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let kind_label = match loc.kind {
+        asciidoc_core::types::AnchorKind::Explicit => "explicit",
+        asciidoc_core::types::AnchorKind::ImplicitSection => "section",
+        asciidoc_core::types::AnchorKind::BlockId => "block",
+    };
+    let detail = format!("{filename} ({kind_label})");
+
+    // Three modes:
+    // (1) `trailing` is Some → an existing `[…]` follows the cursor. Use a
+    //     `TextEdit` whose Range swallows it and emit `id[${1:label}]` so the
+    //     `label` placeholder is selected after acceptance.
+    // (2) `closing == "[]"` (no trailing) → fresh long-form xref: snippet inserts
+    //     `id[${1:label}]` so cursor lands on `label`.
+    // (3) Otherwise (e.g. `closing == ">>"` for shorthand or `""` when something
+    //     else follows) → plain insert.
+    if let Some(t) = trailing {
+        let range = Range {
+            start: Position {
+                line: t.line,
+                character: t.cursor_col,
+            },
+            end: Position {
+                line: t.line,
+                character: t.end_col,
+            },
+        };
+        let new_text = format!("{id}[${{1:label}}]");
+        return CompletionItem {
+            label: id.to_string(),
+            kind: Some(CompletionItemKind::REFERENCE),
+            detail: Some(detail),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit { range, new_text })),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        };
+    }
+
+    let (insert_text, format) = if closing == "[]" {
+        (
+            format!("{id}[${{1:label}}]"),
+            Some(InsertTextFormat::SNIPPET),
+        )
+    } else {
+        (format!("{id}{closing}"), None)
+    };
+
+    CompletionItem {
+        label: id.to_string(),
+        kind: Some(CompletionItemKind::REFERENCE),
+        detail: Some(detail),
+        insert_text: Some(insert_text),
+        insert_text_format: format,
+        ..Default::default()
+    }
 }
 
 /// File extension filter for path completions.
@@ -509,17 +766,21 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "tif", "ico",
 ];
 
-/// Generic path completion resolver for `include::` and `image::` macros.
+/// Generic path completion resolver for `include::`, `image::`, and `xref:` macros.
 ///
-/// Differences between include and image completion are parameterized:
+/// Differences are parameterized:
 /// - `base_dir`: starting directory for filesystem listing
-/// - `filter`: which file extensions to include
+/// - `ext_filter`: which file extensions to include
+/// - `file_snippet`: text appended after the file name when accepted, in LSP
+///   snippet syntax (e.g. `"[${1:opts}]"` for include, `"${1}[${2:label}]"` for
+///   xref so the cursor lands before `[` and Tab jumps to the label slot).
 fn resolve_path_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
     base_dir: &Path,
     ext_filter: PathCompletionFilter,
+    file_snippet: &str,
 ) -> Vec<CompletionItem> {
     // Attribute substitution: resolve {attr} references in prefix
     let resolved_prefix = match ws {
@@ -559,10 +820,16 @@ fn resolve_path_completions(
                 if !dir_name.starts_with(filter) && !name.starts_with(filter) {
                     return None;
                 }
+                let full_path = format!("{original_dir_prefix}{dir_name}");
                 Some(CompletionItem {
                     label: dir_name.clone(),
                     kind: Some(CompletionItemKind::FOLDER),
-                    insert_text: Some(format!("{original_dir_prefix}{dir_name}")),
+                    insert_text: Some(full_path.clone()),
+                    // filter_text must include the typed dir prefix so client-side
+                    // fuzzy matchers (e.g. blink.cmp) don't drop the item when the
+                    // user has typed `chapters/` and the bare label `intro/` no
+                    // longer matches their typed text.
+                    filter_text: Some(full_path),
                     ..Default::default()
                 })
             } else {
@@ -579,10 +846,15 @@ fn resolve_path_completions(
                 if !matches_filter || !name.starts_with(filter) {
                     return None;
                 }
+                let full_path = format!("{original_dir_prefix}{name}");
+                let snippet = format!("{full_path}{file_snippet}");
                 Some(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FILE),
-                    insert_text: Some(format!("{original_dir_prefix}{name}[]")),
+                    insert_text: Some(snippet),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    // See note above: filter_text must include the typed dir prefix.
+                    filter_text: Some(full_path),
                     ..Default::default()
                 })
             }
@@ -601,7 +873,15 @@ pub(crate) fn resolve_include_completions(
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
     let base = doc_path.parent().unwrap_or(doc_path).to_path_buf();
-    resolve_path_completions(prefix, doc_path, ws, &base, PathCompletionFilter::Adoc)
+    // Cursor lands inside `[]` on the `opts` placeholder for include options.
+    resolve_path_completions(
+        prefix,
+        doc_path,
+        ws,
+        &base,
+        PathCompletionFilter::Adoc,
+        "[${1:opts}]",
+    )
 }
 
 /// Resolve image path completions by listing image files from the document's
@@ -612,7 +892,15 @@ pub(crate) fn resolve_image_completions(
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
     let (base, _) = super::navigation::resolve_image_base_dir(doc_path, ws);
-    resolve_path_completions(prefix, doc_path, ws, &base, PathCompletionFilter::Image)
+    // Cursor lands inside `[]` on the `alt` placeholder for image alt text.
+    resolve_path_completions(
+        prefix,
+        doc_path,
+        ws,
+        &base,
+        PathCompletionFilter::Image,
+        "[${1:alt}]",
+    )
 }
 
 /// Resolve attribute completions by listing all attributes from the workspace's
@@ -754,7 +1042,40 @@ pub(crate) fn resolve_completions(
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
     match ctx {
-        CompletionContext::Xref { prefix } => resolve_xref_completions(&prefix, ws),
+        CompletionContext::XrefAnchor {
+            prefix,
+            closing,
+            trailing,
+        } => resolve_xref_completions(&prefix, ws, closing, trailing),
+        CompletionContext::XrefAnchorOrPath {
+            prefix,
+            closing,
+            trailing,
+        } => {
+            // Discovery-friendly: merge anchor + path completions for `xref:foo`.
+            // `closing` is `""` when brackets already exist after the cursor —
+            // both arms must respect it to avoid doubling. When `trailing` is
+            // Some, anchor items use TextEdit so the existing label is selected.
+            let mut items = resolve_xref_completions(&prefix, ws, closing, trailing);
+            items.extend(resolve_xref_path_completions(
+                &prefix, doc_path, ws, closing,
+            ));
+            items.sort_by(|a, b| a.label.cmp(&b.label));
+            items
+        }
+        CompletionContext::XrefCrossAnchor {
+            file,
+            anchor_prefix,
+            closing,
+            trailing,
+        } => resolve_xref_cross_anchor_completions(
+            &file,
+            &anchor_prefix,
+            doc_path,
+            ws,
+            closing,
+            trailing,
+        ),
         CompletionContext::IncludePath { prefix } => {
             resolve_include_completions(&prefix, doc_path, ws)
         }
@@ -786,17 +1107,19 @@ mod tests {
 
     #[rstest]
     #[case("xref shorthand", "See <<my-pre", 0, 12,
-        CompletionContext::Xref { prefix: "my-pre".into() })]
+        CompletionContext::XrefAnchor { prefix: "my-pre".into(), closing: ">>", trailing: None })]
     #[case("include path", "include::chap", 0, 13,
         CompletionContext::IncludePath { prefix: "chap".into() })]
     #[case("attribute", "The {img", 0, 8,
         CompletionContext::Attribute { prefix: "img".into() })]
     #[case("xref empty prefix", "See <<", 0, 6,
-        CompletionContext::Xref { prefix: "".into() })]
+        CompletionContext::XrefAnchor { prefix: "".into(), closing: ">>", trailing: None })]
     #[case("xref multiline", "= Title\n\nSee <<my-id", 2, 11,
-        CompletionContext::Xref { prefix: "my-id".into() })]
+        CompletionContext::XrefAnchor { prefix: "my-id".into(), closing: ">>", trailing: None })]
     #[case("xref with umlaut", "Über <<anch", 0, 11,
-        CompletionContext::Xref { prefix: "anch".into() })]
+        CompletionContext::XrefAnchor { prefix: "anch".into(), closing: ">>", trailing: None })]
+    #[case("xref shorthand cross-file", "See <<other.adoc#sec", 0, 20,
+        CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: ">>", trailing: None })]
     #[case("attribute with CJK", "中{attr", 0, 6,
         CompletionContext::Attribute { prefix: "attr".into() })]
     #[case("inline macro prefix after multibyte", ":imagesdir: Ükbd", 0, 16,
@@ -810,11 +1133,17 @@ mod tests {
     #[case("include closed brace stays include", "include::{snippetsdir}/file", 0, 27,
         CompletionContext::IncludePath { prefix: "{snippetsdir}/file".into() })]
     #[case("xref long form", "See xref:sec", 0, 12,
-        CompletionContext::Xref { prefix: "sec".into() })]
+        CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "[]", trailing: None })]
     #[case("xref long form open attribute", "See xref:{attr", 0, 14,
         CompletionContext::Attribute { prefix: "attr".into() })]
     #[case("xref long form closed attribute", "See xref:{resolved}/sec", 0, 23,
-        CompletionContext::Xref { prefix: "{resolved}/sec".into() })]
+        CompletionContext::XrefAnchorOrPath { prefix: "{resolved}/sec".into(), closing: "[]", trailing: None })]
+    #[case("xref long form cross-file", "See xref:other.adoc#sec", 0, 23,
+        CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: "[]", trailing: None })]
+    #[case("xref long form same-file via hash", "See xref:#sec", 0, 13,
+        CompletionContext::XrefCrossAnchor { file: "".into(), anchor_prefix: "sec".into(), closing: "[]", trailing: None })]
+    #[case("xref long form path subdir", "xref:chapters/", 0, 14,
+        CompletionContext::XrefAnchorOrPath { prefix: "chapters/".into(), closing: "[]", trailing: None })]
     fn test_detect_completion_some(
         #[case] _name: &str,
         #[case] content: &str,
@@ -894,7 +1223,7 @@ mod tests {
             ),
         ]);
 
-        let items = resolve_xref_completions("my", Some(&ws));
+        let items = resolve_xref_completions("my", Some(&ws), ">>", None);
         assert_eq!(items.len(), 2);
         // Sorted alphabetically
         assert_eq!(items[0].label, "my-anchor");
@@ -931,7 +1260,7 @@ mod tests {
             ),
         ]);
 
-        let items = resolve_xref_completions("", Some(&ws));
+        let items = resolve_xref_completions("", Some(&ws), ">>", None);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "alpha");
         assert_eq!(items[1].label, "beta");
@@ -939,8 +1268,111 @@ mod tests {
 
     #[test]
     fn test_xref_completions_no_workspace() {
-        let items = resolve_xref_completions("my", None);
+        let items = resolve_xref_completions("my", None, ">>", None);
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_xref_completions_xref_form_uses_brackets() {
+        let ws = ws_with_anchors(vec![(
+            "sec",
+            AnchorLocation {
+                file: PathBuf::from("/a.adoc"),
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )]);
+        let items = resolve_xref_completions("", Some(&ws), "[]", None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text.as_ref().unwrap(), "sec[${1:label}]");
+        assert_eq!(items[0].insert_text_format, Some(InsertTextFormat::SNIPPET));
+    }
+
+    // --- Phase 2b: resolve_xref_cross_anchor_completions ---
+
+    #[test]
+    fn test_cross_anchor_filters_by_file() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.adoc");
+        let b = dir.path().join("b.adoc");
+        std::fs::write(&a, "= A\n").unwrap();
+        std::fs::write(&b, "= B\n").unwrap();
+        let ws = ws_with_anchors(vec![
+            (
+                "sec1",
+                AnchorLocation {
+                    file: a.clone(),
+                    line: 1,
+                    kind: AnchorKind::ImplicitSection,
+                },
+            ),
+            (
+                "sec2",
+                AnchorLocation {
+                    file: b.clone(),
+                    line: 1,
+                    kind: AnchorKind::ImplicitSection,
+                },
+            ),
+        ]);
+
+        let doc_path = a.clone();
+        let items = resolve_xref_cross_anchor_completions("b.adoc", "", &doc_path, Some(&ws), "[]", None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "sec2");
+        assert_eq!(items[0].insert_text.as_ref().unwrap(), "sec2[${1:label}]");
+    }
+
+    #[test]
+    fn test_cross_anchor_empty_file_means_current_doc() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.adoc");
+        let b = dir.path().join("b.adoc");
+        std::fs::write(&a, "= A\n").unwrap();
+        std::fs::write(&b, "= B\n").unwrap();
+        let ws = ws_with_anchors(vec![
+            (
+                "here",
+                AnchorLocation {
+                    file: a.clone(),
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            ),
+            (
+                "there",
+                AnchorLocation {
+                    file: b.clone(),
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            ),
+        ]);
+
+        let items = resolve_xref_cross_anchor_completions("", "", &a, Some(&ws), ">>", None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "here");
+        assert_eq!(items[0].insert_text.as_ref().unwrap(), "here>>");
+    }
+
+    // --- Phase 2c: resolve_xref_path_completions ---
+
+    #[test]
+    fn test_xref_path_lists_adoc_siblings() {
+        let dir = setup_include_dir();
+        let doc = dir.path().join("a.adoc");
+        let items = resolve_xref_path_completions("", &doc, None, "[]");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"a.adoc"));
+        assert!(labels.contains(&"b.adoc"));
+        assert!(labels.contains(&"chapters/"));
+        // Files get xref-snippet suffix: cursor before `[`, Tab → label slot
+        let b_item = items.iter().find(|i| i.label == "b.adoc").unwrap();
+        assert_eq!(
+            b_item.insert_text.as_ref().unwrap(),
+            "b.adoc${1}[${2:label}]"
+        );
+        assert_eq!(b_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
     }
 
     // --- Phase 3: resolve_include_completions ---
@@ -974,12 +1406,13 @@ mod tests {
         // Files have File kind
         let a_item = items.iter().find(|i| i.label == "a.adoc").unwrap();
         assert_eq!(a_item.kind, Some(CompletionItemKind::FILE));
-        // insert_text for files appends []
-        assert_eq!(a_item.insert_text.as_ref().unwrap(), "a.adoc[]");
+        // insert_text for files uses include-snippet (cursor inside `[opts]`)
+        assert_eq!(a_item.insert_text.as_ref().unwrap(), "a.adoc[${1:opts}]");
+        assert_eq!(a_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
         // Directories have Folder kind
         let ch_item = items.iter().find(|i| i.label == "chapters/").unwrap();
         assert_eq!(ch_item.kind, Some(CompletionItemKind::FOLDER));
-        // insert_text for dirs appends /  (already in label, no extra suffix)
+        // insert_text for dirs is the path so far (no suffix snippet)
         assert_eq!(ch_item.insert_text.as_ref().unwrap(), "chapters/");
     }
 
@@ -1001,7 +1434,7 @@ mod tests {
         assert_eq!(items[0].label, "intro.adoc");
         assert_eq!(
             items[0].insert_text.as_ref().unwrap(),
-            "chapters/intro.adoc[]"
+            "chapters/intro.adoc[${1:opts}]"
         );
     }
 
@@ -1054,7 +1487,7 @@ mod tests {
         let a_item = items.iter().find(|i| i.label == "module-a.adoc").unwrap();
         assert_eq!(
             a_item.insert_text.as_ref().unwrap(),
-            "{source-dir}/module-a.adoc[]"
+            "{source-dir}/module-a.adoc[${1:opts}]"
         );
     }
 
@@ -1073,7 +1506,7 @@ mod tests {
         assert_eq!(items[0].label, "module-a.adoc");
         assert_eq!(
             items[0].insert_text.as_ref().unwrap(),
-            "{source-dir}/module-a.adoc[]"
+            "{source-dir}/module-a.adoc[${1:opts}]"
         );
     }
 
@@ -1194,9 +1627,9 @@ mod tests {
             },
         )]);
         let doc_path = Path::new("/a.adoc");
-        let ctx = CompletionContext::Xref {
+        let ctx = CompletionContext::XrefAnchor {
             prefix: "my".into(),
-        };
+            closing: ">>", trailing: None };
 
         let items = resolve_completions(ctx, doc_path, Some(&ws));
         assert_eq!(items.len(), 1);
@@ -1534,9 +1967,9 @@ mod tests {
         };
         assert_eq!(
             detect_completion_context(content, pos),
-            Some(CompletionContext::Xref {
-                prefix: "target".into()
-            })
+            Some(CompletionContext::XrefAnchorOrPath {
+                prefix: "target".into(),
+                closing: "[]", trailing: None })
         );
     }
 
@@ -2040,9 +2473,13 @@ mod tests {
             !labels.contains(&"readme.txt"),
             "readme.txt should be filtered out"
         );
-        // insert_text appends []
+        // insert_text uses image-snippet (cursor inside `[alt]`)
         let png_item = items.iter().find(|i| i.label == "foto.png").unwrap();
-        assert_eq!(png_item.insert_text.as_ref().unwrap(), "foto.png[]");
+        assert_eq!(
+            png_item.insert_text.as_ref().unwrap(),
+            "foto.png[${1:alt}]"
+        );
+        assert_eq!(png_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
         assert_eq!(png_item.kind, Some(CompletionItemKind::FILE));
     }
 
@@ -2091,7 +2528,10 @@ mod tests {
         let items = resolve_image_completions("sub/", &doc_file, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "icon.gif");
-        assert_eq!(items[0].insert_text.as_ref().unwrap(), "sub/icon.gif[]");
+        assert_eq!(
+            items[0].insert_text.as_ref().unwrap(),
+            "sub/icon.gif[${1:alt}]"
+        );
     }
 
     #[test]
