@@ -741,4 +741,72 @@ anchor) and mark the result.
 // Run T8.3 in the fixture. Expected: `gd` does nothing, BrokenXref
 // diagnostic appears on the line, LSP stays attached.
 
+== T9: External file changes (adoc-0119)
+
+Verifies `workspace/didChangeWatchedFiles`. Run each case from a
+terminal while a `.adoc` file is open in Neovim with the LSP attached.
+
+=== T9.1: Create `.asciidoctorconfig` while LSP runs
+
+// [ ] PASS  [ ] FAIL
+// Setup: open a workspace `.adoc` in Neovim, no `.asciidoctorconfig`
+// in workspace root yet.
+// Action (terminal):
+//   echo ':greeting: hello' > .asciidoctorconfig
+// Then in Neovim, type `{greeting}` and trigger hover on it.
+// Expected: hover shows `hello` (no LSP restart needed).
+
+=== T9.2: Change existing `.asciidoctorconfig`
+
+// [ ] PASS  [ ] FAIL
+// Setup: T9.1 left `.asciidoctorconfig` with `:greeting: hello`.
+// Action (terminal):
+//   sed -i 's/hello/bonjour/' .asciidoctorconfig
+// Then in Neovim hover on `{greeting}`.
+// Expected: hover shows `bonjour`.
+
+=== T9.3: Delete `.asciidoctorconfig`
+
+// [ ] PASS  [ ] FAIL
+// Action (terminal):
+//   rm .asciidoctorconfig
+// Then in Neovim hover on `{greeting}`.
+// Expected: hover shows attribute as undefined / no value.
+
+=== T9.4: External create of sibling `.adoc` with anchor
+
+// [ ] PASS  [ ] FAIL
+// Setup: open `a.adoc` in Neovim. `b.adoc` does not exist.
+// In `a.adoc`, write `xref:b.adoc#new-anchor[link]` — expect
+// BrokenXref diagnostic.
+// Action (terminal):
+//   printf '[[new-anchor]]\n= B\n' > b.adoc
+// Expected: BrokenXref diagnostic on the xref disappears (no restart).
+
+=== T9.5: External delete of `.adoc`
+
+// [ ] PASS  [ ] FAIL
+// Setup: from T9.4, `b.adoc` exists, `a.adoc` references it without
+// diagnostic.
+// Action (terminal):
+//   rm b.adoc
+// Expected: BrokenXref diagnostic reappears in `a.adoc`.
+
+=== T9.6: External edit removes anchor
+
+// [ ] PASS  [ ] FAIL
+// Setup: `b.adoc` contains `[[anchor]]`, `a.adoc` references it.
+// Action (terminal):
+//   sed -i '/anchor/d' b.adoc
+// Expected: BrokenXref diagnostic appears in `a.adoc`.
+
+=== T9.7: Open buffer takes precedence
+
+// [ ] PASS  [ ] FAIL
+// Setup: open `b.adoc` in Neovim, type unsaved changes (anchor `x`).
+// Action (terminal):
+//   touch b.adoc      # bumps mtime, watcher fires Changed
+// Expected: Neovim buffer state is preserved; xrefs to `x` still
+// resolve. The watcher event is ignored for open buffers.
+
 ---

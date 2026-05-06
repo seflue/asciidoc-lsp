@@ -319,6 +319,28 @@ impl Workspace {
         self.documents.insert(file.to_path_buf(), doc);
     }
 
+    /// Remove a file from the workspace entirely.
+    ///
+    /// Drops include edges originating from the file, the reference index entries
+    /// for its anchors, the parsed document model, any cached diagnostics, and the
+    /// per-file attribute entry. Called when a `.adoc` file is deleted on disk.
+    /// Caller is responsible for `recalculate_diagnostics()` afterwards.
+    pub fn remove_file(&mut self, file: &Path) {
+        self.include_graph.remove_edges_from(file);
+        self.reference_index.remove_file(file);
+        self.documents.remove(file);
+        self.diagnostics.remove(file);
+        self.attributes.forget_file(file);
+    }
+
+    /// Drop all cached `.asciidoctorconfig` chains.
+    ///
+    /// Called when an `.asciidoctorconfig*` file changes on disk so the next
+    /// attribute resolution re-reads configs.
+    pub fn clear_config_chains(&mut self) {
+        self.attributes.clear_config_chains();
+    }
+
     /// Scan the workspace root for all `.adoc` files and index them.
     ///
     /// This is a background scan: files are read from disk and added to the
@@ -1612,5 +1634,95 @@ mod tests {
             unique.len(),
             "no duplicate files from symlink loop"
         );
+    }
+
+    // --- adoc-0119: remove_file + clear_config_chains ---
+
+    #[test]
+    fn test_remove_file_clears_all_indexes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.adoc");
+        let b = root.join("b.adoc");
+        fs::write(
+            &a,
+            "[[anchor-a]]\n= Doc A\n\ninclude::b.adoc[]\n\nSee <<anchor-b>>.\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[anchor-b]]\n= Doc B\n").unwrap();
+
+        let mut ws = Workspace::new(&root);
+        let overrides = HashMap::new();
+        let a_canon = a.canonicalize().unwrap();
+        let b_canon = b.canonicalize().unwrap();
+        ws.ensure_file(&a_canon, &overrides);
+        ws.ensure_file(&b_canon, &overrides);
+        ws.recalculate_diagnostics();
+
+        // Pre-condition: both files indexed everywhere
+        assert!(ws.documents.contains_key(&a_canon));
+        assert!(ws.reference_index.lookup("anchor-a").is_some());
+        assert_eq!(ws.include_graph.includes_of(&a_canon).len(), 1);
+
+        // Remove file A
+        ws.remove_file(&a_canon);
+
+        assert!(!ws.documents.contains_key(&a_canon), "documents drops A");
+        assert!(
+            ws.reference_index.lookup("anchor-a").is_none(),
+            "anchor index drops A's anchor"
+        );
+        assert!(
+            ws.include_graph.includes_of(&a_canon).is_empty(),
+            "include edges from A removed"
+        );
+        assert!(
+            !ws.diagnostics.contains_key(&a_canon),
+            "diagnostics for A removed"
+        );
+
+        // B must remain
+        assert!(ws.documents.contains_key(&b_canon));
+        assert!(ws.reference_index.lookup("anchor-b").is_some());
+    }
+
+    #[test]
+    fn test_clear_config_chains_picks_up_new_config_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: hello\n").unwrap();
+        let entry = root.join("doc.adoc");
+        fs::write(&entry, "= Doc\n\n{greeting}\n").unwrap();
+
+        let mut ws = Workspace::new(&root);
+        let overrides = HashMap::new();
+        let entry_canon = entry.canonicalize().unwrap();
+        ws.ensure_file(&entry_canon, &overrides);
+        assert_eq!(
+            ws.attributes().resolve(&entry_canon, "greeting"),
+            Some("hello")
+        );
+
+        // Edit the config on disk; without clear, the cache still serves "hello".
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: bonjour\n").unwrap();
+        ws.clear_config_chains();
+        // Re-resolve: lookup re-populates the chain from disk.
+        ws.update_file(&entry_canon, &overrides);
+        assert_eq!(
+            ws.attributes().resolve(&entry_canon, "greeting"),
+            Some("bonjour")
+        );
+    }
+
+    #[test]
+    fn test_remove_file_idempotent_on_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut ws = Workspace::new(&root);
+
+        // Should not panic on a path that is not in the workspace.
+        ws.remove_file(&root.join("ghost.adoc"));
+        assert!(ws.documents.is_empty());
     }
 }

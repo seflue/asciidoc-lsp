@@ -5,20 +5,23 @@ mod positions;
 mod symbols;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MarkedString, MessageType,
-    OneOf, Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
-    SaveOptions, ServerCapabilities, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MarkedString, MessageType, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams,
+    Registration, RenameOptions, RenameParams, SaveOptions, ServerCapabilities,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -48,6 +51,10 @@ struct AsciiDocLsp {
     /// URIs for which we've published non-empty diagnostics.
     /// Used to clear stale diagnostics when files become clean.
     published_diagnostics: Mutex<HashSet<Uri>>,
+    /// Whether the client supports dynamic registration of
+    /// `workspace/didChangeWatchedFiles`. Set in `initialize()`,
+    /// consumed in `initialized()`.
+    can_request_file_watcher: Mutex<bool>,
 }
 
 impl AsciiDocLsp {
@@ -58,7 +65,75 @@ impl AsciiDocLsp {
             workspace: Mutex::new(None),
             root: Mutex::new(None),
             published_diagnostics: Mutex::new(HashSet::new()),
+            can_request_file_watcher: Mutex::new(false),
         }
+    }
+
+    /// Compute the diagnostics map after applying a batch of watcher events.
+    /// Returns `None` when nothing relevant happened (no events, all events
+    /// belonged to open buffers, or the workspace has not been initialized);
+    /// the caller skips publishing in that case.
+    fn compute_watched_files_update(
+        &self,
+        params: DidChangeWatchedFilesParams,
+    ) -> Option<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>> {
+        let classified = classify_events(params.changes, &self.open_buffer_paths())?;
+        self.apply_watcher_events(classified)
+    }
+
+    /// Apply a classified batch of watcher events to the workspace and return
+    /// fresh diagnostics. Returns `None` if the workspace is not initialized.
+    fn apply_watcher_events(
+        &self,
+        classified: ClassifiedEvents,
+    ) -> Option<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>> {
+        let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = ws.as_mut()?;
+
+        if classified.config_changed {
+            ws.clear_config_chains();
+        }
+
+        // CREATED/CHANGED re-parse from disk (no overrides — open buffers were
+        // filtered upstream). DELETED drops the file from all indexes.
+        let overrides = HashMap::new();
+        for (path, typ) in classified.adoc_events {
+            if typ == FileChangeType::DELETED {
+                ws.remove_file(&resolve_deleted_doc_key(&path));
+            } else if typ == FileChangeType::CREATED || typ == FileChangeType::CHANGED {
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                if ws.documents().contains_key(&canonical) {
+                    ws.update_file(&canonical, &overrides);
+                } else {
+                    ws.ensure_file(&canonical, &overrides);
+                }
+            }
+            // Other (server-side proposed) FileChangeType values: ignored.
+        }
+
+        ws.recalculate_diagnostics();
+        Some(ws.diagnostics_map().clone())
+    }
+
+    /// Snapshot of all paths that correspond to an open editor buffer,
+    /// including canonicalized resolutions. Watcher events for these paths
+    /// are ignored — LSP text-sync is the authoritative source.
+    fn open_buffer_paths(&self) -> HashSet<PathBuf> {
+        let docs = self.documents.lock().expect("documents lock poisoned");
+        let mut set = HashSet::new();
+        for uri in docs.keys() {
+            let Some(path) = uri.to_file_path() else {
+                continue;
+            };
+            let path: PathBuf = path.into_owned();
+            if let Ok(canonical) = path.canonicalize() {
+                set.insert(canonical);
+            }
+            set.insert(path);
+        }
+        set
     }
 
     fn get_document_content(&self, uri: &Uri) -> Option<Arc<String>> {
@@ -129,11 +204,29 @@ impl AsciiDocLsp {
 
 impl LanguageServer for AsciiDocLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Extract root from params. Modern LSP clients (Neovim ≥0.11) prefer
-        // `workspace_folders` and may omit `root_uri` entirely. Fall through:
-        //   1. workspace_folders[0] (modern, multi-root capable)
-        //   2. root_uri (deprecated, but still common)
-        //   3. root_path (legacy, kept for old clients)
+        // Capture client capability for dynamic watcher registration so we can
+        // call `register_capability` in `initialized()` only when supported.
+        {
+            let supported = params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|w| w.did_change_watched_files.as_ref())
+                .and_then(|c| c.dynamic_registration)
+                .unwrap_or(false);
+            *self
+                .can_request_file_watcher
+                .lock()
+                .expect("can_request_file_watcher lock poisoned") = supported;
+        }
+
+        // As a server we read whichever workspace representation the client
+        // sends — staying robust against older clients is cheap and avoids
+        // "no workspace root" failures with non-mainstream LSP clients.
+        // Try modern first, then deprecated fields:
+        //   1. workspace_folders[0] (LSP ≥3.6, multi-root capable)
+        //   2. root_uri (deprecated since 3.6, still common)
+        //   3. root_path (legacy, deprecated since 3.0)
         #[allow(deprecated)]
         let root_path: Option<PathBuf> = params
             .workspace_folders
@@ -198,11 +291,63 @@ impl LanguageServer for AsciiDocLsp {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Register file watchers if the client supports dynamic registration.
+        // Without this, external edits to `.asciidoctorconfig*` and `.adoc` files
+        // outside open buffers leave caches stale (adoc-0119).
+        if *self
+            .can_request_file_watcher
+            .lock()
+            .expect("can_request_file_watcher lock poisoned")
+        {
+            let watchers = vec![
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/.asciidoctorconfig".into()),
+                    kind: None,
+                },
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/.asciidoctorconfig.adoc".into()),
+                    kind: None,
+                },
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/*.adoc".into()),
+                    kind: None,
+                },
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/*.asciidoc".into()),
+                    kind: None,
+                },
+            ];
+            // Serializing a struct of `Vec<FileSystemWatcher>` cannot fail in
+            // practice (no maps with non-string keys, no exotic types).
+            let register_options =
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                    .expect("DidChangeWatchedFilesRegistrationOptions serialization");
+            let registration = Registration {
+                id: "asciidoc-lsp/watched-files".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(register_options),
+            };
+            if let Err(err) = self.client.register_capability(vec![registration]).await {
+                tracing::warn!(?err, "register_capability for didChangeWatchedFiles failed");
+            }
+        } else {
+            tracing::info!(
+                "client does not support dynamic registration of didChangeWatchedFiles; \
+                 external file changes will not invalidate caches"
+            );
+        }
+
         let diagnostics = {
             let ws = self.workspace.lock().expect("workspace lock poisoned");
             ws.as_ref().map(|ws| ws.diagnostics_map().clone())
         };
         if let Some(diagnostics) = diagnostics {
+            self.publish_workspace_diagnostics(&diagnostics).await;
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if let Some(diagnostics) = self.compute_watched_files_update(params) {
             self.publish_workspace_diagnostics(&diagnostics).await;
         }
     }
@@ -216,13 +361,16 @@ impl LanguageServer for AsciiDocLsp {
         let content = params.text_document.text;
         let version = params.text_document.version;
 
-        self.documents.lock().unwrap().insert(
-            uri.clone(),
-            DocumentState {
-                content: Arc::new(content),
-                version,
-            },
-        );
+        self.documents
+            .lock()
+            .expect("documents lock poisoned")
+            .insert(
+                uri.clone(),
+                DocumentState {
+                    content: Arc::new(content),
+                    version,
+                },
+            );
 
         // Per-file: ensure only this file, then recalculate diagnostics
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
@@ -662,6 +810,84 @@ impl LanguageServer for AsciiDocLsp {
         } else {
             Ok(Some(CompletionResponse::Array(items)))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchedKind {
+    Config,
+    AsciiDoc,
+}
+
+/// AsciiDoc-relevant events extracted from a `DidChangeWatchedFilesParams`
+/// batch, with open-buffer events filtered out (LSP text-sync owns those).
+#[derive(Debug, Default)]
+struct ClassifiedEvents {
+    config_changed: bool,
+    adoc_events: Vec<(PathBuf, FileChangeType)>,
+}
+
+/// Filter and bucket a watcher-event batch.
+/// Drops events for open buffers and unrelated paths. Returns `None` when
+/// nothing relevant remains, so the caller can skip the workspace lock and
+/// publish step entirely.
+fn classify_events(
+    changes: Vec<FileEvent>,
+    open_buffers: &HashSet<PathBuf>,
+) -> Option<ClassifiedEvents> {
+    let mut out = ClassifiedEvents::default();
+    for change in changes {
+        let Some(path) = change.uri.to_file_path() else {
+            continue;
+        };
+        let path: PathBuf = path.into_owned();
+        if is_path_open(&path, open_buffers) {
+            continue;
+        }
+        match classify_watched_path(&path) {
+            Some(WatchedKind::Config) => out.config_changed = true,
+            Some(WatchedKind::AsciiDoc) => out.adoc_events.push((path, change.typ)),
+            None => {}
+        }
+    }
+    if !out.config_changed && out.adoc_events.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Whether `path` (from a watcher event) refers to a path the editor owns.
+/// `open_buffers` should be a snapshot from `open_buffer_paths()` containing
+/// both the URI-derived form and the canonicalized form of every open buffer.
+/// Tries an additional canonicalize on `path` itself to bridge symlink and
+/// non-canonical inputs from the client.
+fn is_path_open(path: &Path, open_buffers: &HashSet<PathBuf>) -> bool {
+    open_buffers.contains(path) || path.canonicalize().is_ok_and(|c| open_buffers.contains(&c))
+}
+
+/// Resolve a `documents`-key for a path that has just been deleted.
+/// The deleted file no longer exists, but its parent directory typically does;
+/// canonicalizing the parent and re-attaching the filename produces the same
+/// key that `ensure_file()` / `update_file()` originally inserted. Falls back
+/// to the unmodified path when the parent is also gone.
+fn resolve_deleted_doc_key(path: &Path) -> PathBuf {
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|canonical_parent| path.file_name().map(|name| canonical_parent.join(name)))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Classify a watched-file path. The watcher globs may match unrelated files
+/// (`**/*` is permissive); the handler routes only `.asciidoctorconfig*` and
+/// `.adoc` / `.asciidoc` files and ignores everything else.
+fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
+    let name = path.file_name()?.to_str()?;
+    let ext = path.extension().and_then(|e| e.to_str());
+    match (name, ext) {
+        (".asciidoctorconfig" | ".asciidoctorconfig.adoc", _) => Some(WatchedKind::Config),
+        (_, Some("adoc" | "asciidoc")) => Some(WatchedKind::AsciiDoc),
+        _ => None,
     }
 }
 
@@ -1248,5 +1474,185 @@ mod tests {
             sub.canonicalize().unwrap(),
             "Workspace root must be the LSP root_uri, not walked up to .asciidoctorconfig"
         );
+    }
+
+    // --- adoc-0119: watched-file classification + buffer filter ---
+
+    #[test]
+    fn test_classify_watched_path_config() {
+        assert_eq!(
+            classify_watched_path(Path::new("/ws/.asciidoctorconfig")),
+            Some(WatchedKind::Config)
+        );
+        assert_eq!(
+            classify_watched_path(Path::new("/ws/sub/.asciidoctorconfig.adoc")),
+            Some(WatchedKind::Config)
+        );
+    }
+
+    #[test]
+    fn test_classify_watched_path_adoc() {
+        assert_eq!(
+            classify_watched_path(Path::new("/ws/foo.adoc")),
+            Some(WatchedKind::AsciiDoc)
+        );
+        assert_eq!(
+            classify_watched_path(Path::new("/ws/sub/bar.asciidoc")),
+            Some(WatchedKind::AsciiDoc)
+        );
+    }
+
+    #[test]
+    fn test_classify_watched_path_unrelated() {
+        assert!(classify_watched_path(Path::new("/ws/README.md")).is_none());
+        assert!(classify_watched_path(Path::new("/ws/.gitignore")).is_none());
+        // .adoc extension takes precedence; .asciidoctorconfig.adoc is config (special name).
+        assert_eq!(
+            classify_watched_path(Path::new("/ws/notes.adoc")),
+            Some(WatchedKind::AsciiDoc)
+        );
+    }
+
+    // --- adoc-0119: open-buffer filter + deleted-key resolution ---
+
+    #[test]
+    fn test_is_path_open_direct_match() {
+        let mut set: HashSet<PathBuf> = HashSet::new();
+        set.insert(PathBuf::from("/ws/foo.adoc"));
+        assert!(is_path_open(Path::new("/ws/foo.adoc"), &set));
+        assert!(!is_path_open(Path::new("/ws/bar.adoc"), &set));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_path_open_through_symlink() {
+        // Watcher reports canonical path; editor opened the symlink. The set
+        // built from `documents` keys must contain both forms so the filter
+        // catches the canonical-path event.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real.adoc");
+        fs::write(&real, "= Real\n").unwrap();
+        let link = tmp.path().canonicalize().unwrap().join("link.adoc");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Editor opened `link.adoc`; `open_buffer_paths()` includes the
+        // canonical resolution as well.
+        let mut open_buffers: HashSet<PathBuf> = HashSet::new();
+        open_buffers.insert(link.clone());
+        if let Ok(canonical) = link.canonicalize() {
+            open_buffers.insert(canonical);
+        }
+
+        // Watcher fires with canonical path → filter must match.
+        assert!(is_path_open(&real, &open_buffers));
+        // Watcher fires with the symlink path → filter must also match.
+        assert!(is_path_open(&link, &open_buffers));
+    }
+
+    #[test]
+    fn test_resolve_deleted_doc_key_canonicalizes_parent() {
+        // The deleted file no longer exists, but its parent does. The key we
+        // produce must equal what `ensure_file()` originally inserted (which
+        // canonicalizes the full path before insert).
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_dir = tmp.path().canonicalize().unwrap();
+        let deleted = canonical_dir.join("ghost.adoc");
+        // Don't create the file — simulate it was already removed.
+
+        let key = resolve_deleted_doc_key(&deleted);
+        assert_eq!(key, canonical_dir.join("ghost.adoc"));
+    }
+
+    #[test]
+    fn test_resolve_deleted_doc_key_disambiguates_same_filename() {
+        // Two files with the same name in different dirs. Component-wise
+        // `ends_with` matching would conflate them; canonicalized parent
+        // resolution must keep them apart.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        fs::create_dir(&dir_a).unwrap();
+        fs::create_dir(&dir_b).unwrap();
+
+        let key_a = resolve_deleted_doc_key(&dir_a.join("page.adoc"));
+        let key_b = resolve_deleted_doc_key(&dir_b.join("page.adoc"));
+
+        assert_ne!(key_a, key_b);
+        assert!(key_a.starts_with(&dir_a));
+        assert!(key_b.starts_with(&dir_b));
+    }
+
+    #[test]
+    fn test_resolve_deleted_doc_key_falls_back_when_parent_gone() {
+        // If even the parent dir is gone, return the path unchanged so the
+        // caller can still attempt a `remove_file()` against indexes (no-op
+        // if the key was canonical and we're not).
+        let path = Path::new("/nonexistent/parent/file.adoc");
+        let key = resolve_deleted_doc_key(path);
+        assert_eq!(key, path);
+    }
+
+    // --- adoc-0119: classify_events end-to-end ---
+
+    fn make_event(uri: &str, typ: FileChangeType) -> FileEvent {
+        FileEvent {
+            uri: Uri::from_str(uri).unwrap(),
+            typ,
+        }
+    }
+
+    #[test]
+    fn test_classify_events_buckets_config_and_adoc() {
+        let open: HashSet<PathBuf> = HashSet::new();
+        let changes = vec![
+            make_event("file:///ws/.asciidoctorconfig", FileChangeType::CHANGED),
+            make_event("file:///ws/foo.adoc", FileChangeType::CREATED),
+            make_event("file:///ws/bar.adoc", FileChangeType::DELETED),
+            make_event("file:///ws/README.md", FileChangeType::CHANGED),
+        ];
+        let classified = classify_events(changes, &open).expect("relevant events present");
+        assert!(classified.config_changed);
+        assert_eq!(classified.adoc_events.len(), 2);
+        let kinds: Vec<_> = classified.adoc_events.iter().map(|(_, t)| *t).collect();
+        assert!(kinds.contains(&FileChangeType::CREATED));
+        assert!(kinds.contains(&FileChangeType::DELETED));
+    }
+
+    #[test]
+    fn test_classify_events_returns_none_when_empty() {
+        let open: HashSet<PathBuf> = HashSet::new();
+        assert!(classify_events(vec![], &open).is_none());
+    }
+
+    #[test]
+    fn test_classify_events_returns_none_when_only_unrelated() {
+        let open: HashSet<PathBuf> = HashSet::new();
+        let changes = vec![
+            make_event("file:///ws/README.md", FileChangeType::CHANGED),
+            make_event("file:///ws/Cargo.toml", FileChangeType::CHANGED),
+        ];
+        assert!(classify_events(changes, &open).is_none());
+    }
+
+    #[test]
+    fn test_classify_events_filters_open_buffers() {
+        let mut open: HashSet<PathBuf> = HashSet::new();
+        open.insert(PathBuf::from("/ws/open.adoc"));
+        let changes = vec![
+            make_event("file:///ws/open.adoc", FileChangeType::CHANGED),
+            make_event("file:///ws/closed.adoc", FileChangeType::CHANGED),
+        ];
+        let classified = classify_events(changes, &open).expect("closed.adoc remains");
+        assert_eq!(classified.adoc_events.len(), 1);
+        assert!(classified.adoc_events[0].0.ends_with("closed.adoc"));
+    }
+
+    #[test]
+    fn test_classify_events_returns_none_when_only_open_buffer() {
+        let mut open: HashSet<PathBuf> = HashSet::new();
+        open.insert(PathBuf::from("/ws/open.adoc"));
+        let changes = vec![make_event("file:///ws/open.adoc", FileChangeType::CHANGED)];
+        assert!(classify_events(changes, &open).is_none());
     }
 }

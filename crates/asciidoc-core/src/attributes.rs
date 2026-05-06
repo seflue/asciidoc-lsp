@@ -79,6 +79,24 @@ impl AttributeRegistry {
         self.config_chains.insert(dir, merged);
     }
 
+    /// Drop all cached config chains.
+    ///
+    /// Called when an `.asciidoctorconfig` file is created, changed, or deleted on
+    /// disk. The next `ensure_config_for_dir()` call rebuilds chains lazily from
+    /// the current state.
+    pub fn clear_config_chains(&mut self) {
+        self.config_chains.clear();
+    }
+
+    /// Drop the per-file attribute entry for `file`.
+    ///
+    /// Called when a `.adoc` file is deleted on disk so its document-header
+    /// attributes no longer participate in `resolve()`. Crate-internal because
+    /// the only caller is `Workspace::remove_file`.
+    pub(crate) fn forget_file(&mut self, file: &Path) {
+        self.per_file.remove(file);
+    }
+
     pub fn register_file_attributes(&mut self, file: &Path, attrs: &[AttributeDef]) {
         let map: HashMap<String, AttributeEntry> = attrs
             .iter()
