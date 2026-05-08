@@ -6,7 +6,9 @@ mod symbols;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -87,7 +89,7 @@ impl AsciiDocLsp {
         &self,
         classified: ClassifiedEvents,
     ) -> Option<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>> {
-        let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+        let mut ws = self.workspace.lock();
         let ws = ws.as_mut()?;
 
         if classified.config_changed {
@@ -121,7 +123,7 @@ impl AsciiDocLsp {
     /// including canonicalized resolutions. Watcher events for these paths
     /// are ignored — LSP text-sync is the authoritative source.
     fn open_buffer_paths(&self) -> HashSet<PathBuf> {
-        let docs = self.documents.lock().expect("documents lock poisoned");
+        let docs = self.documents.lock();
         let mut set = HashSet::new();
         for uri in docs.keys() {
             let Some(path) = uri.to_file_path() else {
@@ -137,7 +139,7 @@ impl AsciiDocLsp {
     }
 
     fn get_document_content(&self, uri: &Uri) -> Option<Arc<String>> {
-        let docs = self.documents.lock().expect("documents lock poisoned");
+        let docs = self.documents.lock();
         if let Some(state) = docs.get(uri) {
             Some(Arc::clone(&state.content))
         } else if let Some(path) = uri.to_file_path() {
@@ -158,7 +160,7 @@ impl AsciiDocLsp {
     ) {
         // Prepare all conversions without holding locks across await points
         let conversions: Vec<(Uri, Vec<Diagnostic>)> = {
-            let docs = self.documents.lock().expect("documents lock poisoned");
+            let docs = self.documents.lock();
             diagnostics
                 .iter()
                 .filter_map(|(path, file_diags)| {
@@ -182,11 +184,7 @@ impl AsciiDocLsp {
         }
 
         // Clear diagnostics for files that no longer have any
-        let old_published = self
-            .published_diagnostics
-            .lock()
-            .expect("published_diagnostics lock poisoned")
-            .clone();
+        let old_published = self.published_diagnostics.lock().clone();
         for uri in &old_published {
             if !new_published.contains(uri) {
                 self.client
@@ -195,10 +193,7 @@ impl AsciiDocLsp {
             }
         }
 
-        *self
-            .published_diagnostics
-            .lock()
-            .expect("published_diagnostics lock poisoned") = new_published;
+        *self.published_diagnostics.lock() = new_published;
     }
 }
 
@@ -214,10 +209,7 @@ impl LanguageServer for AsciiDocLsp {
                 .and_then(|w| w.did_change_watched_files.as_ref())
                 .and_then(|c| c.dynamic_registration)
                 .unwrap_or(false);
-            *self
-                .can_request_file_watcher
-                .lock()
-                .expect("can_request_file_watcher lock poisoned") = supported;
+            *self.can_request_file_watcher.lock() = supported;
         }
 
         // As a server we read whichever workspace representation the client
@@ -242,13 +234,13 @@ impl LanguageServer for AsciiDocLsp {
             .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
         if let Some(ref root) = root_path {
-            *self.root.lock().expect("root lock poisoned") = Some(root.clone());
+            *self.root.lock() = Some(root.clone());
 
             // Create workspace and scan for all .adoc files
             let mut ws = Workspace::new(root);
             ws.scan_workspace();
             ws.recalculate_diagnostics();
-            *self.workspace.lock().expect("workspace lock poisoned") = Some(ws);
+            *self.workspace.lock() = Some(ws);
         }
 
         self.client
@@ -294,11 +286,7 @@ impl LanguageServer for AsciiDocLsp {
         // Register file watchers if the client supports dynamic registration.
         // Without this, external edits to `.asciidoctorconfig*` and `.adoc` files
         // outside open buffers leave caches stale (adoc-0119).
-        if *self
-            .can_request_file_watcher
-            .lock()
-            .expect("can_request_file_watcher lock poisoned")
-        {
+        if *self.can_request_file_watcher.lock() {
             let watchers = vec![
                 FileSystemWatcher {
                     glob_pattern: GlobPattern::String("**/.asciidoctorconfig".into()),
@@ -338,7 +326,7 @@ impl LanguageServer for AsciiDocLsp {
         }
 
         let diagnostics = {
-            let ws = self.workspace.lock().expect("workspace lock poisoned");
+            let ws = self.workspace.lock();
             ws.as_ref().map(|ws| ws.diagnostics_map().clone())
         };
         if let Some(diagnostics) = diagnostics {
@@ -361,23 +349,20 @@ impl LanguageServer for AsciiDocLsp {
         let content = params.text_document.text;
         let version = params.text_document.version;
 
-        self.documents
-            .lock()
-            .expect("documents lock poisoned")
-            .insert(
-                uri.clone(),
-                DocumentState {
-                    content: Arc::new(content),
-                    version,
-                },
-            );
+        self.documents.lock().insert(
+            uri.clone(),
+            DocumentState {
+                content: Arc::new(content),
+                version,
+            },
+        );
 
         // Per-file: ensure only this file, then recalculate diagnostics
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
             if let Ok(canonical) = path.canonicalize() {
                 let overrides = build_content_overrides(&self.documents);
                 let diagnostics = {
-                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
                         // Use update_file if already indexed (e.g. from background scan)
                         // to apply editor content over disk content.
@@ -406,7 +391,7 @@ impl LanguageServer for AsciiDocLsp {
 
         // Update document store (lock scope limited)
         {
-            let mut docs = self.documents.lock().expect("documents lock poisoned");
+            let mut docs = self.documents.lock();
             // Version guard: discard outdated changes (DC-2)
             if let Some(existing) = docs.get(&uri) {
                 if new_version <= existing.version {
@@ -431,7 +416,7 @@ impl LanguageServer for AsciiDocLsp {
             if let Ok(canonical) = path.canonicalize() {
                 let overrides = build_content_overrides(&self.documents);
                 let diagnostics = {
-                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
@@ -449,16 +434,13 @@ impl LanguageServer for AsciiDocLsp {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.documents
-            .lock()
-            .expect("documents lock poisoned")
-            .remove(&uri);
+        self.documents.lock().remove(&uri);
 
         // Re-index file from disk so gd/gr still work for closed files
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
             if let Ok(canonical) = path.canonicalize() {
                 let diagnostics = {
-                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
                         ws.update_file(&canonical, &HashMap::new());
                         ws.recalculate_diagnostics();
@@ -481,7 +463,7 @@ impl LanguageServer for AsciiDocLsp {
             if let Ok(canonical) = path.canonicalize() {
                 let overrides = build_content_overrides(&self.documents);
                 let diagnostics = {
-                    let mut ws = self.workspace.lock().expect("workspace lock poisoned");
+                    let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
@@ -537,7 +519,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         tracing::debug!(
             ?doc_path,
             workspace_exists = ws.is_some(),
@@ -561,7 +543,7 @@ impl LanguageServer for AsciiDocLsp {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         let Some(ws) = ws.as_ref() else {
             return Ok(None);
         };
@@ -590,7 +572,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         let result =
             navigation::resolve_goto_definition(&content, position, &doc_path, ws.as_ref());
         // Drop the lock before building response
@@ -637,7 +619,7 @@ impl LanguageServer for AsciiDocLsp {
 
         let include_declaration = params.context.include_declaration;
 
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         let results = navigation::resolve_references(
             &content,
             position,
@@ -688,7 +670,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         let result = navigation::prepare_rename(&content, position, &doc_path, ws.as_ref());
         drop(ws);
 
@@ -738,7 +720,7 @@ impl LanguageServer for AsciiDocLsp {
 
         let overrides = build_content_overrides(&self.documents);
 
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         let result =
             navigation::resolve_rename(&content, position, &doc_path, ws.as_ref(), &overrides);
         drop(ws);
@@ -802,7 +784,7 @@ impl LanguageServer for AsciiDocLsp {
             None => return Ok(None),
         };
 
-        let ws = self.workspace.lock().expect("workspace lock poisoned");
+        let ws = self.workspace.lock();
         let items = completion::resolve_completions(ctx, &doc_path, ws.as_ref());
 
         if items.is_empty() {
@@ -897,7 +879,7 @@ fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
 fn build_content_overrides(
     documents: &Mutex<HashMap<Uri, DocumentState>>,
 ) -> HashMap<PathBuf, Arc<String>> {
-    let docs = documents.lock().expect("documents lock poisoned");
+    let docs = documents.lock();
     docs.iter()
         .filter_map(|(uri, state)| {
             uri.to_file_path()
@@ -953,7 +935,7 @@ mod tests {
         let uri = Uri::from_str("file:///test.adoc").unwrap();
         let content = "= Title\n\nContent.".to_string();
 
-        docs.lock().unwrap().insert(
+        docs.lock().insert(
             uri.clone(),
             DocumentState {
                 content: Arc::new(content.clone()),
@@ -961,7 +943,7 @@ mod tests {
             },
         );
 
-        let stored = docs.lock().unwrap();
+        let stored = docs.lock();
         let state = stored.get(&uri).unwrap();
         assert_eq!(*state.content, content);
         assert_eq!(state.version, 1);
@@ -973,7 +955,7 @@ mod tests {
         let uri = Uri::from_str("file:///test.adoc").unwrap();
 
         // Open
-        docs.lock().unwrap().insert(
+        docs.lock().insert(
             uri.clone(),
             DocumentState {
                 content: Arc::new("old content".into()),
@@ -983,7 +965,7 @@ mod tests {
 
         // Change with newer version
         {
-            let mut locked = docs.lock().unwrap();
+            let mut locked = docs.lock();
             let existing = locked.get(&uri).unwrap();
             assert!(2 > existing.version); // new version is newer
             locked.insert(
@@ -995,7 +977,7 @@ mod tests {
             );
         }
 
-        let stored = docs.lock().unwrap();
+        let stored = docs.lock();
         let state = stored.get(&uri).unwrap();
         assert_eq!(*state.content, "new content");
         assert_eq!(state.version, 2);
@@ -1007,7 +989,7 @@ mod tests {
         let uri = Uri::from_str("file:///test.adoc").unwrap();
 
         // Open with version 5
-        docs.lock().unwrap().insert(
+        docs.lock().insert(
             uri.clone(),
             DocumentState {
                 content: Arc::new("current content".into()),
@@ -1017,7 +999,7 @@ mod tests {
 
         // Attempt change with older version (simulates out-of-order delivery)
         {
-            let mut locked = docs.lock().unwrap();
+            let mut locked = docs.lock();
             let existing = locked.get(&uri).unwrap();
             let old_version = 3;
             if old_version > existing.version {
@@ -1032,7 +1014,7 @@ mod tests {
             // else: discard
         }
 
-        let stored = docs.lock().unwrap();
+        let stored = docs.lock();
         let state = stored.get(&uri).unwrap();
         assert_eq!(*state.content, "current content");
         assert_eq!(state.version, 5);
@@ -1043,17 +1025,17 @@ mod tests {
         let docs: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
         let uri = Uri::from_str("file:///test.adoc").unwrap();
 
-        docs.lock().unwrap().insert(
+        docs.lock().insert(
             uri.clone(),
             DocumentState {
                 content: Arc::new("content".into()),
                 version: 1,
             },
         );
-        assert!(docs.lock().unwrap().contains_key(&uri));
+        assert!(docs.lock().contains_key(&uri));
 
-        docs.lock().unwrap().remove(&uri);
-        assert!(!docs.lock().unwrap().contains_key(&uri));
+        docs.lock().remove(&uri);
+        assert!(!docs.lock().contains_key(&uri));
     }
 
     // --- Content Override tests ---
@@ -1063,7 +1045,7 @@ mod tests {
         let docs: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
         let uri = Uri::from_str("file:///tmp/test.adoc").unwrap();
 
-        docs.lock().unwrap().insert(
+        docs.lock().insert(
             uri,
             DocumentState {
                 content: Arc::new("overridden content".into()),
