@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 tree-sitter = "0.25"
-tree-sitter-asciidoc = "0.6"
-tree-sitter-asciidoc-inline = "0.6"
+tree-sitter-asciidoc = "0.7"
+tree-sitter-asciidoc-inline = "0.7"
 thiserror = "2"
 
 [lints]
