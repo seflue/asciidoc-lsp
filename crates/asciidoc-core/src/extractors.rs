@@ -279,13 +279,9 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
         return;
     }
 
-    // Inline parser: id_assignment > id (grammar packs "id,reftext" into single id node)
     if node.kind() == "id_assignment" {
-        let raw = find_child_text(node, "id", source).unwrap_or_default();
-        let (id, reftext) = match raw.split_once(',') {
-            Some((id_part, ref_part)) => (id_part.to_string(), Some(ref_part.to_string())),
-            None => (raw, None),
-        };
+        let id = find_child_text(node, "id", source).unwrap_or_default();
+        let reftext = find_child_text(node, "reftext", source);
         if !id.is_empty() {
             results.push(Anchor {
                 id,
