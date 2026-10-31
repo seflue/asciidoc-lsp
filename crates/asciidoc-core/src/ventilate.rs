@@ -237,16 +237,17 @@ fn reads_as_block_syntax(line: &str) -> bool {
         || is_delimiter_line(line)
         || ADMONITION_LABELS.iter().any(|label| line.starts_with(label))
         || is_attribute_entry(line)
+        || is_preprocessor_directive(line)
         // Block title: a period followed by anything but whitespace.
         || line
             .strip_prefix('.')
             .is_some_and(|rest| rest.starts_with(|c: char| !c.is_whitespace()))
 }
 
-/// Whether `line` starts with a list marker and a space: `*`, `-`, `.` runs,
-/// `1.`, `a.`, or a callout `<1>`.
+/// Whether `line` starts with a list marker and a space or tab: `*`, `-`,
+/// `.` runs, `1.`, `a.`, or a callout `<1>`.
 fn is_list_marker(line: &str) -> bool {
-    let Some((marker, _)) = line.split_once(' ') else {
+    let Some((marker, _)) = line.split_once([' ', '\t']) else {
         return false;
     };
     let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
@@ -262,9 +263,17 @@ fn is_list_marker(line: &str) -> bool {
             .is_some_and(digits)
 }
 
-/// Whether `line` is a block delimiter line.
+/// Whether `line` is a block delimiter line: an open block `--`, a fenced
+/// code block with an optional language, a table, or a run of four or more
+/// delimiter characters.
 fn is_delimiter_line(line: &str) -> bool {
-    if let Some(rest) = line.strip_prefix("|===") {
+    if line == "--" || line.starts_with("```") {
+        return true;
+    }
+    if let Some(rest) = ["|===", ",===", ":===", "!==="]
+        .iter()
+        .find_map(|table| line.strip_prefix(table))
+    {
         return rest.chars().all(|c| c == '=');
     }
     ['-', '.', '*', '=', '_', '+', '/']
@@ -284,6 +293,16 @@ fn is_attribute_entry(line: &str) -> bool {
     name.trim_start_matches('!')
         .starts_with(|c: char| c.is_alphanumeric() || c == '_')
         && (after.is_empty() || after.starts_with(char::is_whitespace))
+}
+
+/// Whether `line` is a preprocessor directive, which Asciidoctor reads on
+/// any line, inside a paragraph too: `include::`, `ifdef::`, `ifndef::`,
+/// `ifeval::` or `endif::`, up to a closing `]` at the end of the line.
+fn is_preprocessor_directive(line: &str) -> bool {
+    ["include::", "ifdef::", "ifndef::", "ifeval::", "endif::"]
+        .iter()
+        .any(|directive| line.starts_with(directive))
+        && line.ends_with(']')
 }
 
 /// Split `text` at `starts` and write one sentence per line.
@@ -416,7 +435,7 @@ fn sets_hardbreaks_option(root: tree_sitter::Node, source: &str) -> bool {
         .any(|attr| attr.name == "hardbreaks-option")
 }
 
-/// Whether any of `lines` ends in ` +`, a hard line break.
+/// Whether any of `lines` ends in a blank and `+`, a hard line break.
 fn has_hard_line_break(lines: &[&str]) -> bool {
     lines.iter().any(|line| line.trim_end().ends_with(" +"))
 }
@@ -1036,6 +1055,46 @@ mod tests {
         1,
         "One.\n*Two.* .5 Liter here.\n"
     )]
+    #[case::dash_list_marker_followed_by_tab_after_span(
+        "One. *Two.* -\tThree.\n",
+        1,
+        "One.\n*Two.* -\tThree.\n"
+    )]
+    #[case::ordered_list_marker_followed_by_tab(
+        "One. Two. 3.\tthree. Four.\n",
+        1,
+        "One.\nTwo. 3.\tthree.\nFour.\n"
+    )]
+    #[case::callout_marker_followed_by_tab(
+        "One. Two. <1>\tThree.\n",
+        1,
+        "One.\nTwo. <1>\tThree.\n"
+    )]
+    #[case::open_block_delimiter_after_span("One. *Two.* --\n", 1, "One.\n*Two.* --\n")]
+    #[case::csv_table_delimiter_after_span("One. *Two.* ,===\n", 1, "One.\n*Two.* ,===\n")]
+    #[case::dsv_table_delimiter_after_span("One. *Two.* :===\n", 1, "One.\n*Two.* :===\n")]
+    #[case::nested_table_delimiter_after_span("One. *Two.* !===\n", 1, "One.\n*Two.* !===\n")]
+    #[case::include_directive_after_question(
+        "One. Two? include::part.adoc[]\n",
+        1,
+        "One.\nTwo? include::part.adoc[]\n"
+    )]
+    #[case::ifdef_directive_after_question(
+        "One. Two? ifdef::env-x[]\n",
+        1,
+        "One.\nTwo? ifdef::env-x[]\n"
+    )]
+    #[case::ifndef_directive_after_question(
+        "One. Two? ifndef::env-x[]\n",
+        1,
+        "One.\nTwo? ifndef::env-x[]\n"
+    )]
+    #[case::ifeval_directive_after_question(
+        "One. Two? ifeval::[1 == 2]\n",
+        1,
+        "One.\nTwo? ifeval::[1 == 2]\n"
+    )]
+    #[case::endif_directive_after_question("One. Two? endif::[]\n", 1, "One.\nTwo? endif::[]\n")]
     // A sentence that only looks like block syntax starts its own line
     #[case::note_without_colon("One. NOTE that it works.\n", 1, "One.\nNOTE that it works.\n")]
     #[case::admonition_label_not_in_capitals(
@@ -1046,6 +1105,29 @@ mod tests {
     #[case::decimal_number_at_line_start("One. 3.5 kg here.\n", 1, "One.\n3.5 kg here.\n")]
     #[case::bold_at_line_start("One. *Bold* here.\n", 1, "One.\n*Bold* here.\n")]
     #[case::single_slash_at_line_start("One. /Data is here.\n", 1, "One.\n/Data is here.\n")]
+    #[case::double_dash_with_text_after_span(
+        "One. *Two.* -- Three.\n",
+        1,
+        "One.\n*Two.*\n-- Three.\n"
+    )]
+    #[case::table_delimiter_with_text_after_span(
+        "One. *Two.* ,=== Here.\n",
+        1,
+        "One.\n*Two.*\n,=== Here.\n"
+    )]
+    #[case::directive_with_text_after_question(
+        "One. Two? include::part.adoc[] here.\n",
+        1,
+        "One.\nTwo?\ninclude::part.adoc[] here.\n"
+    )]
+    #[case::escaped_directive_after_question(
+        "One. Two? \\include::part.adoc[]\n",
+        1,
+        "One.\nTwo?\n\\include::part.adoc[]\n"
+    )]
+    #[case::toc_block_macro("One. Two? toc::[]\n", 1, "One.\nTwo?\ntoc::[]\n")]
+    #[case::image_block_macro("One. Two? image::a.png[]\n", 1, "One.\nTwo?\nimage::a.png[]\n")]
+    #[case::thematic_break("One. Two. '''\n", 1, "One.\nTwo.\n'''\n")]
     // Without whitespace after the period a line break would change the text
     #[case::period_inside_word("Use .NET here. Next.\n", 1, "Use .NET here.\nNext.\n")]
     // Protected spans, tailoring and the line start guard together
