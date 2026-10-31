@@ -182,7 +182,12 @@ fn ends_sentence(before: &str, after: &str) -> bool {
     };
     let is_ordinal_date = !token.is_empty()
         && token.chars().all(|c| c.is_ascii_digit())
-        && GERMAN_MONTHS.contains(&after.split(|c: char| !c.is_alphabetic()).next().unwrap_or(""));
+        && GERMAN_MONTHS.contains(
+            &after
+                .split(|c: char| !c.is_alphabetic())
+                .next()
+                .unwrap_or(""),
+        );
     if MAY_END_SENTENCE.contains(&token) {
         return before_uppercase;
     }
@@ -787,7 +792,11 @@ mod tests {
         1,
         "Apples, etc. and pears.\nÄpfel usw. 3.\nWeiter.\n"
     )]
-    #[case::usw_before_uppercase("Äpfel, Birnen usw. Dann mehr.\n", 1, "Äpfel, Birnen usw.\nDann mehr.\n")]
+    #[case::usw_before_uppercase(
+        "Äpfel, Birnen usw. Dann mehr.\n",
+        1,
+        "Äpfel, Birnen usw.\nDann mehr.\n"
+    )]
     #[case::ellipsis_before_lowercase(
         "Wait... what happened? Nothing.\n",
         1,
@@ -833,6 +842,21 @@ mod tests {
         "Costs 3.50 euros. Requires pandoc 3.1.2 or later. Connect to 10.0.0.1 now. End.\n",
         1,
         "Costs 3.50 euros.\nRequires pandoc 3.1.2 or later.\nConnect to 10.0.0.1 now.\nEnd.\n"
+    )]
+    #[case::closing_quote_and_parenthesis(
+        "He said \"stop.\" Then he left. (This is an aside.) Next.\n",
+        1,
+        "He said \"stop.\"\nThen he left.\n(This is an aside.)\nNext.\n"
+    )]
+    #[case::german_quotes(
+        "Er sagte „Halt.“ Dann ging er.\n",
+        1,
+        "Er sagte „Halt.“\nDann ging er.\n"
+    )]
+    #[case::abbreviation_in_parenthesis(
+        "Use a tool (e.g. Pandoc) here. Next.\n",
+        1,
+        "Use a tool (e.g. Pandoc) here.\nNext.\n"
     )]
     fn ventilates_paragraph_under_cursor(
         #[case] source: &str,
