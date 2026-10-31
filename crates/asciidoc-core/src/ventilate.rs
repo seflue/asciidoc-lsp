@@ -66,6 +66,7 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
         &joined.protected,
     );
     let starts = tailored_starts(&joined.text, starts);
+    let starts = with_forced_starts(starts, &joined);
     let starts = starts_off_block_syntax(&joined.text, starts);
     let new_text = render(&joined.text, &starts, eol);
 
@@ -96,6 +97,19 @@ fn sentence_starts(text: &str) -> Vec<usize> {
         .filter(|&start| start > 0)
         .chain(after_ellipsis)
         .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+/// Add the starts the source fixes to `starts`, keeping them ascending.
+fn with_forced_starts(mut starts: Vec<usize>, joined: &JoinedParagraph) -> Vec<usize> {
+    starts.extend(
+        joined
+            .forced_starts
+            .iter()
+            .filter(|&&start| start > 0 && start < joined.text.len()),
+    );
     starts.sort_unstable();
     starts.dedup();
     starts
@@ -583,6 +597,8 @@ fn walk_for_error_rows(node: tree_sitter::Node, rows: &mut Vec<Range<usize>>) {
 struct JoinedParagraph {
     text: String,
     protected: Vec<Range<usize>>,
+    /// Sentence starts the source fixes: before and after each label line.
+    forced_starts: Vec<usize>,
 }
 
 /// Join `lines` with single spaces and collect their protected spans.
@@ -592,6 +608,7 @@ fn join_lines(lines: &[&str]) -> Result<Option<JoinedParagraph>, CoreError> {
     let mut joined = JoinedParagraph {
         text: String::new(),
         protected: Vec::new(),
+        forced_starts: Vec::new(),
     };
     for line in lines {
         let tree = crate::parser::parse(&mut parser, line)?;
@@ -609,12 +626,24 @@ fn join_lines(lines: &[&str]) -> Result<Option<JoinedParagraph>, CoreError> {
         let to_joined = |offset: usize| base + offset.clamp(lead, lead + trimmed.len()) - lead;
         joined.protected.extend(
             spans
-                .into_iter()
+                .iter()
                 .map(|span| to_joined(span.start)..to_joined(span.end)),
         );
+        if is_label_line(trimmed, &spans, lead) {
+            joined.forced_starts.push(base);
+            joined.forced_starts.push(base + trimmed.len() + 1);
+        }
         joined.text.push_str(trimmed);
     }
     Ok(Some(joined))
+}
+
+/// A line holding only one bold or italic span whose text ends in `:`,
+/// such as `*Context:*`: a label for the text below it, not part of a sentence.
+fn is_label_line(trimmed: &str, spans: &[Range<usize>], lead: usize) -> bool {
+    trimmed.starts_with(['*', '_'])
+        && trimmed.trim_end_matches(['*', '_']).ends_with(':')
+        && spans.contains(&(lead..lead + trimmed.len()))
 }
 
 /// Byte ranges of inline markup in `line` that no sentence may end inside.
@@ -1284,6 +1313,32 @@ mod tests {
         "Ende. Am 30. Oktober war es. Dann.\n",
         1,
         "Ende.\nAm 30. Oktober war es.\nDann.\n"
+    )]
+    // A line holding only a formatted label ending in `:` stays on its own
+    #[case::bold_label_line(
+        "*Context:*\nThe server needs a parser. It must be fast.\n",
+        1,
+        "*Context:*\nThe server needs a parser.\nIt must be fast.\n"
+    )]
+    #[case::italic_and_unconstrained_label_lines(
+        "_Decision:_\nWe use it.\n**Konsequenzen:**\nMore work. Less risk.\n",
+        1,
+        "_Decision:_\nWe use it.\n**Konsequenzen:**\nMore work.\nLess risk.\n"
+    )]
+    #[case::label_line_after_text_without_sentence_end(
+        "We decided\n*Context:*\nIt was late. Done.\n",
+        1,
+        "We decided\n*Context:*\nIt was late.\nDone.\n"
+    )]
+    #[case::plain_line_ending_in_colon(
+        "The options are:\nfoo and bar. Next.\n",
+        1,
+        "The options are: foo and bar.\nNext.\n"
+    )]
+    #[case::label_with_colon_outside_span(
+        "*Context*:\nThe server needs it. Next.\n",
+        1,
+        "*Context*: The server needs it.\nNext.\n"
     )]
     fn ventilates_paragraph_under_cursor(
         #[case] source: &str,
