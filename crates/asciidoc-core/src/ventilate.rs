@@ -118,10 +118,11 @@ fn starts_outside_spans(text: &str, starts: Vec<usize>, protected: &[Range<usize
 }
 
 /// Abbreviations (without their period) that never end a sentence, English
-/// and German together.
+/// and German together. Multi-part abbreviations appear with and without the
+/// inner space (`z. B.`, `z.B.`).
 const NEVER_SENTENCE_END: &[&str] = &[
-    "Dr", "Mr", "Mrs", "Ms", "Prof", "e.g", "i.e", "vs", "z", "B", "d", "h", "bzw", "S", "Abschn",
-    "ca", "vgl",
+    "Dr", "Mr", "Mrs", "Ms", "Prof", "e.g", "i.e", "vs", "z", "B", "z.B", "d", "h", "d.h", "bzw",
+    "S", "Abschn", "ca", "vgl", "u.a", "z.T", "o.ä", "s.o", "u.U", "v.a",
 ];
 
 /// Abbreviations (without their period) that abbreviate only before a number.
@@ -846,6 +847,21 @@ mod tests {
         "Das ist z. B. ein Fall, d. h. ein Beispiel. Siehe S. 12 bzw. Abschn. 3. Weiter.\n",
         1,
         "Das ist z. B. ein Fall, d. h. ein Beispiel.\nSiehe S. 12 bzw. Abschn. 3.\nWeiter.\n"
+    )]
+    #[case::german_abbreviations_without_inner_space(
+        "Das ist z.B. Pandoc, d.h. Ein Tool. Es kann u.a. Dateien, z.T. Bilder, o.ä. Formate. Siehe s.o. Dort u.U. Mehr, v.a. Text. Weiter.\n",
+        1,
+        "Das ist z.B. Pandoc, d.h. Ein Tool.\nEs kann u.a. Dateien, z.T. Bilder, o.ä. Formate.\nSiehe s.o. Dort u.U. Mehr, v.a. Text.\nWeiter.\n"
+    )]
+    #[case::compact_abbreviation_in_parenthesis(
+        "Ein Tool (z.B. Pandoc) hier. Weiter.\n",
+        1,
+        "Ein Tool (z.B. Pandoc) hier.\nWeiter.\n"
+    )]
+    #[case::unlisted_compact_token_ends_sentence(
+        "Siehe Anhang A.B. Dann weiter.\n",
+        1,
+        "Siehe Anhang A.B.\nDann weiter.\n"
     )]
     #[case::english_and_german_abbreviations_together(
         "Ask Prof. Weber, vgl. Dr. Smith. Then ca. Zehn vs. Mrs. Jones. End.\n",
