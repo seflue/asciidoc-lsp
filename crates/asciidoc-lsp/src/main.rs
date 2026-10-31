@@ -197,6 +197,9 @@ impl AsciiDocLsp {
     }
 }
 
+// Handlers without `.await` stay `async fn`: the trait's signature, and the
+// work runs when the future is polled, not when the handler is called.
+#[allow(clippy::unused_async_trait_impl)]
 impl LanguageServer for AsciiDocLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Capture client capability for dynamic watcher registration so we can
