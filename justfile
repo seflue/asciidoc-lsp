@@ -54,6 +54,10 @@ tree:
 lsp:
     cargo run -p asciidoc-lsp
 
+# Print the path of the debug LSP binary (honours any configured target-dir)
+bin-path:
+    @cargo metadata --no-deps --format-version 1 | jq -r '.target_directory + "/debug/asciidoc-lsp"'
+
 # Show lint warnings without -D (for iteration)
 lint-warn:
     cargo clippy --workspace 2>&1 | grep -E "^(warning|error)\[" | sort | uniq -c | sort -rn
