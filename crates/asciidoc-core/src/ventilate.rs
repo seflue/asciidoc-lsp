@@ -63,6 +63,7 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
         sentence_starts(&joined.text),
         &joined.protected,
     );
+    let starts = tailored_starts(&joined.text, starts);
     let new_text = render(&joined.text, &starts, eol);
 
     if new_text.is_empty() || new_text == source[range.clone()] {
@@ -71,13 +72,24 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
     Ok(Some(VentilateEdit { range, new_text }))
 }
 
-/// Candidate sentence starts in `text` (byte offsets, ascending, never 0),
-/// as UAX #29 sentence boundaries.
+/// Candidate sentence starts in `text` (byte offsets, ascending, never 0):
+/// UAX #29 sentence boundaries, plus one after each `…` and its whitespace,
+/// which UAX #29 does not treat as a sentence terminator.
 fn sentence_starts(text: &str) -> Vec<usize> {
-    text.split_sentence_bound_indices()
+    let after_ellipsis = text.match_indices('…').filter_map(|(i, ellipsis)| {
+        let rest = &text[i + ellipsis.len()..];
+        let start = text.len() - rest.trim_start().len();
+        (start > i + ellipsis.len() && start < text.len()).then_some(start)
+    });
+    let mut starts: Vec<usize> = text
+        .split_sentence_bound_indices()
         .map(|(start, _)| start)
         .filter(|&start| start > 0)
-        .collect()
+        .chain(after_ellipsis)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
 }
 
 /// Move sentence starts out of protected spans. A start inside a span is
@@ -102,6 +114,82 @@ fn starts_outside_spans(text: &str, starts: Vec<usize>, protected: &[Range<usize
     }
     kept.dedup();
     kept
+}
+
+/// Abbreviations (without their period) that never end a sentence, English
+/// and German together.
+const NEVER_SENTENCE_END: &[&str] = &[
+    "Dr", "Mr", "Mrs", "Ms", "Prof", "e.g", "i.e", "vs", "z", "B", "d", "h", "bzw", "S", "Abschn",
+    "ca", "vgl",
+];
+
+/// Abbreviations (without their period) that abbreviate only before a number.
+const BEFORE_NUMBER: &[&str] = &["No", "Nr", "Fig", "Abb"];
+
+/// Abbreviations (without their period) that end a sentence only before an
+/// uppercase letter.
+const MAY_END_SENTENCE: &[&str] = &["etc", "usw"];
+
+/// German month names: a number with a period before one is an ordinal date
+/// (`am 30. Oktober`), not a sentence end.
+const GERMAN_MONTHS: &[&str] = &[
+    "Januar",
+    "Februar",
+    "März",
+    "April",
+    "Mai",
+    "Juni",
+    "Juli",
+    "August",
+    "September",
+    "Oktober",
+    "November",
+    "Dezember",
+];
+
+/// Drop sentence starts that UAX #29 puts after a period that does not end
+/// a sentence: abbreviations, initials, numbers.
+fn tailored_starts(text: &str, starts: Vec<usize>) -> Vec<usize> {
+    starts
+        .into_iter()
+        .filter(|&start| ends_sentence(&text[..start], &text[start..]))
+        .collect()
+}
+
+/// Whether the period-and-whitespace at the end of `before` ends a sentence,
+/// given the text `after` it.
+fn ends_sentence(before: &str, after: &str) -> bool {
+    let trimmed = before.trim_end();
+    if trimmed.len() == before.len() {
+        return true;
+    }
+    let next = after.chars().next();
+    let before_uppercase = next.is_some_and(char::is_uppercase);
+    if trimmed.ends_with("...") || trimmed.ends_with('…') {
+        return before_uppercase;
+    }
+    let Some(stem) = trimmed.strip_suffix('.') else {
+        return true;
+    };
+    let token = stem
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or(stem)
+        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    let is_initial = {
+        let mut chars = token.chars();
+        chars.next().is_some_and(char::is_uppercase) && chars.next().is_none()
+    };
+    let is_ordinal_date = !token.is_empty()
+        && token.chars().all(|c| c.is_ascii_digit())
+        && GERMAN_MONTHS.contains(&after.split(|c: char| !c.is_alphabetic()).next().unwrap_or(""));
+    if MAY_END_SENTENCE.contains(&token) {
+        return before_uppercase;
+    }
+    !(NEVER_SENTENCE_END.contains(&token)
+        || is_initial
+        || is_ordinal_date
+        || BEFORE_NUMBER.contains(&token) && next.is_some_and(|c| c.is_ascii_digit()))
 }
 
 /// Split `text` at `starts` and write one sentence per line.
@@ -529,7 +617,11 @@ mod tests {
         "= Doc\n\n== Section\n\nFirst.\nSecond.\n"
     )]
     #[case::paragraph_without_final_newline("First. Second.", 1, "First.\nSecond.")]
-    #[case::crlf_paragraph_without_final_newline("A.\r\n\r\nB. C.", 3, "A.\r\n\r\nB.\r\nC.")]
+    #[case::crlf_paragraph_without_final_newline(
+        "A.\r\n\r\nOne. Two.",
+        3,
+        "A.\r\n\r\nOne.\r\nTwo."
+    )]
     #[case::paragraph_in_sidebar(
         "****\nSide one. Is\nwrapped. Two.\n****\n",
         3,
@@ -644,6 +736,103 @@ mod tests {
         "First is\nwrapped `a. B` here. Next.\n",
         1,
         "First is wrapped `a. B` here.\nNext.\n"
+    )]
+    #[case::latin_abbreviations_before_lowercase(
+        "Use a tool, e.g. pandoc, i.e. a converter. Next.\n",
+        1,
+        "Use a tool, e.g. pandoc, i.e. a converter.\nNext.\n"
+    )]
+    #[case::latin_abbreviation_before_uppercase(
+        "Use e.g. Pandoc here. Next.\n",
+        1,
+        "Use e.g. Pandoc here.\nNext.\n"
+    )]
+    #[case::title_abbreviations(
+        "Ask Dr. Smith or Mr. Jones. Next.\n",
+        1,
+        "Ask Dr. Smith or Mr. Jones.\nNext.\n"
+    )]
+    #[case::german_abbreviations(
+        "Das ist z. B. ein Fall, d. h. ein Beispiel. Siehe S. 12 bzw. Abschn. 3. Weiter.\n",
+        1,
+        "Das ist z. B. ein Fall, d. h. ein Beispiel.\nSiehe S. 12 bzw. Abschn. 3.\nWeiter.\n"
+    )]
+    #[case::english_and_german_abbreviations_together(
+        "Ask Prof. Weber, vgl. Dr. Smith. Then ca. Zehn vs. Mrs. Jones. End.\n",
+        1,
+        "Ask Prof. Weber, vgl. Dr. Smith.\nThen ca. Zehn vs. Mrs. Jones.\nEnd.\n"
+    )]
+    #[case::initials(
+        "Written by J. R. R. Tolkien. Next.\n",
+        1,
+        "Written by J. R. R. Tolkien.\nNext.\n"
+    )]
+    #[case::number_abbreviations_before_digit(
+        "See No. 5. Then Fig. 2 and Nr. 7. Siehe Abb. 3. Dann.\n",
+        1,
+        "See No. 5.\nThen Fig. 2 and Nr. 7.\nSiehe Abb. 3.\nDann.\n"
+    )]
+    #[case::number_abbreviation_at_sentence_end(
+        "She said No. Then she left.\n",
+        1,
+        "She said No.\nThen she left.\n"
+    )]
+    #[case::etc_before_uppercase(
+        "Apples, pears, etc. Next sentence.\n",
+        1,
+        "Apples, pears, etc.\nNext sentence.\n"
+    )]
+    #[case::etc_and_usw_before_lowercase_and_digit(
+        "Apples, etc. and pears. Äpfel usw. 3. Weiter.\n",
+        1,
+        "Apples, etc. and pears.\nÄpfel usw. 3.\nWeiter.\n"
+    )]
+    #[case::usw_before_uppercase("Äpfel, Birnen usw. Dann mehr.\n", 1, "Äpfel, Birnen usw.\nDann mehr.\n")]
+    #[case::ellipsis_before_lowercase(
+        "Wait... what happened? Nothing.\n",
+        1,
+        "Wait... what happened?\nNothing.\n"
+    )]
+    #[case::ellipsis_before_uppercase(
+        "Wait... What happened? Nothing.\n",
+        1,
+        "Wait...\nWhat happened?\nNothing.\n"
+    )]
+    #[case::ellipsis_character_before_lowercase(
+        "Wait… what happened? Nothing.\n",
+        1,
+        "Wait… what happened?\nNothing.\n"
+    )]
+    #[case::ellipsis_character_before_uppercase(
+        "Wait… What happened? Nothing.\n",
+        1,
+        "Wait…\nWhat happened?\nNothing.\n"
+    )]
+    #[case::ellipsis_character_inside_monospace(
+        "Run `a… B` now. Next.\n",
+        1,
+        "Run `a… B` now.\nNext.\n"
+    )]
+    #[case::ellipsis_before_digit("Count... 3 more. Done.\n", 1, "Count... 3 more.\nDone.\n")]
+    #[case::german_ordinal_date(
+        "Am 30. Oktober. Dann am 1. Mai und 3. März. Ende.\n",
+        1,
+        "Am 30. Oktober.\nDann am 1. Mai und 3. März.\nEnde.\n"
+    )]
+    #[case::number_before_capitalised_word(
+        "Siehe Seite 12. Dort steht es.\n",
+        1,
+        "Siehe Seite 12.\nDort steht es.\n"
+    )]
+    #[case::section_number_at_sentence_end(
+        "See section 2.3. Then continue.\n",
+        1,
+        "See section 2.3.\nThen continue.\n"
+    )]
+    #[case::decimal_version_and_ip(
+        "Costs 3.50 euros. Requires pandoc 3.1.2 or later. Connect to 10.0.0.1 now. End.\n",
+        1,
+        "Costs 3.50 euros.\nRequires pandoc 3.1.2 or later.\nConnect to 10.0.0.1 now.\nEnd.\n"
     )]
     fn ventilates_paragraph_under_cursor(
         #[case] source: &str,
