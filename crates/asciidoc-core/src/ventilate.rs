@@ -67,7 +67,13 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
     let starts = starts_off_block_syntax(&joined.text, starts);
     let new_text = render(&joined.text, &starts, eol);
 
-    if new_text.is_empty() || new_text == source[range.clone()] {
+    // Joining builds the first line anew; on a paragraph's first line
+    // Asciidoctor reads more as block syntax than on the lines after it.
+    let first_line = new_text.split(eol).next().unwrap_or("");
+    if new_text.is_empty()
+        || new_text == source[range.clone()]
+        || opens_block_on_first_line(first_line)
+    {
         return Ok(None);
     }
     Ok(Some(VentilateEdit { range, new_text }))
@@ -303,6 +309,49 @@ fn is_preprocessor_directive(line: &str) -> bool {
         .iter()
         .any(|directive| line.starts_with(directive))
         && line.ends_with(']')
+}
+
+/// Whether Asciidoctor would read `line`, as the first line of a paragraph,
+/// as the start of a block: a list item, an admonition, a description list
+/// term, a block macro or preprocessor directive, or a block attribute line.
+fn opens_block_on_first_line(line: &str) -> bool {
+    is_list_marker(line)
+        || ADMONITION_LABELS.iter().any(|label| {
+            line.strip_prefix(label)
+                .is_some_and(|rest| rest.starts_with([' ', '\t']))
+        })
+        || is_description_list_term(line)
+        || is_block_macro(line)
+        || block_attribute_line(line).is_some()
+}
+
+/// Whether `line` holds a description list term: text, then `::`, `:::`,
+/// `::::` or `;;` followed by whitespace or the end of the line.
+fn is_description_list_term(line: &str) -> bool {
+    ["::", ";;"].iter().any(|delimiter| {
+        // Overlapping matches: `:::` ends in a `::` that starts at its second colon.
+        line.char_indices().any(|(i, _)| {
+            if !line[i..].starts_with(delimiter) {
+                return false;
+            }
+            let after = &line[i + delimiter.len()..];
+            !line[..i].trim().is_empty() && (after.is_empty() || after.starts_with([' ', '\t']))
+        })
+    })
+}
+
+/// Whether `line` is a block macro, `name::target[attributes]`, which
+/// includes the preprocessor directives.
+fn is_block_macro(line: &str) -> bool {
+    let Some((name, rest)) = line.split_once("::") else {
+        return false;
+    };
+    name.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        && rest.contains('[')
+        && rest.ends_with(']')
 }
 
 /// Split `text` at `starts` and write one sentence per line.
@@ -1128,6 +1177,9 @@ mod tests {
     #[case::toc_block_macro("One. Two? toc::[]\n", 1, "One.\nTwo?\ntoc::[]\n")]
     #[case::image_block_macro("One. Two? image::a.png[]\n", 1, "One.\nTwo?\nimage::a.png[]\n")]
     #[case::thematic_break("One. Two. '''\n", 1, "One.\nTwo.\n'''\n")]
+    // Joined first lines that only look like block syntax
+    #[case::join_with_single_colon("A\nb: c. D.\n", 1, "A b: c.\nD.\n")]
+    #[case::description_list_term_on_second_line("One. Two\nb;; c.\n", 1, "One.\nTwo b;; c.\n")]
     // Without whitespace after the period a line break would change the text
     #[case::period_inside_word("Use .NET here. Next.\n", 1, "Use .NET here.\nNext.\n")]
     // Protected spans, tailoring and the line start guard together
@@ -1242,6 +1294,21 @@ mod tests {
         "= Doc\n:hardbreaks-option:\n\nOne. Two.\n",
         4
     )]
+    // Joining would turn the paragraph's first line into block syntax
+    #[case::join_makes_description_list("A\nb:: c.\n", 1)]
+    #[case::join_makes_description_list_at_line_end("A\nb::\n", 1)]
+    #[case::join_makes_semicolon_description_list("A\nb;; c.\n", 1)]
+    #[case::join_makes_nested_description_list("A\nb::: c.\n", 1)]
+    #[case::join_makes_deeper_description_list("A\nb:::: c.\n", 1)]
+    #[case::join_makes_star_list_item("*\nfoo.\n", 1)]
+    #[case::join_makes_dash_list_item("-\nfoo.\n", 1)]
+    #[case::join_makes_ordered_list_item("1.\nfoo.\n", 1)]
+    #[case::join_makes_dot_list_item(".\nfoo.\n", 1)]
+    #[case::join_makes_callout_item("<1>\nfoo.\n", 1)]
+    #[case::join_makes_admonition("NOTE:\nfoo.\n", 1)]
+    #[case::join_makes_block_macro("image::a.png[x\ny]\n", 1)]
+    #[case::join_makes_include_directive("include::a.adoc[x\ny]\n", 1)]
+    #[case::join_makes_block_attribute_line("[x\ny]\nfoo.\n", 1)]
     fn offers_no_edit(#[case] source: &str, #[case] line: usize) {
         assert_eq!(ventilate_paragraph(source, line).unwrap(), None);
     }
