@@ -39,6 +39,8 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
         || layout.ruled_out_above(group.start)
         // A block line right below a paragraph line is text of that paragraph.
         || layout.is_block_line(group.end)
+        // So is a list item line; formatting would cover only part of the paragraph.
+        || layout.starts_item(group.end)
         || sets_hardbreaks_option(tree.root_node(), source)
         || has_hard_line_break(&contents)
         || has_error_near(tree.root_node(), &group)
@@ -464,6 +466,10 @@ struct Layout<'a> {
 impl<'a> Layout<'a> {
     fn continues_item(&self, row: usize) -> bool {
         row > 0 && self.items.iter().any(|rows| rows.contains(&(row - 1)))
+    }
+
+    fn starts_item(&self, row: usize) -> bool {
+        self.items.iter().any(|rows| rows.start == row)
     }
 
     /// Attribute lists of the block attribute lines directly above `row`,
@@ -1375,6 +1381,9 @@ mod tests {
     #[case::join_makes_block_macro("image::a.png[x\ny]\n", 1)]
     #[case::join_makes_include_directive("include::a.adoc[x\ny]\n", 1)]
     #[case::join_makes_block_attribute_line("[x\ny]\nfoo.\n", 1)]
+    #[case::list_item_read_below_paragraph("One. Two.\n- x. Y.\n", 1)]
+    #[case::description_list_read_below_paragraph("One. Two.\nTerm:: d. E.\n", 1)]
+    #[case::semicolon_description_list_read_below_paragraph("One. Two.\nTerm;; d. E.\n", 1)]
     fn offers_no_edit(#[case] source: &str, #[case] line: usize) {
         assert_eq!(ventilate_paragraph(source, line).unwrap(), None);
     }
