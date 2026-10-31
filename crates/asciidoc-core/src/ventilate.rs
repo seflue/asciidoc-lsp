@@ -64,6 +64,7 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
         &joined.protected,
     );
     let starts = tailored_starts(&joined.text, starts);
+    let starts = starts_off_block_syntax(&joined.text, starts);
     let new_text = render(&joined.text, &starts, eol);
 
     if new_text.is_empty() || new_text == source[range.clone()] {
@@ -195,6 +196,84 @@ fn ends_sentence(before: &str, after: &str) -> bool {
         || is_initial
         || is_ordinal_date
         || BEFORE_NUMBER.contains(&token) && next.is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// Drop sentence starts whose line Asciidoctor would read as block syntax;
+/// that sentence stays on the line before. Goes from the last start back, so
+/// each line is known up to the next start that is kept.
+fn starts_off_block_syntax(text: &str, starts: Vec<usize>) -> Vec<usize> {
+    let mut kept = Vec::new();
+    let mut line_end = text.len();
+    for start in starts.into_iter().rev() {
+        if !reads_as_block_syntax(text[start..line_end].trim_end()) {
+            kept.push(start);
+            line_end = start;
+        }
+    }
+    kept.reverse();
+    kept
+}
+
+/// Admonition labels that open an admonition paragraph at the start of a line.
+const ADMONITION_LABELS: &[&str] = &["NOTE:", "TIP:", "IMPORTANT:", "WARNING:", "CAUTION:"];
+
+/// Whether Asciidoctor would read `line`, at the start of a line, as block
+/// syntax rather than paragraph text.
+fn reads_as_block_syntax(line: &str) -> bool {
+    line.starts_with("//")
+        || line.starts_with('[')
+        || line == "+"
+        || is_list_marker(line)
+        || is_delimiter_line(line)
+        || ADMONITION_LABELS.iter().any(|label| line.starts_with(label))
+        || is_attribute_entry(line)
+        // Block title: a period followed by anything but whitespace.
+        || line
+            .strip_prefix('.')
+            .is_some_and(|rest| rest.starts_with(|c: char| !c.is_whitespace()))
+}
+
+/// Whether `line` starts with a list marker and a space: `*`, `-`, `.` runs,
+/// `1.`, `a.`, or a callout `<1>`.
+fn is_list_marker(line: &str) -> bool {
+    let Some((marker, _)) = line.split_once(' ') else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    let ordinal = marker.strip_suffix('.').unwrap_or("");
+    (!marker.is_empty() && marker.chars().all(|c| c == '*'))
+        || marker == "-"
+        || (!marker.is_empty() && marker.chars().all(|c| c == '.'))
+        || digits(ordinal)
+        || (ordinal.len() == 1 && ordinal.chars().all(|c| c.is_ascii_alphabetic()))
+        || marker
+            .strip_prefix('<')
+            .and_then(|m| m.strip_suffix('>'))
+            .is_some_and(digits)
+}
+
+/// Whether `line` is a block delimiter line.
+fn is_delimiter_line(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("|===") {
+        return rest.chars().all(|c| c == '=');
+    }
+    ['-', '.', '*', '=', '_', '+', '/']
+        .iter()
+        .any(|&delimiter| line.len() >= 4 && line.chars().all(|c| c == delimiter))
+}
+
+/// Whether `line` starts with an attribute entry, `:name:` followed by
+/// whitespace or the end of the line.
+fn is_attribute_entry(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix(':') else {
+        return false;
+    };
+    let Some((name, after)) = rest.split_once(':') else {
+        return false;
+    };
+    name.trim_start_matches('!')
+        .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        && (after.is_empty() || after.starts_with(char::is_whitespace))
 }
 
 /// Split `text` at `starts` and write one sentence per line.
@@ -858,6 +937,55 @@ mod tests {
         1,
         "Use a tool (e.g. Pandoc) here.\nNext.\n"
     )]
+    // A sentence that would start a line as block syntax stays on the line before
+    #[case::line_comment_start("One. Two. // Three.\n", 1, "One.\nTwo. // Three.\n")]
+    #[case::dash_list_marker_after_span("One. *Two.* - Three.\n", 1, "One.\n*Two.* - Three.\n")]
+    #[case::ordered_list_markers(
+        "One. Two. 3. 4 items. B. Four.\n",
+        1,
+        "One.\nTwo. 3. 4 items. B. Four.\n"
+    )]
+    #[case::callout_marker("One. Two. <1> Three.\n", 1, "One.\nTwo. <1> Three.\n")]
+    #[case::admonition_labels(
+        "One. Two. NOTE: A. TIP: B. IMPORTANT: C. WARNING: D. CAUTION: E.\n",
+        1,
+        "One.\nTwo. NOTE: A. TIP: B. IMPORTANT: C. WARNING: D. CAUTION: E.\n"
+    )]
+    #[case::block_title_and_dot_list_marker_after_span(
+        "One. *Two.* .title here. *Three.* . item here.\n",
+        1,
+        "One.\n*Two.* .title here.\n*Three.* . item here.\n"
+    )]
+    #[case::attribute_entry_after_span(
+        "One. *Two.* :Attr: Three.\n",
+        1,
+        "One.\n*Two.* :Attr: Three.\n"
+    )]
+    #[case::bracket_start("One. Two. [Three] here.\n", 1, "One.\nTwo. [Three] here.\n")]
+    #[case::lone_plus("One. Two.\t+\n", 1, "One.\nTwo.\t+\n")]
+    #[case::listing_delimiter_after_span("One. *Two.* ----\n", 1, "One.\n*Two.* ----\n")]
+    #[case::sidebar_delimiter("One. Two. ****\n", 1, "One.\nTwo. ****\n")]
+    #[case::example_delimiter("One. Two. ====\n", 1, "One.\nTwo. ====\n")]
+    #[case::quote_delimiter("One. Two. ____\n", 1, "One.\nTwo. ____\n")]
+    #[case::passthrough_delimiter("One. Two. ++++\n", 1, "One.\nTwo. ++++\n")]
+    #[case::comment_delimiter("One. Two. ////\n", 1, "One.\nTwo. ////\n")]
+    #[case::table_delimiter("One. Two. |===\n", 1, "One.\nTwo. |===\n")]
+    #[case::literal_delimiter_after_span("One. *Two.* ....\n", 1, "One.\n*Two.* ....\n")]
+    #[case::decimal_after_period_reads_as_block_title(
+        "One. *Two.* .5 Liter here.\n",
+        1,
+        "One.\n*Two.* .5 Liter here.\n"
+    )]
+    // A sentence that only looks like block syntax starts its own line
+    #[case::note_without_colon("One. NOTE that it works.\n", 1, "One.\nNOTE that it works.\n")]
+    #[case::admonition_label_not_in_capitals(
+        "One. Note: this works.\n",
+        1,
+        "One.\nNote: this works.\n"
+    )]
+    #[case::decimal_number_at_line_start("One. 3.5 kg here.\n", 1, "One.\n3.5 kg here.\n")]
+    #[case::bold_at_line_start("One. *Bold* here.\n", 1, "One.\n*Bold* here.\n")]
+    #[case::single_slash_at_line_start("One. /Data is here.\n", 1, "One.\n/Data is here.\n")]
     fn ventilates_paragraph_under_cursor(
         #[case] source: &str,
         #[case] line: usize,
