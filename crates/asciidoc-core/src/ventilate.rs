@@ -29,10 +29,6 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
     let Some(group) = group_at(&layout.paragraphs, line.saturating_sub(1)) else {
         return Ok(None);
     };
-    let mut error_rows = Vec::new();
-    walk_for_error_rows(tree.root_node(), &mut error_rows);
-    // An error right above or below may be the rest of this paragraph.
-    let neighbourhood = group.start.saturating_sub(1)..group.end + 1;
     let group_lines = &lines[group.clone()];
     let contents: Vec<&str> = group_lines
         .iter()
@@ -43,18 +39,15 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
         || layout.ruled_out_above(group.start)
         // A block line right below a paragraph line is text of that paragraph.
         || layout.is_block_line(group.end)
-        || crate::extractors::extract_attributes(tree.root_node(), source.as_bytes())
-            .iter()
-            .any(|attr| attr.name == "hardbreaks-option")
-        // A line ending in ` +` is a hard line break.
-        || contents.iter().any(|content| content.trim_end().ends_with(" +"))
-        || error_rows
-            .iter()
-            .any(|rows| rows.start < neighbourhood.end && neighbourhood.start < rows.end)
-        || inline_parse_fails(&contents)?
+        || sets_hardbreaks_option(tree.root_node(), source)
+        || has_hard_line_break(&contents)
+        || has_error_near(tree.root_node(), &group)
     {
         return Ok(None);
     }
+    let Some(joined) = join_lines(&contents)? else {
+        return Ok(None);
+    };
     let range = group_lines[0].content.start..group_lines[group_lines.len() - 1].content.end;
     // The last line of a document may lack a line ending; take the group's
     // first one, else the document's.
@@ -65,13 +58,12 @@ pub fn ventilate_paragraph(source: &str, line: usize) -> Result<Option<Ventilate
         .find(|eol| !eol.is_empty())
         .unwrap_or("\n");
 
-    let joined = contents
-        .iter()
-        .map(|content| content.trim())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let starts = sentence_starts(&joined);
-    let new_text = render(&joined, &starts, eol);
+    let starts = starts_outside_spans(
+        &joined.text,
+        sentence_starts(&joined.text),
+        &joined.protected,
+    );
+    let new_text = render(&joined.text, &starts, eol);
 
     if new_text.is_empty() || new_text == source[range.clone()] {
         return Ok(None);
@@ -86,6 +78,30 @@ fn sentence_starts(text: &str) -> Vec<usize> {
         .map(|(start, _)| start)
         .filter(|&start| start > 0)
         .collect()
+}
+
+/// Move sentence starts out of protected spans. A start inside a span is
+/// dropped, unless only markup follows it there: then the sentence ends with
+/// the span, and the next one starts after the whitespace behind it.
+fn starts_outside_spans(text: &str, starts: Vec<usize>, protected: &[Range<usize>]) -> Vec<usize> {
+    let mut kept = Vec::new();
+    for start in starts {
+        match protected
+            .iter()
+            .find(|span| span.start < start && start < span.end)
+        {
+            None => kept.push(start),
+            Some(span) if !text[start..span.end].chars().any(char::is_alphanumeric) => {
+                let after = text.len() - text[span.end..].trim_start().len();
+                if span.end < after && after < text.len() {
+                    kept.push(after);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    kept.dedup();
+    kept
 }
 
 /// Split `text` at `starts` and write one sentence per line.
@@ -211,6 +227,29 @@ fn walk_for_layout<'a>(node: tree_sitter::Node, source: &'a str, layout: &mut La
     }
 }
 
+/// Whether the document sets `:hardbreaks-option:`.
+fn sets_hardbreaks_option(root: tree_sitter::Node, source: &str) -> bool {
+    crate::extractors::extract_attributes(root, source.as_bytes())
+        .iter()
+        .any(|attr| attr.name == "hardbreaks-option")
+}
+
+/// Whether any of `lines` ends in ` +`, a hard line break.
+fn has_hard_line_break(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.trim_end().ends_with(" +"))
+}
+
+/// Whether the block tree has an error in `group` or right above or below
+/// it: an error there may be the rest of this paragraph.
+fn has_error_near(root: tree_sitter::Node, group: &Range<usize>) -> bool {
+    let mut error_rows = Vec::new();
+    walk_for_error_rows(root, &mut error_rows);
+    let neighbourhood = group.start.saturating_sub(1)..group.end + 1;
+    error_rows
+        .iter()
+        .any(|rows| rows.start < neighbourhood.end && neighbourhood.start < rows.end)
+}
+
 /// Rows covered by `ERROR` and `MISSING` nodes.
 fn walk_for_error_rows(node: tree_sitter::Node, rows: &mut Vec<Range<usize>>) {
     if node.is_error() || node.is_missing() {
@@ -227,18 +266,76 @@ fn walk_for_error_rows(node: tree_sitter::Node, rows: &mut Vec<Range<usize>>) {
     }
 }
 
-/// Whether the inline grammar fails on any of `lines`.
-fn inline_parse_fails(lines: &[&str]) -> Result<bool, CoreError> {
+/// A paragraph's lines joined into one, with the byte ranges in it that no
+/// sentence may end inside.
+struct JoinedParagraph {
+    text: String,
+    protected: Vec<Range<usize>>,
+}
+
+/// Join `lines` with single spaces and collect their protected spans.
+/// `None` if the inline grammar fails on any line.
+fn join_lines(lines: &[&str]) -> Result<Option<JoinedParagraph>, CoreError> {
     let mut parser = crate::parser::init_inline_parser()?;
+    let mut joined = JoinedParagraph {
+        text: String::new(),
+        protected: Vec::new(),
+    };
     for line in lines {
-        if crate::parser::parse(&mut parser, line)?
-            .root_node()
-            .has_error()
-        {
-            return Ok(true);
+        let tree = crate::parser::parse(&mut parser, line)?;
+        if tree.root_node().has_error() {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        let lead = line.len() - line.trim_start().len();
+        if !joined.text.is_empty() {
+            joined.text.push(' ');
+        }
+        let base = joined.text.len();
+        let mut spans = Vec::new();
+        walk_for_protected(tree.root_node(), line, &mut spans);
+        let to_joined = |offset: usize| base + offset.clamp(lead, lead + trimmed.len()) - lead;
+        joined.protected.extend(
+            spans
+                .into_iter()
+                .map(|span| to_joined(span.start)..to_joined(span.end)),
+        );
+        joined.text.push_str(trimmed);
+    }
+    Ok(Some(joined))
+}
+
+/// Byte ranges of inline markup in `line` that no sentence may end inside.
+fn walk_for_protected(node: tree_sitter::Node, line: &str, spans: &mut Vec<Range<usize>>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            // `ltalic` is the grammar's spelling of italic.
+            "inline_macro" | "xref" | "monospace" | "passthrough" | "macro_passthrough"
+            | "stem_macro" | "footnote" | "id_assignment" | "index_term" | "index_term2"
+            | "labled_uri" | "emphasis" | "ltalic" | "highlight" => {
+                spans.push(child.byte_range());
+            }
+            // The grammar's autolink can run past the URL; end it ourselves,
+            // unless a label in brackets closes it.
+            "autolink" if child.child(0).is_some_and(|uri| uri.kind() == "labled_uri") => {
+                walk_for_protected(child, line, spans);
+            }
+            "autolink" => spans.push(child.start_byte()..url_end(line, child.start_byte())),
+            _ => walk_for_protected(child, line, spans),
         }
     }
-    Ok(false)
+}
+
+/// End of the URL starting at `start`: the first whitespace, without
+/// trailing punctuation.
+fn url_end(line: &str, start: usize) -> usize {
+    let rest = &line[start..];
+    let url = rest.split(char::is_whitespace).next().unwrap_or(rest);
+    start
+        + url
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')'])
+            .len()
 }
 
 /// The attribute list of a block attribute line, or `None` for other lines.
@@ -360,29 +457,23 @@ mod tests {
     }
 
     #[rstest]
-    // Test-spec 1.1
     #[case::two_sentences_on_one_line(
         "First sentence. Second sentence.\n",
         1,
         "First sentence.\nSecond sentence.\n"
     )]
-    // Test-spec 1.2
     #[case::wrapped_sentence_is_joined(
         "This sentence was wrapped\nat seventy-two columns by an editor.\n",
         1,
         "This sentence was wrapped at seventy-two columns by an editor.\n"
     )]
-    // Test-spec 1.3
     #[case::wrapped_and_multiple_sentences(
         "One. Two is\nwrapped. Three.\n",
         1,
         "One.\nTwo is wrapped.\nThree.\n"
     )]
-    // Test-spec 1.4
     #[case::already_ventilated("One.\nTwo.\nThree.\n", 2, "One.\nTwo.\nThree.\n")]
-    // Test-spec 1.5
     #[case::single_sentence("Just one sentence.\n", 1, "Just one sentence.\n")]
-    // Test-spec 1.6
     #[case::no_terminal_punctuation(
         "No period at the end\nof this paragraph\n",
         1,
@@ -393,41 +484,33 @@ mod tests {
         1,
         "This is a rather long sentence that goes on and on well past any usual column limit without ever ending in a way that would invite wrapping.\n"
     )]
-    // Test-spec 2.1
     #[case::question_and_exclamation("Is it? Yes! Done.\n", 1, "Is it?\nYes!\nDone.\n")]
-    // Test-spec 2.4
     #[case::colon_and_semicolon_do_not_split(
         "Two options: fast; slow. End.\n",
         1,
         "Two options: fast; slow.\nEnd.\n"
     )]
-    // Test-spec 2.5
     #[case::multiple_spaces_after_period("First.   Second.\n", 1, "First.\nSecond.\n")]
-    // Test-spec 8.1
     #[case::trailing_whitespace_on_wrapped_line(
         "Wrapped here   \nand joined.\n",
         1,
         "Wrapped here and joined.\n"
     )]
-    // Test-spec 8.2
     #[case::whitespace_inside_line_is_kept(
         "Tab\there and  two spaces.\nNext\tline.\n",
         1,
         "Tab\there and  two spaces.\nNext\tline.\n"
     )]
-    // Test-spec 8.3
     #[case::crlf_stays_crlf(
         "One. Two is\r\nwrapped. Three.\r\n",
         1,
         "One.\r\nTwo is wrapped.\r\nThree.\r\n"
     )]
-    // Test-spec 8.4
     #[case::umlauts(
         "Größe ändern. Übernächster Satz.\n",
         1,
         "Größe ändern.\nÜbernächster Satz.\n"
     )]
-    // Test-spec 8.6
     #[case::emoji_before_split("Party 🎉 time. Next.\n", 1, "Party 🎉 time.\nNext.\n")]
     #[case::cursor_on_last_line_formats_whole_paragraph(
         "One. Two is\nwrapped. Three.\n",
@@ -447,7 +530,6 @@ mod tests {
     )]
     #[case::paragraph_without_final_newline("First. Second.", 1, "First.\nSecond.")]
     #[case::crlf_paragraph_without_final_newline("A.\r\n\r\nB. C.", 3, "A.\r\n\r\nB.\r\nC.")]
-    // Test-spec 7.2
     #[case::paragraph_in_sidebar(
         "****\nSide one. Is\nwrapped. Two.\n****\n",
         3,
@@ -492,6 +574,77 @@ mod tests {
         4,
         "Intro.\n\n[#intro]\nFirst.\nSecond.\n"
     )]
+    // A sentence end at the end of a formatting span splits after it
+    #[case::sentence_end_inside_bold("*Done.* Next.\n", 1, "*Done.*\nNext.\n")]
+    #[case::xref_macro_text(
+        "See xref:setup.adoc#install[Install. Guide] first. Next.\n",
+        1,
+        "See xref:setup.adoc#install[Install. Guide] first.\nNext.\n"
+    )]
+    #[case::xref_shorthand_text(
+        "See <<sec,Sec. Two>> here. Next.\n",
+        1,
+        "See <<sec,Sec. Two>> here.\nNext.\n"
+    )]
+    #[case::bare_url(
+        "Visit https://example.com/a.B/c for more. Next.\n",
+        1,
+        "Visit https://example.com/a.B/c for more.\nNext.\n"
+    )]
+    #[case::url_with_label(
+        "See https://x.org[Read. This] now. Next.\n",
+        1,
+        "See https://x.org[Read. This] now.\nNext.\n"
+    )]
+    #[case::stem_and_index_term(
+        "Use stem:[a. B] and ((Index. Term)) now. Next.\n",
+        1,
+        "Use stem:[a. B] and ((Index. Term)) now.\nNext.\n"
+    )]
+    #[case::url_at_sentence_end(
+        "Visit https://example.com. Then log in.\n",
+        1,
+        "Visit https://example.com.\nThen log in.\n"
+    )]
+    #[case::link_macro_text(
+        "link:https://x.org[Read this. Now.] today. Next.\n",
+        1,
+        "link:https://x.org[Read this. Now.] today.\nNext.\n"
+    )]
+    #[case::monospace("Run `a. B` now. Next.\n", 1, "Run `a. B` now.\nNext.\n")]
+    #[case::passthrough(
+        "Use +a. B+ and pass:[a. B] here. Next.\n",
+        1,
+        "Use +a. B+ and pass:[a. B] here.\nNext.\n"
+    )]
+    #[case::attribute_reference_at_sentence_end(
+        "{product-name}. Next.\n",
+        1,
+        "{product-name}.\nNext.\n"
+    )]
+    #[case::footnote(
+        "Claim.footnote:[Source. Page 3.] Next.\n",
+        1,
+        "Claim.footnote:[Source. Page 3.]\nNext.\n"
+    )]
+    #[case::inline_anchor("[[id]]First. Second.\n", 1, "[[id]]First.\nSecond.\n")]
+    #[case::image_macro("image:icon.png[] Done. Next.\n", 1, "image:icon.png[] Done.\nNext.\n")]
+    #[case::bold_spanning_sentences(
+        "*Bold one. Bold two.* After.\n",
+        1,
+        "*Bold one. Bold two.*\nAfter.\n"
+    )]
+    #[case::italic_and_highlight(
+        "_Ital. Two._ More. #Mark. Two.# End.\n",
+        1,
+        "_Ital. Two._\nMore.\n#Mark. Two.#\nEnd.\n"
+    )]
+    #[case::unconstrained_bold("**Un. Two.**ab more. End.\n", 1, "**Un. Two.**ab more.\nEnd.\n")]
+    #[case::span_on_wrapped_line(
+        "First is\nwrapped `a. B` here. Next.\n",
+        1,
+        "First is wrapped `a. B` here.\nNext.\n"
+    )]
     fn ventilates_paragraph_under_cursor(
         #[case] source: &str,
         #[case] line: usize,
@@ -508,14 +661,12 @@ mod tests {
     }
 
     #[rstest]
-    // Test-spec 8.7
     #[case::empty_document("", 1)]
     #[case::whitespace_only_document("  \n\t\n", 1)]
     #[case::cursor_on_blank_line("First. Second.\n\nThird.\n", 2)]
     #[case::cursor_on_section_title("== Title. With dot\n\nFirst. Second.\n", 1)]
     #[case::cursor_past_end("First. Second.\n", 5)]
     #[case::already_ventilated("One.\nTwo.\n", 1)]
-    // Test-spec 7.4
     #[case::list_item("* Item one. Two.\n", 1)]
     #[case::list_item_continuation("* Item one. Two.\ncontinued here. More.\n", 2)]
     #[case::ordered_list_item_continuation(". Item one. Two.\ncontinued here. More.\n", 2)]
@@ -523,7 +674,7 @@ mod tests {
     #[case::block_attached_to_list_item("* Item.\n+\nAttached one. Two.\n", 3)]
     #[case::admonition("NOTE: First. Second.\n", 1)]
     #[case::admonition_continuation("NOTE: First. Second.\ncontinued. Yes.\n", 2)]
-    // Test-spec 6.9: the block attribute applies to every line of the group
+    // The block attribute applies to every line of the group
     #[case::verse_style_on_first_line("[verse]\nLine one. Two.\nLine three.\n", 2)]
     #[case::verse_style_on_later_line("[verse]\nLine one. Two.\nLine three.\n", 3)]
     #[case::source_style("[source]\nlet a = 1. Two.\n", 2)]
@@ -533,26 +684,25 @@ mod tests {
     #[case::listing_style("[listing]\nOne. Two.\n", 2)]
     #[case::verse_with_author("[verse,Carl Sandburg,Fog]\nOne. Two.\n", 2)]
     #[case::verse_below_block_title(".Fog\n[verse]\nOne. Two.\n", 3)]
-    // Story 4: a block attribute or title line inside a paragraph is text
+    // A block attribute or title line inside a paragraph is text
     #[case::attribute_line_inside_paragraph_above("One. Two.\n[x]\nThree. Four.\n", 1)]
     #[case::attribute_line_inside_paragraph_below("One. Two.\n[x]\nThree. Four.\n", 3)]
     #[case::anchor_line_inside_paragraph("One. Two.\n[[id]]\nThree. Four.\n", 3)]
     #[case::title_line_inside_paragraph("One. Two.\n.Title\nThree. Four.\n", 1)]
-    // Stories 39, 40: admonition and quote styles
+    // Admonition and quote styles
     #[case::note_style("[NOTE]\nOne. Two.\n", 2)]
     #[case::caution_style("[CAUTION]\nOne. Two.\n", 2)]
     #[case::quote_style("[quote]\nOne. Two.\n", 2)]
     #[case::admonition_block("[NOTE]\n====\nOne. Two.\n====\n", 3)]
     #[case::verse_styled_sidebar("[verse]\n****\nOne. Two.\n****\n", 3)]
     #[case::quote_style_with_attribution("[quote,Author,Source]\nOne. Two.\n", 2)]
-    // Test-spec 6.1
     #[case::hardbreaks_option("[%hardbreaks]\nOne. Two.\nThree.\n", 3)]
     #[case::hardbreaks_option_after_style("[normal%hardbreaks]\nOne. Two.\n", 2)]
     #[case::hardbreaks_named_options("[options=hardbreaks]\nOne. Two.\n", 2)]
     #[case::hardbreaks_quoted_opts("[opts=\"autofit,hardbreaks\"]\nOne. Two.\n", 2)]
     #[case::hardbreaks_after_id("[#intro%hardbreaks]\nOne. Two.\n", 2)]
     #[case::cursor_on_block_anchor("[[sec-a]]\nFirst. Second.\n", 1)]
-    // Test-spec 6.3–6.8, 7.3: the grammar gives these no paragraph node
+    // The grammar gives these no paragraph node
     #[case::literal_paragraph(" Literal. Text.\n", 1)]
     #[case::listing_block("----\nList. Ing.\n----\n", 2)]
     #[case::literal_block("....\nLit. Eral.\n....\n", 2)]
@@ -564,11 +714,9 @@ mod tests {
     #[case::block_attribute_line("[source,rust]\nlet a = 1;\n", 1)]
     #[case::block_title_line(".Title. With dot\nFirst. Second.\n", 1)]
     #[case::quote_block("____\nQuote. Two.\n____\n", 2)]
-    // Story 42
     #[case::block_parse_error_right_below("One. Two.\n[unclosed\nThree. Four.\n", 1)]
     #[case::bold_spanning_two_lines("Some *bold\ntext* here. Two.\n", 1)]
     #[case::description_list_with_lowercase_term("term:: Def. Two.\nmore. Yes.\n", 2)]
-    // Test-spec 6.2
     #[case::hard_line_break("Hard. Break +\nnext. Line.\n", 1)]
     #[case::hard_line_break_on_later_line("First. Line.\nHard. Break +\nnext.\n", 1)]
     #[case::hard_line_break_with_trailing_whitespace("Hard. Break +  \nnext. Line.\n", 1)]
