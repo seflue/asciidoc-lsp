@@ -161,8 +161,9 @@ fn tailored_starts(text: &str, starts: Vec<usize>) -> Vec<usize> {
 /// given the text `after` it.
 fn ends_sentence(before: &str, after: &str) -> bool {
     let trimmed = before.trim_end();
+    // Without whitespace there, a line break would add some to the text.
     if trimmed.len() == before.len() {
-        return true;
+        return false;
     }
     let next = after.chars().next();
     let before_uppercase = next.is_some_and(char::is_uppercase);
@@ -986,6 +987,39 @@ mod tests {
     #[case::decimal_number_at_line_start("One. 3.5 kg here.\n", 1, "One.\n3.5 kg here.\n")]
     #[case::bold_at_line_start("One. *Bold* here.\n", 1, "One.\n*Bold* here.\n")]
     #[case::single_slash_at_line_start("One. /Data is here.\n", 1, "One.\n/Data is here.\n")]
+    // Without whitespace after the period a line break would change the text
+    #[case::period_inside_word("Use .NET here. Next.\n", 1, "Use .NET here.\nNext.\n")]
+    // Protected spans, tailoring and the line start guard together
+    #[case::abbreviations_in_and_before_link_macro(
+        "Ask Dr. link:https://x.org[e.g. Pandoc. Docs] now. Next.\n",
+        1,
+        "Ask Dr. link:https://x.org[e.g. Pandoc. Docs] now.\nNext.\n"
+    )]
+    #[case::url_at_sentence_end_before_line_comment(
+        "One. Visit https://example.com. // Two.\n",
+        1,
+        "One.\nVisit https://example.com. // Two.\n"
+    )]
+    #[case::initial_at_sentence_start_reads_as_list_marker(
+        "One. A. Smith wrote it. Next.\n",
+        1,
+        "One. A. Smith wrote it.\nNext.\n"
+    )]
+    #[case::initials_inside_sentence(
+        "One. Then A. Smith wrote it. Next.\n",
+        1,
+        "One.\nThen A. Smith wrote it.\nNext.\n"
+    )]
+    #[case::ordinal_date_at_sentence_start_reads_as_list_marker(
+        "Ende. 30. Oktober war es. Dann.\n",
+        1,
+        "Ende. 30. Oktober war es.\nDann.\n"
+    )]
+    #[case::ordinal_date_inside_sentence(
+        "Ende. Am 30. Oktober war es. Dann.\n",
+        1,
+        "Ende.\nAm 30. Oktober war es.\nDann.\n"
+    )]
     fn ventilates_paragraph_under_cursor(
         #[case] source: &str,
         #[case] line: usize,
