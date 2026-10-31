@@ -132,6 +132,12 @@ const BEFORE_NUMBER: &[&str] = &["No", "Nr", "Fig", "Abb"];
 /// uppercase letter.
 const MAY_END_SENTENCE: &[&str] = &["etc", "usw"];
 
+/// Opening quotes, brackets and inline markup characters that may stand
+/// before the first letter of a sentence (`"Next"`, `(Siehe …)`, `*Bold*`).
+const OPENING_PUNCTUATION_AND_MARKUP: &[char] = &[
+    '"', '\'', '„', '“', '‚', '‘', '«', '»', '‹', '›', '(', '[', '*', '_', '#', '`', '+', '~', '^',
+];
+
 /// German month names: a number with a period before one is an ordinal date
 /// (`am 30. Oktober`), not a sentence end.
 const GERMAN_MONTHS: &[&str] = &[
@@ -167,7 +173,9 @@ fn ends_sentence(before: &str, after: &str) -> bool {
         return false;
     }
     let next = after.chars().next();
-    let before_uppercase = next.is_some_and(char::is_uppercase);
+    let before_uppercase = after
+        .trim_start_matches(OPENING_PUNCTUATION_AND_MARKUP)
+        .starts_with(char::is_uppercase);
     if trimmed.ends_with("...") || trimmed.ends_with('…') {
         return before_uppercase;
     }
@@ -897,6 +905,36 @@ mod tests {
         "Äpfel, Birnen usw. Dann mehr.\n",
         1,
         "Äpfel, Birnen usw.\nDann mehr.\n"
+    )]
+    #[case::etc_before_quoted_uppercase(
+        "Apples, etc. \"Next\" is a word.\n",
+        1,
+        "Apples, etc.\n\"Next\" is a word.\n"
+    )]
+    #[case::etc_before_german_quoted_uppercase(
+        "Äpfel etc. „Weiter“ ist ein Wort.\n",
+        1,
+        "Äpfel etc.\n„Weiter“ ist ein Wort.\n"
+    )]
+    #[case::usw_before_parenthesised_uppercase(
+        "Äpfel usw. (Siehe unten.) Dann.\n",
+        1,
+        "Äpfel usw.\n(Siehe unten.)\nDann.\n"
+    )]
+    #[case::ellipsis_before_bold_uppercase(
+        "Wait... *Bold* text. Next.\n",
+        1,
+        "Wait...\n*Bold* text.\nNext.\n"
+    )]
+    #[case::ellipsis_character_before_quoted_uppercase(
+        "Wait… \"What\" now? Next.\n",
+        1,
+        "Wait…\n\"What\" now?\nNext.\n"
+    )]
+    #[case::etc_and_ellipsis_before_quoted_lowercase(
+        "Apples, etc. \"and\" pears. Wait... *bold* text. Äpfel etc. „und“ Birnen. End.\n",
+        1,
+        "Apples, etc. \"and\" pears.\nWait... *bold* text.\nÄpfel etc. „und“ Birnen.\nEnd.\n"
     )]
     #[case::ellipsis_before_lowercase(
         "Wait... what happened? Nothing.\n",
