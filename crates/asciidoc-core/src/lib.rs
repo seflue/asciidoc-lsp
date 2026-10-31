@@ -7,4 +7,5 @@ pub mod parser;
 pub mod paths;
 pub mod references;
 pub mod types;
+pub mod ventilate;
 pub mod workspace;

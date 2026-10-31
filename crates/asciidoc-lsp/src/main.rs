@@ -12,8 +12,9 @@ use parking_lot::Mutex;
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
+    CompletionResponse, Diagnostic, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
     DocumentSymbolResponse, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
@@ -271,6 +272,12 @@ impl LanguageServer for AsciiDocLsp {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+                        ..Default::default()
+                    },
+                )),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "<".into(), // << xref
@@ -767,6 +774,45 @@ impl LanguageServer for AsciiDocLsp {
             changes: Some(changes),
             ..Default::default()
         }))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        let Some(content) = self.get_document_content(uri) else {
+            return Ok(None);
+        };
+
+        let (line, _) = positions::from_lsp_position(params.range.start, &content);
+        let edit = match asciidoc_core::ventilate::ventilate_paragraph(&content, line) {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                tracing::warn!(?err, "ventilate_paragraph failed");
+                return Ok(None);
+            }
+        };
+
+        let range = Range {
+            start: positions::offset_to_lsp_position(edit.range.start, &content),
+            end: positions::offset_to_lsp_position(edit.range.end, &content),
+        };
+        let changes = HashMap::from([(
+            uri.clone(),
+            vec![TextEdit {
+                range,
+                new_text: edit.new_text,
+            }],
+        )]);
+
+        Ok(Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: "One sentence per line".to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })]))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {

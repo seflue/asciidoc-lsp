@@ -36,6 +36,24 @@ pub fn from_lsp_position(pos: Position, content: &str) -> (usize, usize) {
     (line_1indexed, byte_col)
 }
 
+/// Convert an absolute byte offset in the document to an LSP Position.
+///
+/// Lines are split at `\n`; a preceding `\r` stays part of the line, so an
+/// offset before it maps to the end of the line's content. An offset past
+/// the end or inside a character is moved back to the nearest valid one.
+// LSP uses u32 for line numbers; real-world files won't exceed u32::MAX lines.
+#[allow(clippy::cast_possible_truncation)]
+pub fn offset_to_lsp_position(offset: usize, content: &str) -> Position {
+    let offset = content.floor_char_boundary(offset);
+    let before = &content[..offset];
+    let line = before.matches('\n').count();
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    Position {
+        line: line as u32,
+        character: byte_offset_to_utf16(&content[line_start..offset], offset - line_start),
+    }
+}
+
 /// Convert a byte offset within a line to a UTF-16 code unit offset.
 /// Only performs character-by-character counting when non-ASCII is present.
 // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX code units.
@@ -196,6 +214,47 @@ mod tests {
 
         assert_eq!(rt_line, original_line);
         assert_eq!(rt_col, original_col);
+    }
+
+    #[test]
+    fn test_offset_to_lsp_position_multiline() {
+        let content = "One.\nTwo three.\n";
+        // byte 9 = "three" on line 1
+        let pos = offset_to_lsp_position(9, content);
+        assert_eq!(pos, Position::new(1, 4));
+    }
+
+    #[test]
+    fn test_offset_to_lsp_position_umlaut_and_emoji() {
+        // "Größe" has two 2-byte chars; the emoji is 4 bytes / 2 UTF-16 units
+        let content = "x\nGröße \u{1F389} ok\n";
+        // byte of "ok": 2 + "Größe ".len() (8) + emoji (4) + space (1) = 15
+        let pos = offset_to_lsp_position(15, content);
+        assert_eq!(pos, Position::new(1, 9));
+    }
+
+    #[test]
+    fn test_offset_to_lsp_position_crlf() {
+        let content = "One.\r\nTwo.\r\n";
+        // byte 6 = start of "Two." after CRLF
+        assert_eq!(offset_to_lsp_position(6, content), Position::new(1, 0));
+        // byte 10 = end of "Two.", before CR
+        assert_eq!(offset_to_lsp_position(10, content), Position::new(1, 4));
+    }
+
+    #[test]
+    fn test_offset_to_lsp_position_end_without_newline() {
+        let content = "One.\nTwo.";
+        assert_eq!(offset_to_lsp_position(9, content), Position::new(1, 4));
+    }
+
+    #[test]
+    fn test_offset_to_lsp_position_invalid_offset_safe() {
+        let content = "Ab\nGröße\n";
+        // past the end clamps to the end
+        assert_eq!(offset_to_lsp_position(99, content), Position::new(2, 0));
+        // inside the 2-byte "ö" (bytes 5..7) floors to its start
+        assert_eq!(offset_to_lsp_position(6, content), Position::new(1, 2));
     }
 
     #[test]
