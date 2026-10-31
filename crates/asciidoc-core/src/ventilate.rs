@@ -806,6 +806,11 @@ mod tests {
     )]
     #[case::inline_anchor("[[id]]First. Second.\n", 1, "[[id]]First.\nSecond.\n")]
     #[case::image_macro("image:icon.png[] Done. Next.\n", 1, "image:icon.png[] Done.\nNext.\n")]
+    #[case::image_macro_alt_text(
+        "See image:icon.png[Alt. Text] here. Next.\n",
+        1,
+        "See image:icon.png[Alt. Text] here.\nNext.\n"
+    )]
     #[case::bold_spanning_sentences(
         "*Bold one. Bold two.* After.\n",
         1,
