@@ -131,6 +131,59 @@ const NEVER_SENTENCE_END: &[&str] = &[
     "S", "Abschn", "ca", "vgl", "u.a", "z.T", "o.ä", "s.o", "u.U", "v.a",
 ];
 
+/// Multi-part abbreviations written with a space between their parts
+/// (`u. a.`), as their parts without periods. A part never ends a sentence
+/// only inside the whole sequence: `u.` or `a.` alone still may.
+const SPACED_NEVER_SENTENCE_END: &[&[&str]] = &[
+    &["e", "g"],
+    &["i", "e"],
+    &["z", "B"],
+    &["d", "h"],
+    &["u", "a"],
+    &["z", "T"],
+    &["o", "ä"],
+    &["s", "o"],
+    &["u", "U"],
+    &["v", "a"],
+];
+
+/// Whether the period-and-whitespace at the end of `before` lies inside or at
+/// the end of a spaced multi-part abbreviation, given the text `after` it.
+fn in_spaced_abbreviation(before: &str, after: &str) -> bool {
+    let before_tokens: Vec<&str> = before.split_whitespace().collect();
+    let after_tokens: Vec<&str> = after.split_whitespace().collect();
+    SPACED_NEVER_SENTENCE_END.iter().any(|parts| {
+        (1..=parts.len()).any(|k| {
+            let (head, tail) = parts.split_at(k);
+            let Some(start) = before_tokens.len().checked_sub(k) else {
+                return false;
+            };
+            let head_matches =
+                before_tokens[start..]
+                    .iter()
+                    .enumerate()
+                    .zip(head)
+                    .all(|((i, token), part)| {
+                        // Only the sequence's first part may follow a bracket or quote.
+                        let token = if i == 0 {
+                            token.trim_start_matches(|c: char| !c.is_alphanumeric())
+                        } else {
+                            token
+                        };
+                        token.strip_suffix('.') == Some(part)
+                    });
+            let tail_matches = tail.len() <= after_tokens.len()
+                && after_tokens.iter().zip(tail).all(|(token, part)| {
+                    token
+                        .strip_prefix(part)
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .is_some_and(|rest| !rest.chars().any(char::is_alphanumeric))
+                });
+            head_matches && tail_matches
+        })
+    })
+}
+
 /// Abbreviations (without their period) that abbreviate only before a number.
 const BEFORE_NUMBER: &[&str] = &["No", "Nr", "Fig", "Abb"];
 
@@ -188,6 +241,9 @@ fn ends_sentence(before: &str, after: &str) -> bool {
     let Some(stem) = trimmed.strip_suffix('.') else {
         return true;
     };
+    if in_spaced_abbreviation(before, after) {
+        return false;
+    }
     let token = stem
         .rsplit(char::is_whitespace)
         .next()
@@ -928,6 +984,16 @@ mod tests {
         "Das ist z.B. Pandoc, d.h. Ein Tool. Es kann u.a. Dateien, z.T. Bilder, o.ä. Formate. Siehe s.o. Dort u.U. Mehr, v.a. Text. Weiter.\n",
         1,
         "Das ist z.B. Pandoc, d.h. Ein Tool.\nEs kann u.a. Dateien, z.T. Bilder, o.ä. Formate.\nSiehe s.o. Dort u.U. Mehr, v.a. Text.\nWeiter.\n"
+    )]
+    #[case::spaced_multi_part_abbreviations(
+        "Es kann u. a. Dateien, z. T. Bilder, o. ä. Formate. Siehe s. o. Dort u. U. Mehr, v. a. Text. Use e. g. Pandoc, i. e. Docs. Weiter.\n",
+        1,
+        "Es kann u. a. Dateien, z. T. Bilder, o. ä. Formate.\nSiehe s. o. Dort u. U. Mehr, v. a. Text.\nUse e. g. Pandoc, i. e. Docs.\nWeiter.\n"
+    )]
+    #[case::single_parts_of_spaced_abbreviations_end_sentences(
+        "Gruppe u. Dann weiter. Spalte a. Berlin liegt. Siehe s. Oben steht es. Ende.\n",
+        1,
+        "Gruppe u.\nDann weiter.\nSpalte a.\nBerlin liegt.\nSiehe s.\nOben steht es.\nEnde.\n"
     )]
     #[case::compact_abbreviation_in_parenthesis(
         "Ein Tool (z.B. Pandoc) hier. Weiter.\n",
