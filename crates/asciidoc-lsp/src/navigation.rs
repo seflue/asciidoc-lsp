@@ -27,8 +27,8 @@ pub(crate) enum NodeKind {
     AttributeDef { name: String },
     /// `[[id]]` anchor / ID assignment
     Anchor { id: String },
-    /// `image::path[]` block macro
-    Image { path: String },
+    /// `image::path[]` block macro or `image:path[]` inline macro
+    Image { path: String, inline: bool },
 }
 
 /// Information about a recognized node at a cursor position.
@@ -68,7 +68,7 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
         return Some(info);
     }
 
-    // Try inline grammar (xrefs, shorthand xrefs).
+    // Try inline grammar (xrefs, shorthand xrefs, inline images).
     // Only parse the range(s) containing the cursor position to avoid cross-range
     // misparses (e.g. a `+` in one paragraph matching a `+` in another, creating
     // a giant false passthrough node that swallows xref nodes — adoc-0023).
@@ -123,8 +123,12 @@ pub fn resolve_goto_definition(
             let source = ws.attributes().resolve_source(doc_path, name)?;
             Some((source.file, source.line))
         }
-        NodeKind::Image { ref path } => {
-            let (target, _, _) = resolve_image_target(path, doc_path, workspace);
+        NodeKind::Image { ref path, .. } => {
+            let ImageTarget::Local { path: target, .. } =
+                resolve_image_target(path, doc_path, workspace)
+            else {
+                return None;
+            };
             let target_canon = target.canonicalize().ok()?;
             Some((target_canon, 1))
         }
@@ -315,15 +319,23 @@ pub fn resolve_hover(
             }
             Some(text)
         }
-        NodeKind::Image { path } => {
-            let (target, _, display) = resolve_image_target(path, doc_path, workspace);
-            let mut text = format!("image::{display}[]");
-            if target.exists() {
-                text.push_str("\n\n\u{2713} File exists");
-            } else {
-                text.push_str("\n\n\u{2717} File not found");
+        NodeKind::Image { path, inline } => {
+            let macro_form = if *inline { "image:" } else { "image::" };
+            match resolve_image_target(path, doc_path, workspace) {
+                ImageTarget::Remote { url } => Some(format!("{macro_form}{url}[]")),
+                ImageTarget::Local {
+                    path: target,
+                    display,
+                } => {
+                    let mut text = format!("{macro_form}{display}[]");
+                    if target.exists() {
+                        text.push_str("\n\n\u{2713} File exists");
+                    } else {
+                        text.push_str("\n\n\u{2717} File not found");
+                    }
+                    Some(text)
+                }
             }
-            Some(text)
         }
         NodeKind::Anchor { .. } => None,
     }
@@ -354,30 +366,43 @@ pub(crate) fn resolve_image_base_dir(
     (base, imagesdir)
 }
 
-/// Resolve an image macro's path to a filesystem target.
-///
-/// Returns `(target_path, resolved_relative_path, display_path)`.
-/// - `target_path`: absolute path to the image file
-/// - `resolved_relative_path`: path after attribute substitution
-/// - `display_path`: human-readable path including imagesdir
+/// Where an image macro points after attribute substitution and `imagesdir`.
+enum ImageTarget {
+    /// A file: `path` is absolute, `display` is the human-readable path
+    /// including imagesdir.
+    Local { path: PathBuf, display: String },
+    /// An `http(s)` URL, from the macro target or from `imagesdir`.
+    Remote { url: String },
+}
+
+fn is_remote_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+/// Resolve an image macro's path to a file or a remote URL.
 fn resolve_image_target(
     image_path: &str,
     doc_path: &Path,
     workspace: Option<&Workspace>,
-) -> (PathBuf, String, String) {
+) -> ImageTarget {
     let resolved_path = if let Some(ws) = workspace {
         ws.attributes().substitute(doc_path, image_path)
     } else {
         image_path.to_string()
     };
     let (base, imagesdir) = resolve_image_base_dir(doc_path, workspace);
-    let target = base.join(&resolved_path);
-    let display = if imagesdir.is_empty() {
+    let display = if imagesdir.is_empty() || is_remote_url(&resolved_path) {
         resolved_path.clone()
     } else {
         format!("{imagesdir}/{resolved_path}")
     };
-    (target, resolved_path, display)
+    if is_remote_url(&display) {
+        return ImageTarget::Remote { url: display };
+    }
+    ImageTarget::Local {
+        path: base.join(&resolved_path),
+        display,
+    }
 }
 
 /// Resolve an include macro's path to a filesystem target, without checking
@@ -486,7 +511,7 @@ fn explain_request(raw_path: &Path, lookup_path: &Path, workspace: Option<&Works
 
 fn explain_node(info: &NodeInfo) -> Value {
     let fields = match &info.kind {
-        NodeKind::Include { path } | NodeKind::Image { path } => json!({ "path": path }),
+        NodeKind::Include { path } | NodeKind::Image { path, .. } => json!({ "path": path }),
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             json!({ "target": target })
         }
@@ -541,13 +566,30 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
                 "exists": target.as_deref().is_some_and(Path::exists),
             })
         }
-        NodeKind::Image { path } => {
-            let (target, _, display) = resolve_image_target(path, doc_path, workspace);
-            json!({
-                "target": path_string(&target),
-                "display": display,
-                "exists": target.exists(),
-            })
+        NodeKind::Image { path, .. } => {
+            match resolve_image_target(path, doc_path, workspace) {
+                ImageTarget::Remote { url } => json!({
+                    "remote": true,
+                    "target": null,
+                    "canonical_target": null,
+                    "display": url,
+                    "exists": null,
+                }),
+                ImageTarget::Local {
+                    path: target,
+                    display,
+                } => {
+                    // Same existence gate as go-to-definition: the path gd returns.
+                    let canonical_target = target.canonicalize().ok();
+                    json!({
+                        "remote": false,
+                        "target": path_string(&target),
+                        "canonical_target": canonical_target.as_deref().map(path_string),
+                        "display": display,
+                        "exists": target.exists(),
+                    })
+                }
+            }
         }
     }
 }
@@ -652,7 +694,10 @@ fn classify_block_node(
                 if macro_name == "image" {
                     let path = find_child_text(n, "target", source).unwrap_or_default();
                     return Some(NodeInfo {
-                        kind: NodeKind::Image { path },
+                        kind: NodeKind::Image {
+                            path,
+                            inline: false,
+                        },
                         line: n.start_position().row + 1,
                     });
                 }
@@ -664,7 +709,8 @@ fn classify_block_node(
     None
 }
 
-/// Check if the node at the given point is inside an xref (`inline_macro` or `<<>>`).
+/// Check if the node at the given point is inside an xref (`inline_macro` or
+/// `<<>>`) or an inline image.
 fn classify_inline_node(
     root: tree_sitter::Node,
     point: tree_sitter::Point,
@@ -681,6 +727,13 @@ fn classify_inline_node(
                     let target = find_child_text(n, "target", source).unwrap_or_default();
                     return Some(NodeInfo {
                         kind: NodeKind::Xref { target },
+                        line: n.start_position().row + 1,
+                    });
+                }
+                if macro_name == "image" {
+                    let path = find_child_text(n, "target", source).unwrap_or_default();
+                    return Some(NodeInfo {
+                        kind: NodeKind::Image { path, inline: true },
                         line: n.start_position().row + 1,
                     });
                 }
@@ -2127,7 +2180,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             info.kind,
             NodeKind::Image {
-                path: "images/diagram.png".into()
+                path: "images/diagram.png".into(),
+                inline: false
             }
         );
         assert_eq!(info.line, 3); // 1-indexed
@@ -2145,7 +2199,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             info.kind,
             NodeKind::Image {
-                path: "logo.png".into()
+                path: "logo.png".into(),
+                inline: false
             }
         );
     }
@@ -2547,6 +2602,109 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             hover.contains("\u{2713} File exists"),
             "Should confirm existence, got: {hover}"
         );
+    }
+
+    #[rstest]
+    #[case::mid_line("= Doc A\n:imagesdir: img\n\nText image:logo.png[Alt] here.\n", 8)]
+    #[case::line_start("= Doc A\n:imagesdir: img\n\nimage:logo.png[Alt] here.\n", 8)]
+    #[case::on_macro_name("= Doc A\n:imagesdir: img\n\nText image:logo.png[Alt] here.\n", 6)]
+    #[case::alone_on_line("= Doc A\n:imagesdir: img\n\nimage:logo.png[Alt]\n", 8)]
+    #[case::list_item("= Doc A\n:imagesdir: img\n\n* image:logo.png[Alt]\n", 8)]
+    #[case::section_title("= Doc A\n:imagesdir: img\n\n== A image:logo.png[Alt]\n", 12)]
+    #[case::second_paragraph_line("= Doc A\n:imagesdir: img\n\nFirst.\nimage:logo.png[Alt]\n", 8)]
+    fn test_inline_image_hover_and_goto_use_imagesdir(#[case] doc: &str, #[case] character: u32) {
+        let (_tmp, root) = canonical_tmp();
+        let img = root.join("img");
+        fs::create_dir(&img).unwrap();
+        fs::write(img.join("logo.png"), "fake-png-data").unwrap();
+        let a = root.join("a.adoc");
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let macro_line = doc.lines().position(|l| l.contains("image:")).unwrap();
+        let pos = Position {
+            line: u32::try_from(macro_line).unwrap(),
+            character,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(hover, "image:img/logo.png[]\n\n\u{2713} File exists");
+        let (target, line) = resolve_goto_definition(doc, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(target, img.join("logo.png"));
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_inline_image_missing_file() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n\nText image:missing.png[] here.\n";
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(hover, "image:missing.png[]\n\n\u{2717} File not found");
+        assert!(resolve_goto_definition(doc, pos, &a, Some(&ws)).is_none());
+    }
+
+    #[rstest]
+    #[case::block(
+        "= Doc\n:imagesdir: ../assets\n\nimage::https://example.com/r.svg[]\n",
+        "image::",
+        "https://example.com/r.svg"
+    )]
+    #[case::inline(
+        "= Doc\n:imagesdir: ../assets\n\nimage:https://example.com/r.svg[] x\n",
+        "image:",
+        "https://example.com/r.svg"
+    )]
+    #[case::http(
+        "= Doc\n\nx\n\nimage::http://example.com/r.svg[]\n",
+        "image::",
+        "http://example.com/r.svg"
+    )]
+    #[case::url_from_attribute(
+        "= Doc\n:base: https://example.com\n\nimage::{base}/r.svg[]\n",
+        "image::",
+        "https://example.com/r.svg"
+    )]
+    #[case::url_imagesdir(
+        "= Doc\n:imagesdir: https://example.com/img\n\nimage::r.svg[]\n",
+        "image::",
+        "https://example.com/img/r.svg"
+    )]
+    fn test_remote_image_is_not_a_local_file(
+        #[case] doc: &str,
+        #[case] macro_form: &str,
+        #[case] url: &str,
+    ) {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let macro_line = doc.lines().position(|l| l.starts_with("image")).unwrap();
+        let pos = Position {
+            line: u32::try_from(macro_line).unwrap(),
+            character: 2,
+        };
+
+        assert_eq!(
+            resolve_hover(doc, pos, &a, Some(&ws)).unwrap(),
+            format!("{macro_form}{url}[]")
+        );
+        assert!(resolve_goto_definition(doc, pos, &a, Some(&ws)).is_none());
+
+        let report = explain_position(doc, pos, &a, &a, Some(&ws));
+        let res = &report["resolution"];
+        assert_eq!(report["node"]["kind"], "image");
+        assert_eq!(res["remote"], true);
+        assert_eq!(res["display"], url);
+        assert!(res["target"].is_null());
+        assert!(res["canonical_target"].is_null());
+        assert!(res["exists"].is_null());
     }
 
     #[test]
@@ -3519,6 +3677,39 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
         assert_eq!(report["resolution"]["display"], "img/logo.png");
         assert_eq!(report["resolution"]["exists"], false);
+        assert_eq!(report["resolution"]["remote"], false);
+        assert!(report["resolution"]["canonical_target"].is_null());
+        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_explain_image_through_symlink_reports_gd_canonical_target() {
+        let (_tmp, root) = canonical_tmp();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let logo = real.join("logo.png");
+        fs::write(&logo, "fake-png-data").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n:imagesdir: link\n\nimage::logo.png[]\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 9,
+        };
+
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
+
+        let res = &report["resolution"];
+        assert_eq!(
+            res["target"],
+            path_string(&root.join("link").join("logo.png"))
+        );
+        assert_eq!(res["canonical_target"], path_string(&logo));
+        let (gd_target, _) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(res["canonical_target"], path_string(&gd_target));
     }
 
     #[test]
@@ -3600,7 +3791,13 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             "attribute_def"
         );
         assert_eq!(node_kind_name(&NodeKind::Anchor { id: s() }), "anchor");
-        assert_eq!(node_kind_name(&NodeKind::Image { path: s() }), "image");
+        assert_eq!(
+            node_kind_name(&NodeKind::Image {
+                path: s(),
+                inline: false
+            }),
+            "image"
+        );
     }
 
     #[test]
