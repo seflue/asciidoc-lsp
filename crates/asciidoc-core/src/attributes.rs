@@ -15,6 +15,70 @@ struct AttributeEntry {
     source: Option<AttributeSource>,
 }
 
+/// One of the three lookup layers of [`AttributeRegistry`], in descending priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeLayer {
+    /// Document-header attributes registered for exactly this file path.
+    PerFile,
+    /// Merged `.asciidoctorconfig` chain cached for the file's parent directory.
+    Config,
+    /// Built-in attributes (`docdir`, `env-asciidoc-lsp`).
+    Builtin,
+}
+
+/// A value found in one layer, with its definition site when the layer has one.
+#[derive(Debug, Clone)]
+pub struct AttributeHit {
+    pub value: String,
+    pub source: Option<AttributeSource>,
+}
+
+/// Per-file layer outcome of [`AttributeRegistry::explain`].
+#[derive(Debug, Clone)]
+pub struct PerFileLookup {
+    /// Whether any attributes are registered under exactly the queried path.
+    pub registered: bool,
+    pub hit: Option<AttributeHit>,
+}
+
+/// Config layer outcome of [`AttributeRegistry::explain`].
+#[derive(Debug, Clone)]
+pub struct ConfigLookup {
+    /// The key looked up in the config cache: the queried file's parent, unchanged.
+    pub dir: Option<PathBuf>,
+    /// Whether a config chain is cached under `dir`.
+    pub chain_cached: bool,
+    pub hit: Option<AttributeHit>,
+}
+
+/// Layer-by-layer account of how one attribute name resolves for one file path.
+///
+/// Uses the same lookup keys and priority as [`AttributeRegistry::resolve`].
+#[derive(Debug, Clone)]
+pub struct AttributeExplanation {
+    pub per_file: PerFileLookup,
+    pub config: ConfigLookup,
+    pub builtin: Option<String>,
+    /// The layer `resolve()` takes the value from; `None` when no layer has it.
+    pub winner: Option<AttributeLayer>,
+}
+
+/// An attribute visible for a file, with the layer that supplies it.
+#[derive(Debug, Clone)]
+pub struct KnownAttribute {
+    pub name: String,
+    pub value: String,
+    pub layer: AttributeLayer,
+    pub source: Option<AttributeSource>,
+}
+
+/// A merged attribute value borrowed from the registry, with its layer.
+struct LayeredValue<'a> {
+    value: &'a str,
+    layer: AttributeLayer,
+    source: Option<&'a AttributeSource>,
+}
+
 pub struct AttributeRegistry {
     builtin: HashMap<String, String>,
     config_chains: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
@@ -120,27 +184,49 @@ impl AttributeRegistry {
     /// Later layers override earlier ones for the same key.
     #[must_use]
     pub fn all_attributes(&self, file: &Path) -> Vec<(&str, &str)> {
-        let mut merged: HashMap<&str, &str> = self
+        self.merged_layers(file)
+            .into_iter()
+            .map(|(name, layered)| (name, layered.value))
+            .collect()
+    }
+
+    /// Merge builtin, config and per-file layers for `file`, later layers
+    /// overriding earlier ones for the same name. Shared by
+    /// `all_attributes()`, `known_attributes()` and `explain()`.
+    fn merged_layers(&self, file: &Path) -> HashMap<&str, LayeredValue<'_>> {
+        let mut merged: HashMap<&str, LayeredValue<'_>> = self
             .builtin
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(k, v)| {
+                (
+                    k.as_str(),
+                    LayeredValue {
+                        value: v.as_str(),
+                        layer: AttributeLayer::Builtin,
+                        source: None,
+                    },
+                )
+            })
             .collect();
 
-        if let Some(dir) = file.parent() {
-            if let Some(config) = self.config_chains.get(dir) {
-                for (k, entry) in config {
-                    merged.insert(k.as_str(), entry.value.as_str());
-                }
+        let config = file.parent().and_then(|d| self.config_chains.get(d));
+        let layers = [
+            (config, AttributeLayer::Config),
+            (self.per_file.get(file), AttributeLayer::PerFile),
+        ];
+        for (entries, layer) in layers {
+            for (k, entry) in entries.into_iter().flatten() {
+                merged.insert(
+                    k.as_str(),
+                    LayeredValue {
+                        value: entry.value.as_str(),
+                        layer,
+                        source: entry.source.as_ref(),
+                    },
+                );
             }
         }
-
-        if let Some(file_attrs) = self.per_file.get(file) {
-            for (k, entry) in file_attrs {
-                merged.insert(k.as_str(), entry.value.as_str());
-            }
-        }
-
-        merged.into_iter().collect()
+        merged
     }
 
     /// Resolve an attribute by name with priority: Document-Header > Config > Built-in
@@ -165,24 +251,111 @@ impl AttributeRegistry {
     /// Builtins have no source location and return None.
     #[must_use]
     pub fn resolve_source(&self, file: &Path, name: &str) -> Option<AttributeSource> {
-        self.per_file
-            .get(file)
-            .and_then(|m| m.get(name))
-            .and_then(|e| e.source.clone())
-            .or_else(|| {
-                let dir = file.parent()?;
-                self.config_chains
-                    .get(dir)?
-                    .get(name)
-                    .and_then(|e| e.source.clone())
+        let per_file = self.per_file.get(file);
+        let per_file_hit = per_file.and_then(|m| m.get(name));
+        tracing::trace!(
+            ?file,
+            name,
+            registered = per_file.is_some(),
+            hit = per_file_hit.is_some(),
+            "resolve_source: per_file layer"
+        );
+        if let Some(source) = per_file_hit.and_then(|e| e.source.clone()) {
+            return Some(source);
+        }
+
+        let Some(dir) = file.parent() else {
+            tracing::trace!(
+                ?file,
+                name,
+                "resolve_source: no parent dir, config layer skipped"
+            );
+            return None;
+        };
+        let chain = self.config_chains.get(dir);
+        let config_hit = chain.and_then(|c| c.get(name));
+        tracing::trace!(
+            ?dir,
+            name,
+            cached = chain.is_some(),
+            hit = config_hit.is_some(),
+            "resolve_source: config layer"
+        );
+        let source = config_hit.and_then(|e| e.source.clone());
+
+        if source.is_none() {
+            // builtins: no source → None
+            tracing::trace!(
+                name,
+                hit = self.builtin.contains_key(name),
+                "resolve_source: builtin layer (no source location)"
+            );
+        }
+        source
+    }
+
+    /// Explain how `name` resolves for `file`, layer by layer, without
+    /// normalising the path (same keys as `resolve()`).
+    #[must_use]
+    pub fn explain(&self, file: &Path, name: &str) -> AttributeExplanation {
+        let file_attrs = self.per_file.get(file);
+        let per_file = PerFileLookup {
+            registered: file_attrs.is_some(),
+            hit: file_attrs.and_then(|m| m.get(name)).map(AttributeHit::from),
+        };
+
+        let dir = file.parent();
+        let chain = dir.and_then(|d| self.config_chains.get(d));
+        let config = ConfigLookup {
+            dir: dir.map(Path::to_path_buf),
+            chain_cached: chain.is_some(),
+            hit: chain.and_then(|m| m.get(name)).map(AttributeHit::from),
+        };
+
+        let builtin = self.builtin.get(name).cloned();
+
+        let winner = self.merged_layers(file).get(name).map(|l| l.layer);
+
+        AttributeExplanation {
+            per_file,
+            config,
+            builtin,
+            winner,
+        }
+    }
+
+    /// All attributes visible for `file`, each with the layer that wins for it
+    /// and its definition site, sorted by name. Same keys and priority as
+    /// `all_attributes()`.
+    #[must_use]
+    pub fn known_attributes(&self, file: &Path) -> Vec<KnownAttribute> {
+        let mut known: Vec<KnownAttribute> = self
+            .merged_layers(file)
+            .into_iter()
+            .map(|(name, layered)| KnownAttribute {
+                name: name.to_string(),
+                value: layered.value.to_string(),
+                layer: layered.layer,
+                source: layered.source.cloned(),
             })
-        // builtins: no source → implicitly None
+            .collect();
+        known.sort_by(|a, b| a.name.cmp(&b.name));
+        known
     }
 
     /// Substitute all `{attr}` references in a string using `resolve()`.
     #[must_use]
     pub fn substitute(&self, file: &Path, input: &str) -> String {
         substitute_inner(input, |name| self.resolve(file, name))
+    }
+}
+
+impl From<&AttributeEntry> for AttributeHit {
+    fn from(entry: &AttributeEntry) -> Self {
+        Self {
+            value: entry.value.clone(),
+            source: entry.source.clone(),
+        }
     }
 }
 
@@ -985,6 +1158,283 @@ mod tests {
             .expect("asciidoctorconfigdir should have a source");
         assert_eq!(source.file, root.join(".asciidoctorconfig"));
         assert_eq!(source.line, 0, "synthetic attribute should use line 0");
+    }
+
+    // --- explain() tests (adoc-0137) ---
+
+    #[test]
+    fn test_explain_same_file_hit_wins_over_config_and_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":docdir: /config\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let file = root.join("doc.adoc");
+        registry.register_file_attributes(
+            &file,
+            &[AttributeDef {
+                name: "docdir".into(),
+                value: "/header".into(),
+                line: 3,
+            }],
+        );
+
+        let ex = registry.explain(&file, "docdir");
+
+        assert!(ex.per_file.registered);
+        let hit = ex.per_file.hit.as_ref().expect("per-file hit");
+        assert_eq!(hit.value, "/header");
+        let src = hit.source.as_ref().expect("per-file source");
+        assert_eq!(src.file, file);
+        assert_eq!(src.line, 3);
+
+        assert_eq!(ex.config.dir.as_deref(), Some(root.as_path()));
+        assert!(ex.config.chain_cached);
+        assert_eq!(
+            ex.config.hit.as_ref().map(|h| h.value.as_str()),
+            Some("/config")
+        );
+        assert_eq!(
+            ex.builtin.as_deref(),
+            Some(root.display().to_string().as_str())
+        );
+        assert_eq!(ex.winner, Some(AttributeLayer::PerFile));
+    }
+
+    #[test]
+    fn test_explain_config_chain_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let file = root.join("doc.adoc");
+        registry.register_file_attributes(&file, &[]);
+
+        let ex = registry.explain(&file, "imagesdir");
+
+        assert!(ex.per_file.registered);
+        assert!(ex.per_file.hit.is_none());
+        assert!(ex.config.chain_cached);
+        let hit = ex.config.hit.as_ref().expect("config hit");
+        assert_eq!(hit.value, "images");
+        let src = hit.source.as_ref().expect("config source");
+        assert_eq!(src.file, root.join(".asciidoctorconfig"));
+        assert_eq!(src.line, 1);
+        assert!(ex.builtin.is_none());
+        assert_eq!(ex.winner, Some(AttributeLayer::Config));
+    }
+
+    #[test]
+    fn test_explain_builtin_hit() {
+        let registry = AttributeRegistry::new(Path::new("/project"));
+        let file = Path::new("/project/doc.adoc");
+
+        let ex = registry.explain(file, "docdir");
+
+        assert!(!ex.per_file.registered);
+        assert!(ex.per_file.hit.is_none());
+        assert_eq!(ex.config.dir.as_deref(), Some(Path::new("/project")));
+        assert!(!ex.config.chain_cached);
+        assert!(ex.config.hit.is_none());
+        assert_eq!(ex.builtin.as_deref(), Some("/project"));
+        assert_eq!(ex.winner, Some(AttributeLayer::Builtin));
+    }
+
+    #[test]
+    fn test_explain_miss() {
+        let registry = AttributeRegistry::new(Path::new("/project"));
+        let file = Path::new("/project/doc.adoc");
+
+        let ex = registry.explain(file, "nonexistent");
+
+        assert!(ex.per_file.hit.is_none());
+        assert!(ex.config.hit.is_none());
+        assert!(ex.builtin.is_none());
+        assert_eq!(ex.winner, None);
+    }
+
+    #[test]
+    fn test_explain_winner_matches_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: images\n").unwrap();
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let file = root.join("doc.adoc");
+
+        for name in ["imagesdir", "docdir", "missing"] {
+            let ex = registry.explain(&file, name);
+            let winning_value = match ex.winner {
+                Some(AttributeLayer::PerFile) => ex.per_file.hit.map(|h| h.value),
+                Some(AttributeLayer::Config) => ex.config.hit.map(|h| h.value),
+                Some(AttributeLayer::Builtin) => ex.builtin,
+                None => None,
+            };
+            assert_eq!(
+                winning_value.as_deref(),
+                registry.resolve(&file, name),
+                "{name}"
+            );
+        }
+    }
+
+    /// Documents current behaviour (adoc-0137): the per-file layer is keyed by
+    /// the exact path passed to `register_file_attributes`. A lookup through a
+    /// symlinked path to the same directory does not find the registration.
+    #[cfg(unix)]
+    #[test]
+    fn test_explain_symlinked_path_not_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut registry = AttributeRegistry::new(&real);
+        let canonical_file = real.join("doc.adoc");
+        registry.register_file_attributes(
+            &canonical_file,
+            &[AttributeDef {
+                name: "author".into(),
+                value: "Alice".into(),
+                line: 2,
+            }],
+        );
+
+        let via_link = link.join("doc.adoc");
+        let ex = registry.explain(&via_link, "author");
+
+        assert!(
+            !ex.per_file.registered,
+            "raw symlinked path is not the registered key"
+        );
+        assert!(ex.per_file.hit.is_none());
+        assert_eq!(ex.config.dir.as_deref(), Some(link.as_path()));
+        assert!(!ex.config.chain_cached);
+        assert_eq!(ex.winner, None);
+
+        let ex_canonical = registry.explain(&canonical_file, "author");
+        assert!(ex_canonical.per_file.registered);
+        assert_eq!(ex_canonical.winner, Some(AttributeLayer::PerFile));
+    }
+
+    /// `known_attributes()` merges through `merged_layers()`, `resolve()` and
+    /// `resolve_source()` walk the layers themselves: pin that they agree.
+    #[test]
+    fn test_known_attributes_agree_with_resolve_and_explain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":imagesdir: images\n:toc: left\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let file = root.join("doc.adoc");
+        registry.register_file_attributes(
+            &file,
+            &[
+                AttributeDef {
+                    name: "imagesdir".into(),
+                    value: "img".into(),
+                    line: 4,
+                },
+                AttributeDef {
+                    name: "author".into(),
+                    value: "Alice".into(),
+                    line: 5,
+                },
+            ],
+        );
+
+        let known = registry.known_attributes(&file);
+        let layer_of = |n: &str| known.iter().find(|a| a.name == n).expect(n).layer;
+        assert_eq!(layer_of("imagesdir"), AttributeLayer::PerFile, "overridden");
+        assert_eq!(layer_of("author"), AttributeLayer::PerFile);
+        assert_eq!(layer_of("toc"), AttributeLayer::Config);
+        assert_eq!(layer_of("docdir"), AttributeLayer::Builtin);
+
+        for attr in &known {
+            let name = attr.name.as_str();
+            assert_eq!(
+                Some(attr.value.as_str()),
+                registry.resolve(&file, name),
+                "{name}"
+            );
+            assert_eq!(
+                attr.source.as_ref().map(|s| (s.file.clone(), s.line)),
+                registry
+                    .resolve_source(&file, name)
+                    .map(|s| (s.file, s.line)),
+                "{name}"
+            );
+            assert_eq!(
+                Some(attr.layer),
+                registry.explain(&file, name).winner,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_known_attributes_reports_winning_layer_and_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":imagesdir: images\n:toc: left\n",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let file = root.join("doc.adoc");
+        registry.register_file_attributes(
+            &file,
+            &[AttributeDef {
+                name: "imagesdir".into(),
+                value: "img".into(),
+                line: 4,
+            }],
+        );
+
+        let known = registry.known_attributes(&file);
+        let find = |n: &str| known.iter().find(|a| a.name == n).expect(n);
+
+        let imagesdir = find("imagesdir");
+        assert_eq!(imagesdir.value, "img");
+        assert_eq!(imagesdir.layer, AttributeLayer::PerFile);
+        let src = imagesdir.source.as_ref().unwrap();
+        assert_eq!((src.file.as_path(), src.line), (file.as_path(), 4));
+
+        let toc = find("toc");
+        assert_eq!(toc.value, "left");
+        assert_eq!(toc.layer, AttributeLayer::Config);
+        let src = toc.source.as_ref().unwrap();
+        assert_eq!(
+            (src.file.as_path(), src.line),
+            (root.join(".asciidoctorconfig").as_path(), 2)
+        );
+
+        let docdir = find("docdir");
+        assert_eq!(docdir.layer, AttributeLayer::Builtin);
+        assert!(docdir.source.is_none());
+
+        assert_eq!(
+            known.iter().filter(|a| a.name == "imagesdir").count(),
+            1,
+            "each name listed once, with its winning layer"
+        );
+        let names: Vec<&str> = known.iter().map(|a| a.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "sorted by name");
     }
 
     // --- adoc-0072: Config-Chain with LSP root_uri ---

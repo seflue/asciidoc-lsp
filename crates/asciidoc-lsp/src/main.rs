@@ -10,21 +10,21 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{self, Result};
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
     CompletionResponse, Diagnostic, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MarkedString, MessageType, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams,
-    Registration, RenameOptions, RenameParams, SaveOptions, ServerCapabilities,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DocumentSymbolResponse, ExecuteCommandOptions, ExecuteCommandParams, FileChangeType, FileEvent,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, Location, MarkedString, MessageType, OneOf, Position, PrepareRenameResponse,
+    Range, ReferenceParams, Registration, RenameOptions, RenameParams, SaveOptions,
+    ServerCapabilities, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -107,7 +107,14 @@ impl AsciiDocLsp {
                 let Ok(canonical) = path.canonicalize() else {
                     continue;
                 };
-                if ws.documents().contains_key(&canonical) {
+                let indexed = ws.documents().contains_key(&canonical);
+                tracing::debug!(
+                    raw_path = ?path,
+                    ?canonical,
+                    indexed,
+                    "did_change_watched_files: register file"
+                );
+                if indexed {
                     ws.update_file(&canonical, &overrides);
                 } else {
                     ws.ensure_file(&canonical, &overrides);
@@ -278,6 +285,10 @@ impl LanguageServer for AsciiDocLsp {
                         ..Default::default()
                     },
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![EXPLAIN_POSITION_COMMAND.to_string()],
+                    ..Default::default()
+                }),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "<".into(), // << xref
@@ -377,7 +388,14 @@ impl LanguageServer for AsciiDocLsp {
                         // Use update_file if already indexed (e.g. from background scan)
                         // to apply editor content over disk content.
                         // Use ensure_file for new files not yet in the workspace.
-                        if ws.documents().contains_key(&canonical) {
+                        let indexed = ws.documents().contains_key(&canonical);
+                        tracing::debug!(
+                            raw_path = ?path,
+                            ?canonical,
+                            indexed,
+                            "did_open: register file"
+                        );
+                        if indexed {
                             ws.update_file(&canonical, &overrides);
                         } else {
                             ws.ensure_file(&canonical, &overrides);
@@ -428,6 +446,11 @@ impl LanguageServer for AsciiDocLsp {
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
+                        tracing::debug!(
+                            raw_path = ?path,
+                            ?canonical,
+                            "did_change: update file"
+                        );
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
                         Some(ws.diagnostics_map().clone())
@@ -452,6 +475,11 @@ impl LanguageServer for AsciiDocLsp {
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
+                        tracing::debug!(
+                            raw_path = ?path,
+                            ?canonical,
+                            "did_close: re-index file from disk"
+                        );
                         ws.update_file(&canonical, &HashMap::new());
                         ws.recalculate_diagnostics();
                         Some(ws.diagnostics_map().clone())
@@ -475,6 +503,7 @@ impl LanguageServer for AsciiDocLsp {
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
+                        tracing::debug!(raw_path = ?path, ?canonical, "did_save: update file");
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
                         Some(ws.diagnostics_map().clone())
@@ -530,13 +559,7 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         let ws = self.workspace.lock();
-        tracing::debug!(
-            ?doc_path,
-            workspace_exists = ws.is_some(),
-            "hover: resolving at {}:{}",
-            position.line,
-            position.character,
-        );
+        log_navigation_request("hover", &doc_path, position, &content, ws.is_some());
         let hover_text = navigation::resolve_hover(&content, position, &doc_path, ws.as_ref());
         tracing::debug!(?hover_text, "hover: result");
 
@@ -583,10 +606,18 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         let ws = self.workspace.lock();
+        log_navigation_request(
+            "goto_definition",
+            &doc_path,
+            position,
+            &content,
+            ws.is_some(),
+        );
         let result =
             navigation::resolve_goto_definition(&content, position, &doc_path, ws.as_ref());
         // Drop the lock before building response
         drop(ws);
+        tracing::debug!(?result, "goto_definition: result");
 
         let Some((target_path, target_line)) = result else {
             return Ok(None);
@@ -630,6 +661,7 @@ impl LanguageServer for AsciiDocLsp {
         let include_declaration = params.context.include_declaration;
 
         let ws = self.workspace.lock();
+        log_navigation_request("references", &doc_path, position, &content, ws.is_some());
         let results = navigation::resolve_references(
             &content,
             position,
@@ -638,6 +670,10 @@ impl LanguageServer for AsciiDocLsp {
             include_declaration,
         );
         drop(ws);
+        tracing::debug!(
+            count = results.as_ref().map(Vec::len),
+            "references: result (None = no target)"
+        );
 
         let Some(refs) = results else {
             return Ok(None);
@@ -656,6 +692,13 @@ impl LanguageServer for AsciiDocLsp {
                 })
             })
             .collect();
+        tracing::debug!(
+            lsp_targets = ?locations
+                .iter()
+                .map(|loc| lsp_target(&loc.uri, &loc.range))
+                .collect::<Vec<_>>(),
+            "references: targets"
+        );
 
         if locations.is_empty() {
             Ok(None)
@@ -681,6 +724,13 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         let ws = self.workspace.lock();
+        log_navigation_request(
+            "prepare_rename",
+            &doc_path,
+            position,
+            &content,
+            ws.is_some(),
+        );
         let result = navigation::prepare_rename(&content, position, &doc_path, ws.as_ref());
         drop(ws);
 
@@ -731,9 +781,14 @@ impl LanguageServer for AsciiDocLsp {
         let overrides = build_content_overrides(&self.documents);
 
         let ws = self.workspace.lock();
+        log_navigation_request("rename", &doc_path, position, &content, ws.is_some());
         let result =
             navigation::resolve_rename(&content, position, &doc_path, ws.as_ref(), &overrides);
         drop(ws);
+        tracing::debug!(
+            files = result.as_ref().map(HashMap::len),
+            "rename: result (None = no target)"
+        );
 
         let Some(file_edits) = result else {
             return Ok(None);
@@ -769,6 +824,13 @@ impl LanguageServer for AsciiDocLsp {
                 .collect();
             changes.insert(file_uri, text_edits);
         }
+        tracing::debug!(
+            lsp_targets = ?changes
+                .iter()
+                .flat_map(|(uri, edits)| edits.iter().map(|edit| lsp_target(uri, &edit.range)))
+                .collect::<Vec<_>>(),
+            "rename: targets"
+        );
 
         Ok(Some(WorkspaceEdit {
             changes: Some(changes),
@@ -813,6 +875,35 @@ impl LanguageServer for AsciiDocLsp {
             }),
             ..Default::default()
         })]))
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        let args = parse_explain_position_command(&params.command, params.arguments)?;
+        let uri = &args.text_document.uri;
+
+        let Some(content) = self.get_document_content(uri) else {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "{EXPLAIN_POSITION_COMMAND}: no content for {}",
+                uri.as_str()
+            )));
+        };
+        let Some(doc_path) = uri.to_file_path() else {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "{EXPLAIN_POSITION_COMMAND}: not a file URI: {}",
+                uri.as_str()
+            )));
+        };
+
+        let ws = self.workspace.lock();
+        Ok(Some(navigation::explain_position(
+            &content,
+            args.position,
+            &doc_path,
+            ws.as_ref(),
+        )))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -897,6 +988,44 @@ fn is_path_open(path: &Path, open_buffers: &HashSet<PathBuf>) -> bool {
     open_buffers.contains(path) || path.canonicalize().is_ok_and(|c| open_buffers.contains(&c))
 }
 
+/// Log a navigation request at debug level: handler, raw document path,
+/// position and the node kind found there. The node lookup re-parses the
+/// document, so it only runs when debug logging is enabled.
+fn log_navigation_request(
+    handler: &'static str,
+    doc_path: &Path,
+    position: Position,
+    content: &str,
+    workspace_exists: bool,
+) {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let node = navigation::find_node_at_position(content, position).map(|n| n.kind);
+        tracing::debug!(
+            handler,
+            ?doc_path,
+            lsp_line = position.line,
+            lsp_character = position.character,
+            ?node,
+            workspace_exists,
+            "navigation request"
+        );
+    }
+}
+
+/// Format a navigation target for the debug log in the LSP convention of
+/// the request log: `uri:line:character-end_line:end_character`, lines
+/// 0-based, characters in UTF-16 code units.
+fn lsp_target(uri: &Uri, range: &Range) -> String {
+    format!(
+        "{}:{}:{}-{}:{}",
+        uri.as_str(),
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character
+    )
+}
+
 /// Resolve a `documents`-key for a path that has just been deleted.
 /// The deleted file no longer exists, but its parent directory typically does;
 /// canonicalizing the parent and re-attaching the filename produces the same
@@ -920,6 +1049,35 @@ fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
         (_, Some("adoc" | "asciidoc")) => Some(WatchedKind::AsciiDoc),
         _ => None,
     }
+}
+
+/// Command name of the position debug report (adoc-0137).
+const EXPLAIN_POSITION_COMMAND: &str = "asciidoc.explainPosition";
+
+/// Validate a `workspace/executeCommand` request for
+/// [`EXPLAIN_POSITION_COMMAND`]: the command must match and `arguments` must
+/// hold exactly one object shaped like `TextDocumentPositionParams`.
+/// Anything else is an `InvalidParams` error.
+fn parse_explain_position_command(
+    command: &str,
+    arguments: Vec<serde_json::Value>,
+) -> Result<TextDocumentPositionParams> {
+    if command != EXPLAIN_POSITION_COMMAND {
+        return Err(jsonrpc::Error::invalid_params(format!(
+            "unknown command: {command}"
+        )));
+    }
+    let [argument]: [serde_json::Value; 1] = arguments.try_into().map_err(|_| {
+        jsonrpc::Error::invalid_params(format!(
+            "{EXPLAIN_POSITION_COMMAND} expects exactly one argument \
+             {{textDocument: {{uri}}, position: {{line, character}}}}"
+        ))
+    })?;
+    serde_json::from_value(argument).map_err(|err| {
+        jsonrpc::Error::invalid_params(format!(
+            "{EXPLAIN_POSITION_COMMAND}: invalid argument: {err}"
+        ))
+    })
 }
 
 /// Build a `HashMap` of file path -> content for all open documents.
@@ -975,6 +1133,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::str::FromStr;
+    use tower_lsp_server::jsonrpc::ErrorCode;
 
     // --- Document Lifecycle tests ---
 
@@ -1685,5 +1844,69 @@ mod tests {
         open.insert(PathBuf::from("/ws/open.adoc"));
         let changes = vec![make_event("file:///ws/open.adoc", FileChangeType::CHANGED)];
         assert!(classify_events(changes, &open).is_none());
+    }
+
+    // --- adoc-0137: asciidoc.explainPosition command arguments ---
+
+    #[test]
+    fn test_explain_position_args_parses_text_document_position() {
+        let args = vec![serde_json::json!({
+            "textDocument": {"uri": "file:///ws/a.adoc"},
+            "position": {"line": 3, "character": 7},
+        })];
+        let params = parse_explain_position_command("asciidoc.explainPosition", args)
+            .expect("valid arguments");
+        assert_eq!(
+            params.text_document.uri,
+            Uri::from_str("file:///ws/a.adoc").unwrap()
+        );
+        assert_eq!(params.position, Position::new(3, 7));
+    }
+
+    #[test]
+    fn test_explain_position_args_rejects_unknown_command() {
+        let args = vec![serde_json::json!({
+            "textDocument": {"uri": "file:///ws/a.adoc"},
+            "position": {"line": 0, "character": 0},
+        })];
+        let err = parse_explain_position_command("asciidoc.somethingElse", args).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn test_explain_position_args_rejects_missing_argument() {
+        let err = parse_explain_position_command("asciidoc.explainPosition", vec![]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn test_explain_position_args_rejects_malformed_argument() {
+        let args = vec![serde_json::json!({"textDocument": "not-an-object"})];
+        let err = parse_explain_position_command("asciidoc.explainPosition", args).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn test_explain_position_args_rejects_extra_arguments() {
+        let arg = serde_json::json!({
+            "textDocument": {"uri": "file:///ws/a.adoc"},
+            "position": {"line": 0, "character": 0},
+        });
+        let err =
+            parse_explain_position_command("asciidoc.explainPosition", vec![arg.clone(), arg])
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    // --- adoc-0137: debug log target format ---
+
+    #[test]
+    fn test_lsp_target_uses_lsp_range_convention() {
+        let uri = Uri::from_str("file:///ws/a.adoc").unwrap();
+        let range = Range {
+            start: Position::new(2, 4),
+            end: Position::new(2, 9),
+        };
+        assert_eq!(lsp_target(&uri, &range), "file:///ws/a.adoc:2:4-2:9");
     }
 }

@@ -84,6 +84,7 @@ dependencies = [
  "rstest",
  "tempfile",
  "thiserror",
+ "tracing",
  "tree-sitter",
  "tree-sitter-asciidoc",
  "tree-sitter-asciidoc-inline",

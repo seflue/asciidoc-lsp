@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
+use asciidoc_core::attributes::{AttributeHit, AttributeLayer, AttributeSource};
 use asciidoc_core::extractors::find_child_text;
-use asciidoc_core::types::{AnchorKind, FileLocation};
+use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
 use asciidoc_core::workspace::Workspace;
 
 use crate::positions;
@@ -106,32 +108,14 @@ pub fn resolve_goto_definition(
 
     match node_info.kind {
         NodeKind::Include { ref path } => {
-            let target = if let Some(ws) = workspace {
-                asciidoc_core::paths::resolve_doc_target(doc_path, path, ws.attributes())?
-            } else {
-                doc_path.parent()?.join(path)
-            };
+            let target = resolve_include_target(path, doc_path, workspace)?;
             // Require an existing on-disk file.
             let target_canon = target.canonicalize().ok()?;
             Some((target_canon, 1))
         }
         NodeKind::Xref { ref target } | NodeKind::ShorthandXref { ref target } => {
             let ws = workspace?;
-            let xref = asciidoc_core::types::Xref {
-                target: target.clone(),
-                display_text: None,
-                line: node_info.line,
-            };
-            let resolved = ws
-                .reference_index()
-                .resolve_xref(
-                    &xref,
-                    doc_path,
-                    ws.include_graph(),
-                    ws.documents(),
-                    ws.attributes(),
-                )
-                .ok()?;
+            let resolved = resolve_xref_target(ws, doc_path, target, node_info.line).ok()?;
             Some((resolved.file, resolved.line))
         }
         NodeKind::AttributeRef { ref name } => {
@@ -394,6 +378,241 @@ fn resolve_image_target(
         format!("{imagesdir}/{resolved_path}")
     };
     (target, resolved_path, display)
+}
+
+/// Resolve an include macro's path to a filesystem target, without checking
+/// that it exists. Shared by go-to-definition and the explain report.
+fn resolve_include_target(
+    include_path: &str,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> Option<PathBuf> {
+    if let Some(ws) = workspace {
+        asciidoc_core::paths::resolve_doc_target(doc_path, include_path, ws.attributes())
+    } else {
+        doc_path.parent().map(|dir| dir.join(include_path))
+    }
+}
+
+/// Resolve an xref target through the workspace reference index.
+/// Shared by go-to-definition and the explain report.
+fn resolve_xref_target(
+    ws: &Workspace,
+    doc_path: &Path,
+    target: &str,
+    line: usize,
+) -> Result<ResolvedXref, DiagnosticKind> {
+    let xref = asciidoc_core::types::Xref {
+        target: target.to_string(),
+        display_text: None,
+        line,
+    };
+    ws.reference_index().resolve_xref(
+        &xref,
+        doc_path,
+        ws.include_graph(),
+        ws.documents(),
+        ws.attributes(),
+    )
+}
+
+/// Build a debug report of what go-to-definition and hover see at `pos`.
+///
+/// Uses `doc_path` exactly as passed (no canonicalization), like the
+/// handlers do, so path-key mismatches in the workspace show up in the
+/// report. Top-level fields: `request`, `node`, `resolution`,
+/// `known_attributes`.
+pub fn explain_position(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> Value {
+    let node_info = find_node_at_position(content, pos);
+    let node = node_info.as_ref().map_or(Value::Null, explain_node);
+    let resolution = node_info.as_ref().map_or(Value::Null, |info| {
+        explain_resolution(info, doc_path, workspace)
+    });
+    let known_attributes: Vec<Value> = workspace
+        .map(|ws| {
+            ws.attributes()
+                .known_attributes(doc_path)
+                .into_iter()
+                .map(|k| {
+                    json!({
+                        "name": k.name,
+                        "value": k.value,
+                        "layer": layer_name(k.layer),
+                        "source": source_json(k.source.as_ref()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "request": explain_request(doc_path, workspace),
+        "node": node,
+        "resolution": resolution,
+        "known_attributes": known_attributes,
+    })
+}
+
+fn explain_request(doc_path: &Path, workspace: Option<&Workspace>) -> Value {
+    let canonical = doc_path.canonicalize();
+    let in_documents = |p: &Path| workspace.is_some_and(|ws| ws.documents().contains_key(p));
+    let (canonical_path, canonicalize_error, paths_differ, in_canonical) = match &canonical {
+        Ok(c) => (
+            Value::String(path_string(c)),
+            Value::Null,
+            c != doc_path,
+            in_documents(c),
+        ),
+        Err(e) => (Value::Null, Value::String(e.to_string()), false, false),
+    };
+    json!({
+        "raw_path": path_string(doc_path),
+        "canonical_path": canonical_path,
+        "canonicalize_error": canonicalize_error,
+        "paths_differ": paths_differ,
+        "workspace_root": workspace.map(|ws| path_string(ws.root())),
+        "in_documents_raw": in_documents(doc_path),
+        "in_documents_canonical": in_canonical,
+    })
+}
+
+fn explain_node(info: &NodeInfo) -> Value {
+    let fields = match &info.kind {
+        NodeKind::Include { path } | NodeKind::Image { path } => json!({ "path": path }),
+        NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
+            json!({ "target": target })
+        }
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+            json!({ "name": name })
+        }
+        NodeKind::Anchor { id } => json!({ "id": id }),
+    };
+    json!({ "kind": node_kind_name(&info.kind), "line": info.line, "fields": fields })
+}
+
+/// Stable report name of a node kind, independent of Rust's `Debug`.
+fn node_kind_name(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Include { .. } => "include",
+        NodeKind::Xref { .. } => "xref",
+        NodeKind::ShorthandXref { .. } => "shorthand_xref",
+        NodeKind::AttributeRef { .. } => "attribute_ref",
+        NodeKind::AttributeDef { .. } => "attribute_def",
+        NodeKind::Anchor { .. } => "anchor",
+        NodeKind::Image { .. } => "image",
+    }
+}
+
+fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Workspace>) -> Value {
+    let no_workspace = || json!({ "error": "no workspace" });
+    match &info.kind {
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+            workspace.map_or_else(no_workspace, |ws| explain_attribute(ws, doc_path, name))
+        }
+        NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => workspace
+            .map_or_else(no_workspace, |ws| {
+                explain_xref(ws, doc_path, target, info.line)
+            }),
+        NodeKind::Anchor { id } => workspace.map_or_else(no_workspace, |ws| {
+            let definition = ws.reference_index().lookup(id).map(|loc| {
+                json!({
+                    "file": path_string(&loc.file),
+                    "line": loc.line,
+                    "kind": anchor_kind_name(loc.kind),
+                })
+            });
+            json!({ "definition": definition })
+        }),
+        NodeKind::Include { path } => {
+            let target = resolve_include_target(path, doc_path, workspace);
+            // Same existence gate as go-to-definition: the path gd returns.
+            let canonical_target = target.as_deref().and_then(|t| t.canonicalize().ok());
+            json!({
+                "target": target.as_deref().map(path_string),
+                "canonical_target": canonical_target.as_deref().map(path_string),
+                "exists": target.as_deref().is_some_and(Path::exists),
+            })
+        }
+        NodeKind::Image { path } => {
+            let (target, _, display) = resolve_image_target(path, doc_path, workspace);
+            json!({
+                "target": path_string(&target),
+                "display": display,
+                "exists": target.exists(),
+            })
+        }
+    }
+}
+
+fn explain_attribute(ws: &Workspace, doc_path: &Path, name: &str) -> Value {
+    let registry = ws.attributes();
+    let explanation = registry.explain(doc_path, name);
+    json!({
+        "name": name,
+        "value": registry.resolve(doc_path, name),
+        "winner": explanation.winner.map(layer_name),
+        "per_file": {
+            "registered": explanation.per_file.registered,
+            "hit": hit_json(explanation.per_file.hit.as_ref()),
+        },
+        "config": {
+            "dir": explanation.config.dir.as_deref().map(path_string),
+            "chain_cached": explanation.config.chain_cached,
+            "hit": hit_json(explanation.config.hit.as_ref()),
+        },
+        "builtin": explanation.builtin,
+    })
+}
+
+fn explain_xref(ws: &Workspace, doc_path: &Path, target: &str, line: usize) -> Value {
+    match resolve_xref_target(ws, doc_path, target, line) {
+        Ok(resolved) => json!({
+            "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
+            "error": null,
+        }),
+        Err(e) => json!({ "resolved": null, "error": e.to_string() }),
+    }
+}
+
+fn hit_json(hit: Option<&AttributeHit>) -> Value {
+    hit.map_or(
+        Value::Null,
+        |h| json!({ "value": h.value, "source": source_json(h.source.as_ref()) }),
+    )
+}
+
+fn source_json(source: Option<&AttributeSource>) -> Value {
+    source.map_or(
+        Value::Null,
+        |s| json!({ "file": path_string(&s.file), "line": s.line }),
+    )
+}
+
+/// Stable report name of an attribute layer, independent of Rust's `Debug`.
+fn layer_name(layer: AttributeLayer) -> &'static str {
+    match layer {
+        AttributeLayer::PerFile => "per_file",
+        AttributeLayer::Config => "config",
+        AttributeLayer::Builtin => "builtin",
+    }
+}
+
+/// Stable report name of an anchor kind, independent of Rust's `Debug`.
+fn anchor_kind_name(kind: AnchorKind) -> &'static str {
+    match kind {
+        AnchorKind::Explicit => "explicit",
+        AnchorKind::ImplicitSection => "implicit_section",
+        AnchorKind::BlockId => "block_id",
+    }
+}
+
+fn path_string(path: &Path) -> String {
+    path.display().to_string()
 }
 
 /// Extract a display-friendly filename from a path.
@@ -3087,5 +3306,358 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             2,
             "expected 2 edits (def + ref), got: {file_edits:?}"
         );
+    }
+
+    // --- adoc-0137: explain_position report ---
+
+    /// Canonical temp dir, so raw and canonical document paths coincide.
+    fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        (tmp, root)
+    }
+
+    #[test]
+    fn test_explain_attribute_ref_reports_layers_and_value() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n:author: Alice\n\nWritten by {author}.\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 12,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "attribute_ref");
+        assert_eq!(report["node"]["line"], 4);
+        assert_eq!(report["node"]["fields"]["name"], "author");
+        let res = &report["resolution"];
+        assert_eq!(res["value"], "Alice");
+        assert_eq!(res["winner"], "per_file");
+        assert_eq!(res["per_file"]["registered"], true);
+        assert_eq!(res["per_file"]["hit"]["value"], "Alice");
+        assert_eq!(res["per_file"]["hit"]["source"]["line"], 2);
+        assert_eq!(res["config"]["dir"], path_string(&root));
+        assert!(res["builtin"].is_null());
+    }
+
+    #[test]
+    fn test_explain_attribute_def_reports_resolution() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n:author: Alice\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 1,
+            character: 3,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "attribute_def");
+        assert_eq!(report["node"]["fields"]["name"], "author");
+        assert_eq!(report["resolution"]["value"], "Alice");
+        assert_eq!(report["resolution"]["winner"], "per_file");
+    }
+
+    #[test]
+    fn test_explain_xref_reports_resolved_target() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let b = root.join("b.adoc");
+        fs::write(
+            &a,
+            "= Doc A\n\nSee xref:b.adoc#my-anchor[link].\n\ninclude::b.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(&b, "[[my-anchor]]\n== Chapter B\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "xref");
+        assert_eq!(report["node"]["fields"]["target"], "b.adoc#my-anchor");
+        assert_eq!(report["resolution"]["resolved"]["file"], path_string(&b));
+        assert_eq!(report["resolution"]["resolved"]["line"], 1);
+        assert!(report["resolution"]["error"].is_null());
+    }
+
+    #[test]
+    fn test_explain_shorthand_xref_broken_reports_error() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n\nSee <<nonexistent-anchor>>.\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "shorthand_xref");
+        assert!(report["resolution"]["resolved"].is_null());
+        assert_eq!(
+            report["resolution"]["error"],
+            "Broken cross-reference: nonexistent-anchor"
+        );
+    }
+
+    #[test]
+    fn test_explain_include_reports_target_and_existence() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let b = root.join("sub.adoc");
+        fs::write(&a, "= Doc A\n\ninclude::sub.adoc[]\n").unwrap();
+        fs::write(&b, "== Sub\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "include");
+        assert_eq!(report["node"]["fields"]["path"], "sub.adoc");
+        assert_eq!(report["resolution"]["target"], path_string(&b));
+        assert_eq!(report["resolution"]["exists"], true);
+        let (gd_target, _) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(
+            report["resolution"]["canonical_target"],
+            path_string(&gd_target)
+        );
+    }
+
+    #[test]
+    fn test_explain_include_missing_has_no_canonical_target() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n\ninclude::missing.adoc[]\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(
+            report["resolution"]["target"],
+            path_string(&root.join("missing.adoc"))
+        );
+        assert_eq!(report["resolution"]["exists"], false);
+        assert!(report["resolution"]["canonical_target"].is_null());
+        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_explain_include_through_symlink_reports_gd_canonical_target() {
+        let (_tmp, root) = canonical_tmp();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let sub = real.join("sub.adoc");
+        fs::write(&sub, "== Sub\n").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n\ninclude::link/sub.adoc[]\n").unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        // Without a workspace the target is joined but not canonicalized,
+        // so the symlinked raw target and gd's canonical path differ.
+        let report = explain_position(&content, pos, &a, None);
+
+        let res = &report["resolution"];
+        assert_eq!(
+            res["target"],
+            path_string(&root.join("link").join("sub.adoc"))
+        );
+        assert_eq!(res["canonical_target"], path_string(&sub));
+        let (gd_target, _) = resolve_goto_definition(&content, pos, &a, None).unwrap();
+        assert_eq!(res["canonical_target"], path_string(&gd_target));
+    }
+
+    #[test]
+    fn test_explain_image_reports_target_display_and_existence() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n:imagesdir: img\n\nimage::logo.png[]\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 9,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "image");
+        assert_eq!(report["node"]["fields"]["path"], "logo.png");
+        assert_eq!(
+            report["resolution"]["target"],
+            path_string(&root.join("img").join("logo.png"))
+        );
+        assert_eq!(report["resolution"]["display"], "img/logo.png");
+        assert_eq!(report["resolution"]["exists"], false);
+    }
+
+    #[test]
+    fn test_explain_anchor_reports_index_entry() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n\nText with [[my-anchor]] inline.\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 14,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert_eq!(report["node"]["kind"], "anchor");
+        assert_eq!(report["node"]["fields"]["id"], "my-anchor");
+        let def = &report["resolution"]["definition"];
+        assert_eq!(def["file"], path_string(&a));
+        assert_eq!(def["line"], 3);
+        assert_eq!(def["kind"], "explicit");
+    }
+
+    #[test]
+    fn test_explain_no_node_still_reports_request_and_attributes() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n:author: Alice\n\nJust plain text.\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 5,
+        };
+
+        let report = explain_position(&content, pos, &a, Some(&ws));
+
+        assert!(report["node"].is_null());
+        assert!(report["resolution"].is_null());
+        let req = &report["request"];
+        assert_eq!(req["raw_path"], path_string(&a));
+        assert_eq!(req["canonical_path"], path_string(&a));
+        assert_eq!(req["paths_differ"], false);
+        assert_eq!(req["workspace_root"], path_string(&root));
+        assert_eq!(req["in_documents_raw"], true);
+        assert_eq!(req["in_documents_canonical"], true);
+        let known = report["known_attributes"].as_array().unwrap();
+        let author = known.iter().find(|k| k["name"] == "author").unwrap();
+        assert_eq!(author["value"], "Alice");
+        assert_eq!(author["layer"], "per_file");
+        assert_eq!(author["source"]["line"], 2);
+        let docdir = known.iter().find(|k| k["name"] == "docdir").unwrap();
+        assert_eq!(docdir["layer"], "builtin");
+    }
+
+    #[test]
+    fn test_explain_layer_names_are_stable_snake_case() {
+        assert_eq!(layer_name(AttributeLayer::PerFile), "per_file");
+        assert_eq!(layer_name(AttributeLayer::Config), "config");
+        assert_eq!(layer_name(AttributeLayer::Builtin), "builtin");
+    }
+
+    #[test]
+    fn test_explain_node_kind_names_are_stable_snake_case() {
+        let s = String::new;
+        assert_eq!(node_kind_name(&NodeKind::Include { path: s() }), "include");
+        assert_eq!(node_kind_name(&NodeKind::Xref { target: s() }), "xref");
+        assert_eq!(
+            node_kind_name(&NodeKind::ShorthandXref { target: s() }),
+            "shorthand_xref"
+        );
+        assert_eq!(
+            node_kind_name(&NodeKind::AttributeRef { name: s() }),
+            "attribute_ref"
+        );
+        assert_eq!(
+            node_kind_name(&NodeKind::AttributeDef { name: s() }),
+            "attribute_def"
+        );
+        assert_eq!(node_kind_name(&NodeKind::Anchor { id: s() }), "anchor");
+        assert_eq!(node_kind_name(&NodeKind::Image { path: s() }), "image");
+    }
+
+    #[test]
+    fn test_explain_anchor_kind_names_are_stable_snake_case() {
+        assert_eq!(anchor_kind_name(AnchorKind::Explicit), "explicit");
+        assert_eq!(
+            anchor_kind_name(AnchorKind::ImplicitSection),
+            "implicit_section"
+        );
+        assert_eq!(anchor_kind_name(AnchorKind::BlockId), "block_id");
+    }
+
+    #[test]
+    fn test_explain_without_workspace() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, "= Doc A\n\nWritten by {author}.\n").unwrap();
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        let report = explain_position(&content, pos, &a, None);
+
+        assert!(report["request"]["workspace_root"].is_null());
+        assert_eq!(report["request"]["in_documents_raw"], false);
+        assert_eq!(report["request"]["in_documents_canonical"], false);
+        assert_eq!(report["node"]["kind"], "attribute_ref");
+        assert_eq!(report["resolution"]["error"], "no workspace");
+        assert_eq!(report["known_attributes"], serde_json::json!([]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_explain_symlinked_path_exposes_raw_lookup_miss() {
+        let (_tmp, root) = canonical_tmp();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let a = real.join("a.adoc");
+        fs::write(&a, "= Doc A\n:author: Alice\n\nWritten by {author}.\n").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let ws = Workspace::build(&real, &a);
+        let raw = link.join("a.adoc");
+        let content = fs::read_to_string(&raw).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 12,
+        };
+
+        let report = explain_position(&content, pos, &raw, Some(&ws));
+
+        let req = &report["request"];
+        assert_eq!(req["raw_path"], path_string(&raw));
+        assert_eq!(req["canonical_path"], path_string(&a));
+        assert_eq!(req["paths_differ"], true);
+        assert_eq!(req["in_documents_raw"], false);
+        assert_eq!(req["in_documents_canonical"], true);
+        assert_eq!(report["resolution"]["per_file"]["registered"], false);
+        assert!(report["resolution"]["value"].is_null());
     }
 }
