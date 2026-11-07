@@ -146,6 +146,16 @@ impl AsciiDocLsp {
         set
     }
 
+    /// URIs the client addresses its open documents by, keyed by
+    /// [`document_path`]. `request` wins over another buffer of the same file.
+    fn client_uris(&self, request: &Uri) -> HashMap<PathBuf, Uri> {
+        let docs = self.documents.lock();
+        docs.keys()
+            .chain(std::iter::once(request))
+            .filter_map(|uri| Some((document_path(uri)?, uri.clone())))
+            .collect()
+    }
+
     fn get_document_content(&self, uri: &Uri) -> Option<Arc<String>> {
         let docs = self.documents.lock();
         if let Some(state) = docs.get(uri) {
@@ -381,7 +391,7 @@ impl LanguageServer for AsciiDocLsp {
         // Per-file: ensure only this file, then recalculate diagnostics
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
             if let Ok(canonical) = path.canonicalize() {
-                let overrides = build_content_overrides(&self.documents);
+                let overrides = build_content_overrides(&self.documents, &uri);
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
@@ -442,7 +452,7 @@ impl LanguageServer for AsciiDocLsp {
         // Per-file: update only this file, then recalculate diagnostics
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
             if let Ok(canonical) = path.canonicalize() {
-                let overrides = build_content_overrides(&self.documents);
+                let overrides = build_content_overrides(&self.documents, &uri);
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
@@ -499,7 +509,7 @@ impl LanguageServer for AsciiDocLsp {
         let uri = params.text_document.uri;
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
             if let Ok(canonical) = path.canonicalize() {
-                let overrides = build_content_overrides(&self.documents);
+                let overrides = build_content_overrides(&self.documents, &uri);
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
@@ -553,9 +563,8 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let doc_path = match uri.to_file_path() {
-            Some(p) => p.into_owned(),
-            None => return Ok(None),
+        let Some(doc_path) = document_path(uri) else {
+            return Ok(None);
         };
 
         let ws = self.workspace.lock();
@@ -600,9 +609,8 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let doc_path = match uri.to_file_path() {
-            Some(p) => p.into_owned(),
-            None => return Ok(None),
+        let Some(doc_path) = document_path(uri) else {
+            return Ok(None);
         };
 
         let ws = self.workspace.lock();
@@ -623,7 +631,7 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let Some(target_uri) = Uri::from_file_path(&target_path) else {
+        let Some(target_uri) = result_uri(&target_path, &self.client_uris(uri)) else {
             return Ok(None);
         };
 
@@ -653,9 +661,8 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let doc_path = match uri.to_file_path() {
-            Some(p) => p.into_owned(),
-            None => return Ok(None),
+        let Some(doc_path) = document_path(uri) else {
+            return Ok(None);
         };
 
         let include_declaration = params.context.include_declaration;
@@ -679,10 +686,11 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        let client_uris = self.client_uris(uri);
         let locations: Vec<Location> = refs
             .into_iter()
             .filter_map(|loc| {
-                let target_uri = Uri::from_file_path(&loc.path)?;
+                let target_uri = result_uri(&loc.path, &client_uris)?;
                 let file_content = std::fs::read_to_string(&loc.path).unwrap_or_default();
                 let start = positions::to_lsp_position(loc.line, loc.col, &file_content);
                 let end = positions::to_lsp_position(loc.line, loc.end_col, &file_content);
@@ -718,9 +726,8 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let doc_path = match uri.to_file_path() {
-            Some(p) => p.into_owned(),
-            None => return Ok(None),
+        let Some(doc_path) = document_path(uri) else {
+            return Ok(None);
         };
 
         let ws = self.workspace.lock();
@@ -773,12 +780,11 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let doc_path = match uri.to_file_path() {
-            Some(p) => p.into_owned(),
-            None => return Ok(None),
+        let Some(doc_path) = document_path(uri) else {
+            return Ok(None);
         };
 
-        let overrides = build_content_overrides(&self.documents);
+        let overrides = build_content_overrides(&self.documents, uri);
 
         let ws = self.workspace.lock();
         log_navigation_request("rename", &doc_path, position, &content, ws.is_some());
@@ -794,9 +800,10 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        let client_uris = self.client_uris(uri);
         let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
         for (path, edits) in file_edits {
-            let Some(file_uri) = Uri::from_file_path(&path) else {
+            let Some(file_uri) = result_uri(&path, &client_uris) else {
                 continue;
             };
             let file_content = overrides.get(&path).map_or_else(
@@ -890,7 +897,7 @@ impl LanguageServer for AsciiDocLsp {
                 uri.as_str()
             )));
         };
-        let Some(doc_path) = uri.to_file_path() else {
+        let (Some(raw_path), Some(doc_path)) = (uri.to_file_path(), document_path(uri)) else {
             return Err(jsonrpc::Error::invalid_params(format!(
                 "{EXPLAIN_POSITION_COMMAND}: not a file URI: {}",
                 uri.as_str()
@@ -901,6 +908,7 @@ impl LanguageServer for AsciiDocLsp {
         Ok(Some(navigation::explain_position(
             &content,
             args.position,
+            &raw_path,
             &doc_path,
             ws.as_ref(),
         )))
@@ -919,9 +927,8 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
-        let doc_path = match uri.to_file_path() {
-            Some(p) => p.into_owned(),
-            None => return Ok(None),
+        let Some(doc_path) = document_path(uri) else {
+            return Ok(None);
         };
 
         let ws = self.workspace.lock();
@@ -1080,19 +1087,40 @@ fn parse_explain_position_command(
     })
 }
 
+/// The path a document is registered under in the workspace: canonical when
+/// `canonicalize` succeeds, the raw URI path otherwise (unsaved new file).
+fn document_path(uri: &Uri) -> Option<PathBuf> {
+    let raw = uri.to_file_path()?;
+    Some(raw.canonicalize().unwrap_or_else(|_| raw.into_owned()))
+}
+
+/// URI of a result path: the client's own URI for that document where it has
+/// one, so a result does not address a second buffer of an open file.
+fn result_uri(path: &Path, client_uris: &HashMap<PathBuf, Uri>) -> Option<Uri> {
+    client_uris
+        .get(path)
+        .cloned()
+        .or_else(|| Uri::from_file_path(path))
+}
+
 /// Build a `HashMap` of file path -> content for all open documents.
 /// Used as overrides so the semantic layer reads in-memory content
-/// instead of stale disk content.
+/// instead of stale disk content. Keys are [`document_path`]s, the form the
+/// workspace reads files under. Two buffers of one file (raw and canonical
+/// URI) share a key; the content of `active` wins.
 fn build_content_overrides(
     documents: &Mutex<HashMap<Uri, DocumentState>>,
+    active: &Uri,
 ) -> HashMap<PathBuf, Arc<String>> {
     let docs = documents.lock();
-    docs.iter()
-        .filter_map(|(uri, state)| {
-            uri.to_file_path()
-                .map(|path| (path.into_owned(), Arc::clone(&state.content)))
-        })
-        .collect()
+    let mut overrides: HashMap<PathBuf, Arc<String>> = docs
+        .iter()
+        .filter_map(|(uri, state)| Some((document_path(uri)?, Arc::clone(&state.content))))
+        .collect();
+    if let (Some(path), Some(state)) = (document_path(active), docs.get(active)) {
+        overrides.insert(path, Arc::clone(&state.content));
+    }
+    overrides
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,14 +1282,14 @@ mod tests {
         let uri = Uri::from_str("file:///tmp/test.adoc").unwrap();
 
         docs.lock().insert(
-            uri,
+            uri.clone(),
             DocumentState {
                 content: Arc::new("overridden content".into()),
                 version: 1,
             },
         );
 
-        let overrides = build_content_overrides(&docs);
+        let overrides = build_content_overrides(&docs, &uri);
         assert_eq!(overrides.len(), 1);
         assert_eq!(
             overrides.get(Path::new("/tmp/test.adoc")).unwrap().as_str(),
@@ -1272,7 +1300,8 @@ mod tests {
     #[test]
     fn test_build_content_overrides_empty() {
         let docs: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
-        let overrides = build_content_overrides(&docs);
+        let uri = Uri::from_str("file:///tmp/test.adoc").unwrap();
+        let overrides = build_content_overrides(&docs, &uri);
         assert!(overrides.is_empty());
     }
 
@@ -1908,5 +1937,499 @@ mod tests {
             end: Position::new(2, 9),
         };
         assert_eq!(lsp_target(&uri, &range), "file:///ws/a.adoc:2:4-2:9");
+    }
+
+    // --- adoc-0138: documents opened through a symlink ---
+
+    /// A project at `<tmp>/real` with a directory symlink `<tmp>/link` to it.
+    #[cfg(unix)]
+    struct SymlinkedProject {
+        _tmp: tempfile::TempDir,
+        real: PathBuf,
+        link: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl SymlinkedProject {
+        const DOC: &'static str = "= Doc\n:imagesdir: ../assets\n:my_attr: value\n\n\
+                                   Text {my_attr}.\n\nimage::logo.svg[]\n\nimage::\n";
+        const CONFIG_DOC: &'static str = "= Config\n\nimage::logo.svg[]\n";
+
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().canonicalize().unwrap();
+            let real = base.join("real");
+            for dir in ["docs", "assets", "config"] {
+                fs::create_dir_all(real.join(dir)).unwrap();
+            }
+            fs::write(real.join("docs/a.adoc"), Self::DOC).unwrap();
+            fs::write(real.join("assets/logo.svg"), "<svg/>").unwrap();
+            fs::write(real.join("config/ch2.adoc"), Self::CONFIG_DOC).unwrap();
+            fs::write(
+                real.join("config/.asciidoctorconfig"),
+                format!(":imagesdir: {}\n", real.join("assets").display()),
+            )
+            .unwrap();
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            Self {
+                _tmp: tmp,
+                real,
+                link,
+            }
+        }
+    }
+
+    fn file_uri(path: &Path) -> Uri {
+        Uri::from_file_path(path).unwrap()
+    }
+
+    /// The `ClientSocket` stays alive next to the service: dropping it would
+    /// close the channel the server's client notifications go to.
+    async fn initialized_server(
+        root: &Path,
+    ) -> (LspService<AsciiDocLsp>, tower_lsp_server::ClientSocket) {
+        let (service, socket) = LspService::new(AsciiDocLsp::new);
+        service
+            .inner()
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(root),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        (service, socket)
+    }
+
+    async fn open_document(server: &AsciiDocLsp, uri: &Uri, text: &str) {
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: tower_lsp_server::ls_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "asciidoc".into(),
+                    version: 1,
+                    text: text.into(),
+                },
+            })
+            .await;
+    }
+
+    fn position_of(text: &str, needle: &str, offset: u32) -> Position {
+        let idx = text.find(needle).unwrap();
+        let before = &text[..idx];
+        let line = u32::try_from(before.matches('\n').count()).unwrap();
+        let column = idx - before.rfind('\n').map_or(0, |nl| nl + 1);
+        Position::new(line, u32::try_from(column).unwrap() + offset)
+    }
+
+    fn doc_position(uri: &Uri, position: Position) -> TextDocumentPositionParams {
+        TextDocumentPositionParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        }
+    }
+
+    async fn hover_text(server: &AsciiDocLsp, uri: &Uri, position: Position) -> Option<String> {
+        let hover = server
+            .hover(HoverParams {
+                text_document_position_params: doc_position(uri, position),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()?;
+        match hover.contents {
+            HoverContents::Scalar(MarkedString::String(text)) => Some(text),
+            other => panic!("unexpected hover contents: {other:?}"),
+        }
+    }
+
+    async fn definition(server: &AsciiDocLsp, uri: &Uri, position: Position) -> Option<Location> {
+        let response = server
+            .goto_definition(GotoDefinitionParams {
+                text_document_position_params: doc_position(uri, position),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()?;
+        match response {
+            GotoDefinitionResponse::Scalar(location) => Some(location),
+            other => panic!("unexpected definition response: {other:?}"),
+        }
+    }
+
+    async fn completion_labels(server: &AsciiDocLsp, uri: &Uri, position: Position) -> Vec<String> {
+        let response = server
+            .completion(CompletionParams {
+                text_document_position: doc_position(uri, position),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap();
+        match response {
+            Some(CompletionResponse::Array(items)) => {
+                let mut labels: Vec<String> = items.into_iter().map(|i| i.label).collect();
+                labels.sort();
+                labels
+            }
+            Some(other) => panic!("unexpected completion response: {other:?}"),
+            None => vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_document_resolves_attribute() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        for root in [&project.real, &project.link] {
+            let (service, _socket) = initialized_server(root).await;
+            let server = service.inner();
+            let uri = file_uri(&project.link.join("docs/a.adoc"));
+            open_document(server, &uri, doc).await;
+            let position = position_of(doc, "{my_attr}", 3);
+
+            let hover = hover_text(server, &uri, position).await;
+            let target = definition(server, &uri, position).await;
+
+            assert_eq!(
+                hover.as_deref(),
+                Some(":my_attr: value\n\nDefined in a.adoc:3")
+            );
+            assert_eq!(target.unwrap().range.start.line, 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_document_uses_document_imagesdir() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        for root in [&project.real, &project.link] {
+            let (service, _socket) = initialized_server(root).await;
+            let server = service.inner();
+            let uri = file_uri(&project.link.join("docs/a.adoc"));
+            open_document(server, &uri, doc).await;
+            let position = position_of(doc, "image::logo.svg", 9);
+
+            let hover = hover_text(server, &uri, position).await.unwrap();
+            let target = definition(server, &uri, position).await.unwrap();
+
+            assert_eq!(hover, "image::../assets/logo.svg[]\n\n✓ File exists");
+            assert_eq!(target.uri, file_uri(&project.real.join("assets/logo.svg")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_document_uses_config_imagesdir() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::CONFIG_DOC;
+        let (service, _socket) = initialized_server(&project.link).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("config/ch2.adoc"));
+        open_document(server, &uri, doc).await;
+        let position = position_of(doc, "image::logo.svg", 9);
+
+        let target = definition(server, &uri, position).await.unwrap();
+
+        assert_eq!(target.uri, file_uri(&project.real.join("assets/logo.svg")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_document_completes_image_paths() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        for root in [&project.real, &project.link] {
+            let (service, _socket) = initialized_server(root).await;
+            let server = service.inner();
+            let uri = file_uri(&project.link.join("docs/a.adoc"));
+            open_document(server, &uri, doc).await;
+            let position = position_of(doc, "image::\n", 7);
+
+            let labels = completion_labels(server, &uri, position).await;
+
+            assert_eq!(labels, vec!["logo.svg".to_string()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_buffer_content_reaches_the_workspace() {
+        let project = SymlinkedProject::new();
+        let (service, _socket) = initialized_server(&project.real).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        let unsaved = "= Doc\n:unsaved: buffer\n\nText {unsaved}.\n";
+        open_document(server, &uri, unsaved).await;
+        let position = position_of(unsaved, "{unsaved}", 3);
+
+        let hover = hover_text(server, &uri, position).await;
+
+        assert_eq!(
+            hover.as_deref(),
+            Some(":unsaved: buffer\n\nDefined in a.adoc:2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_buffer_is_registered_once() {
+        let project = SymlinkedProject::new();
+        let (service, _socket) = initialized_server(&project.link).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        open_document(server, &uri, SymlinkedProject::DOC).await;
+
+        let ws = server.workspace.lock();
+        let keys: Vec<&PathBuf> = ws
+            .as_ref()
+            .unwrap()
+            .documents()
+            .keys()
+            .filter(|path| path.ends_with("docs/a.adoc"))
+            .collect();
+
+        assert_eq!(keys, vec![&project.real.join("docs/a.adoc")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_content_overrides_key_a_symlinked_buffer_canonically() {
+        let project = SymlinkedProject::new();
+        let docs: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        docs.lock().insert(
+            uri.clone(),
+            DocumentState {
+                content: Arc::new("buffer".into()),
+                version: 1,
+            },
+        );
+
+        let overrides = build_content_overrides(&docs, &uri);
+
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(
+            overrides[&project.real.join("docs/a.adoc")].as_str(),
+            "buffer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_content_overrides_prefer_the_active_buffer_of_one_file() {
+        let project = SymlinkedProject::new();
+        let docs: Mutex<HashMap<Uri, DocumentState>> = Mutex::new(HashMap::new());
+        let via_link = file_uri(&project.link.join("docs/a.adoc"));
+        let via_real = file_uri(&project.real.join("docs/a.adoc"));
+        for (uri, content) in [(&via_link, "link buffer"), (&via_real, "real buffer")] {
+            docs.lock().insert(
+                uri.clone(),
+                DocumentState {
+                    content: Arc::new(content.into()),
+                    version: 1,
+                },
+            );
+        }
+        let canonical = project.real.join("docs/a.adoc");
+
+        let active_link = build_content_overrides(&docs, &via_link);
+        let active_real = build_content_overrides(&docs, &via_real);
+
+        assert_eq!(active_link.len(), 1);
+        assert_eq!(active_link[&canonical].as_str(), "link buffer");
+        assert_eq!(active_real[&canonical].as_str(), "real buffer");
+    }
+
+    async fn references_of(server: &AsciiDocLsp, uri: &Uri, position: Position) -> Vec<Location> {
+        server
+            .references(ReferenceParams {
+                text_document_position: doc_position(uri, position),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: tower_lsp_server::ls_types::ReferenceContext {
+                    include_declaration: true,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn rename_edits(
+        server: &AsciiDocLsp,
+        uri: &Uri,
+        position: Position,
+    ) -> HashMap<Uri, Vec<TextEdit>> {
+        server
+            .rename(RenameParams {
+                text_document_position: doc_position(uri, position),
+                new_name: "renamed".into(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .changes
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_same_file_definition_stays_on_the_client_uri() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        for root in [&project.real, &project.link] {
+            let (service, _socket) = initialized_server(root).await;
+            let server = service.inner();
+            let uri = file_uri(&project.link.join("docs/a.adoc"));
+            open_document(server, &uri, doc).await;
+
+            let target = definition(server, &uri, position_of(doc, "{my_attr}", 3)).await;
+
+            assert_eq!(target.unwrap().uri, uri);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_same_file_references_stay_on_the_client_uri() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        let (service, _socket) = initialized_server(&project.link).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        open_document(server, &uri, doc).await;
+
+        let locations = references_of(server, &uri, position_of(doc, "{my_attr}", 3)).await;
+
+        let lines: Vec<u32> = locations.iter().map(|l| l.range.start.line).collect();
+        assert_eq!(lines, vec![2, 4], "declaration and usage");
+        assert!(locations.iter().all(|l| l.uri == uri));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_same_file_rename_stays_on_the_client_uri() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        let (service, _socket) = initialized_server(&project.link).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        open_document(server, &uri, doc).await;
+
+        let changes = rename_edits(server, &uri, position_of(doc, "{my_attr}", 3)).await;
+
+        assert_eq!(changes.keys().collect::<Vec<_>>(), vec![&uri]);
+        assert_eq!(changes[&uri].len(), 2, "declaration and usage");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rename_reads_the_symlinked_buffer_not_the_disk() {
+        let project = SymlinkedProject::new();
+        let (service, _socket) = initialized_server(&project.real).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        let unsaved = "= Doc\n\n\n:shifted: value\n\nText {shifted}.\n";
+        open_document(server, &uri, unsaved).await;
+
+        let changes = rename_edits(server, &uri, position_of(unsaved, "{shifted}", 3)).await;
+
+        let lines: Vec<u32> = changes[&uri].iter().map(|e| e.range.start.line).collect();
+        assert!(lines.contains(&3), "definition from the buffer: {lines:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cross_file_result_uses_the_uri_of_an_open_buffer() {
+        let project = SymlinkedProject::new();
+        fs::write(project.real.join("docs/b.adoc"), "[[target]]\n== B\n").unwrap();
+        let doc = "= Doc\n\nSee xref:b.adoc#target[B].\n";
+        let (service, _socket) = initialized_server(&project.link).await;
+        let server = service.inner();
+        let uri = file_uri(&project.link.join("docs/a.adoc"));
+        open_document(server, &uri, doc).await;
+        let position = position_of(doc, "b.adoc#target", 3);
+
+        let closed = definition(server, &uri, position).await.unwrap();
+        let b_link = file_uri(&project.link.join("docs/b.adoc"));
+        open_document(server, &b_link, "[[target]]\n== B\n").await;
+        let open = definition(server, &uri, position).await.unwrap();
+
+        assert_eq!(closed.uri, file_uri(&project.real.join("docs/b.adoc")));
+        assert_eq!(open.uri, b_link);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_same_file_result_follows_the_requesting_buffer() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        let (service, _socket) = initialized_server(&project.real).await;
+        let server = service.inner();
+        let via_link = file_uri(&project.link.join("docs/a.adoc"));
+        let via_real = file_uri(&project.real.join("docs/a.adoc"));
+        open_document(server, &via_link, doc).await;
+        open_document(server, &via_real, doc).await;
+        let position = position_of(doc, "{my_attr}", 3);
+
+        let from_link = definition(server, &via_link, position).await.unwrap();
+        let from_real = definition(server, &via_real, position).await.unwrap();
+
+        assert_eq!(from_link.uri, via_link);
+        assert_eq!(from_real.uri, via_real);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_explain_position_reports_what_the_handlers_look_up() {
+        let project = SymlinkedProject::new();
+        let doc = SymlinkedProject::DOC;
+        let (service, _socket) = initialized_server(&project.real).await;
+        let server = service.inner();
+        let raw = project.link.join("docs/a.adoc");
+        let canonical = project.real.join("docs/a.adoc");
+        let uri = file_uri(&raw);
+        open_document(server, &uri, doc).await;
+        let argument =
+            serde_json::to_value(doc_position(&uri, position_of(doc, "{my_attr}", 3))).unwrap();
+
+        let report = server
+            .execute_command(ExecuteCommandParams {
+                command: EXPLAIN_POSITION_COMMAND.into(),
+                arguments: vec![argument],
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let request = &report["request"];
+        assert_eq!(request["raw_path"], raw.display().to_string());
+        assert_eq!(request["canonical_path"], canonical.display().to_string());
+        assert_eq!(request["lookup_path"], canonical.display().to_string());
+        assert_eq!(request["paths_differ"], true);
+        assert_eq!(request["in_documents_raw"], false);
+        assert_eq!(request["in_documents_canonical"], true);
+        assert_eq!(report["resolution"]["per_file"]["registered"], true);
+        assert_eq!(report["resolution"]["value"], "value");
+    }
+
+    #[test]
+    fn test_document_path_keeps_the_raw_path_of_an_unsaved_file() {
+        let uri = Uri::from_str("file:///does/not/exist/new.adoc").unwrap();
+
+        assert_eq!(
+            document_path(&uri),
+            Some(PathBuf::from("/does/not/exist/new.adoc"))
+        );
     }
 }

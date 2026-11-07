@@ -418,25 +418,27 @@ fn resolve_xref_target(
 
 /// Build a debug report of what go-to-definition and hover see at `pos`.
 ///
-/// Uses `doc_path` exactly as passed (no canonicalization), like the
-/// handlers do, so path-key mismatches in the workspace show up in the
-/// report. Top-level fields: `request`, `node`, `resolution`,
+/// `lookup_path` is the path the handlers resolve with; pass it exactly as
+/// they do, so a path-key mismatch in the workspace shows up in the report.
+/// `raw_path` is the path of the client's URI, reported next to its canonical
+/// form. Top-level fields: `request`, `node`, `resolution`,
 /// `known_attributes`.
 pub fn explain_position(
     content: &str,
     pos: Position,
-    doc_path: &Path,
+    raw_path: &Path,
+    lookup_path: &Path,
     workspace: Option<&Workspace>,
 ) -> Value {
     let node_info = find_node_at_position(content, pos);
     let node = node_info.as_ref().map_or(Value::Null, explain_node);
     let resolution = node_info.as_ref().map_or(Value::Null, |info| {
-        explain_resolution(info, doc_path, workspace)
+        explain_resolution(info, lookup_path, workspace)
     });
     let known_attributes: Vec<Value> = workspace
         .map(|ws| {
             ws.attributes()
-                .known_attributes(doc_path)
+                .known_attributes(lookup_path)
                 .into_iter()
                 .map(|k| {
                     json!({
@@ -451,32 +453,33 @@ pub fn explain_position(
         .unwrap_or_default();
 
     json!({
-        "request": explain_request(doc_path, workspace),
+        "request": explain_request(raw_path, lookup_path, workspace),
         "node": node,
         "resolution": resolution,
         "known_attributes": known_attributes,
     })
 }
 
-fn explain_request(doc_path: &Path, workspace: Option<&Workspace>) -> Value {
-    let canonical = doc_path.canonicalize();
+fn explain_request(raw_path: &Path, lookup_path: &Path, workspace: Option<&Workspace>) -> Value {
+    let canonical = raw_path.canonicalize();
     let in_documents = |p: &Path| workspace.is_some_and(|ws| ws.documents().contains_key(p));
     let (canonical_path, canonicalize_error, paths_differ, in_canonical) = match &canonical {
         Ok(c) => (
             Value::String(path_string(c)),
             Value::Null,
-            c != doc_path,
+            c != raw_path,
             in_documents(c),
         ),
         Err(e) => (Value::Null, Value::String(e.to_string()), false, false),
     };
     json!({
-        "raw_path": path_string(doc_path),
+        "raw_path": path_string(raw_path),
         "canonical_path": canonical_path,
+        "lookup_path": path_string(lookup_path),
         "canonicalize_error": canonicalize_error,
         "paths_differ": paths_differ,
         "workspace_root": workspace.map(|ws| path_string(ws.root())),
-        "in_documents_raw": in_documents(doc_path),
+        "in_documents_raw": in_documents(raw_path),
         "in_documents_canonical": in_canonical,
     })
 }
@@ -3329,7 +3332,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "attribute_ref");
         assert_eq!(report["node"]["line"], 4);
@@ -3356,7 +3359,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 3,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "attribute_def");
         assert_eq!(report["node"]["fields"]["name"], "author");
@@ -3382,7 +3385,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "xref");
         assert_eq!(report["node"]["fields"]["target"], "b.adoc#my-anchor");
@@ -3403,7 +3406,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 8,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "shorthand_xref");
         assert!(report["resolution"]["resolved"].is_null());
@@ -3427,7 +3430,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "include");
         assert_eq!(report["node"]["fields"]["path"], "sub.adoc");
@@ -3452,7 +3455,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(
             report["resolution"]["target"],
@@ -3482,7 +3485,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         // Without a workspace the target is joined but not canonicalized,
         // so the symlinked raw target and gd's canonical path differ.
-        let report = explain_position(&content, pos, &a, None);
+        let report = explain_position(&content, pos, &a, &a, None);
 
         let res = &report["resolution"];
         assert_eq!(
@@ -3506,7 +3509,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 9,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "image");
         assert_eq!(report["node"]["fields"]["path"], "logo.png");
@@ -3530,7 +3533,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 14,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "anchor");
         assert_eq!(report["node"]["fields"]["id"], "my-anchor");
@@ -3552,7 +3555,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 5,
         };
 
-        let report = explain_position(&content, pos, &a, Some(&ws));
+        let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert!(report["node"].is_null());
         assert!(report["resolution"].is_null());
@@ -3621,7 +3624,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let report = explain_position(&content, pos, &a, None);
+        let report = explain_position(&content, pos, &a, &a, None);
 
         assert!(report["request"]["workspace_root"].is_null());
         assert_eq!(report["request"]["in_documents_raw"], false);
@@ -3649,15 +3652,23 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let report = explain_position(&content, pos, &raw, Some(&ws));
+        let report = explain_position(&content, pos, &raw, &raw, Some(&ws));
 
         let req = &report["request"];
         assert_eq!(req["raw_path"], path_string(&raw));
         assert_eq!(req["canonical_path"], path_string(&a));
+        assert_eq!(req["lookup_path"], path_string(&raw));
         assert_eq!(req["paths_differ"], true);
         assert_eq!(req["in_documents_raw"], false);
         assert_eq!(req["in_documents_canonical"], true);
         assert_eq!(report["resolution"]["per_file"]["registered"], false);
         assert!(report["resolution"]["value"].is_null());
+
+        let fixed = explain_position(&content, pos, &raw, &a, Some(&ws));
+
+        assert_eq!(fixed["request"]["raw_path"], path_string(&raw));
+        assert_eq!(fixed["request"]["lookup_path"], path_string(&a));
+        assert_eq!(fixed["resolution"]["per_file"]["registered"], true);
+        assert_eq!(fixed["resolution"]["value"], "Alice");
     }
 }
