@@ -826,4 +826,53 @@ terminal while a `.adoc` file is open in Neovim with the LSP attached.
 // Expected: Neovim buffer state is preserved; xrefs to `x` still
 // resolve. The watcher event is ignored for open buffers.
 
+== T10: Debug tooling (adoc-0137)
+
+Needs asciidoc.nvim with `:AsciidocDebug` and the language-server
+section in `:checkhealth asciidoc`.
+
+:t10-product: Widget
+
+=== T10.1: `:AsciidocDebug` per reference kind
+
+// [ ] PASS  [ ] FAIL
+// Put the cursor on each reference below and run `:AsciidocDebug`:
+
+Attribute: {t10-product}.
+Xref: xref:chapters/introduction.adoc#_quality_goals[Quality Goals].
+
+include::chapters/introduction.adoc[]
+
+Plain text without a reference.
+
+// Expected: a split with the Markdown report opens, the same buffer and
+// window on every call, text yankable. Each report has `Request` (raw and
+// canonical path, workspace root), `Node`, `Resolution` and `Known
+// attributes`:
+//   attribute: kind `attribute_ref`, value `Widget`, winner `per_file`
+//   xref:      kind `xref`, `resolved` points to `chapters/introduction.adoc`
+//   include:   kind `include`, `exists` is `true`
+//   text:      "No AsciiDoc reference under the cursor."
+
+=== T10.2: `gd` on an attribute defined in the same file
+
+// [ ] PASS  [ ] FAIL
+// Put the cursor on `{t10-product}` in T10.1 and press `gd`.
+// Expected: jumps to the `:t10-product: Widget` line above T10.1.
+// On FAIL: run `:AsciidocDebug` there and note `paths_differ`,
+// `in_documents_raw` and `per_file.registered`.
+
+=== T10.3: `:checkhealth asciidoc` path warning
+
+// [ ] PASS  [ ] FAIL
+// Setup (terminal), a file symlink (Neovim resolves symlinked
+// directories in buffer names itself):
+//   ln -s manual-test-plan.adoc tests/t10-link.adoc
+// Open `tests/t10-link.adoc` in Neovim, then run `:checkhealth asciidoc`.
+// Expected: section "asciidoc.nvim: language server" lists the buffer
+// with `asciidoc (root_dir: …)` and a WARNING
+// "…/t10-link.adoc resolves to …/manual-test-plan.adoc".
+// Opening `tests/manual-test-plan.adoc` directly shows OK, no warning.
+// Cleanup: rm tests/t10-link.adoc
+
 ---
