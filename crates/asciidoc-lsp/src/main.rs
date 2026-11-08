@@ -90,11 +90,16 @@ impl AsciiDocLsp {
         &self,
         classified: ClassifiedEvents,
     ) -> Option<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>> {
+        // Open buffers are read before the workspace lock is taken, as in
+        // the text-sync handlers.
+        let open = classified
+            .config_changed
+            .then(|| open_contents(&self.documents.lock()));
         let mut ws = self.workspace.lock();
         let ws = ws.as_mut()?;
 
-        if classified.config_changed {
-            ws.clear_config_chains();
+        if let Some(open) = open {
+            ws.reload_config(&open);
         }
 
         // CREATED/CHANGED re-parse from disk (no overrides — open buffers were
@@ -958,7 +963,8 @@ enum WatchedKind {
 }
 
 /// AsciiDoc-relevant events extracted from a `DidChangeWatchedFilesParams`
-/// batch, with open-buffer events filtered out (LSP text-sync owns those).
+/// batch, with `.adoc` events for open buffers filtered out (LSP text-sync
+/// owns those).
 #[derive(Debug, Default)]
 struct ClassifiedEvents {
     config_changed: bool,
@@ -966,9 +972,9 @@ struct ClassifiedEvents {
 }
 
 /// Filter and bucket a watcher-event batch.
-/// Drops events for open buffers and unrelated paths. Returns `None` when
-/// nothing relevant remains, so the caller can skip the workspace lock and
-/// publish step entirely.
+/// Drops `.adoc` events for open buffers and events for unrelated paths.
+/// Returns `None` when nothing relevant remains, so the caller can skip the
+/// workspace lock and publish step entirely.
 fn classify_events(
     changes: Vec<FileEvent>,
     open_buffers: &HashSet<PathBuf>,
@@ -979,13 +985,13 @@ fn classify_events(
             continue;
         };
         let path: PathBuf = path.into_owned();
-        if is_path_open(&path, open_buffers) {
-            continue;
-        }
         match classify_watched_path(&path) {
+            // Config chains are read from disk, open in the editor or not.
             Some(WatchedKind::Config) => out.config_changed = true,
-            Some(WatchedKind::AsciiDoc) => out.adoc_events.push((path, change.typ)),
-            None => {}
+            Some(WatchedKind::AsciiDoc) if !is_path_open(&path, open_buffers) => {
+                out.adoc_events.push((path, change.typ));
+            }
+            Some(WatchedKind::AsciiDoc) | None => {}
         }
     }
     if !out.config_changed && out.adoc_events.is_empty() {
@@ -1122,14 +1128,19 @@ fn build_content_overrides(
     active: &Uri,
 ) -> HashMap<PathBuf, Arc<String>> {
     let docs = documents.lock();
-    let mut overrides: HashMap<PathBuf, Arc<String>> = docs
-        .iter()
-        .filter_map(|(uri, state)| Some((document_path(uri)?, Arc::clone(&state.content))))
-        .collect();
+    let mut overrides = open_contents(&docs);
     if let (Some(path), Some(state)) = (document_path(active), docs.get(active)) {
         overrides.insert(path, Arc::clone(&state.content));
     }
     overrides
+}
+
+/// Content of every open document keyed by [`document_path`]. Of two
+/// buffers of one file, either one's content is taken.
+fn open_contents(docs: &HashMap<Uri, DocumentState>) -> HashMap<PathBuf, Arc<String>> {
+    docs.iter()
+        .filter_map(|(uri, state)| Some((document_path(uri)?, Arc::clone(&state.content))))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,6 +1893,20 @@ mod tests {
         open.insert(PathBuf::from("/ws/open.adoc"));
         let changes = vec![make_event("file:///ws/open.adoc", FileChangeType::CHANGED)];
         assert!(classify_events(changes, &open).is_none());
+    }
+
+    /// Config chains are read from disk, so saving a config open in the
+    /// editor (`.asciidoctorconfig.adoc` is an AsciiDoc buffer) must count.
+    #[test]
+    fn test_classify_events_keeps_config_open_in_editor() {
+        let mut open: HashSet<PathBuf> = HashSet::new();
+        open.insert(PathBuf::from("/ws/.asciidoctorconfig.adoc"));
+        let changes = vec![make_event(
+            "file:///ws/.asciidoctorconfig.adoc",
+            FileChangeType::CHANGED,
+        )];
+        let classified = classify_events(changes, &open).expect("config event remains");
+        assert!(classified.config_changed);
     }
 
     // --- adoc-0137: asciidoc.explainPosition command arguments ---
@@ -3217,5 +3242,157 @@ mod tests {
                 "{needle}"
             );
         }
+    }
+
+    // --- External file changes (manual test plan T9) ---
+
+    async fn notify_watched(server: &AsciiDocLsp, path: &Path, typ: FileChangeType) {
+        server
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: file_uri(path),
+                    typ,
+                }],
+            })
+            .await;
+    }
+
+    /// Targets of the broken xrefs the server holds for `path`.
+    fn broken_xrefs(server: &AsciiDocLsp, path: &Path) -> Vec<String> {
+        let ws = server.workspace.lock();
+        ws.as_ref()
+            .unwrap()
+            .diagnostics_for(path)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                asciidoc_core::types::DiagnosticKind::BrokenXref { target } => Some(target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// T9.1–T9.3: creating, changing and deleting the config changes hover
+    /// on an open document without any edit to it.
+    #[tokio::test]
+    async fn test_config_watch_events_update_hover_without_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let config = root.join(".asciidoctorconfig");
+        let text = "= A\n\nGreeting: {greeting}\n";
+        fs::write(root.join("a.adoc"), text).unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let uri = file_uri(&root.join("a.adoc"));
+        open_document(server, &uri, text).await;
+        let at = position_of(text, "{greeting}", 1);
+
+        let steps = [
+            (
+                Some(":greeting: hello\n"),
+                FileChangeType::CREATED,
+                Some("hello"),
+            ),
+            (
+                Some(":greeting: bonjour\n"),
+                FileChangeType::CHANGED,
+                Some("bonjour"),
+            ),
+            (None, FileChangeType::DELETED, None),
+        ];
+        for (content, typ, expected) in steps {
+            match content {
+                Some(content) => fs::write(&config, content).unwrap(),
+                None => fs::remove_file(&config).unwrap(),
+            }
+            notify_watched(server, &config, typ).await;
+
+            let hover = hover_text(server, &uri, at).await;
+            match expected {
+                Some(value) => {
+                    let hover = hover.unwrap_or_else(|| panic!("no hover after {typ:?}"));
+                    assert!(
+                        hover.contains(&format!(":greeting: {value}")),
+                        "{typ:?}: {hover}"
+                    );
+                }
+                None => assert_eq!(hover, None, "{typ:?}"),
+            }
+        }
+    }
+
+    /// A config event re-reads open documents from the editor, not from disk.
+    #[tokio::test]
+    async fn test_config_watch_event_keeps_unsaved_buffer_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let config = root.join(".asciidoctorconfig");
+        fs::write(&config, ":greeting: hello\n").unwrap();
+        fs::write(root.join("a.adoc"), "= A\n").unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let uri = file_uri(&root.join("a.adoc"));
+        let unsaved = "= A\n:local: unsaved\n\n{local} {greeting}\n";
+        open_document(server, &uri, unsaved).await;
+
+        fs::write(&config, ":greeting: bonjour\n").unwrap();
+        notify_watched(server, &config, FileChangeType::CHANGED).await;
+
+        let local = hover_text(server, &uri, position_of(unsaved, "{local}", 1)).await;
+        assert!(local.is_some_and(|h| h.contains(":local: unsaved")));
+        let greeting = hover_text(server, &uri, position_of(unsaved, "{greeting}", 1)).await;
+        assert!(greeting.is_some_and(|h| h.contains(":greeting: bonjour")));
+    }
+
+    /// T9.4–T9.6: creating, deleting and editing a closed `.adoc` on disk
+    /// updates the broken-xref diagnostics of an open document.
+    #[tokio::test]
+    async fn test_adoc_watch_events_update_xref_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.adoc");
+        let b = root.join("b.adoc");
+        let text = "= A\n\nSee xref:b.adoc#new-anchor[link].\n";
+        fs::write(&a, text).unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        open_document(server, &file_uri(&a), text).await;
+        let broken = vec!["b.adoc#new-anchor".to_string()];
+        assert_eq!(broken_xrefs(server, &a), broken, "before b.adoc exists");
+
+        fs::write(&b, "[[new-anchor]]\n= B\n").unwrap();
+        notify_watched(server, &b, FileChangeType::CREATED).await;
+        assert!(broken_xrefs(server, &a).is_empty(), "T9.4: create");
+
+        fs::remove_file(&b).unwrap();
+        notify_watched(server, &b, FileChangeType::DELETED).await;
+        assert_eq!(broken_xrefs(server, &a), broken, "T9.5: delete");
+
+        fs::write(&b, "[[new-anchor]]\n= B\n").unwrap();
+        notify_watched(server, &b, FileChangeType::CREATED).await;
+        fs::write(&b, "= B\n").unwrap();
+        notify_watched(server, &b, FileChangeType::CHANGED).await;
+        assert_eq!(broken_xrefs(server, &a), broken, "T9.6: edit");
+    }
+
+    /// T9.7: a watcher event for an open document keeps the editor's
+    /// unsaved content.
+    #[tokio::test]
+    async fn test_adoc_watch_event_for_open_buffer_keeps_unsaved_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.adoc");
+        let b = root.join("b.adoc");
+        let a_text = "= A\n\nSee xref:b.adoc#x[x].\n";
+        fs::write(&a, a_text).unwrap();
+        fs::write(&b, "= B\n").unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        open_document(server, &file_uri(&a), a_text).await;
+        open_document(server, &file_uri(&b), "[[x]]\n= B\n").await;
+        assert!(broken_xrefs(server, &a).is_empty(), "unsaved anchor");
+
+        notify_watched(server, &b, FileChangeType::CHANGED).await;
+
+        assert!(broken_xrefs(server, &a).is_empty(), "after event");
     }
 }

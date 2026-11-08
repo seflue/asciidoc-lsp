@@ -344,12 +344,20 @@ impl Workspace {
         self.attributes.set_doc_dir(file, dir);
     }
 
-    /// Drop all cached `.asciidoctorconfig` chains.
+    /// Re-read all `.asciidoctorconfig` chains and re-parse every indexed
+    /// document against them.
     ///
-    /// Called when an `.asciidoctorconfig*` file changes on disk so the next
-    /// attribute resolution re-reads configs.
-    pub fn clear_config_chains(&mut self) {
+    /// Called when an `.asciidoctorconfig*` file is created, changed or
+    /// deleted on disk. Config attributes feed attribute resolution and
+    /// include targets (`include::{dir}/x.adoc[]`), so every document is
+    /// re-parsed, open ones from `overrides`. Caller is responsible for
+    /// `recalculate_diagnostics()` afterwards.
+    pub fn reload_config(&mut self, overrides: &HashMap<PathBuf, Arc<String>>) {
         self.attributes.clear_config_chains();
+        let files: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        for file in files {
+            self.update_file(&file, overrides);
+        }
     }
 
     /// Scan the workspace root for all `.adoc` files and index them.
@@ -1768,7 +1776,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0119: remove_file + clear_config_chains ---
+    // --- adoc-0119: remove_file + reload_config ---
 
     #[test]
     fn test_remove_file_clears_all_indexes() {
@@ -1818,33 +1826,101 @@ mod tests {
         assert!(ws.reference_index.lookup("anchor-b").is_some());
     }
 
+    /// Workspace with `doc.adoc` (`{greeting}`) indexed from disk.
+    fn workspace_with_doc(root: &Path) -> (Workspace, PathBuf) {
+        let doc = root.join("doc.adoc");
+        fs::write(&doc, "= Doc\n\n{greeting}\n").unwrap();
+        let mut ws = Workspace::new(root);
+        ws.ensure_file(&doc, &HashMap::new());
+        (ws, doc)
+    }
+
     #[test]
-    fn test_clear_config_chains_picks_up_new_config_value() {
+    fn test_reload_config_picks_up_changed_value() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-
         fs::write(root.join(".asciidoctorconfig"), ":greeting: hello\n").unwrap();
-        let entry = root.join("doc.adoc");
-        fs::write(&entry, "= Doc\n\n{greeting}\n").unwrap();
+        let (mut ws, doc) = workspace_with_doc(&root);
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), Some("hello"));
 
-        let mut ws = Workspace::new(&root);
-        let overrides = HashMap::new();
-        let entry_canon = entry.canonicalize().unwrap();
-        ws.ensure_file(&entry_canon, &overrides);
-        assert_eq!(
-            ws.attributes().resolve(&entry_canon, "greeting"),
-            Some("hello")
-        );
-
-        // Edit the config on disk; without clear, the cache still serves "hello".
         fs::write(root.join(".asciidoctorconfig"), ":greeting: bonjour\n").unwrap();
-        ws.clear_config_chains();
-        // Re-resolve: lookup re-populates the chain from disk.
-        ws.update_file(&entry_canon, &overrides);
-        assert_eq!(
-            ws.attributes().resolve(&entry_canon, "greeting"),
-            Some("bonjour")
-        );
+        ws.reload_config(&HashMap::new());
+
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), Some("bonjour"));
+    }
+
+    #[test]
+    fn test_reload_config_drops_value_of_deleted_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: hello\n").unwrap();
+        let (mut ws, doc) = workspace_with_doc(&root);
+
+        fs::remove_file(root.join(".asciidoctorconfig")).unwrap();
+        ws.reload_config(&HashMap::new());
+
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), None);
+    }
+
+    #[test]
+    fn test_reload_config_reads_config_created_in_folder_without_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let doc = sub.join("doc.adoc");
+        fs::write(&doc, "= Doc\n\n{greeting}\n").unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.ensure_file(&doc, &HashMap::new());
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), None);
+
+        fs::write(sub.join(".asciidoctorconfig"), ":greeting: hello\n").unwrap();
+        ws.reload_config(&HashMap::new());
+
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), Some("hello"));
+    }
+
+    #[test]
+    fn test_reload_config_follows_include_target_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["one", "two"] {
+            fs::create_dir(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("part.adoc"), "Part\n").unwrap();
+        }
+        fs::write(root.join(".asciidoctorconfig"), ":partsdir: one\n").unwrap();
+        let doc = root.join("doc.adoc");
+        fs::write(&doc, "= Doc\n\ninclude::{partsdir}/part.adoc[]\n").unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.ensure_file(&doc, &HashMap::new());
+
+        fs::write(root.join(".asciidoctorconfig"), ":partsdir: two\n").unwrap();
+        ws.reload_config(&HashMap::new());
+
+        let targets: Vec<&Path> = ws
+            .include_graph
+            .includes_of(&doc)
+            .iter()
+            .map(|edge| edge.target.as_path())
+            .collect();
+        assert_eq!(targets, vec![root.join("two/part.adoc").as_path()]);
+    }
+
+    #[test]
+    fn test_reload_config_keeps_open_buffer_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: hello\n").unwrap();
+        let (mut ws, doc) = workspace_with_doc(&root);
+        let buffer = Arc::new(String::from("= Doc\n:unsaved: yes\n\n{greeting}\n"));
+        let overrides = HashMap::from([(doc.clone(), buffer)]);
+        ws.update_file(&doc, &overrides);
+
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: bonjour\n").unwrap();
+        ws.reload_config(&overrides);
+
+        assert_eq!(ws.attributes().resolve(&doc, "unsaved"), Some("yes"));
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), Some("bonjour"));
     }
 
     #[test]
