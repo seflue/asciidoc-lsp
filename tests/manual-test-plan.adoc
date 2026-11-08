@@ -704,6 +704,23 @@ Subdir: xref:chapters/
 // Expected: Only files inside `chapters/` appear (e.g. `introduction.adoc[]`).
 // Actually: No asciidoc contextual results, only snippets and buffer words
 
+==== T7.12: Goto — xref and inline image inside table cells
+
+// [ ] PASS  [ ] FAIL
+// Place cursor on each xref and on the image in the cells below and press `gd`
+// (`K` on the image shows hover):
+
+|===
+| See xref:chapters/introduction.adoc#_quality_goals[Quality Goals] in a cell.
+a| See xref:chapters/introduction.adoc#_quality_goals[Quality Goals] in an a-cell.
+| Logo | image:test-placeholder.png[Placeholder]
+|===
+
+// Expected: Both xrefs jump to `tests/chapters/introduction.adoc` at
+// `=== Quality Goals`. The image resolves like T1.1 (`gd` opens
+// `tests/images/test-placeholder.png`, hover shows `✓ File exists`). Regression for adoc-0125: table cells are raw
+// `table_cell_content` in the grammar and were never fed to the inline parser.
+
 ---
 
 [[t8-target]]

@@ -1107,6 +1107,33 @@ mod tests {
 
     // --- adoc-0072 Phase 4: Per-File-Diagnostics tests ---
 
+    // adoc-0125: xrefs in default table cells take part in xref diagnostics.
+    #[test]
+    fn test_scan_workspace_checks_xrefs_in_table_cells() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join("defs.adoc"), "[[my-target]]\n= Definitions\n").unwrap();
+        fs::write(
+            root.join("refs.adoc"),
+            "= References\n\n|===\n| xref:defs.adoc#my-target[ok] | <<missing-target>>\n|===\n",
+        )
+        .unwrap();
+
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        let broken: Vec<_> = ws
+            .all_diagnostics()
+            .into_iter()
+            .filter_map(|d| match d.kind {
+                crate::types::DiagnosticKind::BrokenXref { target } => Some(target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(broken, vec!["missing-target".to_string()]);
+    }
+
     #[test]
     fn test_diagnostics_stored_per_file() {
         // Two files: A has a broken xref (warning), B has a broken include (error).

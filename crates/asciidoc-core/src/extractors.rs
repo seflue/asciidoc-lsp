@@ -376,6 +376,12 @@ fn walk_for_inline_ranges(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter:
         }
     }
 
+    // Table cells (`|` and `a|`) are raw `table_cell_content` without `line`
+    // children, so the whole cell content is one inline range.
+    if parent_kind == "table_cell_content" {
+        ranges.push(node.range());
+    }
+
     // Still recurse into children for nested structures
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -561,6 +567,48 @@ mod tests {
             "Should find inline ranges in list items, got {}",
             ranges.len()
         );
+    }
+
+    // --- adoc-0125: xrefs in table cells ---
+
+    fn xrefs_in(source: &str) -> Vec<Xref> {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        let ranges = collect_inline_ranges(tree.root_node());
+        let (xrefs, _) = extract_inline_content_safe(&ranges, source);
+        xrefs
+    }
+
+    #[rstest::rstest]
+    #[case::default_cell("= T\n\n|===\n| xref:target.adoc[Label]\n|===\n")]
+    #[case::asciidoc_cell("= T\n\n|===\na| xref:target.adoc[Label]\n|===\n")]
+    #[case::second_cell_in_row("= T\n\n|===\n| A | xref:target.adoc[Label]\n|===\n")]
+    #[case::header_cell(
+        "= T\n\n[options=\"header\"]\n|===\n| xref:target.adoc[Label]\n| Other\n|===\n"
+    )]
+    #[case::multiline_cell("= T\n\n|===\n| first line\nxref:target.adoc[Label]\n|===\n")]
+    #[case::escaped_pipe_in_label("= T\n\n|===\n| xref:target.adoc[A \\| B]\n|===\n")]
+    fn test_xref_in_table_cell(#[case] source: &str) {
+        let xrefs = xrefs_in(source);
+        assert_eq!(xrefs.len(), 1, "got {xrefs:?}");
+        assert_eq!(xrefs[0].target, "target.adoc");
+    }
+
+    #[test]
+    fn test_escaped_pipe_keeps_cell_boundary_and_raw_label() {
+        // The grammar does not split the cell at `\|`. The label keeps the
+        // source text; Asciidoctor would render `A | B`. Only the CLI shows
+        // labels, so the backslash is not unescaped here.
+        let xrefs = xrefs_in("= T\n\n|===\n| xref:target.adoc[A \\| B] | next\n|===\n");
+        assert_eq!(xrefs.len(), 1, "got {xrefs:?}");
+        assert_eq!(xrefs[0].display_text.as_deref(), Some("A \\| B"));
+    }
+
+    #[test]
+    fn test_shorthand_xref_in_default_table_cell() {
+        let xrefs = xrefs_in("= T\n\n|===\n| See <<my-anchor,Label>>\n|===\n");
+        assert_eq!(xrefs.len(), 1, "got {xrefs:?}");
+        assert_eq!(xrefs[0].target, "my-anchor");
     }
 
     // --- adoc-0013: Include-Attribute extraction ---

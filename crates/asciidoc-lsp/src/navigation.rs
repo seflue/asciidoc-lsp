@@ -1330,6 +1330,36 @@ mod tests {
         assert_eq!(line, 1); // [[my-anchor]] is on line 1
     }
 
+    // adoc-0125: xrefs in default (`|`) and AsciiDoc (`a|`) table cells.
+    #[rstest]
+    #[case::default_cell("| See xref:b.adoc#my-anchor[link].", 12)]
+    #[case::asciidoc_cell("a| See xref:b.adoc#my-anchor[link].", 13)]
+    #[case::second_cell_in_row("| A | xref:b.adoc#my-anchor[link]", 12)]
+    #[case::shorthand("| See <<my-anchor>>.", 10)]
+    #[case::second_line_of_cell("| First line\nxref:b.adoc#my-anchor[link]", 6)]
+    fn test_goto_def_xref_in_table_cell(#[case] row: &str, #[case] character: u32) {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let b = root.join("b.adoc");
+        let content = format!("= Doc A\n\n|===\n{row}\n|===\n\ninclude::b.adoc[]\n");
+        fs::write(&a, &content).unwrap();
+        fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(&root, &a);
+        let xref_line = content
+            .lines()
+            .position(|l| l.contains("my-anchor"))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(xref_line).unwrap(),
+            character,
+        };
+
+        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(target, b);
+        assert_eq!(line, 1);
+    }
+
     #[test]
     fn test_goto_def_xref_shorthand() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2612,6 +2642,18 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     #[case::list_item("= Doc A\n:imagesdir: img\n\n* image:logo.png[Alt]\n", 8)]
     #[case::section_title("= Doc A\n:imagesdir: img\n\n== A image:logo.png[Alt]\n", 12)]
     #[case::second_paragraph_line("= Doc A\n:imagesdir: img\n\nFirst.\nimage:logo.png[Alt]\n", 8)]
+    #[case::default_table_cell(
+        "= Doc A\n:imagesdir: img\n\n|===\n| image:logo.png[Alt]\n|===\n",
+        10
+    )]
+    #[case::asciidoc_table_cell(
+        "= Doc A\n:imagesdir: img\n\n|===\na| image:logo.png[Alt]\n|===\n",
+        10
+    )]
+    #[case::second_cell_in_row(
+        "= Doc A\n:imagesdir: img\n\n|===\n| A | image:logo.png[Alt]\n|===\n",
+        14
+    )]
     fn test_inline_image_hover_and_goto_use_imagesdir(#[case] doc: &str, #[case] character: u32) {
         let (_tmp, root) = canonical_tmp();
         let img = root.join("img");
