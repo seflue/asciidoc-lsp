@@ -309,6 +309,7 @@ impl LanguageServer for AsciiDocLsp {
                         "<".into(), // << xref
                         ":".into(), // include::
                         "{".into(), // {attribute
+                        "/".into(), // next path segment
                     ]),
                     ..Default::default()
                 }),
@@ -2502,11 +2503,42 @@ mod tests {
             panic!("expected completion items, got {response:?}");
         };
         let intro = items.iter().find(|i| i.label == "intro.adoc").unwrap();
+        // The edit replaces the typed `chapters/` instead of leaving it to the
+        // client's keyword rules, which stop at `/`.
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &intro.text_edit
+        else {
+            panic!("expected a TextEdit, got {:?}", intro.text_edit);
+        };
         assert_eq!(
-            intro.insert_text.as_deref(),
-            Some("chapters/intro.adoc${1}[${2:label}]")
+            edit.range,
+            Range::new(Position::new(2, 9), Position::new(2, 18))
         );
+        assert_eq!(edit.new_text, "chapters/intro.adoc${1}[${2:label}]");
         assert_eq!(intro.filter_text.as_deref(), Some("chapters/intro.adoc"));
+    }
+
+    #[tokio::test]
+    async fn test_slash_triggers_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let result = service
+            .inner()
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(tmp.path()),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let triggers = result
+            .capabilities
+            .completion_provider
+            .and_then(|c| c.trigger_characters)
+            .unwrap_or_default();
+        assert!(triggers.iter().any(|t| t == "/"), "triggers: {triggers:?}");
     }
 
     #[test]
