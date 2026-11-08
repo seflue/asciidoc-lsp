@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, InsertTextFormat, Position, Range,
@@ -657,7 +657,16 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     items
 }
 
-/// Resolve xref path completions: `.adoc` files relative to `doc_path`'s parent.
+/// The directory relative paths in `doc_path` resolve against: the
+/// workspace's document directory, else `doc_path`'s parent.
+fn document_dir(doc_path: &Path, ws: Option<&Workspace>) -> PathBuf {
+    ws.and_then(|ws| ws.attributes().doc_dir(doc_path))
+        .or_else(|| doc_path.parent())
+        .unwrap_or(doc_path)
+        .to_path_buf()
+}
+
+/// Resolve xref path completions: `.adoc` files relative to the document directory.
 /// Reuses `resolve_path_completions` (which appends `[]` to file entries).
 pub(crate) fn resolve_xref_path_completions(
     prefix: &str,
@@ -665,7 +674,7 @@ pub(crate) fn resolve_xref_path_completions(
     ws: Option<&Workspace>,
     closing: &str,
 ) -> Vec<CompletionItem> {
-    let base = doc_path.parent().unwrap_or(doc_path).to_path_buf();
+    let base = document_dir(doc_path, ws);
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
     // When brackets already follow the cursor (`closing == ""`): drop the bracket
@@ -803,7 +812,7 @@ fn resolve_path_completions(
         None => ("", resolved_prefix.as_str()),
     };
 
-    let list_dir = base_dir.join(resolved_dir);
+    let list_dir = asciidoc_core::paths::normalize_lexically(&base_dir.join(resolved_dir));
 
     let Ok(entries) = std::fs::read_dir(&list_dir) else {
         return Vec::new();
@@ -866,13 +875,13 @@ fn resolve_path_completions(
 }
 
 /// Resolve include-path completions by listing `.adoc` files and subdirectories
-/// relative to the document's parent directory, filtered by prefix.
+/// relative to the document directory, filtered by prefix.
 pub(crate) fn resolve_include_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
-    let base = doc_path.parent().unwrap_or(doc_path).to_path_buf();
+    let base = document_dir(doc_path, ws);
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(
         prefix,

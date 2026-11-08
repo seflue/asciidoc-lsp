@@ -173,9 +173,14 @@ pub fn build_graph_with_overrides(
     let mut graph = IncludeGraph::new();
     let mut documents = HashMap::new();
     let mut visited = HashSet::new();
+    // Like Asciidoctor's `File.absolute_path`: absolute, `..` popped, symlinks kept.
+    let entry = std::path::absolute(entry).map_or_else(
+        |_| entry.to_path_buf(),
+        |path| crate::paths::normalize_lexically(&path),
+    );
 
     walk(
-        entry,
+        &entry,
         registry,
         &mut graph,
         &mut documents,
@@ -222,9 +227,9 @@ pub fn parse_single_file(
     // Extract conditional directives (ifdef/ifndef) via byte-scanning
     let conditionals = crate::extractors::extract_conditionals(&source);
 
-    // Ensure config chain is loaded for this file's directory
-    if let Some(dir) = canonical.parent() {
-        registry.ensure_config_for_dir(dir);
+    // Ensure config chain is loaded for this file's document directory
+    if let Some(dir) = registry.doc_dir(canonical).map(Path::to_path_buf) {
+        registry.ensure_config_for_dir(&dir);
     }
 
     // Register file attributes
@@ -273,15 +278,24 @@ fn walk(
     if !visited.insert(canonical.clone()) {
         return; // Already parsed → dedup
     }
+    // `file` is the path as reached (entry or include path, symlinks kept):
+    // its folder is the document directory. A file reached by several paths
+    // is parsed once, so the first path in walk order sets it.
+    if let Some(dir) = file.parent() {
+        registry.set_doc_dir(&canonical, dir);
+    }
 
     let Some((doc, edges)) = parse_single_file(&canonical, registry, overrides) else {
         return;
     };
 
-    // Add edges to graph and recurse into includes
-    for edge in &edges {
+    // Add edges to graph and recurse into includes along the path as written.
+    // `edges` is built from `doc.includes` in the same order.
+    for (edge, include) in edges.iter().zip(&doc.includes) {
         graph.add_edge(&canonical, edge.clone());
-        walk(&edge.target, registry, graph, documents, visited, overrides);
+        let next = crate::paths::resolve_doc_path(&canonical, &include.path, registry)
+            .unwrap_or_else(|| edge.target.clone());
+        walk(&next, registry, graph, documents, visited, overrides);
     }
 
     documents.insert(canonical, doc);
@@ -357,6 +371,43 @@ mod tests {
 
         assert_eq!(documents.len(), 1);
         assert!(graph.forward.is_empty() || graph.forward.values().all(|v| v.is_empty()));
+    }
+
+    /// A file included through a symlinked folder resolves its own includes
+    /// from the folder of the include path as written (the link), with `..`
+    /// popped textually; the entry keeps its folder too if it is a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn test_graph_nested_include_through_symlinked_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("dir")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            elsewhere.join("main.adoc"),
+            "= A\n\ninclude::lnk/sub.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(
+            elsewhere.join("dir/sub.adoc"),
+            "== B\n\ninclude::../part.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/part.adoc"), "Link side.\n").unwrap();
+        fs::write(elsewhere.join("part.adoc"), "Target side.\n").unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("dir"), root.join("docs/lnk")).unwrap();
+        let entry = root.join("docs/main.adoc");
+        std::os::unix::fs::symlink(elsewhere.join("main.adoc"), &entry).unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        let (graph, _) = build_graph(&entry, &mut registry);
+
+        let main_edges = graph.includes_of(&elsewhere.join("main.adoc"));
+        assert_eq!(main_edges[0].target, elsewhere.join("dir/sub.adoc"));
+        let sub_edges = graph.includes_of(&elsewhere.join("dir/sub.adoc"));
+        assert_eq!(sub_edges[0].target, root.join("docs/part.adoc"));
     }
 
     #[test]

@@ -2,35 +2,75 @@
 //!
 //! `include::`, `xref:`, and `image::` all resolve their target path the same
 //! way: substitute `{attr}` references against the source document's attribute
-//! scope, then join onto the source file's directory, then canonicalize. This
+//! scope, then join onto the source file's document directory, pop `..`
+//! segments textually, then canonicalize. This
 //! module provides a single implementation of that pipeline so resolvers stay
 //! in sync with each other (and with Asciidoctor's behaviour).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::attributes::AttributeRegistry;
 
 /// Resolve a target path string (as written in an `AsciiDoc` macro) relative
-/// to the source file's directory, after applying attribute substitution.
+/// to the source file's document directory, after applying attribute substitution.
 ///
 /// Pipeline:
 /// 1. Substitute `{attr}` references via the registry, scoped to `source`.
-/// 2. Join the result onto `source.parent()`.
-/// 3. Canonicalize. If the path does not exist on disk, return the joined
+/// 2. Join the result onto the document directory of `source`
+///    ([`AttributeRegistry::doc_dir`]): the symlink's folder for a document
+///    opened through a symlink, as with Asciidoctor's `docdir`.
+/// 3. Pop `..` segments textually ([`normalize_lexically`]).
+/// 4. Canonicalize. If the path does not exist on disk, return the normalized
 ///    (uncanonicalized) path so callers can still compare against in-memory
 ///    document keys.
 ///
-/// Returns `None` if `source` has no parent directory.
+/// Returns `None` if `source` has no document directory.
 #[must_use]
 pub fn resolve_doc_target(
     source: &Path,
     target: &str,
     registry: &AttributeRegistry,
 ) -> Option<PathBuf> {
-    let resolved = registry.substitute(source, target);
-    let base = source.parent()?;
-    let joined = base.join(resolved);
+    let joined = resolve_doc_path(source, target, registry)?;
     Some(joined.canonicalize().unwrap_or(joined))
+}
+
+/// Steps 1–3 of [`resolve_doc_target`]: the target as Asciidoctor sees it,
+/// with symlinks kept. Its parent is the document directory of the target.
+#[must_use]
+pub fn resolve_doc_path(
+    source: &Path,
+    target: &str,
+    registry: &AttributeRegistry,
+) -> Option<PathBuf> {
+    let resolved = registry.substitute(source, target);
+    let base = registry.doc_dir(source)?;
+    Some(normalize_lexically(&base.join(resolved)))
+}
+
+/// Drop `.` segments and let each `..` pop the segment before it, without
+/// asking the filesystem. Asciidoctor's `PathResolver#system_path` resolves
+/// paths this way, so `..` in a symlinked folder goes to the link's parent,
+/// not the target's. A `..` at the root or at the start of a relative path
+/// is kept as the root or as `..`. A relative path that pops to nothing
+/// (`a/..`) gives an empty path.
+#[must_use]
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(".."),
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -58,14 +98,31 @@ mod tests {
     #[test]
     fn resolves_uncanonicalized_when_target_missing() {
         let registry = AttributeRegistry::new(Path::new("/tmp"));
-        // Synthetic paths (don't exist on disk) — falls back to joined path.
+        // Synthetic paths (don't exist on disk) — falls back to the
+        // joined path with `..` popped textually.
         let resolved = resolve_doc_target(
             Path::new("/workspace/sub/src.adoc"),
             "../other/doc.adoc",
             &registry,
         )
         .unwrap();
-        assert_eq!(resolved, PathBuf::from("/workspace/sub/../other/doc.adoc"));
+        assert_eq!(resolved, PathBuf::from("/workspace/other/doc.adoc"));
+    }
+
+    #[test]
+    fn normalize_lexically_pops_parent_segments() {
+        for (input, expected) in [
+            ("/a/b/../c/./d.adoc", "/a/c/d.adoc"),
+            ("/a/../../b", "/b"),
+            ("../a/../b", "../b"),
+            ("a/../../b", "../b"),
+        ] {
+            assert_eq!(
+                normalize_lexically(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        }
     }
 
     #[test]

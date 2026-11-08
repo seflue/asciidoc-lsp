@@ -7,6 +7,7 @@ use tower_lsp_server::ls_types::Position;
 
 use asciidoc_core::attributes::{AttributeHit, AttributeLayer, AttributeSource};
 use asciidoc_core::extractors::find_child_text;
+use asciidoc_core::paths::normalize_lexically;
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
 use asciidoc_core::workspace::Workspace;
 
@@ -344,12 +345,16 @@ pub fn resolve_hover(
 /// Resolve the base directory and imagesdir for image paths.
 ///
 /// Returns `(base_dir, resolved_imagesdir)` where `base_dir` is `doc_dir / imagesdir`
-/// (or just `doc_dir` if imagesdir is empty/unset).
+/// (or just `doc_dir` if imagesdir is empty/unset). `doc_dir` is the document
+/// directory from the workspace (a symlink's folder for a symlinked document).
 pub(crate) fn resolve_image_base_dir(
     doc_path: &Path,
     workspace: Option<&Workspace>,
 ) -> (PathBuf, String) {
-    let doc_dir = doc_path.parent().unwrap_or(doc_path);
+    let doc_dir = workspace
+        .and_then(|ws| ws.attributes().doc_dir(doc_path))
+        .or_else(|| doc_path.parent())
+        .unwrap_or(doc_path);
     let imagesdir_raw = workspace
         .and_then(|ws| ws.attributes().resolve(doc_path, "imagesdir"))
         .unwrap_or("");
@@ -361,7 +366,7 @@ pub(crate) fn resolve_image_base_dir(
     let base = if imagesdir.is_empty() {
         doc_dir.to_path_buf()
     } else {
-        doc_dir.join(&imagesdir)
+        normalize_lexically(&doc_dir.join(&imagesdir))
     };
     (base, imagesdir)
 }
@@ -400,7 +405,7 @@ fn resolve_image_target(
         return ImageTarget::Remote { url: display };
     }
     ImageTarget::Local {
-        path: base.join(&resolved_path),
+        path: normalize_lexically(&base.join(&resolved_path)),
         display,
     }
 }

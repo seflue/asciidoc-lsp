@@ -405,6 +405,9 @@ impl LanguageServer for AsciiDocLsp {
                             indexed,
                             "did_open: register file"
                         );
+                        if let Some(dir) = path.parent() {
+                            ws.set_doc_dir(&canonical, dir);
+                        }
                         if indexed {
                             ws.update_file(&canonical, &overrides);
                         } else {
@@ -461,6 +464,9 @@ impl LanguageServer for AsciiDocLsp {
                             ?canonical,
                             "did_change: update file"
                         );
+                        if let Some(dir) = path.parent() {
+                            ws.set_doc_dir(&canonical, dir);
+                        }
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
                         Some(ws.diagnostics_map().clone())
@@ -514,6 +520,9 @@ impl LanguageServer for AsciiDocLsp {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
                         tracing::debug!(raw_path = ?path, ?canonical, "did_save: update file");
+                        if let Some(dir) = path.parent() {
+                            ws.set_doc_dir(&canonical, dir);
+                        }
                         ws.update_file(&canonical, &overrides);
                         ws.recalculate_diagnostics();
                         Some(ws.diagnostics_map().clone())
@@ -2599,9 +2608,12 @@ mod tests {
             let hover = hover_text(server, &uri, position).await;
             let target = definition(server, &uri, position).await;
 
+            // The hover shows imagesdir as reached (E keeps `linked`); gd
+            // returns the canonical file.
+            let shown = root.join("assets/logo.svg");
             assert_eq!(
                 hover,
-                Some(format!("image::{}[]\n\n✓ File exists", logo.display())),
+                Some(format!("image::{}[]\n\n✓ File exists", shown.display())),
                 "scenario {name}"
             );
             assert_eq!(
@@ -2711,6 +2723,99 @@ mod tests {
             );
             assert_eq!(report["resolution"]["winner"], "per_file", "{name}");
         }
+    }
+
+    /// A single symlinked file resolves relative targets against the link's
+    /// folder, as Asciidoctor does (`docdir` keeps the symlink).
+    /// `other/relative.adoc` links to `real/project/docs/relative.adoc`; both
+    /// folders hold a `part.adoc` and a `pic.svg`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_symlinked_file_resolves_relative_targets_from_link_folder() {
+        let fx = fixture_dir("symlinks");
+        let other = fx.join("other");
+        let raw = other.join("relative.adoc");
+        let (service, _socket, uri, text) = open_fixture(&other, &raw).await;
+        let server = service.inner();
+        let include = position_of(&text, "include::part", 10);
+        let image = position_of(&text, "image::pic", 8);
+
+        let include_target = definition(server, &uri, include).await;
+        let image_target = definition(server, &uri, image).await;
+        let labels = completion_labels(server, &uri, position_of(&text, "image::\n", 7)).await;
+        let report = explain(server, &uri, image).await;
+
+        assert_eq!(
+            include_target.map(|l| l.uri),
+            Some(file_uri(&other.join("part.adoc")))
+        );
+        assert_eq!(
+            image_target.map(|l| l.uri),
+            Some(file_uri(&other.join("pic.svg")))
+        );
+        assert_eq!(labels, vec!["pic.svg"]);
+        assert_eq!(report["request"]["raw_path"], raw.display().to_string());
+        assert_eq!(
+            report["request"]["canonical_path"],
+            fx.join("real/project/docs/relative.adoc")
+                .display()
+                .to_string()
+        );
+    }
+
+    /// In a symlinked folder, `..` pops the link's name, as Asciidoctor's
+    /// `PathResolver#system_path` does, instead of going to the target's
+    /// parent. `real/project/guide` links to `real/outside/guide`; both
+    /// parents hold a `part-up.adoc` and an `up.svg`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_parent_of_symlinked_folder_is_the_link_side_parent() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let (service, _socket, uri, text) = open_fixture(&real, &real.join("guide/up.adoc")).await;
+        let server = service.inner();
+        let include = position_of(&text, "include::../part-up", 13);
+        let image = position_of(&text, "image::../up", 11);
+
+        let include_target = definition(server, &uri, include).await;
+        let image_target = definition(server, &uri, image).await;
+        let labels = completion_labels(server, &uri, position_of(&text, "image::../\n", 10)).await;
+
+        assert_eq!(
+            include_target.map(|l| l.uri),
+            Some(file_uri(&real.join("part-up.adoc")))
+        );
+        assert_eq!(
+            image_target.map(|l| l.uri),
+            Some(file_uri(&real.join("up.svg")))
+        );
+        assert!(labels.contains(&"docs/".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"shared/".to_string()), "{labels:?}");
+    }
+
+    /// A symlink inside the workspace whose target lies outside takes the
+    /// `.asciidoctorconfig` chain of the link's folder, as the `IntelliJ`
+    /// plugin does: `config/outside.adoc` gets `imagesdir` from
+    /// `config/.asciidoctorconfig`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_symlink_to_outside_target_uses_config_of_link_folder() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let logo = real.join("assets/logo.svg");
+        let (service, _socket, uri, text) =
+            open_fixture(&real, &real.join("config/outside.adoc")).await;
+        let server = service.inner();
+        let position = position_of(&text, "image::logo.svg", 9);
+
+        let hover = hover_text(server, &uri, position).await;
+        let target = definition(server, &uri, position).await;
+
+        assert_eq!(
+            hover,
+            Some(format!("image::{}[]\n\n✓ File exists", logo.display()))
+        );
+        assert_eq!(target.map(|l| l.uri), Some(file_uri(&logo)));
     }
 
     /// adoc-0139, Verify "inline image has hover and gd like the block macro".

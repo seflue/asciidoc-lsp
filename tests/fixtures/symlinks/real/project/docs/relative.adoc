@@ -1,0 +1,7 @@
+= Relative targets
+
+include::part.adoc[]
+
+image::pic.svg[]
+
+image::

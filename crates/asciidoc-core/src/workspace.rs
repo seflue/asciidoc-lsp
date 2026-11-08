@@ -8,9 +8,10 @@ use crate::graph::{build_graph, build_graph_with_overrides, parse_single_file, I
 use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DocumentModel, FileLocation};
 
-/// Recursively find all `.adoc` files under a directory.
+/// Recursively find all `.adoc` files under a directory, as `(path as
+/// reached, canonical path)` pairs in a stable order.
 /// Tracks visited canonical paths to avoid infinite loops from symlinks.
-fn find_adoc_files(root: &Path) -> Vec<PathBuf> {
+fn find_adoc_files(root: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut results = Vec::new();
     let mut visited = HashSet::new();
     let mut stack = vec![root.to_path_buf()];
@@ -24,13 +25,14 @@ fn find_adoc_files(root: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|ext| ext == "adoc") {
                 if let Ok(canonical) = path.canonicalize() {
-                    results.push(canonical);
+                    results.push((path, canonical));
                 }
             }
         }
@@ -333,6 +335,15 @@ impl Workspace {
         self.attributes.forget_file(file);
     }
 
+    /// Record the folder of the path `file` is addressed by (a symlink's
+    /// folder for a symlinked document) as its document directory.
+    ///
+    /// Takes effect at the next parse of `file`; see
+    /// [`AttributeRegistry::set_doc_dir`].
+    pub fn set_doc_dir(&mut self, file: &Path, dir: &Path) {
+        self.attributes.set_doc_dir(file, dir);
+    }
+
     /// Drop all cached `.asciidoctorconfig` chains.
     ///
     /// Called when an `.asciidoctorconfig*` file changes on disk so the next
@@ -346,11 +357,36 @@ impl Workspace {
     /// This is a background scan: files are read from disk and added to the
     /// workspace via `ensure_file()`. Already-open files (from `did_open`) are
     /// not overwritten because `ensure_file()` is idempotent.
+    ///
+    /// A file whose canonical path lies outside the root, reached through a
+    /// symlink, gets the link's folder as document directory (the first link
+    /// in scan order). Files inside the root keep their canonical folder,
+    /// whichever path the scan reaches them by.
     pub fn scan_workspace(&mut self) {
         let overrides = HashMap::new();
         let files = find_adoc_files(&self.root);
-        for file in &files {
-            self.ensure_file(file, &overrides);
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let mut doc_dirs: HashMap<&Path, &Path> = HashMap::new();
+        for (path, canonical) in &files {
+            let dir = if canonical.starts_with(&canonical_root) {
+                canonical.parent()
+            } else {
+                path.parent()
+            };
+            if let Some(dir) = dir {
+                doc_dirs.entry(canonical).or_insert(dir);
+            }
+        }
+        for (_, file) in &files {
+            if let Some(dir) = doc_dirs.remove(file.as_path()) {
+                if !self.documents.contains_key(file) {
+                    self.attributes.set_doc_dir(file, dir);
+                }
+                self.ensure_file(file, &overrides);
+            }
         }
     }
 
@@ -1452,6 +1488,57 @@ mod tests {
         );
     }
 
+    /// A scanned symlink resolves relative includes from its own folder, and
+    /// one whose target lies outside the root keeps the root's config chain.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_workspace_resolves_symlinked_files_from_link_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":from-config: yes\n").unwrap();
+        fs::write(root.join("docs/part.adoc"), "= Part\n").unwrap();
+        let target = outside.join("doc.adoc");
+        fs::write(&target, "= Doc\n\ninclude::part.adoc[]\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("docs/link.adoc")).unwrap();
+
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        let diagnostics = ws.diagnostics_for(&target);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(ws.attributes.resolve(&target, "from-config"), Some("yes"));
+    }
+
+    /// A folder symlink pointing inside the root does not move the document
+    /// directory of the files it reaches: they keep their canonical folder,
+    /// whichever path the scan takes first.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_workspace_keeps_canonical_folder_for_links_inside_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("common")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/.asciidoctorconfig"), ":from-docs: yes\n").unwrap();
+        let file = root.join("common/doc.adoc");
+        fs::write(&file, "= Doc\n").unwrap();
+        std::os::unix::fs::symlink("../common", root.join("docs/shared")).unwrap();
+
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+
+        assert_eq!(ws.attributes.resolve(&file, "from-docs"), None);
+        assert_eq!(
+            ws.attributes.doc_dir(&file),
+            Some(root.join("common").as_path())
+        );
+    }
+
     #[test]
     fn test_scan_workspace_gd_works_cross_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1655,7 +1742,7 @@ mod tests {
             "should find at least the real .adoc file"
         );
         // Should not contain duplicates from the loop
-        let unique: std::collections::HashSet<_> = files.iter().collect();
+        let unique: std::collections::HashSet<_> = files.iter().map(|(_, c)| c).collect();
         assert_eq!(
             files.len(),
             unique.len(),

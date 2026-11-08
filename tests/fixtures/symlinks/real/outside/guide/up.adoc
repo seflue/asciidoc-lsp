@@ -1,0 +1,7 @@
+= Parent of a symlinked folder
+
+include::../part-up.adoc[]
+
+image::../up.svg[]
+
+image::../

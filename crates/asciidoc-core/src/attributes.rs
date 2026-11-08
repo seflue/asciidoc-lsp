@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::paths::normalize_lexically;
 use crate::types::AttributeDef;
 
 #[derive(Debug, Clone)]
@@ -20,7 +21,7 @@ struct AttributeEntry {
 pub enum AttributeLayer {
     /// Document-header attributes registered for exactly this file path.
     PerFile,
-    /// Merged `.asciidoctorconfig` chain cached for the file's parent directory.
+    /// Merged `.asciidoctorconfig` chain cached for the file's document directory.
     Config,
     /// Built-in attributes (`docdir`, `env-asciidoc-lsp`).
     Builtin,
@@ -44,7 +45,8 @@ pub struct PerFileLookup {
 /// Config layer outcome of [`AttributeRegistry::explain`].
 #[derive(Debug, Clone)]
 pub struct ConfigLookup {
-    /// The key looked up in the config cache: the queried file's parent, unchanged.
+    /// The key looked up in the config cache: the file's document directory
+    /// (see [`AttributeRegistry::doc_dir`]), unchanged.
     pub dir: Option<PathBuf>,
     /// Whether a config chain is cached under `dir`.
     pub chain_cached: bool,
@@ -83,6 +85,9 @@ pub struct AttributeRegistry {
     builtin: HashMap<String, String>,
     config_chains: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
     per_file: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
+    /// Document directories that differ from the file's parent: the folder of
+    /// the symlink a document was opened through.
+    doc_dirs: HashMap<PathBuf, PathBuf>,
     workspace_root: PathBuf,
 }
 
@@ -96,51 +101,46 @@ impl AttributeRegistry {
             builtin,
             config_chains: HashMap::new(),
             per_file: HashMap::new(),
+            doc_dirs: HashMap::new(),
             workspace_root: root.to_path_buf(),
         }
     }
 
     /// Ensure a config chain is computed and cached for the given directory.
     ///
-    /// Walks from `workspace_root` down to `dir`, merging `.asciidoctorconfig` files
-    /// along the way. Idempotent — returns early if already cached.
+    /// Walks upward from `dir` as given, without resolving symlinks, until it
+    /// reaches the workspace root (compared canonically), then merges the
+    /// `.asciidoctorconfig` files from the root down to `dir`. A `dir` that
+    /// never reaches the root gets no chain. The chain is cached under `dir`
+    /// unchanged, so a symlinked folder keeps its own chain. Idempotent —
+    /// returns early if already cached.
     pub fn ensure_config_for_dir(&mut self, dir: &Path) {
-        let Ok(dir) = dir.canonicalize() else {
+        if self.config_chains.contains_key(dir) || !dir.exists() {
             return;
-        };
+        }
         let Ok(ws_root) = self.workspace_root.canonicalize() else {
             return;
         };
 
-        // Guard: dir must be under workspace_root
-        if !dir.starts_with(&ws_root) {
-            return;
-        }
-
-        // Idempotent: already cached
-        if self.config_chains.contains_key(&dir) {
-            return;
-        }
-
-        // Collect directories from workspace_root to dir (inclusive), walking upward then reversing
+        // Collect directories from dir up to workspace_root (inclusive), then reverse
         let mut chain_dirs = Vec::new();
-        let mut current = dir.clone();
+        let mut current = Some(dir);
         loop {
-            chain_dirs.push(current.clone());
-            if current == ws_root {
+            let Some(here) = current else {
+                return; // never reached the workspace root
+            };
+            chain_dirs.push(here.to_path_buf());
+            if here.canonicalize().is_ok_and(|c| c == ws_root) {
                 break;
             }
-            match current.parent() {
-                Some(parent) => current = parent.to_path_buf(),
-                None => break,
-            }
+            current = here.parent();
         }
         chain_dirs.reverse(); // now root → dir order
 
         let mut merged = load_home_config();
         merge_config_chain(&chain_dirs, &mut merged);
 
-        self.config_chains.insert(dir, merged);
+        self.config_chains.insert(dir.to_path_buf(), merged);
     }
 
     /// Drop all cached config chains.
@@ -159,6 +159,33 @@ impl AttributeRegistry {
     /// the only caller is `Workspace::remove_file`.
     pub(crate) fn forget_file(&mut self, file: &Path) {
         self.per_file.remove(file);
+        self.doc_dirs.remove(file);
+    }
+
+    /// Record `dir` as the document directory of `file`.
+    ///
+    /// `file` is the registry key (canonical path); `dir` is the folder of
+    /// the path the document is addressed by. For a symlinked document that
+    /// is the link's folder: Asciidoctor's `docdir` keeps symlinks, so
+    /// relative targets and the config chain start there. One directory per
+    /// file: when the same file is open through a link and its real path,
+    /// the last call wins for both.
+    pub fn set_doc_dir(&mut self, file: &Path, dir: &Path) {
+        if file.parent() == Some(dir) {
+            self.doc_dirs.remove(file);
+        } else {
+            self.doc_dirs.insert(file.to_path_buf(), dir.to_path_buf());
+        }
+    }
+
+    /// The directory relative paths in `file` resolve against: the one
+    /// recorded by [`Self::set_doc_dir`], else `file`'s parent.
+    #[must_use]
+    pub fn doc_dir<'a>(&'a self, file: &'a Path) -> Option<&'a Path> {
+        self.doc_dirs
+            .get(file)
+            .map(PathBuf::as_path)
+            .or_else(|| file.parent())
     }
 
     pub fn register_file_attributes(&mut self, file: &Path, attrs: &[AttributeDef]) {
@@ -209,7 +236,7 @@ impl AttributeRegistry {
             })
             .collect();
 
-        let config = file.parent().and_then(|d| self.config_chains.get(d));
+        let config = self.doc_dir(file).and_then(|d| self.config_chains.get(d));
         let layers = [
             (config, AttributeLayer::Config),
             (self.per_file.get(file), AttributeLayer::PerFile),
@@ -237,7 +264,7 @@ impl AttributeRegistry {
             .and_then(|m| m.get(name))
             .map(|e| e.value.as_str())
             .or_else(|| {
-                let dir = file.parent()?;
+                let dir = self.doc_dir(file)?;
                 self.config_chains
                     .get(dir)?
                     .get(name)
@@ -264,7 +291,7 @@ impl AttributeRegistry {
             return Some(source);
         }
 
-        let Some(dir) = file.parent() else {
+        let Some(dir) = self.doc_dir(file) else {
             tracing::trace!(
                 ?file,
                 name,
@@ -304,7 +331,7 @@ impl AttributeRegistry {
             hit: file_attrs.and_then(|m| m.get(name)).map(AttributeHit::from),
         };
 
-        let dir = file.parent();
+        let dir = self.doc_dir(file);
         let chain = dir.and_then(|d| self.config_chains.get(d));
         let config = ConfigLookup {
             dir: dir.map(Path::to_path_buf),
@@ -378,7 +405,7 @@ fn load_home_config() -> HashMap<String, AttributeEntry> {
                 );
                 for (key, value, line) in parse_asciidoctorconfig(&content) {
                     let substituted = substitute_with(&merged, &value);
-                    let resolved = canonicalize_path_value(&substituted, &canonical_home);
+                    let resolved = resolve_path_value(&substituted, &canonical_home);
                     merged.insert(
                         key,
                         AttributeEntry {
@@ -420,7 +447,7 @@ fn merge_config_chain(chain_dirs: &[PathBuf], merged: &mut HashMap<String, Attri
 
             for (key, value, line) in parse_asciidoctorconfig(&content) {
                 let substituted = substitute_with(merged, &value);
-                let resolved = canonicalize_path_value(&substituted, chain_dir);
+                let resolved = resolve_path_value(&substituted, chain_dir);
                 merged.insert(
                     key,
                     AttributeEntry {
@@ -519,20 +546,16 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<(String, String, usize)> {
 }
 
 /// Heuristic: if a value looks like a relative path (starts with `.` or `../`),
-/// canonicalize it relative to the config file's directory.
-fn canonicalize_path_value(value: &str, config_dir: &Path) -> String {
+/// make it absolute against the config file's directory. `..` is popped
+/// textually ([`normalize_lexically`]) and symlinks are kept, as Asciidoctor
+/// resolves paths; an absolute value containing `..` is normalized the same way.
+fn resolve_path_value(value: &str, config_dir: &Path) -> String {
     if value.starts_with("../") || value.starts_with("./") {
-        let resolved = config_dir.join(value);
-        match resolved.canonicalize() {
-            Ok(canonical) => canonical.display().to_string(),
-            // Path doesn't exist yet — normalize without canonicalize
-            Err(_) => resolved.display().to_string(),
-        }
+        normalize_lexically(&config_dir.join(value))
+            .display()
+            .to_string()
     } else if Path::new(value).is_absolute() && value.contains("..") {
-        match Path::new(value).canonicalize() {
-            Ok(canonical) => canonical.display().to_string(),
-            Err(_) => value.to_string(),
-        }
+        normalize_lexically(Path::new(value)).display().to_string()
     } else {
         value.to_string()
     }
@@ -580,6 +603,35 @@ mod tests {
         let dummy = docs.join("any.adoc");
         let resolved = registry.resolve(&dummy, "source-dir").unwrap();
         assert_eq!(resolved, src.display().to_string());
+    }
+
+    /// A config path value into a symlinked folder keeps the link: no
+    /// realpath, as Asciidoctor resolves paths.
+    #[cfg(unix)]
+    #[test]
+    fn test_config_path_value_keeps_symlinked_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(base.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", root.join("shared")).unwrap();
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":imagesdir: ./shared
+",
+        )
+        .unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+
+        let expected = root.join("shared").display().to_string();
+        let dummy = root.join("any.adoc");
+        assert_eq!(
+            registry.resolve(&dummy, "imagesdir"),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -960,6 +1012,64 @@ mod tests {
 
         let file = root.join("index.adoc");
         assert_eq!(registry.resolve(&file, "theme"), Some("dark"));
+    }
+
+    /// A folder symlinked into the root from outside walks up through the
+    /// link, not through its target, and reads the link folder's config.
+    #[cfg(unix)]
+    #[test]
+    fn test_doc_dir_in_symlinked_folder_keeps_root_config_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":theme: dark\n").unwrap();
+        fs::write(outside.join(".asciidoctorconfig"), ":local: yes\n").unwrap();
+        let linked = root.join("linked");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        let file = outside.join("doc.adoc");
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.set_doc_dir(&file, &linked);
+        registry.ensure_config_for_dir(&linked);
+
+        assert_eq!(registry.resolve(&file, "theme"), Some("dark"));
+        assert_eq!(registry.resolve(&file, "local"), Some("yes"));
+        assert_eq!(registry.explain(&file, "theme").config.dir, Some(linked));
+    }
+
+    /// A relative path value in a config inside a symlinked folder pops `..`
+    /// to the link's parent, like include and image targets.
+    #[cfg(unix)]
+    #[test]
+    fn test_config_path_value_in_symlinked_folder_uses_link_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        let outside = base.join("elsewhere/outside");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::create_dir_all(base.join("elsewhere/assets")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join(".asciidoctorconfig"),
+            ":imagesdir: ../assets\n",
+        )
+        .unwrap();
+        let linked = root.join("linked");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        let file = outside.join("doc.adoc");
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.set_doc_dir(&file, &linked);
+        registry.ensure_config_for_dir(&linked);
+
+        let expected = root.join("assets").display().to_string();
+        assert_eq!(
+            registry.resolve(&file, "imagesdir"),
+            Some(expected.as_str())
+        );
     }
 
     #[test]

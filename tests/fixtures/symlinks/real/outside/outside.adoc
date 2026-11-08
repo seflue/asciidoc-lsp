@@ -1,0 +1,3 @@
+= Outside the workspace
+
+image::logo.svg[]
