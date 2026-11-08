@@ -1,0 +1,4 @@
+= Symlinked assets
+:imagesdir: ../shared-assets
+
+image::linked.svg[]

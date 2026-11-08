@@ -1,0 +1,22 @@
+= Chapter
+:imagesdir: ../assets
+:my_variable: value
+:logo-name: logo.svg
+
+Block image next.
+
+image::logo.svg[]
+
+image::{logo-name}[]
+
+image::sub/nested.svg[]
+
+image::missing.svg[]
+
+image::https://example.com/remote.svg[]
+
+Inline image:inline.svg[] here.
+
+Variable {my_variable} here.
+
+image::

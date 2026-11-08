@@ -1,0 +1,3 @@
+= Config imagesdir
+
+image::logo.svg[]

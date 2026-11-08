@@ -2464,4 +2464,449 @@ mod tests {
             Some(PathBuf::from("/does/not/exist/new.adoc"))
         );
     }
+
+    // --- Committed fixtures: tests/fixtures/symlinks, tests/fixtures/ventilate ---
+    //
+    // In `symlinks/`, `linked` points to `real/project` and
+    // `real/project/shared-assets` to `real/outside/shared`. Scenarios:
+    // A canonical root and path, B symlinked root, C canonical root with a
+    // symlinked document path, D/E imagesdir from `.asciidoctorconfig`
+    // (canonical/symlinked), F an imagesdir that is itself a symlink.
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        workspace_root().join("tests/fixtures").join(name)
+    }
+
+    /// Opens `doc` with its text from disk, addressed by `doc` as given.
+    async fn open_fixture(
+        root: &Path,
+        doc: &Path,
+    ) -> (
+        LspService<AsciiDocLsp>,
+        tower_lsp_server::ClientSocket,
+        Uri,
+        String,
+    ) {
+        let text = fs::read_to_string(doc).unwrap();
+        let (service, socket) = initialized_server(root).await;
+        let uri = file_uri(doc);
+        open_document(service.inner(), &uri, &text).await;
+        (service, socket, uri, text)
+    }
+
+    async fn explain(server: &AsciiDocLsp, uri: &Uri, position: Position) -> serde_json::Value {
+        let argument = serde_json::to_value(doc_position(uri, position)).unwrap();
+        server
+            .execute_command(ExecuteCommandParams {
+                command: EXPLAIN_POSITION_COMMAND.into(),
+                arguments: vec![argument],
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Scenarios A, B and C: `docs/ch1.adoc` through canonical and symlinked paths.
+    fn ch1_scenarios(fx: &Path) -> [(&'static str, PathBuf, PathBuf); 3] {
+        let real = fx.join("real/project");
+        let linked = fx.join("linked");
+        [
+            ("A", real.clone(), real.join("docs/ch1.adoc")),
+            ("B", linked.clone(), linked.join("docs/ch1.adoc")),
+            ("C", real, linked.join("docs/ch1.adoc")),
+        ]
+    }
+
+    /// Hover, gd and completion in `ch1.adoc`, one line per probe. A gd target
+    /// in the requesting document is written as `<self>`: B and C differ from
+    /// A only there, by design.
+    async fn observe_ch1(server: &AsciiDocLsp, uri: &Uri, text: &str, fx: &Path) -> Vec<String> {
+        let mut seen = Vec::new();
+        for (needle, offset) in [
+            ("image::logo.svg", 9),
+            ("image::{logo-name}", 7),
+            ("image::sub/nested", 12),
+            ("image::missing", 9),
+            ("{my_variable}", 3),
+        ] {
+            let position = position_of(text, needle, offset);
+            let hover = hover_text(server, uri, position).await;
+            let target = definition(server, uri, position).await.map(|location| {
+                let file = if location.uri == *uri {
+                    "<self>".to_string()
+                } else {
+                    let path = location.uri.to_file_path().unwrap();
+                    let relative = path.strip_prefix(fx).unwrap();
+                    format!("<fx>/{}", relative.display())
+                };
+                format!("{file}:{}", location.range.start.line)
+            });
+            seen.push(format!(
+                "{needle} | {} | {}",
+                hover.as_deref().unwrap_or("-"),
+                target.as_deref().unwrap_or("-")
+            ));
+        }
+        for (needle, offset) in [("image::\n", 7), ("image::sub/", 11)] {
+            let labels = completion_labels(server, uri, position_of(text, needle, offset)).await;
+            seen.push(format!("complete {needle:?} | {}", labels.join(", ")));
+        }
+        seen
+    }
+
+    /// adoc-0138, Verify "B, C, E behave like A and D", part 1.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_symlinked_paths_behave_like_canonical_paths() {
+        let fx = fixture_dir("symlinks");
+        let expected = vec![
+            "image::logo.svg | image::../assets/logo.svg[]\n\n✓ File exists \
+             | <fx>/real/project/assets/logo.svg:0",
+            "image::{logo-name} | :logo-name: logo.svg\n\nDefined in ch1.adoc:4 | <self>:3",
+            "image::sub/nested | image::../assets/sub/nested.svg[]\n\n✓ File exists \
+             | <fx>/real/project/assets/sub/nested.svg:0",
+            "image::missing | image::../assets/missing.svg[]\n\n✗ File not found | -",
+            "{my_variable} | :my_variable: value\n\nDefined in ch1.adoc:3 | <self>:2",
+            "complete \"image::\\n\" | inline.svg, logo.svg, sub/",
+            "complete \"image::sub/\" | nested.svg",
+        ];
+        for (name, root, doc) in ch1_scenarios(&fx) {
+            let (service, _socket, uri, text) = open_fixture(&root, &doc).await;
+
+            let observed = observe_ch1(service.inner(), &uri, &text, &fx).await;
+
+            assert_eq!(observed, expected, "scenario {name}");
+        }
+    }
+
+    /// adoc-0138, Verify "B, C, E behave like A and D", part 2.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_config_imagesdir_through_symlinked_root() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let linked = fx.join("linked");
+        let logo = real.join("assets/logo.svg");
+        for (name, root, doc) in [
+            ("D", &real, real.join("config/ch2.adoc")),
+            ("E", &linked, linked.join("config/ch2.adoc")),
+        ] {
+            let (service, _socket, uri, text) = open_fixture(root, &doc).await;
+            let server = service.inner();
+            let position = position_of(&text, "image::logo.svg", 9);
+
+            let hover = hover_text(server, &uri, position).await;
+            let target = definition(server, &uri, position).await;
+
+            assert_eq!(
+                hover,
+                Some(format!("image::{}[]\n\n✓ File exists", logo.display())),
+                "scenario {name}"
+            );
+            assert_eq!(
+                target.map(|l| l.uri),
+                Some(file_uri(&logo)),
+                "scenario {name}"
+            );
+        }
+    }
+
+    /// adoc-0138, Verify "explainPosition shows raw and canonical path".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_explain_position_reports_raw_and_canonical_path() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let linked = fx.join("linked");
+        for (name, root, raw, canonical, needle, offset) in [
+            (
+                "B",
+                &linked,
+                "docs/ch1.adoc",
+                "docs/ch1.adoc",
+                "{my_variable}",
+                3,
+            ),
+            (
+                "C",
+                &real,
+                "docs/ch1.adoc",
+                "docs/ch1.adoc",
+                "{my_variable}",
+                3,
+            ),
+            (
+                "E",
+                &linked,
+                "config/ch2.adoc",
+                "config/ch2.adoc",
+                "image::logo.svg",
+                9,
+            ),
+        ] {
+            let raw = linked.join(raw);
+            let canonical = real.join(canonical);
+            let (service, _socket, uri, text) = open_fixture(root, &raw).await;
+
+            let report = explain(service.inner(), &uri, position_of(&text, needle, offset)).await;
+
+            let request = &report["request"];
+            assert_eq!(request["raw_path"], raw.display().to_string(), "{name}");
+            assert_eq!(
+                request["canonical_path"],
+                canonical.display().to_string(),
+                "{name}"
+            );
+            assert_eq!(
+                request["lookup_path"],
+                canonical.display().to_string(),
+                "{name}"
+            );
+            assert_eq!(request["paths_differ"], true, "{name}");
+            assert_eq!(request["in_documents_raw"], false, "{name}");
+            assert_eq!(request["in_documents_canonical"], true, "{name}");
+            assert_eq!(
+                request["workspace_root"],
+                root.display().to_string(),
+                "{name}"
+            );
+        }
+    }
+
+    /// adoc-0138, verification run: a single symlinked file, inside the
+    /// workspace root and from another root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_symlinked_file_resolves_attributes() {
+        let fx = fixture_dir("symlinks");
+        let canonical = fx.join("real/project/docs/ch1.adoc");
+        for (root, raw) in [
+            (
+                fx.join("real/project"),
+                fx.join("real/project/docs/link-in.adoc"),
+            ),
+            (fx.join("other"), fx.join("other/link.adoc")),
+        ] {
+            let (service, _socket, uri, text) = open_fixture(&root, &raw).await;
+            let server = service.inner();
+            let position = position_of(&text, "{my_variable}", 3);
+
+            let hover = hover_text(server, &uri, position).await;
+            let target = definition(server, &uri, position).await.unwrap();
+            let report = explain(server, &uri, position).await;
+
+            let name = raw.display();
+            assert_eq!(
+                hover.as_deref(),
+                Some(":my_variable: value\n\nDefined in ch1.adoc:3"),
+                "{name}"
+            );
+            assert_eq!(target.uri, uri, "{name}");
+            assert_eq!(target.range.start.line, 2, "{name}");
+            assert_eq!(report["request"]["raw_path"], raw.display().to_string());
+            assert_eq!(
+                report["request"]["canonical_path"],
+                canonical.display().to_string()
+            );
+            assert_eq!(report["resolution"]["winner"], "per_file", "{name}");
+        }
+    }
+
+    /// adoc-0139, Verify "inline image has hover and gd like the block macro".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_inline_image_resolves_like_block_image() {
+        let fx = fixture_dir("symlinks");
+        let assets = fx.join("real/project/assets");
+        for (name, root, doc) in ch1_scenarios(&fx) {
+            let (service, _socket, uri, text) = open_fixture(&root, &doc).await;
+            let server = service.inner();
+            let inline = position_of(&text, "image:inline.svg", 8);
+            let block = position_of(&text, "image::logo.svg", 9);
+
+            let inline_hover = hover_text(server, &uri, inline).await;
+            let inline_target = definition(server, &uri, inline).await;
+            let block_hover = hover_text(server, &uri, block).await;
+            let block_target = definition(server, &uri, block).await;
+
+            assert_eq!(
+                inline_hover.as_deref(),
+                Some("image:../assets/inline.svg[]\n\n✓ File exists"),
+                "scenario {name}"
+            );
+            assert_eq!(
+                inline_target.map(|l| l.uri),
+                Some(file_uri(&assets.join("inline.svg"))),
+                "scenario {name}"
+            );
+            assert_eq!(
+                block_hover.as_deref(),
+                Some("image::../assets/logo.svg[]\n\n✓ File exists"),
+                "scenario {name}"
+            );
+            assert_eq!(
+                block_target.map(|l| l.uri),
+                Some(file_uri(&assets.join("logo.svg"))),
+                "scenario {name}"
+            );
+        }
+    }
+
+    /// adoc-0139, Verify "remote image: hover shows the URL unchanged, no
+    /// File not found".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_remote_image_is_not_a_local_file() {
+        let fx = fixture_dir("symlinks");
+        for (name, root, doc) in ch1_scenarios(&fx) {
+            let (service, _socket, uri, text) = open_fixture(&root, &doc).await;
+            let server = service.inner();
+            let position = position_of(&text, "image::https", 9);
+
+            let hover = hover_text(server, &uri, position).await;
+            let target = definition(server, &uri, position).await;
+            let report = explain(server, &uri, position).await;
+
+            assert_eq!(
+                hover.as_deref(),
+                Some("image::https://example.com/remote.svg[]"),
+                "scenario {name}"
+            );
+            assert_eq!(target, None, "scenario {name}");
+            assert_eq!(report["resolution"]["remote"], true, "scenario {name}");
+            assert_eq!(
+                report["resolution"]["canonical_target"],
+                serde_json::Value::Null,
+                "scenario {name}"
+            );
+        }
+    }
+
+    /// adoc-0139, Verify "report for an image has `canonical_target` equal to
+    /// the gd target", over all scenarios A to F.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_image_report_canonical_target_matches_definition() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let linked = fx.join("linked");
+        let mut cases = Vec::new();
+        for (name, root, doc) in ch1_scenarios(&fx) {
+            cases.push((name, root.clone(), doc.clone(), "image::logo.svg", 9));
+            cases.push((name, root, doc, "image:inline.svg", 8));
+        }
+        cases.push((
+            "D",
+            real.clone(),
+            real.join("config/ch2.adoc"),
+            "image::logo.svg",
+            9,
+        ));
+        cases.push((
+            "E",
+            linked.clone(),
+            linked.join("config/ch2.adoc"),
+            "image::logo.svg",
+            9,
+        ));
+        cases.push((
+            "F",
+            real.clone(),
+            real.join("docs/ch3.adoc"),
+            "image::linked.svg",
+            9,
+        ));
+
+        for (name, root, doc, needle, offset) in cases {
+            let (service, _socket, uri, text) = open_fixture(&root, &doc).await;
+            let server = service.inner();
+            let position = position_of(&text, needle, offset);
+
+            let target = definition(server, &uri, position).await.unwrap();
+            let report = explain(server, &uri, position).await;
+
+            let target = target.uri.to_file_path().unwrap();
+            assert_eq!(
+                report["resolution"]["canonical_target"],
+                target.display().to_string(),
+                "scenario {name}, {needle}"
+            );
+            if name == "F" {
+                assert_eq!(target, fx.join("real/outside/shared/linked.svg"));
+            }
+        }
+    }
+
+    /// Applies one LSP edit to an ASCII text (UTF-16 columns equal bytes).
+    fn apply_edit(text: &str, edit: &TextEdit) -> String {
+        let offset = |position: Position| -> usize {
+            let line = usize::try_from(position.line).unwrap();
+            let line_start: usize = text.split_inclusive('\n').take(line).map(str::len).sum();
+            line_start + usize::try_from(position.character).unwrap()
+        };
+        let (start, end) = (offset(edit.range.start), offset(edit.range.end));
+        format!("{}{}{}", &text[..start], edit.new_text, &text[end..])
+    }
+
+    /// adoc-0143, Verify "one-sentence-per-line code action joins a wrapped
+    /// paragraph", over the protocol with the develop grammar.
+    #[tokio::test]
+    async fn test_fixture_code_action_puts_one_sentence_per_line() {
+        let fx = fixture_dir("ventilate");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("wrapped.adoc")).await;
+        let server = service.inner();
+        let wrapped = "This is the first sentence of a paragraph that is\n\
+                       wrapped over several lines. Here is a second sentence\n\
+                       that also wraps. And a third one with *bold text* and\n\
+                       a link:https://example.com[link]. Done.\n";
+        let ventilated =
+            "This is the first sentence of a paragraph that is wrapped over several lines.\n\
+                          Here is a second sentence that also wraps.\n\
+                          And a third one with *bold text* and a link:https://example.com[link].\n\
+                          Done.\n";
+        for (needle, before, after) in [
+            ("wrapped over", wrapped, ventilated),
+            (
+                "Some *bold",
+                "Some *bold\ntext* here. Two.\n",
+                "Some *bold text* here.\nTwo.\n",
+            ),
+        ] {
+            assert!(text.contains(before), "fixture lost {needle:?}");
+            let actions = server
+                .code_action(CodeActionParams {
+                    text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                        uri: uri.clone(),
+                    },
+                    range: Range::new(position_of(&text, needle, 0), position_of(&text, needle, 0)),
+                    context: Default::default(),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+
+            let action = actions
+                .iter()
+                .find_map(|action| match action {
+                    CodeActionOrCommand::CodeAction(a) if a.title == "One sentence per line" => {
+                        Some(a)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no sentence-per-line action in {actions:?}"));
+            assert_eq!(action.kind, Some(CodeActionKind::REFACTOR_REWRITE));
+            let edits = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri];
+            let [edit] = edits.as_slice() else {
+                panic!("expected one edit, got {edits:?}");
+            };
+            assert_eq!(
+                apply_edit(&text, edit),
+                text.replace(before, after),
+                "{needle}"
+            );
+        }
+    }
 }

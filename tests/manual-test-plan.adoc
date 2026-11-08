@@ -876,3 +876,37 @@ Plain text without a reference.
 // Cleanup: rm tests/t10-link.adoc
 
 ---
+
+== T11: Committed fixtures in Neovim
+
+The protocol side runs in `cargo test` (`test_fixture_*` in
+`crates/asciidoc-lsp/src/main.rs`). These cases cover what only the
+editor shows. Do not save the fixtures: the automated tests read them.
+
+=== T11.1: Document opened through a file symlink
+
+// [ ] PASS  [ ] FAIL
+// Open `tests/fixtures/symlinks/real/project/docs/link-in.adoc` (a symlink
+// to `ch1.adoc` next to it). `:lua print(vim.api.nvim_buf_get_name(0))`
+// must end in `link-in.adoc`; if it shows `ch1.adoc`, Neovim resolved the
+// link and the case says nothing.
+// Expected:
+//   `K` on `{my_variable}`: `:my_variable: value` / `Defined in ch1.adoc:3`
+//   `gd` on `{my_variable}`: line 3 of the same `link-in.adoc` buffer
+//   `K` on `image:inline.svg[]`: `image:../assets/inline.svg[]` / `✓ File exists`
+//   `gd` on it: opens `real/project/assets/inline.svg`
+
+=== T11.2: One sentence per line
+
+// [ ] PASS  [ ] FAIL
+// Open `tests/fixtures/ventilate/wrapped.adoc`, cursor on line 4
+// (`wrapped over several lines. …`), trigger code actions.
+// Expected: the menu offers `One sentence per line`; applying it turns
+// the paragraph into four lines, one per sentence:
+//   `This is the first sentence of a paragraph that is wrapped over several lines.`
+//   `Here is a second sentence that also wraps.`
+//   `And a third one with *bold text* and a link:https://example.com[link].`
+//   `Done.`
+// Then `:e!` to drop the change.
+
+---
