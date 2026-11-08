@@ -70,10 +70,14 @@ fn main() -> anyhow::Result<()> {
         let includes = asciidoc_core::extractors::extract_includes(root, source.as_bytes());
         let attributes = asciidoc_core::extractors::extract_attributes(root, source.as_bytes());
 
-        // Inline parsing for xrefs and anchors
+        // Inline parsing for xrefs and inline anchors; block anchors come
+        // from the block tree
         let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(root);
-        let (xrefs, anchors) =
+        let (xrefs, inline_anchors) =
             asciidoc_core::extractors::extract_inline_content_safe(&inline_ranges, &source);
+        let mut anchors = asciidoc_core::extractors::extract_anchors(root, source.as_bytes());
+        anchors.extend(inline_anchors);
+        anchors.sort_by_key(|anchor| anchor.line);
 
         // Output
         println!("File: {}", cli.path.display());

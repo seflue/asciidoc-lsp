@@ -26,14 +26,18 @@ pub fn extract_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<Attribu
     results
 }
 
-// --- Inline-level extractors (work on inline parse tree) ---
+// --- Anchor extraction (works on both parse trees) ---
 
+/// Extract anchors: block anchors (`[[id]]` on a line of its own) from the
+/// block tree, inline anchors from the inline tree.
 #[must_use]
 pub fn extract_anchors(node: tree_sitter::Node, source: &[u8]) -> Vec<Anchor> {
     let mut results = Vec::new();
     walk_for_anchors(node, source, &mut results);
     results
 }
+
+// --- Inline-level extractors (work on inline parse tree) ---
 
 #[must_use]
 pub fn extract_xrefs(node: tree_sitter::Node, source: &[u8]) -> Vec<Xref> {
@@ -279,7 +283,9 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
         return;
     }
 
-    if node.kind() == "id_assignment" {
+    // `block_anchor` (block tree) and `id_assignment` (inline tree) both
+    // carry `id` and an optional `reftext`.
+    if matches!(node.kind(), "block_anchor" | "id_assignment") {
         let id = find_child_text(node, "id", source).unwrap_or_default();
         let reftext = find_child_text(node, "reftext", source);
         if !id.is_empty() {
@@ -514,6 +520,22 @@ mod tests {
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].id, "my-anchor");
         assert_eq!(anchors[0].reftext, Some("Display Text".to_string()));
+    }
+
+    #[test]
+    fn test_extract_block_anchors() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "== A\n\nBody.\n\n[[b,Section B]]\n== B\n\n[[para]]\nText.\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let anchors = extract_anchors(tree.root_node(), source.as_bytes());
+
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].id, "b");
+        assert_eq!(anchors[0].reftext, Some("Section B".to_string()));
+        assert_eq!(anchors[0].line, 5);
+        assert_eq!(anchors[1].id, "para");
+        assert_eq!(anchors[1].reftext, None);
+        assert_eq!(anchors[1].line, 8);
     }
 
     #[test]

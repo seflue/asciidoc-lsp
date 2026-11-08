@@ -527,8 +527,10 @@ fn walk_for_layout<'a>(node: tree_sitter::Node, source: &'a str, layout: &mut La
         let row = child.start_position().row;
         match child.kind() {
             "paragraph" if node.kind() == "section_block" => {
-                // The grammar reads `[[id]]` and `[#id]` lines as paragraph
-                // text; Asciidoctor reads them as block attribute lines.
+                // The grammar reads an `[[id]]` line it rejects as a block
+                // anchor (no block below it, trailing blanks, a `]` in the
+                // reftext) as paragraph text; Asciidoctor reads it as a block
+                // attribute line.
                 let mut lines = child.walk();
                 for line in child.children(&mut lines).filter(|n| n.kind() == "line") {
                     let row = line.start_position().row;
@@ -538,7 +540,7 @@ fn walk_for_layout<'a>(node: tree_sitter::Node, source: &'a str, layout: &mut La
                     }
                 }
             }
-            "element_attr" => {
+            "element_attr" | "block_anchor" => {
                 let attr = block_attribute_line(source[child.byte_range()].trim()).unwrap_or("");
                 layout.attributes.push((row, attr));
             }
@@ -1196,7 +1198,6 @@ mod tests {
     #[case::sidebar_delimiter("One. Two. ****\n", 1, "One.\nTwo. ****\n")]
     #[case::example_delimiter("One. Two. ====\n", 1, "One.\nTwo. ====\n")]
     #[case::quote_delimiter("One. Two. ____\n", 1, "One.\nTwo. ____\n")]
-    #[ignore = "grammar reads `++++` as an unclosed passthrough (adoc-0146)"]
     #[case::passthrough_delimiter("One. Two. ++++\n", 1, "One.\nTwo. ++++\n")]
     #[case::comment_delimiter("One. Two. ////\n", 1, "One.\nTwo. ////\n")]
     #[case::table_delimiter("One. Two. |===\n", 1, "One.\nTwo. |===\n")]
@@ -1286,8 +1287,20 @@ mod tests {
     )]
     // Joined first lines that only look like block syntax
     #[case::join_with_single_colon("A\nb: c. D.\n", 1, "A b: c.\nD.\n")]
-    #[ignore = "grammar starts a description list on line 2 (adoc-0135)"]
     #[case::description_list_term_on_second_line("One. Two\nb;; c.\n", 1, "One.\nTwo b;; c.\n")]
+    // A list or description list line right below a paragraph line is text
+    // of that paragraph
+    #[case::list_item_read_below_paragraph("One. Two.\n- x. Y.\n", 1, "One.\nTwo. - x.\nY.\n")]
+    #[case::description_list_read_below_paragraph(
+        "One. Two.\nTerm:: d. E.\n",
+        1,
+        "One.\nTwo.\nTerm:: d. E.\n"
+    )]
+    #[case::semicolon_description_list_read_below_paragraph(
+        "One. Two.\nTerm;; d. E.\n",
+        1,
+        "One.\nTwo.\nTerm;; d. E.\n"
+    )]
     // Without whitespace after the period a line break would change the text
     #[case::period_inside_word("Use .NET here. Next.\n", 1, "Use .NET here.\nNext.\n")]
     // Protected spans, tailoring and the line start guard together
@@ -1442,9 +1455,6 @@ mod tests {
     #[case::join_makes_block_macro("image::a.png[x\ny]\n", 1)]
     #[case::join_makes_include_directive("include::a.adoc[x\ny]\n", 1)]
     #[case::join_makes_block_attribute_line("[x\ny]\nfoo.\n", 1)]
-    #[case::list_item_read_below_paragraph("One. Two.\n- x. Y.\n", 1)]
-    #[case::description_list_read_below_paragraph("One. Two.\nTerm:: d. E.\n", 1)]
-    #[case::semicolon_description_list_read_below_paragraph("One. Two.\nTerm;; d. E.\n", 1)]
     fn offers_no_edit(#[case] source: &str, #[case] line: usize) {
         assert_eq!(ventilate_paragraph(source, line).unwrap(), None);
     }

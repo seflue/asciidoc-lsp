@@ -215,11 +215,16 @@ pub fn parse_single_file(
     let includes_raw = crate::extractors::extract_includes(root_node, source.as_bytes());
     let file_attrs = crate::extractors::extract_attributes(root_node, source.as_bytes());
 
-    // Inline parsing for xrefs and anchors.
-    // Parse each range individually to prevent cross-range passthrough
-    // misparses (adoc-0023).
+    // Inline parsing for xrefs and inline anchors; block anchors come from
+    // the block tree. Parse each range individually to prevent cross-range
+    // passthrough misparses (adoc-0023).
     let inline_ranges = crate::extractors::collect_inline_ranges(root_node);
-    let (xrefs, anchors) = crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
+    let (xrefs, inline_anchors) =
+        crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
+    let mut anchors = crate::extractors::extract_anchors(root_node, source.as_bytes());
+    anchors.extend(inline_anchors);
+    // Document order: the first definition of an id is the one that counts.
+    anchors.sort_by_key(|anchor| anchor.line);
 
     // Extract attribute references ({name} patterns) via byte-scanning
     let attribute_refs = crate::extractors::extract_attribute_refs(&source);
@@ -471,6 +476,29 @@ mod tests {
             graph.includes_of(&up)[0].target,
             project.join("part-up.adoc")
         );
+    }
+
+    /// Block and inline anchors come from different trees but keep document
+    /// order, so the first definition of an id is the one that counts.
+    #[test]
+    fn test_parse_single_file_keeps_anchors_in_document_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "Text with [[first]] inline.\n\n[[second]]\nMore text.\n",
+        )
+        .unwrap();
+        let mut registry = AttributeRegistry::new(tmp.path());
+
+        let (doc, _) = parse_single_file(&a, &mut registry, &HashMap::new()).unwrap();
+
+        let anchors: Vec<_> = doc
+            .anchors
+            .iter()
+            .map(|a| (a.id.as_str(), a.line))
+            .collect();
+        assert_eq!(anchors, vec![("first", 1), ("second", 3)]);
     }
 
     #[test]

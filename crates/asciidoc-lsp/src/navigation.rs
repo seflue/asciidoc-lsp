@@ -677,7 +677,8 @@ fn file_display_name(path: &Path) -> String {
 // Internal classification helpers
 // ---------------------------------------------------------------------------
 
-/// Check if the node at the given point is inside a `block_macro` with name "include".
+/// Check if the node at the given point is inside a `block_macro` with name
+/// "include" or "image", or inside a block anchor.
 fn classify_block_node(
     root: tree_sitter::Node,
     point: tree_sitter::Point,
@@ -687,6 +688,15 @@ fn classify_block_node(
 
     let mut current = Some(node);
     while let Some(n) = current {
+        // [[anchor-id]] on a line of its own, above the block it names
+        if n.kind() == "block_anchor" {
+            if let Some(id) = find_child_text(n, "id", source) {
+                return Some(NodeInfo {
+                    kind: NodeKind::Anchor { id },
+                    line: n.start_position().row + 1,
+                });
+            }
+        }
         if n.kind() == "block_macro" {
             if let Some(macro_name) = find_child_text(n, "block_macro_name", source) {
                 if macro_name == "include" {
