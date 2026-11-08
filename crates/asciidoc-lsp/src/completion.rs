@@ -1376,6 +1376,21 @@ mod tests {
         assert_eq!(b_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
     }
 
+    #[test]
+    fn test_xref_path_lists_files_in_subdirectory() {
+        let dir = setup_include_dir();
+        let doc = dir.path().join("a.adoc");
+        let items = resolve_xref_path_completions("chapters/", &doc, None, "[]");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["intro.adoc"]);
+        let intro = &items[0];
+        assert_eq!(
+            intro.insert_text.as_deref(),
+            Some("chapters/intro.adoc${1}[${2:label}]")
+        );
+        assert_eq!(intro.filter_text.as_deref(), Some("chapters/intro.adoc"));
+    }
+
     // --- Phase 3: resolve_include_completions ---
 
     use tempfile::TempDir;

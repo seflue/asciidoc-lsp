@@ -2423,6 +2423,38 @@ mod tests {
         assert_eq!(report["resolution"]["value"], "value");
     }
 
+    #[tokio::test]
+    async fn test_xref_subdirectory_completion_over_the_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("chapters")).unwrap();
+        fs::write(tmp.path().join("chapters/intro.adoc"), "= Intro\n").unwrap();
+        let doc = "= Doc\n\nSee xref:chapters/\n";
+        let (service, _socket) = initialized_server(tmp.path()).await;
+        let server = service.inner();
+        let uri = file_uri(&tmp.path().join("index.adoc"));
+        open_document(server, &uri, doc).await;
+
+        let response = server
+            .completion(CompletionParams {
+                text_document_position: doc_position(&uri, position_of(doc, "xref:chapters/", 14)),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap();
+
+        let Some(CompletionResponse::Array(items)) = response else {
+            panic!("expected completion items, got {response:?}");
+        };
+        let intro = items.iter().find(|i| i.label == "intro.adoc").unwrap();
+        assert_eq!(
+            intro.insert_text.as_deref(),
+            Some("chapters/intro.adoc${1}[${2:label}]")
+        );
+        assert_eq!(intro.filter_text.as_deref(), Some("chapters/intro.adoc"));
+    }
+
     #[test]
     fn test_document_path_keeps_the_raw_path_of_an_unsaved_file() {
         let uri = Uri::from_str("file:///does/not/exist/new.adoc").unwrap();
