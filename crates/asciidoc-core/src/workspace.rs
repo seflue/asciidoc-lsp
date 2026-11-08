@@ -1721,6 +1721,24 @@ mod tests {
         );
     }
 
+    /// Precondition of the LSP's option-A fixture test: the scan reaches
+    /// `book/twice.adoc` through `config/book-link` first, so a scan that
+    /// took the link's folder would show there.
+    #[cfg(unix)]
+    #[test]
+    fn test_fixture_scan_reaches_book_through_the_link_first() {
+        let project = crate::symlink_fixture().join("real/project");
+
+        let files = find_adoc_files(&project);
+
+        let reached: Vec<&PathBuf> = files
+            .iter()
+            .filter(|(_, canonical)| *canonical == project.join("book/twice.adoc"))
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(reached, vec![&project.join("config/book-link/twice.adoc")]);
+    }
+
     #[test]
     fn test_find_adoc_files_symlink_loop() {
         let tmp = tempfile::tempdir().unwrap();

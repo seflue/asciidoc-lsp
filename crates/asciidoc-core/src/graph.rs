@@ -410,6 +410,69 @@ mod tests {
         assert_eq!(sub_edges[0].target, root.join("docs/part.adoc"));
     }
 
+    /// For a file included through a folder link and through its real path,
+    /// the path met first in walk order sets the document directory. `diamond.adoc` includes `guide/up.adoc` (through
+    /// `guide -> ../outside/guide`) before `../outside/guide/up.adoc`.
+    #[cfg(unix)]
+    #[test]
+    fn test_graph_first_include_path_sets_the_document_directory() {
+        let fx = crate::symlink_fixture();
+        let project = fx.join("real/project");
+        let up = fx.join("real/outside/guide/up.adoc");
+        let mut registry = AttributeRegistry::new(&project);
+
+        let (graph, _) = build_graph(&project.join("diamond.adoc"), &mut registry);
+
+        assert_eq!(registry.doc_dir(&up), Some(project.join("guide").as_path()));
+        assert_eq!(
+            graph.includes_of(&up)[0].target,
+            project.join("part-up.adoc")
+        );
+    }
+
+    /// The entry is taken as given, made absolute with `..` popped textually
+    /// (Asciidoctor's `File.absolute_path`): `guide/../config/ch2.adoc` is the
+    /// project's `config/ch2.adoc`, although `guide` links elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn test_graph_entry_pops_parent_segments_textually() {
+        let fx = crate::symlink_fixture();
+        let project = fx.join("real/project");
+        let ch2 = project.join("config/ch2.adoc");
+        let mut registry = AttributeRegistry::new(&project);
+
+        let (_, documents) = build_graph(&project.join("guide/../config/ch2.adoc"), &mut registry);
+
+        assert!(documents.contains_key(&ch2), "{:?}", documents.keys());
+        let assets = project.join("assets").display().to_string();
+        assert_eq!(registry.resolve(&ch2, "imagesdir"), Some(assets.as_str()));
+    }
+
+    /// A relative entry resolves against the working directory (the crate
+    /// folder under `cargo test`) and keeps the symlinked folder it names.
+    #[cfg(unix)]
+    #[test]
+    fn test_graph_relative_entry_keeps_its_symlinked_folder() {
+        let fx = crate::symlink_fixture();
+        let project = fx.join("real/project");
+        let up = fx.join("real/outside/guide/up.adoc");
+        let entry = Path::new("../../tests/fixtures/symlinks/real/project/guide/up.adoc");
+        assert_eq!(
+            entry.canonicalize().ok(),
+            Some(up.clone()),
+            "precondition: the working directory is the crate folder"
+        );
+        let mut registry = AttributeRegistry::new(&project);
+
+        let (graph, _) = build_graph(entry, &mut registry);
+
+        assert_eq!(registry.doc_dir(&up), Some(project.join("guide").as_path()));
+        assert_eq!(
+            graph.includes_of(&up)[0].target,
+            project.join("part-up.adoc")
+        );
+    }
+
     #[test]
     fn test_graph_builder_nested() {
         let tmp = tempfile::tempdir().unwrap();

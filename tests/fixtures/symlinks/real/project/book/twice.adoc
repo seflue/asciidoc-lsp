@@ -1,0 +1,5 @@
+= Reached through a folder link inside the root
+
+include::../part-up.adoc[]
+
+image::logo.svg[]

@@ -2026,6 +2026,26 @@ mod tests {
             .await;
     }
 
+    async fn change_document(server: &AsciiDocLsp, uri: &Uri, version: i32, text: &str) {
+        server
+            .did_change(DidChangeTextDocumentParams {
+                text_document: tower_lsp_server::ls_types::VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                content_changes: vec![tower_lsp_server::ls_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.into(),
+                }],
+            })
+            .await;
+    }
+
+    fn document_id(uri: &Uri) -> tower_lsp_server::ls_types::TextDocumentIdentifier {
+        tower_lsp_server::ls_types::TextDocumentIdentifier { uri: uri.clone() }
+    }
+
     fn position_of(text: &str, needle: &str, offset: u32) -> Position {
         let idx = text.find(needle).unwrap();
         let before = &text[..idx];
@@ -2481,6 +2501,9 @@ mod tests {
     // A canonical root and path, B symlinked root, C canonical root with a
     // symlinked document path, D/E imagesdir from `.asciidoctorconfig`
     // (canonical/symlinked), F an imagesdir that is itself a symlink.
+    // The other links (`other/*.adoc`, `real/project/guide`,
+    // `config/book-link`, `config/outside.adoc`, `docs/outside.adoc`, `home`)
+    // are described at the tests that use them.
 
     fn fixture_dir(name: &str) -> PathBuf {
         workspace_root().join("tests/fixtures").join(name)
@@ -2816,6 +2839,187 @@ mod tests {
             Some(format!("image::{}[]\n\n✓ File exists", logo.display()))
         );
         assert_eq!(target.map(|l| l.uri), Some(file_uri(&logo)));
+    }
+
+    /// A symlink outside the workspace whose target lies inside gets no
+    /// `.asciidoctorconfig` chain: the walk up from the link's folder never
+    /// reaches the root. `other/ch2.adoc` links to `config/ch2.adoc`, whose
+    /// folder config sets `imagesdir`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_symlink_from_outside_the_root_gets_no_config_chain() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let (service, _socket, uri, text) = open_fixture(&real, &fx.join("other/ch2.adoc")).await;
+        let server = service.inner();
+        let position = position_of(&text, "image::logo.svg", 9);
+
+        let hover = hover_text(server, &uri, position).await;
+        let target = definition(server, &uri, position).await;
+
+        assert_eq!(
+            hover.as_deref(),
+            Some("image::logo.svg[]\n\n✗ File not found")
+        );
+        assert_eq!(target, None);
+    }
+
+    // `book/twice.adoc` is also reached through `config/book-link -> ../book`,
+    // a folder link inside the root. The scan pops folders from a stack of
+    // sorted entries, so it visits them in reverse order and reaches the file
+    // through `config/book-link` before `book/` (asserted in the core test
+    // `test_fixture_scan_reaches_book_through_the_link_first`).
+    // `include::../part-up.adoc[]` reaches `part-up.adoc` from the real folder
+    // and `config/part-up.adoc` from the link; only the link side gets
+    // `imagesdir` from `config/.asciidoctorconfig`.
+
+    fn first_include_target(server: &AsciiDocLsp, file: &Path) -> PathBuf {
+        let ws = server.workspace.lock();
+        ws.as_ref().unwrap().include_graph().includes_of(file)[0]
+            .target
+            .clone()
+    }
+
+    /// Option A: a file inside the root that a folder link inside the root
+    /// also reaches resolves from its real folder while unopened (the scan
+    /// keeps the canonical folder, though it reaches the file through the
+    /// link), and from the link's folder, config chain
+    /// included, once opened through the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_file_behind_folder_link_resolves_from_real_folder_until_opened_through_it(
+    ) {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let canonical = real.join("book/twice.adoc");
+        let (service, _socket) = initialized_server(&real).await;
+        let server = service.inner();
+        let scanned_include = first_include_target(server, &canonical);
+        let scanned_imagesdir = {
+            let ws = server.workspace.lock();
+            let attributes = ws.as_ref().unwrap().attributes();
+            attributes
+                .resolve(&canonical, "imagesdir")
+                .map(str::to_owned)
+        };
+
+        let link = real.join("config/book-link/twice.adoc");
+        let text = fs::read_to_string(&link).unwrap();
+        let uri = file_uri(&link);
+        open_document(server, &uri, &text).await;
+        let include = definition(server, &uri, position_of(&text, "include::../part-up", 13)).await;
+        let image = definition(server, &uri, position_of(&text, "image::logo", 9)).await;
+
+        assert_eq!(scanned_include, real.join("part-up.adoc"));
+        assert_eq!(scanned_imagesdir, None);
+        assert_eq!(
+            include.map(|l| l.uri),
+            Some(file_uri(&real.join("config/part-up.adoc")))
+        );
+        assert_eq!(
+            image.map(|l| l.uri),
+            Some(file_uri(&real.join("assets/logo.svg")))
+        );
+    }
+
+    /// One document directory per file: with the same file open through a
+    /// folder link and its real path, the last open, change or save decides
+    /// for both buffers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_last_open_change_or_save_sets_the_folder_for_both_buffers() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let real_uri = file_uri(&real.join("book/twice.adoc"));
+        let link_uri = file_uri(&real.join("config/book-link/twice.adoc"));
+        let text = fs::read_to_string(real.join("book/twice.adoc")).unwrap();
+        let include = position_of(&text, "include::../part-up", 13);
+        let real_side = Some(file_uri(&real.join("part-up.adoc")));
+        let link_side = Some(file_uri(&real.join("config/part-up.adoc")));
+        let (service, _socket) = initialized_server(&real).await;
+        let server = service.inner();
+
+        open_document(server, &real_uri, &text).await;
+        open_document(server, &link_uri, &text).await;
+        let after_open = definition(server, &real_uri, include).await.map(|l| l.uri);
+        change_document(server, &real_uri, 2, &text).await;
+        let after_change = definition(server, &link_uri, include).await.map(|l| l.uri);
+        server
+            .did_save(DidSaveTextDocumentParams {
+                text_document: document_id(&link_uri),
+                text: None,
+            })
+            .await;
+        let after_save = definition(server, &real_uri, include).await.map(|l| l.uri);
+
+        assert_eq!(after_open, link_side, "open through the link");
+        assert_eq!(after_change, real_side, "change through the real path");
+        assert_eq!(after_save, link_side, "save through the link");
+    }
+
+    /// Closing a buffer opened through a folder link keeps the link's folder:
+    /// the file is re-indexed from disk with the link-side resolution.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_close_keeps_the_folder_of_the_link() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let (service, _socket, uri, _) =
+            open_fixture(&real, &real.join("config/book-link/twice.adoc")).await;
+        let server = service.inner();
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&uri),
+            })
+            .await;
+
+        assert_eq!(
+            first_include_target(server, &real.join("book/twice.adoc")),
+            real.join("config/part-up.adoc")
+        );
+    }
+
+    /// Option A for nested includes: opening `via-link.adoc`, which includes
+    /// `config/book-link/twice.adoc`, leaves `twice.adoc` on its real folder.
+    /// Only opening a file through the link moves it (the CLI walk differs:
+    /// there the include path decides).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_include_through_folder_link_keeps_the_real_folder() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let twice = real.join("book/twice.adoc");
+        let (service, _socket, _, _) = open_fixture(&real, &real.join("via-link.adoc")).await;
+        let server = service.inner();
+
+        let include = first_include_target(server, &real.join("via-link.adoc"));
+        let nested = first_include_target(server, &twice);
+
+        assert_eq!(include, twice);
+        assert_eq!(nested, real.join("part-up.adoc"));
+    }
+
+    /// A file outside the root that the scan reaches through several links
+    /// takes the folder of the first one in scan order (folders in reverse
+    /// sorted order): `docs/outside.adoc` before `config/outside.adoc`, so no
+    /// `imagesdir` from `config/.asciidoctorconfig`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fixture_scan_takes_the_first_link_to_a_file_outside_the_root() {
+        let fx = fixture_dir("symlinks");
+        let real = fx.join("real/project");
+        let outside = fx.join("real/outside/outside.adoc");
+        let (service, _socket) = initialized_server(&real).await;
+
+        let ws = service.inner().workspace.lock();
+        let attributes = ws.as_ref().unwrap().attributes();
+
+        assert_eq!(
+            attributes.doc_dir(&outside),
+            Some(real.join("docs").as_path())
+        );
+        assert_eq!(attributes.resolve(&outside, "imagesdir"), None);
     }
 
     /// adoc-0139, Verify "inline image has hover and gd like the block macro".

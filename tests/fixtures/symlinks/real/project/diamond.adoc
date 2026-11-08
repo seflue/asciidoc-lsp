@@ -1,0 +1,5 @@
+= Included through a folder link and its real path
+
+include::guide/up.adoc[]
+
+include::../outside/guide/up.adoc[]

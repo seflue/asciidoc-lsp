@@ -1014,6 +1014,24 @@ mod tests {
         assert_eq!(registry.resolve(&file, "theme"), Some("dark"));
     }
 
+    /// Forgetting a deleted file also drops its document directory, so the
+    /// file falls back to its own folder if it comes back.
+    #[cfg(unix)]
+    #[test]
+    fn test_forget_file_drops_the_document_directory() {
+        let project = crate::symlink_fixture().join("real/project");
+        let file = project.join("book/twice.adoc");
+        let mut registry = AttributeRegistry::new(&project);
+        registry.set_doc_dir(&file, &project.join("config/book-link"));
+
+        registry.forget_file(&file);
+
+        assert_eq!(
+            registry.doc_dir(&file),
+            Some(project.join("book").as_path())
+        );
+    }
+
     /// A folder symlinked into the root from outside walks up through the
     /// link, not through its target, and reads the link folder's config.
     #[cfg(unix)]
@@ -1249,6 +1267,33 @@ mod tests {
             Some(val) => std::env::set_var("HOME", val),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// Unlike project configs, which keep symlinks, the home config resolves
+    /// relative values and `asciidoctorconfigdir` against the canonical
+    /// `$HOME`. In the fixture, `home` links to `real/home`.
+    #[cfg(unix)]
+    #[test]
+    fn test_home_config_resolves_against_canonical_home() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let fx = crate::symlink_fixture();
+        let project = fx.join("real/project");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fx.join("home"));
+
+        let mut registry = AttributeRegistry::new(&project);
+        registry.ensure_config_for_dir(&project);
+        let file = project.join("doc.adoc");
+        let images = registry.resolve(&file, "home-images").map(str::to_owned);
+        let snippets = registry.resolve(&file, "home-snippets").map(str::to_owned);
+
+        match original_home {
+            Some(val) => std::env::set_var("HOME", val),
+            None => std::env::remove_var("HOME"),
+        }
+        let home = fx.join("real/home");
+        assert_eq!(images, Some(home.join("img").display().to_string()));
+        assert_eq!(snippets, Some(home.join("snippets").display().to_string()));
     }
 
     // --- resolve_source() for asciidoctorconfigdir ---

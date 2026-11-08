@@ -1,0 +1,3 @@
+= Includes a file through a folder link
+
+include::config/book-link/twice.adoc[]
