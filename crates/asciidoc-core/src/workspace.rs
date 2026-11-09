@@ -1933,4 +1933,21 @@ mod tests {
         ws.remove_file(&root.join("ghost.adoc"));
         assert!(ws.documents.is_empty());
     }
+
+    /// An attribute entry in a section body, after a `:to` line without
+    /// closing colon, is registered for the file (committed fixture
+    /// `tests/fixtures/attribute_entries`).
+    #[test]
+    fn test_fixture_attribute_entry_in_section_body_is_registered() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/attribute_entries")
+            .canonicalize()
+            .unwrap();
+        let main = root.join("main.adoc");
+
+        let ws = Workspace::build(&root, &main);
+
+        assert_eq!(ws.attributes().resolve(&main, "product"), Some("Widget"));
+        assert_eq!(ws.attributes().resolve(&main, "to"), None);
+    }
 }

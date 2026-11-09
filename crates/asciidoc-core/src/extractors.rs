@@ -901,4 +901,114 @@ mod tests {
             xrefs
         );
     }
+
+    // --- Committed fixture: tests/fixtures/attribute_entries ---
+    //
+    // A `:to` line without closing colon and an attribute entry in a
+    // section body. Each one used to turn the rest of the file into a parse
+    // error, which hid its sections, attributes and inline references.
+
+    fn attribute_entries_fixture() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/attribute_entries/main.adoc");
+        std::fs::read_to_string(path).expect("attribute_entries fixture should exist")
+    }
+
+    #[test]
+    fn test_fixture_attribute_entries_keep_the_sections_after_them() {
+        let source = attribute_entries_fixture();
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, &source).unwrap();
+
+        let sections: Vec<_> = extract_sections(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|s| (s.level, s.title))
+            .collect();
+
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let expected = [
+            (0, "Attribute entries in section bodies"),
+            (1, "Completion probes"),
+            (2, "Bare colon line"),
+            (2, "After the bare line"),
+            (1, "Body attributes"),
+            (2, "Target"),
+        ];
+        let expected: Vec<_> = expected.iter().map(|(l, t)| (*l, t.to_string())).collect();
+        assert_eq!(sections, expected);
+    }
+
+    #[test]
+    fn test_fixture_colon_line_without_closing_colon_is_no_attribute() {
+        let source = attribute_entries_fixture();
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, &source).unwrap();
+
+        let attrs: Vec<_> = extract_attributes(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|a| (a.name, a.value, a.line))
+            .collect();
+
+        assert_eq!(attrs, [("product".to_string(), "Widget".to_string(), 20)]);
+    }
+
+    #[test]
+    fn test_fixture_references_after_attribute_entries_are_found() {
+        let source = attribute_entries_fixture();
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, &source).unwrap();
+
+        let ranges = collect_inline_ranges(tree.root_node());
+        let (xrefs, _) = extract_inline_content_safe(&ranges, &source);
+        let rows: Vec<_> = ranges.iter().map(|r| r.start_point.row).collect();
+        let includes: Vec<_> = extract_includes(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|i| (i.path, i.line))
+            .collect();
+
+        assert_eq!(xrefs.len(), 1, "got {xrefs:?}");
+        assert_eq!(xrefs[0].target, "_target");
+        // `Uses {product} here.` on line 24.
+        assert!(rows.contains(&23), "inline rows: {rows:?}");
+        assert_eq!(includes, [("part.adoc".to_string(), 26)]);
+    }
+
+    /// `header.adoc`: a `:to` line in the header, typed on the way to
+    /// `:toc:`, is a one-word author line (as in Asciidoctor) and must not
+    /// carry on over the following lines into the first section.
+    #[test]
+    fn test_fixture_colon_line_in_header_keeps_the_sections() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/attribute_entries/header.adoc");
+        let source = std::fs::read_to_string(path).expect("header fixture should exist");
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, &source).unwrap();
+
+        let sections: Vec<_> = extract_sections(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|s| (s.level, s.title))
+            .collect();
+        let attrs: Vec<_> = extract_attributes(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let expected = [
+            (0, "Header probe"),
+            (1, "Before the list"),
+            (2, "After the list"),
+        ];
+        let expected: Vec<_> = expected.iter().map(|(l, t)| (*l, t.to_string())).collect();
+        assert_eq!(sections, expected);
+        assert_eq!(attrs, ["toc", "a"]);
+    }
 }

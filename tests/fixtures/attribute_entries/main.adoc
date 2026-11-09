@@ -1,0 +1,26 @@
+= Attribute entries in section bodies
+
+// Two constructs that each broke navigation for the rest of the file:
+// a `:name` line with no closing colon, which Asciidoctor reads as
+// paragraph text, and an attribute entry in a section body.
+
+== Completion probes
+
+=== Bare colon line
+
+:to
+// Expected: completion offers toc
+
+=== After the bare line
+
+See <<_target,Target>>.
+
+== Body attributes
+
+:product: Widget
+
+=== Target
+
+Uses {product} here.
+
+include::part.adoc[]

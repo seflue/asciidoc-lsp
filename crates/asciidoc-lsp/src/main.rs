@@ -3427,4 +3427,114 @@ mod tests {
 
         assert!(broken_xrefs(server, &a).is_empty(), "after event");
     }
+
+    /// gd target of `position` as `<file>:<line>`, the file relative to
+    /// `root`; `-` when there is none.
+    async fn definition_at(
+        server: &AsciiDocLsp,
+        uri: &Uri,
+        position: Position,
+        root: &Path,
+    ) -> String {
+        definition(server, uri, position).await.map_or_else(
+            || "-".to_string(),
+            |location| {
+                let path = location.uri.to_file_path().unwrap();
+                let relative = path.strip_prefix(root).unwrap();
+                format!("{}:{}", relative.display(), location.range.start.line)
+            },
+        )
+    }
+
+    /// Navigation keeps working after an attribute entry in a section body
+    /// and after a `:to` line without closing colon (committed fixture
+    /// `tests/fixtures/attribute_entries`).
+    #[tokio::test]
+    async fn test_fixture_navigation_after_attribute_entries() {
+        let fx = fixture_dir("attribute_entries");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+        let product = position_of(&text, "Uses {product}", 6);
+
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "<<_target", 3), &fx).await,
+            "main.adoc:21"
+        );
+        assert_eq!(
+            definition_at(server, &uri, product, &fx).await,
+            "main.adoc:19"
+        );
+        assert_eq!(
+            hover_text(server, &uri, product).await.as_deref(),
+            Some(":product: Widget\n\nDefined in main.adoc:20")
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "include::part", 10), &fx).await,
+            "part.adoc:0"
+        );
+    }
+
+    /// The committed manual test plan stays navigable past its `:to`
+    /// completion probe and the attribute entry in the T10 section body:
+    /// T7.12 and T10.1/T10.2.
+    #[tokio::test]
+    async fn test_manual_test_plan_navigates_after_attribute_entries() {
+        let root = workspace_root().join("tests");
+        let doc = root.join("manual-test-plan.adoc");
+        let (service, _socket, uri, text) = open_fixture(&root, &doc).await;
+        let server = service.inner();
+        let quality_goals = "chapters/introduction.adoc:8";
+        // The plan is edited by hand, so take the definition line from it.
+        let product_line = position_of(&text, ":t10-product: Widget", 0).line;
+        let product_target = format!("manual-test-plan.adoc:{product_line}");
+
+        for (needle, offset, target) in [
+            (
+                "| See xref:chapters/introduction.adoc#_quality_goals",
+                8,
+                quality_goals,
+            ),
+            (
+                "a| See xref:chapters/introduction.adoc#_quality_goals",
+                9,
+                quality_goals,
+            ),
+            (
+                "image:test-placeholder.png[Placeholder]",
+                8,
+                "images/test-placeholder.png:0",
+            ),
+            ("Attribute: {t10-product}", 13, product_target.as_str()),
+            ("Xref: xref:chapters/introduction.adoc", 8, quality_goals),
+        ] {
+            let position = position_of(&text, needle, offset);
+            assert_eq!(
+                definition_at(server, &uri, position, &root).await,
+                target,
+                "gd on {needle:?}"
+            );
+        }
+        let image = hover_text(
+            server,
+            &uri,
+            position_of(&text, "image:test-placeholder.png[Placeholder]", 8),
+        )
+        .await
+        .unwrap_or_default();
+        assert!(image.ends_with("✓ File exists"), "image hover: {image:?}");
+        assert_eq!(
+            hover_text(
+                server,
+                &uri,
+                position_of(&text, "Attribute: {t10-product}", 13)
+            )
+            .await
+            .as_deref(),
+            Some(format!(
+                ":t10-product: Widget\n\nDefined in manual-test-plan.adoc:{}",
+                product_line + 1
+            ))
+            .as_deref()
+        );
+    }
 }
