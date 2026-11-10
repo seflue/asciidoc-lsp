@@ -3537,4 +3537,32 @@ mod tests {
             .as_deref()
         );
     }
+
+    /// Navigation keeps working after a section that opens out of sequence,
+    /// `===` with no `==` open (committed fixture
+    /// `tests/fixtures/out_of_sequence`).
+    #[tokio::test]
+    async fn test_fixture_navigation_after_out_of_sequence_section() {
+        let fx = fixture_dir("out_of_sequence");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+        let product = position_of(&text, "Uses {product}", 6);
+
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "<<_target", 3), &fx).await,
+            "main.adoc:13"
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "<<_orphan", 3), &fx).await,
+            "main.adoc:7"
+        );
+        assert_eq!(
+            definition_at(server, &uri, product, &fx).await,
+            "main.adoc:1"
+        );
+        assert_eq!(
+            hover_text(server, &uri, product).await.as_deref(),
+            Some(":product: Widget\n\nDefined in main.adoc:2")
+        );
+    }
 }

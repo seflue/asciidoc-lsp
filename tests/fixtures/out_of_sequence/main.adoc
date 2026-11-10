@@ -1,0 +1,16 @@
+= Sections out of sequence
+:product: Widget
+
+// `=== Orphan` opens with no `==` section, as below the document title
+// or at the start of a partial file. Asciidoctor warns "section title
+// out of sequence" and reads on.
+
+=== Orphan
+
+See <<_target,Target>>.
+
+Uses {product} here.
+
+== Target
+
+Back to <<_orphan>>.
