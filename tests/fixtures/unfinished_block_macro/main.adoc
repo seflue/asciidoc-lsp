@@ -1,0 +1,17 @@
+= Unfinished block macros
+:product: Widget
+
+// An include or image without its attribute list, as while typing, is
+// paragraph text for Asciidoctor, not a block macro.
+
+== First
+
+include::{docdir}/
+
+image::logo.png
+
+Uses {product} here.
+
+== Second
+
+See <<_first>>.

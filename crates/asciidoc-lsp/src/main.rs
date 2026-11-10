@@ -3565,4 +3565,39 @@ mod tests {
             Some(":product: Widget\n\nDefined in main.adoc:2")
         );
     }
+
+    /// An include or image without its attribute list, as while typing, is
+    /// text: no broken include, and navigation after it keeps working
+    /// (committed fixture `tests/fixtures/unfinished_block_macro`).
+    #[tokio::test]
+    async fn test_fixture_unfinished_block_macro_is_text() {
+        let fx = fixture_dir("unfinished_block_macro");
+        let main = fx.join("main.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &main).await;
+        let server = service.inner();
+
+        let broken_includes = {
+            let ws = server.workspace.lock();
+            ws.as_ref()
+                .unwrap()
+                .diagnostics_for(&main)
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.kind,
+                        asciidoc_core::types::DiagnosticKind::BrokenInclude { .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(broken_includes, 0);
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "<<_first", 3), &fx).await,
+            "main.adoc:6"
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "Uses {product}", 6), &fx).await,
+            "main.adoc:1"
+        );
+    }
 }
