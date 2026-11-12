@@ -580,22 +580,27 @@ fn merge_config_chain(
                 continue;
             }
 
-            for (key, value, line) in parse_asciidoctorconfig(&content) {
-                // `docdir` is locked (see `docdir_layers`): setting it is skipped.
-                if key == DOCDIR {
-                    continue;
+            for entry in parse_asciidoctorconfig(&content) {
+                match entry {
+                    // `docdir` is locked (see `docdir_layers`): setting it is skipped.
+                    ConfigEntry::Set { name, .. } if name == DOCDIR => {}
+                    ConfigEntry::Set { name, value, line } => {
+                        let substituted = substitute_with(merged, &value);
+                        merged.insert(
+                            name,
+                            AttributeEntry {
+                                value: substituted,
+                                source: Some(AttributeSource {
+                                    file: config_path.clone(),
+                                    line,
+                                }),
+                            },
+                        );
+                    }
+                    ConfigEntry::Unset { name } => {
+                        merged.remove(&name);
+                    }
                 }
-                let substituted = substitute_with(merged, &value);
-                merged.insert(
-                    key,
-                    AttributeEntry {
-                        value: substituted,
-                        source: Some(AttributeSource {
-                            file: config_path.clone(),
-                            line,
-                        }),
-                    },
-                );
             }
         }
     }
@@ -662,9 +667,21 @@ fn config_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Parse :key: value lines from an .asciidoctorconfig file.
-/// Returns (key, value, 1-indexed line number) tuples.
-fn parse_asciidoctorconfig(content: &str) -> Vec<(String, String, usize)> {
+/// One attribute entry of a config file.
+#[derive(Debug)]
+enum ConfigEntry {
+    /// `:name: value`, with its 1-indexed line.
+    Set {
+        name: String,
+        value: String,
+        line: usize,
+    },
+    /// `:name!:` or `:!name:`.
+    Unset { name: String },
+}
+
+/// Parse the attribute entries of an .asciidoctorconfig file.
+fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
     let mut result = Vec::new();
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -673,8 +690,17 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<(String, String, usize)> {
                 if let Some((key, value)) = rest.split_once(':') {
                     let key = key.trim();
                     let value = value.trim();
-                    if !key.is_empty() {
-                        result.push((key.to_string(), value.to_string(), idx + 1));
+                    let unset = key.strip_suffix('!').or_else(|| key.strip_prefix('!'));
+                    if let Some(name) = unset.filter(|name| !name.is_empty()) {
+                        result.push(ConfigEntry::Unset {
+                            name: name.to_string(),
+                        });
+                    } else if !key.is_empty() {
+                        result.push(ConfigEntry::Set {
+                            name: key.to_string(),
+                            value: value.to_string(),
+                            line: idx + 1,
+                        });
                     }
                 }
             }
@@ -1089,6 +1115,34 @@ mod tests {
             (root.join(".asciidoctorconfig.adoc"), 2)
         );
         assert_eq!(registry.resolve(&doc, "derived"), Some("from-adoc/x"));
+    }
+
+    /// A case folder of the committed fixture `tests/fixtures/config_prepended_text`.
+    fn prepended_text_case(case: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config_prepended_text")
+            .join(case)
+            .canonicalize()
+            .unwrap()
+    }
+
+    /// `:name!:` and `:!name:` unset an attribute, also one an earlier layer
+    /// set, as in prepended AsciiDoc text.
+    #[test]
+    fn test_config_unset_removes_attribute() {
+        let root = prepended_text_case("unset");
+        let sub = root.join("sub");
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&sub);
+        let doc = sub.join("doc.adoc");
+
+        assert_eq!(registry.resolve(&doc, "gone-bang"), None);
+        assert_eq!(registry.resolve(&doc, "gone-bang!"), None);
+        assert_eq!(registry.resolve(&doc, "gone-prefix"), None);
+        assert_eq!(registry.resolve(&doc, "!gone-prefix"), None);
+        assert_eq!(registry.resolve(&doc, "local"), None);
+        assert!(registry.resolve_source(&doc, "gone-bang").is_none());
+        assert_eq!(registry.resolve(&doc, "kept"), Some("k"));
     }
 
     #[test]
