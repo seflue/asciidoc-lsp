@@ -5,7 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-tree-sitter = "0.25"
+tree-sitter = "0.27"
 tree-sitter-asciidoc = "0.11"
 tree-sitter-asciidoc-inline = "0.11"
 thiserror = "2"
