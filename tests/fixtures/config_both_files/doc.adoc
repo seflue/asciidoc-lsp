@@ -1,0 +1,3 @@
+= Doc
+
+{shared} {adoc-only}

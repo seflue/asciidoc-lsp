@@ -536,10 +536,10 @@ impl From<&AttributeEntry> for AttributeHit {
 /// and merging its attributes. Later directories override earlier ones.
 fn merge_config_chain(chain_dirs: &[PathBuf], merged: &mut HashMap<String, AttributeEntry>) {
     for chain_dir in chain_dirs {
-        let Some(config_path) = find_config_file(chain_dir) else {
-            continue;
-        };
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
+        for config_path in config_files(chain_dir) {
+            let Ok(content) = std::fs::read_to_string(&config_path) else {
+                continue;
+            };
             // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
             merged.insert(
                 "asciidoctorconfigdir".into(),
@@ -619,20 +619,20 @@ fn substitute_inner<'a>(input: &str, lookup: impl Fn(&str) -> Option<&'a str>) -
     result
 }
 
-/// Find the `.asciidoctorconfig` file in a directory.
+/// File names of the config files in one folder, in load order.
 ///
-/// Asciidoctor recognizes both `.asciidoctorconfig` and `.asciidoctorconfig.adoc`.
-/// The shorter name takes priority (same as Asciidoctor).
-fn find_config_file(dir: &Path) -> Option<PathBuf> {
-    let plain = dir.join(".asciidoctorconfig");
-    if plain.is_file() {
-        return Some(plain);
-    }
-    let with_ext = dir.join(".asciidoctorconfig.adoc");
-    if with_ext.is_file() {
-        return Some(with_ext);
-    }
-    None
+/// Both load when present, as in the `IntelliJ` plugin: `.asciidoctorconfig.adoc`
+/// first, then `.asciidoctorconfig`, so the file without extension wins for
+/// the same attribute.
+const CONFIG_FILE_NAMES: [&str; 2] = [".asciidoctorconfig.adoc", ".asciidoctorconfig"];
+
+/// The config files present in a directory, in load order.
+fn config_files(dir: &Path) -> Vec<PathBuf> {
+    CONFIG_FILE_NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 /// Parse :key: value lines from an .asciidoctorconfig file.
@@ -1077,6 +1077,35 @@ mod tests {
             Some("plain"),
             ".asciidoctorconfig (without extension) should take priority"
         );
+    }
+
+    /// Both config files in one folder load, as in IntelliJ:
+    /// `.asciidoctorconfig.adoc` first, then `.asciidoctorconfig`, so the
+    /// plain one wins for the same attribute (committed fixture
+    /// `tests/fixtures/config_both_files`).
+    #[test]
+    fn test_both_config_files_in_folder_load_adoc_first() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config_both_files")
+            .canonicalize()
+            .unwrap();
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let doc = root.join("doc.adoc");
+
+        assert_eq!(registry.resolve(&doc, "shared"), Some("plain"));
+        let shared = registry.resolve_source(&doc, "shared").unwrap();
+        assert_eq!(
+            (shared.file, shared.line),
+            (root.join(".asciidoctorconfig"), 1)
+        );
+        assert_eq!(registry.resolve(&doc, "adoc-only"), Some("from-adoc"));
+        let adoc_only = registry.resolve_source(&doc, "adoc-only").unwrap();
+        assert_eq!(
+            (adoc_only.file, adoc_only.line),
+            (root.join(".asciidoctorconfig.adoc"), 2)
+        );
+        assert_eq!(registry.resolve(&doc, "derived"), Some("from-adoc/x"));
     }
 
     #[test]

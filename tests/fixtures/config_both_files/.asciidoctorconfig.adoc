@@ -1,0 +1,3 @@
+:shared: adoc
+:adoc-only: from-adoc
+:derived: {adoc-only}/x

@@ -1948,6 +1948,28 @@ mod tests {
         assert_eq!(targets, vec![root.join("two/part.adoc").as_path()]);
     }
 
+    /// With both config files in the folder, a change to either one shows
+    /// after reload.
+    #[test]
+    fn test_reload_config_with_both_config_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: hello\n").unwrap();
+        fs::write(root.join(".asciidoctorconfig.adoc"), ":farewell: bye\n").unwrap();
+        let (mut ws, doc) = workspace_with_doc(&root);
+        assert_eq!(ws.attributes().resolve(&doc, "farewell"), Some("bye"));
+
+        fs::write(root.join(".asciidoctorconfig.adoc"), ":farewell: ciao\n").unwrap();
+        ws.reload_config(&HashMap::new());
+        assert_eq!(ws.attributes().resolve(&doc, "farewell"), Some("ciao"));
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), Some("hello"));
+
+        fs::write(root.join(".asciidoctorconfig"), ":greeting: bonjour\n").unwrap();
+        ws.reload_config(&HashMap::new());
+        assert_eq!(ws.attributes().resolve(&doc, "greeting"), Some("bonjour"));
+        assert_eq!(ws.attributes().resolve(&doc, "farewell"), Some("ciao"));
+    }
+
     #[test]
     fn test_reload_config_keeps_open_buffer_content() {
         let tmp = tempfile::tempdir().unwrap();
