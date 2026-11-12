@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::paths::normalize_lexically;
@@ -81,6 +81,18 @@ struct LayeredValue<'a> {
     source: Option<&'a AttributeSource>,
 }
 
+/// Name of the attribute Asciidoctor sets to the folder of the converted document.
+pub const DOCDIR: &str = "docdir";
+
+/// A top-level document a file is converted as part of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocRoot {
+    document: PathBuf,
+    /// The document directory of `document`, as a string: its `docdir`
+    /// unless its config chain sets one.
+    dir: String,
+}
+
 pub struct AttributeRegistry {
     builtin: HashMap<String, String>,
     config_chains: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
@@ -88,6 +100,9 @@ pub struct AttributeRegistry {
     /// Document directories that differ from the file's parent: the folder of
     /// the symlink a document was opened through.
     doc_dirs: HashMap<PathBuf, PathBuf>,
+    /// The top-level documents each file is converted as part of, sorted;
+    /// they decide `docdir`. See [`Self::set_doc_roots`].
+    doc_roots: HashMap<PathBuf, Vec<DocRoot>>,
     workspace_root: PathBuf,
 }
 
@@ -95,13 +110,15 @@ impl AttributeRegistry {
     #[must_use]
     pub fn new(root: &Path) -> Self {
         let mut builtin = HashMap::new();
-        builtin.insert("docdir".into(), root.display().to_string());
+        // `docdir` of a file the registry has never seen.
+        builtin.insert(DOCDIR.into(), root.display().to_string());
         builtin.insert("env-asciidoc-lsp".into(), String::new());
         Self {
             builtin,
             config_chains: HashMap::new(),
             per_file: HashMap::new(),
             doc_dirs: HashMap::new(),
+            doc_roots: HashMap::new(),
             workspace_root: root.to_path_buf(),
         }
     }
@@ -160,6 +177,7 @@ impl AttributeRegistry {
     pub(crate) fn forget_file(&mut self, file: &Path) {
         self.per_file.remove(file);
         self.doc_dirs.remove(file);
+        self.doc_roots.remove(file);
     }
 
     /// Record `dir` as the document directory of `file`.
@@ -188,7 +206,113 @@ impl AttributeRegistry {
             .or_else(|| file.parent())
     }
 
+    fn doc_root(&self, document: &Path) -> DocRoot {
+        DocRoot {
+            document: document.to_path_buf(),
+            dir: self
+                .doc_dir(document)
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Record the top-level documents each file is converted as part of
+    /// (sorted). Their folders are the file's `docdir`. A file missing from
+    /// `roots` is its own top-level document. Returns the files whose
+    /// `docdir` changed.
+    pub fn set_doc_roots(&mut self, roots: &HashMap<PathBuf, Vec<PathBuf>>) -> Vec<PathBuf> {
+        let files: HashSet<&PathBuf> = self.per_file.keys().chain(roots.keys()).collect();
+        let next: HashMap<PathBuf, Vec<DocRoot>> = files
+            .into_iter()
+            .map(|file| {
+                let documents = roots.get(file).map_or(&[][..], Vec::as_slice);
+                let entry = if documents.is_empty() {
+                    vec![self.doc_root(file)]
+                } else {
+                    documents.iter().map(|doc| self.doc_root(doc)).collect()
+                };
+                (file.clone(), entry)
+            })
+            .collect();
+        let changed = next
+            .iter()
+            .filter(|(file, entry)| self.doc_roots.get(*file) != Some(*entry))
+            .map(|(file, _)| file.clone())
+            .collect();
+        self.doc_roots = next;
+        changed
+    }
+
+    /// Record `document` as the only top-level document of `file`, ahead of
+    /// [`Self::set_doc_roots`]: for a graph walk from a known entry.
+    pub(crate) fn assign_doc_root(&mut self, file: &Path, document: &Path) {
+        let root = self.doc_root(document);
+        self.doc_roots.insert(file.to_path_buf(), vec![root]);
+    }
+
+    /// `docdir` of `file`, once per top-level document it belongs to, in
+    /// order. Asciidoctor sets it to the folder of the converted document
+    /// and ignores `:docdir:` entries in the document. A `:docdir:` in the
+    /// top-level document's `.asciidoctorconfig` chain wins: it stands for a
+    /// build that sets the base directory.
+    fn docdir_layers(&self, file: &Path) -> Vec<LayeredValue<'_>> {
+        let Some(roots) = self.doc_roots.get(file) else {
+            return self
+                .builtin
+                .get(DOCDIR)
+                .map(|dir| LayeredValue {
+                    value: dir.as_str(),
+                    layer: AttributeLayer::Builtin,
+                    source: None,
+                })
+                .into_iter()
+                .collect();
+        };
+        roots
+            .iter()
+            .map(|root| {
+                let configured = self
+                    .doc_dir(&root.document)
+                    .and_then(|dir| self.config_chains.get(dir))
+                    .and_then(|chain| chain.get(DOCDIR));
+                configured.map_or(
+                    LayeredValue {
+                        value: root.dir.as_str(),
+                        layer: AttributeLayer::Builtin,
+                        source: None,
+                    },
+                    |entry| LayeredValue {
+                        value: entry.value.as_str(),
+                        layer: AttributeLayer::Config,
+                        source: entry.source.as_ref(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Every distinct `docdir` of `file`, one per top-level document it
+    /// belongs to; the first is the one [`Self::resolve`] returns.
+    #[must_use]
+    pub fn docdirs(&self, file: &Path) -> Vec<&str> {
+        let mut dirs: Vec<&str> = Vec::new();
+        for layered in self.docdir_layers(file) {
+            if !dirs.contains(&layered.value) {
+                dirs.push(layered.value);
+            }
+        }
+        dirs
+    }
+
     pub fn register_file_attributes(&mut self, file: &Path, attrs: &[AttributeDef]) {
+        let is_own_root = self
+            .doc_roots
+            .get(file)
+            .is_none_or(|roots| roots.len() == 1 && roots[0].document == file);
+        if is_own_root {
+            let root = self.doc_root(file);
+            self.doc_roots.insert(file.to_path_buf(), vec![root]);
+        }
         let map: HashMap<String, AttributeEntry> = attrs
             .iter()
             .map(|a| {
@@ -253,12 +377,19 @@ impl AttributeRegistry {
                 );
             }
         }
+        if let Some(docdir) = self.docdir_layers(file).into_iter().next() {
+            merged.insert(DOCDIR, docdir);
+        }
         merged
     }
 
-    /// Resolve an attribute by name with priority: Document-Header > Config > Built-in
+    /// Resolve an attribute by name with priority: Document-Header > Config > Built-in.
+    /// `docdir` follows [`Self::docdir_layers`] instead.
     #[must_use]
     pub fn resolve(&self, file: &Path, name: &str) -> Option<&str> {
+        if name == DOCDIR {
+            return self.docdir_layers(file).first().map(|l| l.value);
+        }
         self.per_file
             .get(file)
             .and_then(|m| m.get(name))
@@ -278,6 +409,12 @@ impl AttributeRegistry {
     /// Builtins have no source location and return None.
     #[must_use]
     pub fn resolve_source(&self, file: &Path, name: &str) -> Option<AttributeSource> {
+        if name == DOCDIR {
+            return self
+                .docdir_layers(file)
+                .first()
+                .and_then(|l| l.source.cloned());
+        }
         let per_file = self.per_file.get(file);
         let per_file_hit = per_file.and_then(|m| m.get(name));
         tracing::trace!(
@@ -339,7 +476,15 @@ impl AttributeRegistry {
             hit: chain.and_then(|m| m.get(name)).map(AttributeHit::from),
         };
 
-        let builtin = self.builtin.get(name).cloned();
+        let builtin = if name == DOCDIR {
+            self.doc_roots
+                .get(file)
+                .and_then(|roots| roots.first())
+                .map(|root| root.dir.clone())
+                .or_else(|| self.builtin.get(name).cloned())
+        } else {
+            self.builtin.get(name).cloned()
+        };
 
         let winner = self.merged_layers(file).get(name).map(|l| l.layer);
 
@@ -374,6 +519,19 @@ impl AttributeRegistry {
     #[must_use]
     pub fn substitute(&self, file: &Path, input: &str) -> String {
         substitute_inner(input, |name| self.resolve(file, name))
+    }
+
+    /// [`Self::substitute`] with `docdir` taken as `docdir`: the value for
+    /// one particular top-level document (see [`Self::docdirs`]).
+    #[must_use]
+    pub fn substitute_with_docdir(&self, file: &Path, input: &str, docdir: &str) -> String {
+        substitute_inner(input, |name| {
+            if name == DOCDIR {
+                Some(docdir)
+            } else {
+                self.resolve(file, name)
+            }
+        })
     }
 }
 
@@ -679,35 +837,97 @@ mod tests {
         assert_eq!(registry.resolve(file, "version"), Some("1.0"));
     }
 
-    #[test]
-    fn test_resolve_priority() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-
-        let mut registry = AttributeRegistry::new(&root);
-        // Simulate config layer via config_chains
+    fn docdir_config(registry: &mut AttributeRegistry, dir: &str, value: &str) {
         let mut config_map = HashMap::new();
         config_map.insert(
             "docdir".into(),
             AttributeEntry {
-                value: "/config".into(),
-                source: None,
+                value: value.into(),
+                source: Some(AttributeSource {
+                    file: Path::new(dir).join(".asciidoctorconfig"),
+                    line: 1,
+                }),
             },
         );
-        registry.config_chains.insert(root.clone(), config_map);
+        registry.config_chains.insert(dir.into(), config_map);
+    }
 
-        let file = root.join("doc.adoc");
-        // Config overrides built-in
-        assert_eq!(registry.resolve(&file, "docdir"), Some("/config"));
-
-        // Doc-header overrides config
-        let attrs = vec![AttributeDef {
+    /// `docdir` is the folder of the top-level document, also in the files
+    /// it includes. Asciidoctor locks it, so a `:docdir:` entry in a document
+    /// is ignored; only the top-level document's `.asciidoctorconfig` chain
+    /// overrides it.
+    #[test]
+    fn test_docdir_priority() {
+        let mut registry = AttributeRegistry::new(Path::new("/ws"));
+        let book = Path::new("/ws/book/book.adoc");
+        let part = Path::new("/ws/shared/part.adoc");
+        registry.register_file_attributes(book, &[]);
+        let header = AttributeDef {
             name: "docdir".into(),
             value: "/header".into(),
             line: 1,
-        }];
-        registry.register_file_attributes(&file, &attrs);
-        assert_eq!(registry.resolve(&file, "docdir"), Some("/header"));
+        };
+        registry.register_file_attributes(part, std::slice::from_ref(&header));
+
+        // Before the include graph is known, a file is its own top-level document.
+        assert_eq!(registry.resolve(part, "docdir"), Some("/ws/shared"));
+
+        let roots = HashMap::from([
+            (book.to_path_buf(), vec![book.to_path_buf()]),
+            (part.to_path_buf(), vec![book.to_path_buf()]),
+        ]);
+        assert_eq!(registry.set_doc_roots(&roots), vec![part.to_path_buf()]);
+        assert_eq!(registry.resolve(part, "docdir"), Some("/ws/book"));
+        assert_eq!(registry.resolve(book, "docdir"), Some("/ws/book"));
+        assert!(registry.resolve_source(part, "docdir").is_none());
+
+        // The included file's own config chain does not count.
+        docdir_config(&mut registry, "/ws/shared", "/shared-config");
+        assert_eq!(registry.resolve(part, "docdir"), Some("/ws/book"));
+
+        docdir_config(&mut registry, "/ws/book", "/configured");
+        assert_eq!(registry.resolve(part, "docdir"), Some("/configured"));
+        assert_eq!(
+            registry.substitute(part, "{docdir}/x.adoc"),
+            "/configured/x.adoc"
+        );
+        let source = registry.resolve_source(part, "docdir").unwrap();
+        assert_eq!(source.file, Path::new("/ws/book/.asciidoctorconfig"));
+        assert_eq!(
+            registry.explain(part, "docdir").winner,
+            Some(AttributeLayer::Config)
+        );
+        let known = registry.known_attributes(part);
+        let docdir = known.iter().find(|k| k.name == "docdir").unwrap();
+        assert_eq!(docdir.value, "/configured");
+    }
+
+    /// A file several top-level documents include has one `docdir` per
+    /// document, deduplicated; `resolve()` takes the first.
+    #[test]
+    fn test_docdirs_per_top_level_document() {
+        let mut registry = AttributeRegistry::new(Path::new("/ws"));
+        let a = Path::new("/ws/a/a.adoc");
+        let a2 = Path::new("/ws/a/a2.adoc");
+        let b = Path::new("/ws/b/b.adoc");
+        let part = Path::new("/ws/shared/part.adoc");
+        let roots = HashMap::from([(
+            part.to_path_buf(),
+            vec![a.to_path_buf(), a2.to_path_buf(), b.to_path_buf()],
+        )]);
+        registry.set_doc_roots(&roots);
+        assert_eq!(registry.docdirs(part), vec!["/ws/a", "/ws/b"]);
+        // A registered file no top-level document reaches (an include
+        // cycle) is its own top-level document.
+        let looped = Path::new("/ws/loop/x.adoc");
+        registry.register_file_attributes(looped, &[]);
+        registry.set_doc_roots(&roots);
+        assert_eq!(registry.resolve(looped, "docdir"), Some("/ws/loop"));
+        assert_eq!(registry.resolve(part, "docdir"), Some("/ws/a"));
+        assert_eq!(
+            registry.substitute_with_docdir(part, "{docdir}/x", "/ws/b"),
+            "/ws/b/x"
+        );
     }
 
     #[test]
@@ -1321,7 +1541,13 @@ mod tests {
     fn test_explain_same_file_hit_wins_over_config_and_builtin() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        fs::write(root.join(".asciidoctorconfig"), ":docdir: /config\n").unwrap();
+        // `env-asciidoc-lsp` has all three layers; `docdir` ignores the
+        // per-file one (see test_docdir_priority).
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":env-asciidoc-lsp: /config\n",
+        )
+        .unwrap();
 
         let mut registry = AttributeRegistry::new(&root);
         registry.ensure_config_for_dir(&root);
@@ -1329,13 +1555,13 @@ mod tests {
         registry.register_file_attributes(
             &file,
             &[AttributeDef {
-                name: "docdir".into(),
+                name: "env-asciidoc-lsp".into(),
                 value: "/header".into(),
                 line: 3,
             }],
         );
 
-        let ex = registry.explain(&file, "docdir");
+        let ex = registry.explain(&file, "env-asciidoc-lsp");
 
         assert!(ex.per_file.registered);
         let hit = ex.per_file.hit.as_ref().expect("per-file hit");
@@ -1350,10 +1576,7 @@ mod tests {
             ex.config.hit.as_ref().map(|h| h.value.as_str()),
             Some("/config")
         );
-        assert_eq!(
-            ex.builtin.as_deref(),
-            Some(root.display().to_string().as_str())
-        );
+        assert_eq!(ex.builtin.as_deref(), Some(""));
         assert_eq!(ex.winner, Some(AttributeLayer::PerFile));
     }
 

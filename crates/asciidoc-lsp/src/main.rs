@@ -1485,7 +1485,8 @@ mod tests {
         let ws = Workspace::build(&ws_root, &index);
 
         // Line 20 in index.adoc: include::{docdir}/appendix/glossary.adoc[]
-        // {docdir} is at columns 9..16 (0-indexed LSP line 19)
+        // {docdir} is at columns 9..16 (0-indexed LSP line 19). index.adoc is
+        // the top-level document, so the `:docdir:` of its config chain wins.
         let pos = Position {
             line: 19,
             character: 12, // inside "docdir"
@@ -3684,6 +3685,39 @@ mod tests {
             .await
             .as_deref(),
             Some(":pdf-themesdir: theme")
+        );
+    }
+
+    /// `{docdir}` in a file included from a top-level document in a
+    /// subfolder is that document's folder: hover, go-to-definition through
+    /// it and PDF paths agree (committed fixture `tests/fixtures/docdir_top_level`).
+    #[tokio::test]
+    async fn test_fixture_docdir_in_included_file_is_top_level_folder() {
+        let fx = fixture_dir("docdir_top_level");
+        let path = |p: &str| fx.join(p).display().to_string();
+
+        let chapters = fx.join("docs/shared/chapters.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &chapters).await;
+        let server = service.inner();
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "{docdir}", 2)).await,
+            Some(format!(":docdir: {}", path("docs/handbook")))
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "chapters/intro", 2), &fx).await,
+            "docs/handbook/chapters/intro.adoc:0"
+        );
+
+        let settings = fx.join("docs/shared/pdf-settings.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &settings).await;
+        assert_eq!(
+            hover_text(
+                service.inner(),
+                &uri,
+                position_of(&text, ":pdf-themesdir:", 1)
+            )
+            .await,
+            Some(format!(":pdf-themesdir: {}", path("docs/theme")))
         );
     }
 }

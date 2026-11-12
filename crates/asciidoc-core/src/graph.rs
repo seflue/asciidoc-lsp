@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::attributes::AttributeRegistry;
-use crate::types::{DocumentModel, IncludeEdge, IncludeTree};
+use crate::types::{DocumentModel, IncludeEdge, IncludeMacro, IncludeTree};
 
 pub struct IncludeGraph {
     pub(crate) forward: HashMap<PathBuf, Vec<IncludeEdge>>,
@@ -60,6 +60,38 @@ impl IncludeGraph {
     pub fn included_by(&self, file: &Path) -> &[PathBuf] {
         static EMPTY: Vec<PathBuf> = Vec::new();
         self.reverse.get(file).map_or(&EMPTY, |v| v.as_slice())
+    }
+
+    /// For every document, the top-level documents whose include tree
+    /// reaches it, sorted. A top-level document is one no other document
+    /// includes, the one Asciidoctor converts; it reaches itself. A document
+    /// reachable only through an include cycle has no entry.
+    #[must_use]
+    pub fn doc_roots(
+        &self,
+        documents: &HashMap<PathBuf, DocumentModel>,
+    ) -> HashMap<PathBuf, Vec<PathBuf>> {
+        let mut tops: Vec<&PathBuf> = documents
+            .keys()
+            .filter(|path| self.included_by(path).is_empty())
+            .collect();
+        tops.sort();
+        let mut roots: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for top in tops {
+            let mut seen: HashSet<&Path> = HashSet::new();
+            let mut stack = vec![top.as_path()];
+            while let Some(file) = stack.pop() {
+                if !seen.insert(file) || !documents.contains_key(file) {
+                    continue;
+                }
+                roots
+                    .entry(file.to_path_buf())
+                    .or_default()
+                    .push(top.clone());
+                stack.extend(self.includes_of(file).iter().map(|e| e.target.as_path()));
+            }
+        }
+        roots
     }
 
     /// Detect cycles in the include graph using DFS with 3-color marking.
@@ -179,8 +211,10 @@ pub fn build_graph_with_overrides(
         |path| crate::paths::normalize_lexically(&path),
     );
 
+    let top = entry.canonicalize().unwrap_or_else(|_| entry.clone());
     walk(
         &entry,
+        &top,
         registry,
         &mut graph,
         &mut documents,
@@ -240,19 +274,7 @@ pub fn parse_single_file(
     // Register file attributes
     registry.register_file_attributes(canonical, &file_attrs);
 
-    // Resolve include paths to edges
-    let edges: Vec<IncludeEdge> = includes_raw
-        .iter()
-        .map(|inc| {
-            let target = crate::paths::resolve_doc_target(canonical, &inc.path, registry)
-                .unwrap_or_else(|| PathBuf::from(&inc.path));
-            IncludeEdge {
-                target,
-                line: inc.line,
-                attributes: inc.attributes.clone(),
-            }
-        })
-        .collect();
+    let edges = include_edges(canonical, &includes_raw, registry);
 
     let doc = DocumentModel {
         path: canonical.to_path_buf(),
@@ -268,8 +290,29 @@ pub fn parse_single_file(
     Some((doc, edges))
 }
 
+/// Resolve the include macros of `file` to graph edges, in the same order.
+pub(crate) fn include_edges(
+    file: &Path,
+    includes: &[IncludeMacro],
+    registry: &AttributeRegistry,
+) -> Vec<IncludeEdge> {
+    includes
+        .iter()
+        .map(|inc| {
+            let target = crate::paths::resolve_doc_target(file, &inc.path, registry)
+                .unwrap_or_else(|| PathBuf::from(&inc.path));
+            IncludeEdge {
+                target,
+                line: inc.line,
+                attributes: inc.attributes.clone(),
+            }
+        })
+        .collect()
+}
+
 fn walk(
     file: &Path,
+    top: &Path,
     registry: &mut AttributeRegistry,
     graph: &mut IncludeGraph,
     documents: &mut HashMap<PathBuf, DocumentModel>,
@@ -289,6 +332,11 @@ fn walk(
     if let Some(dir) = file.parent() {
         registry.set_doc_dir(&canonical, dir);
     }
+    // Everything the walk reaches is converted as part of the entry, so an
+    // included file resolves `{docdir}` before the graph is complete.
+    if canonical != top {
+        registry.assign_doc_root(&canonical, top);
+    }
 
     let Some((doc, edges)) = parse_single_file(&canonical, registry, overrides) else {
         return;
@@ -300,7 +348,7 @@ fn walk(
         graph.add_edge(&canonical, edge.clone());
         let next = crate::paths::resolve_doc_path(&canonical, &include.path, registry)
             .unwrap_or_else(|| edge.target.clone());
-        walk(&next, registry, graph, documents, visited, overrides);
+        walk(&next, top, registry, graph, documents, visited, overrides);
     }
 
     documents.insert(canonical, doc);

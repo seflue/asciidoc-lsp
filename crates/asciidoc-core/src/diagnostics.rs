@@ -287,17 +287,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        // Create target file on disk
-        let sub = root.join("appendix");
+        // Create target file on disk, below the top-level document's folder
+        let sub = root.join("book/appendix");
         std::fs::create_dir_all(&sub).unwrap();
         let target_file = sub.join("glossary.adoc");
         std::fs::write(&target_file, "= Glossary\n").unwrap();
 
-        // Registry with docdir = root
-        let registry = AttributeRegistry::new(root);
+        // docdir = folder of the top-level document, not the workspace root
+        let mut registry = AttributeRegistry::new(root);
+        let parent = root.join("book/index.adoc");
+        registry.register_file_attributes(&parent, &[]);
 
         // Parent doc includes {docdir}/appendix/glossary.adoc
-        let parent = root.join("index.adoc");
         let mut documents = HashMap::new();
         documents.insert(
             parent.clone(),

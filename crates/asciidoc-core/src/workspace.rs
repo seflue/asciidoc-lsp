@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use crate::attributes::AttributeRegistry;
 use crate::diagnostics::collect_diagnostics;
-use crate::graph::{build_graph, build_graph_with_overrides, parse_single_file, IncludeGraph};
+use crate::graph::{
+    build_graph, build_graph_with_overrides, include_edges, parse_single_file, IncludeGraph,
+};
 use crate::pdf_theme::PdfResolution;
 use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DocumentModel, FileLocation};
@@ -153,12 +155,7 @@ impl Workspace {
         ws.include_graph = graph;
         ws.documents = documents;
         ws.reference_index = ReferenceIndex::build(&ws.documents, &ws.attributes);
-        ws.diagnostics = collect_diagnostics(
-            &ws.documents,
-            &ws.include_graph,
-            &ws.reference_index,
-            &ws.attributes,
-        );
+        ws.recalculate_diagnostics();
         ws
     }
 
@@ -304,11 +301,40 @@ impl Workspace {
         self.diagnostics.values().flatten().cloned().collect()
     }
 
+    /// Recompute each document's top-level documents, and so its `{docdir}`,
+    /// from the include graph. A file whose `{docdir}` changed gets its
+    /// include edges resolved again, which can change the graph, so this
+    /// repeats until nothing changes (bounded).
+    fn refresh_doc_roots(&mut self) {
+        // Settles in two passes unless a `{docdir}` include adds or removes
+        // an edge that changes another file's top-level documents.
+        const MAX_PASSES: usize = 8;
+        for _ in 0..MAX_PASSES {
+            let roots = self.include_graph.doc_roots(&self.documents);
+            let changed = self.attributes.set_doc_roots(&roots);
+            if changed.is_empty() {
+                return;
+            }
+            for file in changed {
+                let Some(doc) = self.documents.get(&file) else {
+                    continue;
+                };
+                let edges = include_edges(&file, &doc.includes, &self.attributes);
+                self.include_graph.remove_edges_from(&file);
+                for edge in edges {
+                    self.include_graph.add_edge(&file, edge);
+                }
+            }
+        }
+    }
+
     /// Recalculate diagnostics from current workspace state.
     ///
     /// Call this after `ensure_file()` or `update_file()` to refresh diagnostics.
     /// The reference index is already kept up-to-date incrementally by those methods.
+    /// Refreshes `{docdir}` first: it depends on the whole include graph.
     pub fn recalculate_diagnostics(&mut self) {
+        self.refresh_doc_roots();
         self.diagnostics = collect_diagnostics(
             &self.documents,
             &self.include_graph,
@@ -435,12 +461,7 @@ impl Workspace {
         ws.include_graph = graph;
         ws.documents = documents;
         ws.reference_index = ReferenceIndex::build(&ws.documents, &ws.attributes);
-        ws.diagnostics = collect_diagnostics(
-            &ws.documents,
-            &ws.include_graph,
-            &ws.reference_index,
-            &ws.attributes,
-        );
+        ws.recalculate_diagnostics();
         ws
     }
 }
@@ -1970,5 +1991,90 @@ mod tests {
 
         assert_eq!(ws.attributes().resolve(&main, "product"), Some("Widget"));
         assert_eq!(ws.attributes().resolve(&main, "to"), None);
+    }
+
+    fn docdir_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/docdir_top_level")
+            .canonicalize()
+            .unwrap()
+    }
+
+    fn broken_includes(ws: &Workspace, file: &Path) -> usize {
+        ws.diagnostics_for(file)
+            .iter()
+            .filter(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenInclude { .. }))
+            .count()
+    }
+
+    /// `{docdir}` is the folder of the top-level document, also inside the
+    /// files it includes; a file several top-level documents include sees
+    /// the first one in sorted order, and lists all (committed fixture
+    /// `tests/fixtures/docdir_top_level`).
+    #[test]
+    fn test_fixture_docdir_is_folder_of_top_level_document() {
+        let root = docdir_fixture();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let dir = |p: &str| root.join(p).display().to_string();
+        let docdir = |p: &str| {
+            ws.attributes()
+                .resolve(&root.join(p), "docdir")
+                .map(str::to_string)
+        };
+
+        assert_eq!(
+            docdir("docs/handbook/handbook.adoc"),
+            Some(dir("docs/handbook"))
+        );
+        assert_eq!(
+            docdir("docs/print/guide/guide.adoc"),
+            Some(dir("docs/print/guide"))
+        );
+        assert_eq!(
+            docdir("docs/shared/pdf-settings.adoc"),
+            Some(dir("docs/handbook"))
+        );
+        // Reached only through `include::{docdir}/...` in an included file.
+        assert_eq!(
+            docdir("docs/handbook/chapters/intro.adoc"),
+            Some(dir("docs/handbook"))
+        );
+        assert_eq!(
+            ws.attributes()
+                .docdirs(&root.join("docs/shared/chapters.adoc")),
+            vec![
+                dir("docs/handbook").as_str(),
+                dir("docs/print/guide").as_str()
+            ]
+        );
+    }
+
+    /// `include::{docdir}/...` in an included file follows the top-level
+    /// document's folder. The target is missing for the second including
+    /// document only, so the include is not broken.
+    #[test]
+    fn test_fixture_docdir_include_from_included_file() {
+        let root = docdir_fixture();
+        let chapters = root.join("docs/shared/chapters.adoc");
+        let intro = root.join("docs/handbook/chapters/intro.adoc");
+
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let targets: Vec<&Path> = ws
+            .include_graph()
+            .includes_of(&chapters)
+            .iter()
+            .map(|edge| edge.target.as_path())
+            .collect();
+        assert_eq!(targets, vec![intro.as_path()]);
+        assert_eq!(broken_includes(&ws, &chapters), 0);
+
+        // A graph walk from the entry gets there too.
+        let ws = Workspace::build(&root, &root.join("docs/handbook/handbook.adoc"));
+        assert!(ws.documents().contains_key(&intro));
+        assert_eq!(broken_includes(&ws, &chapters), 0);
     }
 }

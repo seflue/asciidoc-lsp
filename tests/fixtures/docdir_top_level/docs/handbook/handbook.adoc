@@ -1,0 +1,5 @@
+= Handbook
+include::../shared/pdf-settings.adoc[]
+:pdf-theme: custom
+
+include::../shared/chapters.adoc[]

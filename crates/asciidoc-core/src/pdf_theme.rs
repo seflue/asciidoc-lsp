@@ -4,13 +4,14 @@
 //! Asciidoctor PDF reads these from the top-level document it converts, so an
 //! entry in an included file (a shared `pdf-settings.adoc`) counts for every
 //! document that includes it. A value is taken after attribute substitution
-//! in the file that sets it. A relative value resolves against the working
+//! in the file that sets it, with `{docdir}` of the top-level document that
+//! includes it, checked once per such document. A relative value resolves against the working
 //! directory of the build, which the server cannot know.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::attributes::{AttributeRegistry, AttributeSource};
+use crate::attributes::{AttributeRegistry, AttributeSource, DOCDIR};
 use crate::graph::IncludeGraph;
 use crate::paths::normalize_lexically;
 use crate::types::{AttributeDef, Diagnostic, DiagnosticKind, DocumentModel};
@@ -83,6 +84,8 @@ struct Entry<'a> {
 /// The PDF path entries one top-level document sees, in document order.
 struct Scope<'a> {
     root: &'a Path,
+    /// `{docdir}` of `root`, which every file it includes sees.
+    docdir: String,
     entries: Vec<Entry<'a>>,
     files: HashSet<&'a Path>,
 }
@@ -102,6 +105,10 @@ impl<'a> Scope<'a> {
     ) -> Self {
         let mut scope = Scope {
             root,
+            docdir: registry
+                .resolve(root, DOCDIR)
+                .unwrap_or_default()
+                .to_string(),
             entries: Vec::new(),
             files: HashSet::new(),
         };
@@ -141,7 +148,7 @@ impl<'a> Scope<'a> {
                     file: doc.path.as_path(),
                     line: attr.line,
                     name: attr.name.as_str(),
-                    value: registry.substitute(&doc.path, &attr.value),
+                    value: registry.substitute_with_docdir(&doc.path, &attr.value, &self.docdir),
                 }),
                 Step::Include(target) => self.visit(target, documents, graph, registry),
             }
@@ -286,7 +293,8 @@ fn check_entry(entry: &Entry<'_>, themesdir: Option<&PdfPath>) -> Vec<Diagnostic
 
 /// Diagnostics for every `pdf-theme`, `pdf-themesdir` and `pdf-fontsdir`
 /// entry, checked once per top-level document that reaches it. An entry
-/// reached from several documents reports each distinct finding once.
+/// reached from several documents reports each distinct finding once, and
+/// nothing when it checks clean for at least one of them.
 #[must_use]
 pub fn collect_pdf_diagnostics(
     documents: &HashMap<PathBuf, DocumentModel>,
@@ -294,11 +302,16 @@ pub fn collect_pdf_diagnostics(
     registry: &AttributeRegistry,
 ) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
+    let mut clean: HashSet<(PathBuf, usize)> = HashSet::new();
     for root in top_level_documents(documents, graph) {
         let scope = Scope::collect(&root, documents, graph, registry);
         let themesdir = scope.themesdir(registry);
         for entry in &scope.entries {
-            for kind in check_entry(entry, themesdir.as_ref()) {
+            let kinds = check_entry(entry, themesdir.as_ref());
+            if kinds.is_empty() {
+                clean.insert((entry.file.to_path_buf(), entry.line));
+            }
+            for kind in kinds {
                 let seen = diags
                     .iter()
                     .any(|d| d.file == entry.file && d.line == entry.line && d.kind == kind);
@@ -312,6 +325,7 @@ pub fn collect_pdf_diagnostics(
             }
         }
     }
+    diags.retain(|d| !clean.contains(&(d.file.clone(), d.line)));
     diags
 }
 
@@ -372,7 +386,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     /// Committed fixture `tests/fixtures/pdf_theme`, scanned with itself as
-    /// workspace root, so `{docdir}` is the fixture directory.
+    /// workspace root. Every document using `{docdir}` is top-level in the
+    /// fixture directory or included from one there, so `{docdir}` is the
+    /// fixture directory.
     fn fixture() -> (PathBuf, Workspace) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/pdf_theme")
@@ -551,6 +567,44 @@ mod tests {
         assert_eq!(
             resolve(&ws, &root.join("no-themesdir.adoc"), PDF_THEME, Some(2)),
             vec![PdfPath::Builtin("default-sans".into())]
+        );
+    }
+
+    /// `{docdir}` in a shared file is the folder of each top-level document
+    /// that includes it (committed fixture `tests/fixtures/docdir_top_level`):
+    /// `docs/handbook/handbook.adoc` finds `docs/theme`. For
+    /// `docs/print/guide/guide.adoc` it points to the missing
+    /// `docs/print/theme`, which is not reported: the entry resolves for one
+    /// including document.
+    #[test]
+    fn docdir_in_shared_settings_is_folder_of_each_top_level_document() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/docdir_top_level")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let settings = root.join("docs/shared/pdf-settings.adoc");
+
+        assert_eq!(
+            pdf_diags(&ws, &root.join("docs/handbook/handbook.adoc")),
+            vec![]
+        );
+        assert_eq!(pdf_diags(&ws, &settings), vec![]);
+        // Hover: the first top-level document in sorted order.
+        assert_eq!(
+            resolve(&ws, &settings, PDF_THEMESDIR, Some(1)),
+            vec![PdfPath::Absolute(root.join("docs/theme"))]
+        );
+        assert_eq!(
+            resolve(
+                &ws,
+                &root.join("docs/handbook/handbook.adoc"),
+                PDF_THEME,
+                Some(3)
+            ),
+            vec![PdfPath::Absolute(root.join("docs/theme/custom-theme.yml"))]
         );
     }
 

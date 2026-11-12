@@ -37,15 +37,31 @@ pub fn resolve_doc_target(
 
 /// Steps 1–3 of [`resolve_doc_target`]: the target as Asciidoctor sees it,
 /// with symlinks kept. Its parent is the document directory of the target.
+///
+/// A target with `{docdir}` in a file that several top-level documents
+/// include ([`AttributeRegistry::docdirs`]) resolves to the first candidate
+/// that exists, else to the first one: it is broken only if it is broken
+/// for every including document.
 #[must_use]
 pub fn resolve_doc_path(
     source: &Path,
     target: &str,
     registry: &AttributeRegistry,
 ) -> Option<PathBuf> {
-    let resolved = registry.substitute(source, target);
     let base = registry.doc_dir(source)?;
-    Some(normalize_lexically(&base.join(resolved)))
+    let join = |resolved: String| normalize_lexically(&base.join(resolved));
+    let docdirs = registry.docdirs(source);
+    if docdirs.len() < 2 || !target.contains("{docdir}") {
+        return Some(join(registry.substitute(source, target)));
+    }
+    let mut candidates = docdirs
+        .iter()
+        .map(|docdir| join(registry.substitute_with_docdir(source, target, docdir)));
+    let first = candidates.next()?;
+    if first.exists() {
+        return Some(first);
+    }
+    Some(candidates.find(|path| path.exists()).unwrap_or(first))
 }
 
 /// Drop `.` segments and let each `..` pop the segment before it, without
@@ -107,6 +123,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/workspace/other/doc.adoc"));
+    }
+
+    /// A `{docdir}` target that exists for no including document resolves
+    /// with the first one's `docdir`, so it reports as broken.
+    #[test]
+    fn docdir_target_missing_for_every_document_uses_first_docdir() {
+        let mut registry = AttributeRegistry::new(Path::new("/ws"));
+        let part = Path::new("/ws/shared/part.adoc");
+        let roots = std::collections::HashMap::from([(
+            part.to_path_buf(),
+            vec![PathBuf::from("/ws/a/a.adoc"), PathBuf::from("/ws/b/b.adoc")],
+        )]);
+        registry.set_doc_roots(&roots);
+        assert_eq!(
+            resolve_doc_target(part, "{docdir}/x.adoc", &registry),
+            Some(PathBuf::from("/ws/a/x.adoc"))
+        );
     }
 
     #[test]
