@@ -1,0 +1,6 @@
+:before: config
+include::{asciidoctorconfigdir}/shared/attrs.adoc[]
+include::shared/rel.adoc[]
+include::missing.adoc[]
+include::shared/loop-a.adoc[]
+:after-include: {from-shared}

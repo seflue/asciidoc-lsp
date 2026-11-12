@@ -580,30 +580,75 @@ fn merge_config_chain(
                 continue;
             }
 
-            for entry in parse_asciidoctorconfig(&content) {
-                match entry {
-                    // `docdir` is locked (see `docdir_layers`): setting it is skipped.
-                    ConfigEntry::Set { name, .. } if name == DOCDIR => {}
-                    ConfigEntry::Set { name, value, line } => {
-                        let substituted = substitute_with(merged, &value);
-                        merged.insert(
-                            name,
-                            AttributeEntry {
-                                value: substituted,
-                                source: Some(AttributeSource {
-                                    file: config_path.clone(),
-                                    line,
-                                }),
-                            },
-                        );
-                    }
-                    ConfigEntry::Unset { name } => {
-                        merged.remove(&name);
-                    }
+            apply_config_text(
+                &config_path,
+                &content,
+                merged,
+                &mut Vec::new(),
+                MAX_CONFIG_INCLUDE_DEPTH,
+            );
+        }
+    }
+}
+
+/// Asciidoctor's default `max-include-depth`; the include graph sets no
+/// limit of its own.
+const MAX_CONFIG_INCLUDE_DEPTH: usize = 64;
+
+/// Apply the entries of `content`, the text of config file `file`, to
+/// `merged` in order. `stack` holds the canonical paths of the files being
+/// read, outermost first; an include nests at most `max_depth` levels and
+/// never re-enters a file on the stack. A missing target is skipped.
+fn apply_config_text(
+    file: &Path,
+    content: &str,
+    merged: &mut HashMap<String, AttributeEntry>,
+    stack: &mut Vec<PathBuf>,
+    max_depth: usize,
+) {
+    stack.push(file.canonicalize().unwrap_or_else(|_| file.to_path_buf()));
+    for entry in parse_asciidoctorconfig(content) {
+        match entry {
+            // `docdir` is locked (see `docdir_layers`): setting it is skipped.
+            ConfigEntry::Set { name, .. } if name == DOCDIR => {}
+            ConfigEntry::Set { name, value, line } => {
+                let substituted = substitute_with(merged, &value);
+                merged.insert(
+                    name,
+                    AttributeEntry {
+                        value: substituted,
+                        source: Some(AttributeSource {
+                            file: file.to_path_buf(),
+                            line,
+                        }),
+                    },
+                );
+            }
+            ConfigEntry::Unset { name } => {
+                merged.remove(&name);
+            }
+            ConfigEntry::Include { target } => {
+                if stack.len() > max_depth {
+                    continue;
                 }
+                let Some(dir) = file.parent() else {
+                    continue;
+                };
+                let target = dir.join(substitute_with(merged, &target));
+                let Ok(canonical) = target.canonicalize() else {
+                    continue;
+                };
+                if stack.contains(&canonical) {
+                    continue;
+                }
+                let Ok(included) = std::fs::read_to_string(&target) else {
+                    continue;
+                };
+                apply_config_text(&target, &included, merged, stack, max_depth);
             }
         }
     }
+    stack.pop();
 }
 
 /// Substitute all `{attr}` references in a string using the provided attribute map.
@@ -678,6 +723,8 @@ enum ConfigEntry {
     },
     /// `:name!:` or `:!name:`.
     Unset { name: String },
+    /// `include::target[...]`, target not yet substituted.
+    Include { target: String },
 }
 
 /// Ends an attribute value that continues on the next line, as in Asciidoctor.
@@ -689,7 +736,11 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
     let mut lines = content.lines().enumerate().peekable();
     while let Some((idx, line)) = lines.next() {
         let line = line.trim();
-        if line.starts_with(':') && line.len() > 1 {
+        if let Some(target) = include_target(line) {
+            result.push(ConfigEntry::Include {
+                target: target.to_string(),
+            });
+        } else if line.starts_with(':') && line.len() > 1 {
             if let Some(rest) = line.strip_prefix(':') {
                 if let Some((key, value)) = rest.split_once(':') {
                     let key = key.trim();
@@ -726,6 +777,13 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
         }
     }
     result
+}
+
+/// The target of an `include::target[...]` line; the attribute list is not read.
+fn include_target(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("include::")?;
+    let (target, _) = rest.split_once('[')?;
+    (!target.is_empty() && rest.ends_with(']')).then_some(target)
 }
 
 #[cfg(test)]
@@ -1177,6 +1235,49 @@ mod tests {
         assert_eq!(registry.resolve_source(&doc, "long").unwrap().line, 1);
         assert_eq!(registry.resolve(&doc, "after"), Some("next"));
         assert_eq!(registry.resolve_source(&doc, "after").unwrap().line, 4);
+    }
+
+    /// `include::` in a config reads the included file's entries in place,
+    /// the target substituted and relative to the including file's folder.
+    /// A missing target is skipped, an include cycle ends.
+    #[test]
+    fn test_config_include_reads_entries_in_place() {
+        let root = prepended_text_case("include");
+        let shared = root.join("shared");
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let doc = root.join("doc.adoc");
+
+        assert_eq!(registry.resolve(&doc, "from-shared"), Some("s"));
+        let source = registry.resolve_source(&doc, "from-shared").unwrap();
+        assert_eq!((source.file, source.line), (shared.join("attrs.adoc"), 1));
+        assert_eq!(registry.resolve(&doc, "before"), Some("shared"));
+        assert_eq!(registry.resolve(&doc, "from-rel"), Some("r"));
+        assert_eq!(registry.resolve(&doc, "from-nested"), Some("n"));
+        assert_eq!(registry.resolve(&doc, "loop-a"), Some("a"));
+        assert_eq!(registry.resolve(&doc, "loop-b"), Some("b"));
+        assert_eq!(registry.resolve(&doc, "after-include"), Some("s"));
+    }
+
+    /// Includes nest at most `max_depth` levels below the config file.
+    #[test]
+    fn test_config_include_depth_is_limited() {
+        let root = prepended_text_case("include");
+        let config = root.join(".asciidoctorconfig");
+        let content = fs::read_to_string(&config).unwrap();
+        let mut merged = HashMap::new();
+        merged.insert(
+            "asciidoctorconfigdir".to_string(),
+            AttributeEntry {
+                value: root.display().to_string(),
+                source: None,
+            },
+        );
+
+        apply_config_text(&config, &content, &mut merged, &mut Vec::new(), 1);
+
+        assert!(merged.contains_key("from-rel"));
+        assert!(!merged.contains_key("from-nested"));
     }
 
     #[test]

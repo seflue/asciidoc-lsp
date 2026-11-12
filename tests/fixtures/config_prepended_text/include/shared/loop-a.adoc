@@ -1,0 +1,2 @@
+:loop-a: a
+include::loop-b.adoc[]
