@@ -154,7 +154,7 @@ impl AttributeRegistry {
         }
         chain_dirs.reverse(); // now root → dir order
 
-        let mut merged = load_home_config();
+        let mut merged = HashMap::new();
         merge_config_chain(&chain_dirs, &mut merged);
 
         self.config_chains.insert(dir.to_path_buf(), merged);
@@ -542,43 +542,6 @@ impl From<&AttributeEntry> for AttributeHit {
             source: entry.source.clone(),
         }
     }
-}
-
-/// Load `~/.asciidoctorconfig` from the user's home directory (lowest priority in chain).
-fn load_home_config() -> HashMap<String, AttributeEntry> {
-    let mut merged = HashMap::new();
-    if let Some(home_dir) = std::env::var("HOME").ok().map(PathBuf::from) {
-        if let Some(home_config) = find_config_file(&home_dir) {
-            if let Ok(content) = std::fs::read_to_string(&home_config) {
-                let canonical_home = home_dir.canonicalize().unwrap_or(home_dir);
-                merged.insert(
-                    "asciidoctorconfigdir".into(),
-                    AttributeEntry {
-                        value: canonical_home.display().to_string(),
-                        source: Some(AttributeSource {
-                            file: home_config.clone(),
-                            line: 0,
-                        }),
-                    },
-                );
-                for (key, value, line) in parse_asciidoctorconfig(&content) {
-                    let substituted = substitute_with(&merged, &value);
-                    let resolved = resolve_path_value(&substituted, &canonical_home);
-                    merged.insert(
-                        key,
-                        AttributeEntry {
-                            value: resolved,
-                            source: Some(AttributeSource {
-                                file: home_config.clone(),
-                                line,
-                            }),
-                        },
-                    );
-                }
-            }
-        }
-    }
-    merged
 }
 
 /// Merge `.asciidoctorconfig` files from root to leaf directory into `merged`.
@@ -1359,161 +1322,22 @@ mod tests {
         assert!(!registry.config_chains.contains_key(&root));
     }
 
-    // --- Home-Dir ~/.asciidoctorconfig tests (adoc-0074) ---
-
-    // Mutex to serialize tests that modify the HOME env var
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// The config chain ends at the workspace root, as in IntelliJ: an
+    /// `.asciidoctorconfig` above it does not leak in (committed fixture
+    /// `tests/fixtures/config_chain_root`, workspace root `project`).
     #[test]
-    fn test_home_dir_config_loaded() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path().join("fakehome");
-        let workspace = tmp.path().join("workspace");
-        fs::create_dir_all(&fake_home).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-
-        fs::write(
-            fake_home.join(".asciidoctorconfig"),
-            ":home-attr: home-val\n",
-        )
-        .unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let mut registry = AttributeRegistry::new(&workspace);
-        registry.ensure_config_for_dir(&workspace);
-
-        let file = workspace.join("doc.adoc");
-        assert_eq!(registry.resolve(&file, "home-attr"), Some("home-val"));
-
-        // Restore HOME
-        match original_home {
-            Some(val) => std::env::set_var("HOME", val),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    #[test]
-    fn test_home_dir_config_overridden_by_project() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path().join("fakehome");
-        let workspace = tmp.path().join("workspace");
-        fs::create_dir_all(&fake_home).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-
-        fs::write(fake_home.join(".asciidoctorconfig"), ":shared: home-val\n").unwrap();
-        fs::write(
-            workspace.join(".asciidoctorconfig"),
-            ":shared: project-val\n",
-        )
-        .unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let mut registry = AttributeRegistry::new(&workspace);
-        registry.ensure_config_for_dir(&workspace);
-
-        let file = workspace.join("doc.adoc");
-        assert_eq!(registry.resolve(&file, "shared"), Some("project-val"));
-
-        match original_home {
-            Some(val) => std::env::set_var("HOME", val),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    #[test]
-    fn test_home_dir_config_missing_is_ok() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path().join("fakehome_empty");
-        let workspace = tmp.path().join("workspace");
-        fs::create_dir_all(&fake_home).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-        // No .asciidoctorconfig in fake_home
-
-        fs::write(workspace.join(".asciidoctorconfig"), ":project-key: pval\n").unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let mut registry = AttributeRegistry::new(&workspace);
-        registry.ensure_config_for_dir(&workspace);
-
-        let file = workspace.join("doc.adoc");
-        // Project config still works
-        assert_eq!(registry.resolve(&file, "project-key"), Some("pval"));
-        // No error, no crash
-
-        match original_home {
-            Some(val) => std::env::set_var("HOME", val),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    #[test]
-    fn test_home_dir_asciidoctorconfigdir() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path().join("fakehome");
-        let workspace = tmp.path().join("workspace");
-        fs::create_dir_all(&fake_home).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-        let fake_home = fake_home.canonicalize().unwrap();
-
-        fs::write(
-            fake_home.join(".asciidoctorconfig"),
-            ":home-snippets: {asciidoctorconfigdir}/snippets\n",
-        )
-        .unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let mut registry = AttributeRegistry::new(&workspace);
-        registry.ensure_config_for_dir(&workspace);
-
-        let file = workspace.join("doc.adoc");
-        assert_eq!(
-            registry.resolve(&file, "home-snippets"),
-            Some(format!("{}/snippets", fake_home.display())).as_deref()
-        );
-
-        match original_home {
-            Some(val) => std::env::set_var("HOME", val),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    /// Unlike project configs, which keep symlinks, the home config resolves
-    /// relative values and `asciidoctorconfigdir` against the canonical
-    /// `$HOME`. In the fixture, `home` links to `real/home`.
-    #[cfg(unix)]
-    #[test]
-    fn test_home_config_resolves_against_canonical_home() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap();
-        let fx = crate::symlink_fixture();
-        let project = fx.join("real/project");
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", fx.join("home"));
+    fn test_config_above_workspace_root_is_ignored() {
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config_chain_root")
+            .canonicalize()
+            .unwrap();
+        let project = fx.join("project");
 
         let mut registry = AttributeRegistry::new(&project);
         registry.ensure_config_for_dir(&project);
         let file = project.join("doc.adoc");
-        let images = registry.resolve(&file, "home-images").map(str::to_owned);
-        let snippets = registry.resolve(&file, "home-snippets").map(str::to_owned);
-
-        match original_home {
-            Some(val) => std::env::set_var("HOME", val),
-            None => std::env::remove_var("HOME"),
-        }
-        let home = fx.join("real/home");
-        assert_eq!(images, Some(home.join("img").display().to_string()));
-        assert_eq!(snippets, Some(home.join("snippets").display().to_string()));
+        assert_eq!(registry.resolve(&file, "outside"), None);
+        assert_eq!(registry.resolve(&file, "inside"), Some("project"));
     }
 
     // --- resolve_source() for asciidoctorconfigdir ---
