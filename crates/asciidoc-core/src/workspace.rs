@@ -2103,6 +2103,40 @@ mod tests {
         );
     }
 
+    /// A config file indexed as a document (`.asciidoctorconfig.adoc` is
+    /// scanned as `*.adoc`) is not in its own config chain, as in IntelliJ.
+    /// The other config file in the folder still applies, and
+    /// `{asciidoctorconfigdir}` keeps its folder (committed fixture
+    /// `tests/fixtures/config_both_files`).
+    #[test]
+    fn test_fixture_config_file_not_in_own_chain() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config_both_files")
+            .canonicalize()
+            .unwrap();
+        let config = root.join(".asciidoctorconfig.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        assert!(ws.documents.contains_key(&config));
+        let attrs = ws.attributes();
+
+        let own = attrs.explain(&config, "adoc-only");
+        assert!(own.config.hit.is_none());
+        assert_eq!(own.winner, Some(crate::attributes::AttributeLayer::PerFile));
+        let shared = attrs.explain(&config, "shared");
+        assert_eq!(shared.config.hit.unwrap().value, "plain");
+        assert_eq!(attrs.resolve(&config, "shared"), Some("adoc"));
+        let root_dir = root.display().to_string();
+        assert_eq!(
+            attrs.resolve(&config, "asciidoctorconfigdir"),
+            Some(root_dir.as_str())
+        );
+
+        // Other documents in the folder still see the file.
+        let doc = root.join("doc.adoc");
+        assert_eq!(attrs.resolve(&doc, "adoc-only"), Some("from-adoc"));
+    }
+
     /// `include::{docdir}/...` in an included file follows the top-level
     /// document's folder. The target is missing for the second including
     /// document only, so the include is not broken.

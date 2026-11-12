@@ -1820,6 +1820,45 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
+    /// Goto and references from inside an indexed `.asciidoctorconfig.adoc`
+    /// list its own declaration once (committed fixture
+    /// `tests/fixtures/config_both_files`).
+    #[test]
+    fn test_references_in_config_file_list_declaration_once() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config_both_files")
+            .canonicalize()
+            .unwrap();
+        let config = root.join(".asciidoctorconfig.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let content = fs::read_to_string(&config).unwrap();
+        // cursor on {adoc-only} in `:derived: {adoc-only}/x`
+        let pos = Position {
+            line: 2,
+            character: 12,
+        };
+
+        assert_eq!(
+            resolve_goto_definition(&content, pos, &config, Some(&ws)),
+            Some((config.clone(), 2))
+        );
+        let refs = resolve_references(&content, pos, &config, Some(&ws), true).unwrap();
+        let found: Vec<(&Path, usize)> = refs
+            .iter()
+            .map(|loc| (loc.path.as_path(), loc.line))
+            .collect();
+        let doc = root.join("doc.adoc");
+        assert_eq!(
+            found,
+            vec![
+                (config.as_path(), 2),
+                (config.as_path(), 3),
+                (doc.as_path(), 3)
+            ]
+        );
+    }
+
     // --- adoc-0025 Task 4.1: Integration test — gr on {attr} in .adoc ---
 
     #[test]

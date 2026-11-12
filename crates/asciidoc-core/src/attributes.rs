@@ -45,10 +45,11 @@ pub struct PerFileLookup {
 /// Config layer outcome of [`AttributeRegistry::explain`].
 #[derive(Debug, Clone)]
 pub struct ConfigLookup {
-    /// The key looked up in the config cache: the file's document directory
-    /// (see [`AttributeRegistry::doc_dir`]), unchanged.
+    /// The file's document directory (see [`AttributeRegistry::doc_dir`]),
+    /// unchanged: the directory whose config chain applies (for a config
+    /// file there, without the file itself).
     pub dir: Option<PathBuf>,
-    /// Whether a config chain is cached under `dir`.
+    /// Whether a config chain is cached for the file.
     pub chain_cached: bool,
     pub hit: Option<AttributeHit>,
 }
@@ -95,7 +96,11 @@ struct DocRoot {
 
 pub struct AttributeRegistry {
     builtin: HashMap<String, String>,
+    /// Config chains by directory.
     config_chains: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
+    /// Config chains of the config files themselves, by config-file path:
+    /// the chain of their directory without the file (see `config_chain`).
+    config_file_chains: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
     per_file: HashMap<PathBuf, HashMap<String, AttributeEntry>>,
     /// Document directories that differ from the file's parent: the folder of
     /// the symlink a document was opened through.
@@ -116,6 +121,7 @@ impl AttributeRegistry {
         Self {
             builtin,
             config_chains: HashMap::new(),
+            config_file_chains: HashMap::new(),
             per_file: HashMap::new(),
             doc_dirs: HashMap::new(),
             doc_roots: HashMap::new(),
@@ -155,9 +161,28 @@ impl AttributeRegistry {
         chain_dirs.reverse(); // now root → dir order
 
         let mut merged = HashMap::new();
-        merge_config_chain(&chain_dirs, &mut merged);
-
+        merge_config_chain(&chain_dirs, None, &mut merged);
         self.config_chains.insert(dir.to_path_buf(), merged);
+
+        // A config file in `dir` gets the chain without itself (see `config_chain`).
+        for config_path in config_files(dir) {
+            let mut own = HashMap::new();
+            merge_config_chain(&chain_dirs, Some(&config_path), &mut own);
+            self.config_file_chains.insert(config_path, own);
+        }
+    }
+
+    /// The config chain `file` sees: the one of its document directory, or
+    /// for a config file in that directory the chain without the file
+    /// itself, as in `IntelliJ` (`!currentFile.equals(configFile)`).
+    fn config_chain(&self, file: &Path) -> Option<&HashMap<String, AttributeEntry>> {
+        let dir = self.doc_dir(file)?;
+        match file.file_name().and_then(|name| name.to_str()) {
+            Some(name) if CONFIG_FILE_NAMES.contains(&name) => {
+                self.config_file_chains.get(&dir.join(name))
+            }
+            _ => self.config_chains.get(dir),
+        }
     }
 
     /// Drop all cached config chains.
@@ -167,6 +192,7 @@ impl AttributeRegistry {
     /// the current state.
     pub fn clear_config_chains(&mut self) {
         self.config_chains.clear();
+        self.config_file_chains.clear();
     }
 
     /// Drop the per-file attribute entry for `file`.
@@ -346,7 +372,7 @@ impl AttributeRegistry {
             })
             .collect();
 
-        let config = self.doc_dir(file).and_then(|d| self.config_chains.get(d));
+        let config = self.config_chain(file);
         let layers = [
             (config, AttributeLayer::Config),
             (self.per_file.get(file), AttributeLayer::PerFile),
@@ -380,13 +406,7 @@ impl AttributeRegistry {
             .get(file)
             .and_then(|m| m.get(name))
             .map(|e| e.value.as_str())
-            .or_else(|| {
-                let dir = self.doc_dir(file)?;
-                self.config_chains
-                    .get(dir)?
-                    .get(name)
-                    .map(|e| e.value.as_str())
-            })
+            .or_else(|| self.config_chain(file)?.get(name).map(|e| e.value.as_str()))
             .or_else(|| self.builtin.get(name).map(std::string::String::as_str))
     }
 
@@ -422,7 +442,7 @@ impl AttributeRegistry {
             );
             return None;
         };
-        let chain = self.config_chains.get(dir);
+        let chain = self.config_chain(file);
         let config_hit = chain.and_then(|c| c.get(name));
         tracing::trace!(
             ?dir,
@@ -455,7 +475,7 @@ impl AttributeRegistry {
         };
 
         let dir = self.doc_dir(file);
-        let chain = dir.and_then(|d| self.config_chains.get(d));
+        let chain = self.config_chain(file);
         let config = ConfigLookup {
             dir: dir.map(Path::to_path_buf),
             chain_cached: chain.is_some(),
@@ -534,7 +554,13 @@ impl From<&AttributeEntry> for AttributeHit {
 ///
 /// Walks `chain_dirs` (expected in root → leaf order), loading each config file
 /// and merging its attributes. Later directories override earlier ones.
-fn merge_config_chain(chain_dirs: &[PathBuf], merged: &mut HashMap<String, AttributeEntry>) {
+/// `exclude` contributes only its `{asciidoctorconfigdir}`, not its entries:
+/// the chain of that config file itself.
+fn merge_config_chain(
+    chain_dirs: &[PathBuf],
+    exclude: Option<&Path>,
+    merged: &mut HashMap<String, AttributeEntry>,
+) {
     for chain_dir in chain_dirs {
         for config_path in config_files(chain_dir) {
             let Ok(content) = std::fs::read_to_string(&config_path) else {
@@ -551,6 +577,9 @@ fn merge_config_chain(chain_dirs: &[PathBuf], merged: &mut HashMap<String, Attri
                     }),
                 },
             );
+            if exclude == Some(config_path.as_path()) {
+                continue;
+            }
 
             for (key, value, line) in parse_asciidoctorconfig(&content) {
                 // `docdir` is locked (see `docdir_layers`): setting it is skipped.
