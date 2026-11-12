@@ -245,7 +245,8 @@ fn pdf_paths_display(name: &str, paths: &[PdfPath]) -> String {
 /// Resolve a hover request to a formatted Markdown string.
 ///
 /// Returns hover content for the node at the cursor position:
-/// - `AttributeRef`: value + definition location
+/// - `AttributeRef`: value + definition location; a relative path from an
+///   `.asciidoctorconfig` also resolved against the document's folder
 /// - `AttributeDef`: resolved value
 /// - `pdf-theme`, `pdf-themesdir`, `pdf-fontsdir` (reference or definition):
 ///   resolved absolute path
@@ -283,6 +284,9 @@ pub fn resolve_hover(
             let ws = workspace?;
             let value = ws.attributes().resolve(doc_path, name)?;
             let mut text = format!(":{name}: {value}");
+            if let Some(resolved) = config_relative_path(ws, doc_path, name, value) {
+                let _ = write!(text, "\n\nResolves to {}", resolved.display());
+            }
             if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
                 let display_path = file_display_name(&source.file);
                 let _ = write!(text, "\n\nDefined in {display_path}:{}", source.line);
@@ -379,6 +383,25 @@ pub fn resolve_hover(
         }
         NodeKind::Anchor { .. } => None,
     }
+}
+
+/// A relative path value (`./`, `../`) from an `.asciidoctorconfig`, joined
+/// onto the document directory of `doc_path`: the config value is prepended
+/// text, so Asciidoctor resolves it where the document uses it.
+fn config_relative_path(
+    ws: &Workspace,
+    doc_path: &Path,
+    name: &str,
+    value: &str,
+) -> Option<PathBuf> {
+    let registry = ws.attributes();
+    let is_relative = value.starts_with("./") || value.starts_with("../");
+    if !is_relative || registry.explain(doc_path, name).winner != Some(AttributeLayer::Config) {
+        return None;
+    }
+    Some(normalize_lexically(
+        &registry.doc_dir(doc_path)?.join(value),
+    ))
 }
 
 /// Resolve the base directory and imagesdir for image paths.

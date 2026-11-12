@@ -2690,12 +2690,12 @@ mod tests {
             let hover = hover_text(server, &uri, position).await;
             let target = definition(server, &uri, position).await;
 
-            // The hover shows imagesdir as reached (E keeps `linked`); gd
-            // returns the canonical file.
-            let shown = root.join("assets/logo.svg");
+            // The hover shows imagesdir as written in the config, resolved
+            // from the document folder (E through `linked`); gd returns the
+            // canonical file.
             assert_eq!(
-                hover,
-                Some(format!("image::{}[]\n\n✓ File exists", shown.display())),
+                hover.as_deref(),
+                Some("image::../assets/logo.svg[]\n\n✓ File exists"),
                 "scenario {name}"
             );
             assert_eq!(
@@ -2894,8 +2894,8 @@ mod tests {
         let target = definition(server, &uri, position).await;
 
         assert_eq!(
-            hover,
-            Some(format!("image::{}[]\n\n✓ File exists", logo.display()))
+            hover.as_deref(),
+            Some("image::../assets/logo.svg[]\n\n✓ File exists")
         );
         assert_eq!(target.map(|l| l.uri), Some(file_uri(&logo)));
     }
@@ -2967,7 +2967,7 @@ mod tests {
         let uri = file_uri(&link);
         open_document(server, &uri, &text).await;
         let include = definition(server, &uri, position_of(&text, "include::../part-up", 13)).await;
-        let image = definition(server, &uri, position_of(&text, "image::logo", 9)).await;
+        let image = hover_text(server, &uri, position_of(&text, "image::logo", 9)).await;
 
         assert_eq!(scanned_include, real.join("part-up.adoc"));
         assert_eq!(scanned_imagesdir, None);
@@ -2975,9 +2975,11 @@ mod tests {
             include.map(|l| l.uri),
             Some(file_uri(&real.join("config/part-up.adoc")))
         );
+        // `imagesdir` comes from the chain of `config/`; its literal `../assets`
+        // resolves from the link folder to `config/assets`, as in Asciidoctor.
         assert_eq!(
-            image.map(|l| l.uri),
-            Some(file_uri(&real.join("assets/logo.svg")))
+            image.as_deref(),
+            Some("image::../assets/logo.svg[]\n\n✗ File not found")
         );
     }
 
@@ -3686,6 +3688,74 @@ mod tests {
             .await
             .as_deref(),
             Some(":pdf-themesdir: theme")
+        );
+    }
+
+    /// adoc-0164: a `./` value in a `.asciidoctorconfig` stays literal, as
+    /// prepended text does in Asciidoctor, and resolves against the folder
+    /// of the document that uses it, not the config folder. Hover shows the
+    /// literal value and the resolved path; `{asciidoctorconfigdir}` anchors
+    /// a value to the config folder (committed fixture
+    /// `tests/fixtures/config_relative_values`).
+    #[tokio::test]
+    async fn test_fixture_config_relative_value_resolves_at_use_site() {
+        let fx = fixture_dir("config_relative_values");
+        let path = |p: &str| fx.join(p).display().to_string();
+
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("sub/a.adoc")).await;
+        let server = service.inner();
+        let only_sub = position_of(&text, "image::only-sub", 9);
+        assert_eq!(
+            hover_text(server, &uri, only_sub).await.as_deref(),
+            Some("image::./images/only-sub.png[]\n\n✓ File exists")
+        );
+        assert_eq!(
+            definition(server, &uri, only_sub).await.map(|l| l.uri),
+            Some(file_uri(&fx.join("sub/images/only-sub.png")))
+        );
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "image::only-root", 9))
+                .await
+                .as_deref(),
+            Some("image::./images/only-root.png[]\n\n✗ File not found")
+        );
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "{imagesdir}", 2)).await,
+            Some(format!(
+                ":imagesdir: ./images\n\nResolves to {}\n\nDefined in .asciidoctorconfig:1",
+                path("sub/images")
+            ))
+        );
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "{anchored-images}", 2)).await,
+            Some(format!(
+                ":anchored-images: {}\n\nDefined in .asciidoctorconfig:2",
+                path("images")
+            ))
+        );
+    }
+
+    /// adoc-0164: "Resolves to" shows only for a reference whose value comes
+    /// from a config. A `./` value from the document header, and hover on an
+    /// attribute entry, show the value alone (committed fixture
+    /// `tests/fixtures/config_relative_values`, `sub/header.adoc`).
+    #[tokio::test]
+    async fn test_fixture_header_relative_value_shows_no_resolved_path() {
+        let fx = fixture_dir("config_relative_values");
+
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("sub/header.adoc")).await;
+        let server = service.inner();
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "{imagesdir}", 2))
+                .await
+                .as_deref(),
+            Some(":imagesdir: ./images\n\nDefined in header.adoc:2")
+        );
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, ":imagesdir:", 2))
+                .await
+                .as_deref(),
+            Some(":imagesdir: ./images")
         );
     }
 

@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::paths::normalize_lexically;
 use crate::types::AttributeDef;
 
 #[derive(Debug, Clone)]
@@ -587,11 +586,10 @@ fn merge_config_chain(
                     continue;
                 }
                 let substituted = substitute_with(merged, &value);
-                let resolved = resolve_path_value(&substituted, chain_dir);
                 merged.insert(
                     key,
                     AttributeEntry {
-                        value: resolved,
+                        value: substituted,
                         source: Some(AttributeSource {
                             file: config_path.clone(),
                             line,
@@ -685,22 +683,6 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<(String, String, usize)> {
     result
 }
 
-/// Heuristic: if a value looks like a relative path (starts with `.` or `../`),
-/// make it absolute against the config file's directory. `..` is popped
-/// textually ([`normalize_lexically`]) and symlinks are kept, as Asciidoctor
-/// resolves paths; an absolute value containing `..` is normalized the same way.
-fn resolve_path_value(value: &str, config_dir: &Path) -> String {
-    if value.starts_with("../") || value.starts_with("./") {
-        normalize_lexically(&config_dir.join(value))
-            .display()
-            .to_string()
-    } else if Path::new(value).is_absolute() && value.contains("..") {
-        normalize_lexically(Path::new(value)).display().to_string()
-    } else {
-        value.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,14 +708,14 @@ mod tests {
         assert_eq!(registry.resolve(&dummy, "imagesdir"), Some("images"));
     }
 
+    /// A relative path value stays as written: the config is prepended text,
+    /// so it resolves where a document uses it, not against the config folder.
     #[test]
-    fn test_config_path_canonicalization() {
+    fn test_config_relative_value_stays_literal() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let docs = root.join("project").join("docs");
-        let src = root.join("project").join("src");
         fs::create_dir_all(&docs).unwrap();
-        fs::create_dir_all(&src).unwrap();
 
         fs::write(docs.join(".asciidoctorconfig"), ":source-dir: ../src\n").unwrap();
 
@@ -741,37 +723,7 @@ mod tests {
         registry.ensure_config_for_dir(&docs);
 
         let dummy = docs.join("any.adoc");
-        let resolved = registry.resolve(&dummy, "source-dir").unwrap();
-        assert_eq!(resolved, src.display().to_string());
-    }
-
-    /// A config path value into a symlinked folder keeps the link: no
-    /// realpath, as Asciidoctor resolves paths.
-    #[cfg(unix)]
-    #[test]
-    fn test_config_path_value_keeps_symlinked_folder() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().canonicalize().unwrap();
-        let root = base.join("root");
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(base.join("elsewhere")).unwrap();
-        std::os::unix::fs::symlink("../elsewhere", root.join("shared")).unwrap();
-        fs::write(
-            root.join(".asciidoctorconfig"),
-            ":imagesdir: ./shared
-",
-        )
-        .unwrap();
-
-        let mut registry = AttributeRegistry::new(&root);
-        registry.ensure_config_for_dir(&root);
-
-        let expected = root.join("shared").display().to_string();
-        let dummy = root.join("any.adoc");
-        assert_eq!(
-            registry.resolve(&dummy, "imagesdir"),
-            Some(expected.as_str())
-        );
+        assert_eq!(registry.resolve(&dummy, "source-dir"), Some("../src"));
     }
 
     #[test]
@@ -1048,9 +1000,11 @@ mod tests {
             registry.resolve(&dummy, "asciidoctorconfigdir"),
             Some(docs.display().to_string()).as_deref()
         );
+        // The value stays as written after substitution: `..` is popped only
+        // where a path is used.
         assert_eq!(
             registry.resolve(&dummy, "source-dir"),
-            Some(src.display().to_string()).as_deref()
+            Some(format!("{}/../src", docs.display())).as_deref()
         );
     }
 
@@ -1082,7 +1036,7 @@ mod tests {
         );
         assert_eq!(
             registry.resolve(&dummy, "source-dir"),
-            Some(src.display().to_string()).as_deref(),
+            Some(format!("{}/../src", docs.display())).as_deref(),
             "Attributes from .asciidoctorconfig.adoc should be resolved"
         );
     }
@@ -1289,38 +1243,6 @@ mod tests {
         assert_eq!(registry.resolve(&file, "theme"), Some("dark"));
         assert_eq!(registry.resolve(&file, "local"), Some("yes"));
         assert_eq!(registry.explain(&file, "theme").config.dir, Some(linked));
-    }
-
-    /// A relative path value in a config inside a symlinked folder pops `..`
-    /// to the link's parent, like include and image targets.
-    #[cfg(unix)]
-    #[test]
-    fn test_config_path_value_in_symlinked_folder_uses_link_parent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().canonicalize().unwrap();
-        let root = base.join("root");
-        let outside = base.join("elsewhere/outside");
-        fs::create_dir_all(root.join("assets")).unwrap();
-        fs::create_dir_all(base.join("elsewhere/assets")).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(
-            outside.join(".asciidoctorconfig"),
-            ":imagesdir: ../assets\n",
-        )
-        .unwrap();
-        let linked = root.join("linked");
-        std::os::unix::fs::symlink(&outside, &linked).unwrap();
-        let file = outside.join("doc.adoc");
-
-        let mut registry = AttributeRegistry::new(&root);
-        registry.set_doc_dir(&file, &linked);
-        registry.ensure_config_for_dir(&linked);
-
-        let expected = root.join("assets").display().to_string();
-        assert_eq!(
-            registry.resolve(&file, "imagesdir"),
-            Some(expected.as_str())
-        );
     }
 
     #[test]

@@ -1,0 +1,7 @@
+= A
+
+image::only-sub.png[]
+
+image::only-root.png[]
+
+Images in {imagesdir}, anchored in {anchored-images}.

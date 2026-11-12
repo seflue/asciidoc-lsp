@@ -497,8 +497,8 @@ mod tests {
         let (_, documents) = build_graph(&project.join("guide/../config/ch2.adoc"), &mut registry);
 
         assert!(documents.contains_key(&ch2), "{:?}", documents.keys());
-        let assets = project.join("assets").display().to_string();
-        assert_eq!(registry.resolve(&ch2, "imagesdir"), Some(assets.as_str()));
+        // The value of `config/.asciidoctorconfig`: the chain of `config/`.
+        assert_eq!(registry.resolve(&ch2, "imagesdir"), Some("../assets"));
     }
 
     /// A relative entry resolves against the working directory (the crate
