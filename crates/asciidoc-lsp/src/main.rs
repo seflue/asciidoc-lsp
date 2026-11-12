@@ -1479,23 +1479,24 @@ mod tests {
     fn test_integration_arc42_goto_definition_attribute_config() {
         let docs_dir = arc42_docs_dir();
         let index = docs_dir.join("index.adoc");
-        let content = fs::read_to_string(&index).unwrap();
+        let file = docs_dir.join("chapters/subsections/workspace_manager.adoc");
+        let content = fs::read_to_string(&file).unwrap();
 
         let ws_root = workspace_root();
         let ws = Workspace::build(&ws_root, &index);
 
-        // Line 20 in index.adoc: include::{docdir}/appendix/glossary.adoc[]
-        // {docdir} is at columns 9..16 (0-indexed LSP line 19). index.adoc is
-        // the top-level document, so the `:docdir:` of its config chain wins.
+        // Line 15 in workspace_manager.adoc:
+        // include::{cli-source-dir}/main.rs[tags=workspace-setup]
+        // {cli-source-dir} is at columns 9..25 (0-indexed LSP line 14).
         let pos = Position {
-            line: 19,
-            character: 12, // inside "docdir"
+            line: 14,
+            character: 14, // inside "cli-source-dir"
         };
 
-        let result = navigation::resolve_goto_definition(&content, pos, &index, Some(&ws));
+        let result = navigation::resolve_goto_definition(&content, pos, &file, Some(&ws));
         assert!(
             result.is_some(),
-            "goto-definition on {{docdir}} should resolve to .asciidoctorconfig"
+            "goto-definition on {{cli-source-dir}} should resolve to .asciidoctorconfig"
         );
 
         let (target, line) = result.unwrap();
@@ -1504,13 +1505,13 @@ mod tests {
             "target should be .asciidoctorconfig, got: {:?}",
             target
         );
-        // Verify the line actually contains the docdir attribute definition
+        // Verify the line actually contains the cli-source-dir attribute definition
         let config_path = target;
         let config_content = std::fs::read_to_string(&config_path).unwrap();
         let config_line = config_content.lines().nth(line - 1).unwrap_or("");
         assert!(
-            config_line.contains(":docdir:"),
-            "line {} of .asciidoctorconfig should contain :docdir:, got: {:?}",
+            config_line.contains(":cli-source-dir:"),
+            "line {} of .asciidoctorconfig should contain :cli-source-dir:, got: {:?}",
             line,
             config_line
         );

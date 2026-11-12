@@ -2051,6 +2051,36 @@ mod tests {
         );
     }
 
+    /// A `:docdir:` in `.asciidoctorconfig` has no effect: `docdir` stays the
+    /// folder of the top-level document, so `include::{docdir}/...` resolves
+    /// next to it (committed fixture `tests/fixtures/config_docdir_locked`,
+    /// whose root config sets `:docdir: {asciidoctorconfigdir}` and then
+    /// `:snippets: {docdir}/snippets`).
+    #[test]
+    fn test_fixture_config_docdir_is_ignored() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config_docdir_locked")
+            .canonicalize()
+            .unwrap();
+        let book = root.join("book/book.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        let book_dir = root.join("book").display().to_string();
+        assert_eq!(
+            ws.attributes().resolve(&book, "docdir"),
+            Some(book_dir.as_str())
+        );
+        assert!(ws.attributes().resolve_source(&book, "docdir").is_none());
+        assert_eq!(broken_includes(&ws, &book), 0);
+        // Later config lines do not see the ignored `:docdir:` either.
+        assert_eq!(
+            ws.attributes().resolve(&book, "snippets"),
+            Some("{docdir}/snippets")
+        );
+    }
+
     /// `include::{docdir}/...` in an included file follows the top-level
     /// document's folder. The target is missing for the second including
     /// document only, so the include is not broken.

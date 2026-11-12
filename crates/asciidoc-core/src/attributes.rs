@@ -252,9 +252,8 @@ impl AttributeRegistry {
 
     /// `docdir` of `file`, once per top-level document it belongs to, in
     /// order. Asciidoctor sets it to the folder of the converted document
-    /// and ignores `:docdir:` entries in the document. A `:docdir:` in the
-    /// top-level document's `.asciidoctorconfig` chain wins: it stands for a
-    /// build that sets the base directory.
+    /// and ignores `:docdir:` entries in the document, and so in any
+    /// `.asciidoctorconfig` (prepended text counts as a header entry).
     fn docdir_layers(&self, file: &Path) -> Vec<LayeredValue<'_>> {
         let Some(roots) = self.doc_roots.get(file) else {
             return self
@@ -270,23 +269,10 @@ impl AttributeRegistry {
         };
         roots
             .iter()
-            .map(|root| {
-                let configured = self
-                    .doc_dir(&root.document)
-                    .and_then(|dir| self.config_chains.get(dir))
-                    .and_then(|chain| chain.get(DOCDIR));
-                configured.map_or(
-                    LayeredValue {
-                        value: root.dir.as_str(),
-                        layer: AttributeLayer::Builtin,
-                        source: None,
-                    },
-                    |entry| LayeredValue {
-                        value: entry.value.as_str(),
-                        layer: AttributeLayer::Config,
-                        source: entry.source.as_ref(),
-                    },
-                )
+            .map(|root| LayeredValue {
+                value: root.dir.as_str(),
+                layer: AttributeLayer::Builtin,
+                source: None,
             })
             .collect()
     }
@@ -567,6 +553,10 @@ fn merge_config_chain(chain_dirs: &[PathBuf], merged: &mut HashMap<String, Attri
             );
 
             for (key, value, line) in parse_asciidoctorconfig(&content) {
+                // `docdir` is locked (see `docdir_layers`): setting it is skipped.
+                if key == DOCDIR {
+                    continue;
+                }
                 let substituted = substitute_with(merged, &value);
                 let resolved = resolve_path_value(&substituted, chain_dir);
                 merged.insert(
@@ -817,8 +807,8 @@ mod tests {
 
     /// `docdir` is the folder of the top-level document, also in the files
     /// it includes. Asciidoctor locks it, so a `:docdir:` entry in a document
-    /// is ignored; only the top-level document's `.asciidoctorconfig` chain
-    /// overrides it.
+    /// is ignored, and so is one in any `.asciidoctorconfig` chain (prepended
+    /// text counts as a header entry).
     #[test]
     fn test_docdir_priority() {
         let mut registry = AttributeRegistry::new(Path::new("/ws"));
@@ -848,21 +838,23 @@ mod tests {
         docdir_config(&mut registry, "/ws/shared", "/shared-config");
         assert_eq!(registry.resolve(part, "docdir"), Some("/ws/book"));
 
+        // Neither does the top-level document's chain.
         docdir_config(&mut registry, "/ws/book", "/configured");
-        assert_eq!(registry.resolve(part, "docdir"), Some("/configured"));
+        assert_eq!(registry.resolve(part, "docdir"), Some("/ws/book"));
+        assert_eq!(registry.resolve(book, "docdir"), Some("/ws/book"));
         assert_eq!(
             registry.substitute(part, "{docdir}/x.adoc"),
-            "/configured/x.adoc"
+            "/ws/book/x.adoc"
         );
-        let source = registry.resolve_source(part, "docdir").unwrap();
-        assert_eq!(source.file, Path::new("/ws/book/.asciidoctorconfig"));
+        assert!(registry.resolve_source(part, "docdir").is_none());
         assert_eq!(
             registry.explain(part, "docdir").winner,
-            Some(AttributeLayer::Config)
+            Some(AttributeLayer::Builtin)
         );
         let known = registry.known_attributes(part);
         let docdir = known.iter().find(|k| k.name == "docdir").unwrap();
-        assert_eq!(docdir.value, "/configured");
+        assert_eq!(docdir.value, "/ws/book");
+        assert_eq!(docdir.layer, AttributeLayer::Builtin);
     }
 
     /// A file several top-level documents include has one `docdir` per

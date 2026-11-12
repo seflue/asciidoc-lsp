@@ -1,0 +1,2 @@
+:docdir: {asciidoctorconfigdir}
+:snippets: {docdir}/snippets

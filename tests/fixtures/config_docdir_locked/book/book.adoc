@@ -1,0 +1,3 @@
+= Book
+
+include::{docdir}/chapter.adoc[]
