@@ -680,10 +680,14 @@ enum ConfigEntry {
     Unset { name: String },
 }
 
+/// Ends an attribute value that continues on the next line, as in Asciidoctor.
+const LINE_CONTINUATION: &str = " \\";
+
 /// Parse the attribute entries of an .asciidoctorconfig file.
 fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
     let mut result = Vec::new();
-    for (idx, line) in content.lines().enumerate() {
+    let mut lines = content.lines().enumerate().peekable();
+    while let Some((idx, line)) = lines.next() {
         let line = line.trim();
         if line.starts_with(':') && line.len() > 1 {
             if let Some(rest) = line.strip_prefix(':') {
@@ -696,9 +700,24 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
                             name: name.to_string(),
                         });
                     } else if !key.is_empty() {
+                        let mut value = value.to_string();
+                        if let Some(head) = value.strip_suffix(LINE_CONTINUATION) {
+                            value = head.trim_end().to_string();
+                            while let Some((_, next)) =
+                                lines.next_if(|(_, next)| !next.trim().is_empty())
+                            {
+                                let next = next.trim();
+                                let part = next.strip_suffix(LINE_CONTINUATION);
+                                value.push(' ');
+                                value.push_str(part.map_or(next, str::trim_end));
+                                if part.is_none() {
+                                    break;
+                                }
+                            }
+                        }
                         result.push(ConfigEntry::Set {
                             name: key.to_string(),
-                            value: value.to_string(),
+                            value,
                             line: idx + 1,
                         });
                     }
@@ -1143,6 +1162,21 @@ mod tests {
         assert_eq!(registry.resolve(&doc, "local"), None);
         assert!(registry.resolve_source(&doc, "gone-bang").is_none());
         assert_eq!(registry.resolve(&doc, "kept"), Some("k"));
+    }
+
+    /// A value ending in ` \` continues on the next line: Asciidoctor joins
+    /// the lines with one space, leading blanks of a continued line dropped.
+    #[test]
+    fn test_config_value_line_continuation() {
+        let root = prepended_text_case("continuation");
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let doc = root.join("doc.adoc");
+
+        assert_eq!(registry.resolve(&doc, "long"), Some("one two three"));
+        assert_eq!(registry.resolve_source(&doc, "long").unwrap().line, 1);
+        assert_eq!(registry.resolve(&doc, "after"), Some("next"));
+        assert_eq!(registry.resolve_source(&doc, "after").unwrap().line, 4);
     }
 
     #[test]
