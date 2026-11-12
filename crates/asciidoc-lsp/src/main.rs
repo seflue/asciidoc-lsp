@@ -3600,4 +3600,28 @@ mod tests {
             "main.adoc:1"
         );
     }
+
+    /// A cell whose text starts on the line after `a|` and goes on past a
+    /// blank line, and a row-span cell after a header gap, parse as cells:
+    /// an xref inside the cell and navigation after the tables resolve
+    /// (committed fixture `tests/fixtures/table_cells`).
+    #[tokio::test]
+    async fn test_fixture_table_cells_keep_navigation() {
+        let fx = fixture_dir("table_cells");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "see <<_second", 6), &fx).await,
+            "main.adoc:23"
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "and <<_first", 6), &fx).await,
+            "main.adoc:3"
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "Uses {product}", 6), &fx).await,
+            "main.adoc:1"
+        );
+    }
 }

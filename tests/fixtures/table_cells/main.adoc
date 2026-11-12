@@ -1,0 +1,26 @@
+= Table Cells
+:product: Widget
+
+== First
+
+[cols="1a"]
+|===
+a|
+Opens on its own line, see <<_second>>.
+
+A second paragraph of the same cell.
+
+----
+listing
+----
+|===
+
+|===
+|Header
+
+.2+| spanned body cell
+|===
+
+== Second
+
+Uses {product} and <<_first>>.
