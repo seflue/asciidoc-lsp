@@ -1,0 +1,9 @@
+= No Themes Directory
+:pdf-theme: default-sans
+:pdf-theme: corporate
+:pdf-theme: {docdir}/theme/custom-theme.yaml
+:pdf-theme: theme/custom-theme.yml
+:pdf-theme: {docdir}/theme/custom-theme.yml
+:pdf-theme: {docdir}/theme/none-theme.yml
+:pdf-theme: {undefined-dir}/custom-theme.yml
+:pdf-theme:

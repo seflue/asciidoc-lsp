@@ -90,6 +90,11 @@ pub fn collect_diagnostics(
         });
     }
 
+    // 6. PDF theme and font paths
+    for diag in crate::pdf_theme::collect_pdf_diagnostics(documents, graph, registry) {
+        diags.entry(diag.file.clone()).or_default().push(diag);
+    }
+
     diags
 }
 

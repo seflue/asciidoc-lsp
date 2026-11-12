@@ -5,6 +5,7 @@ pub mod extractors;
 pub mod graph;
 pub mod parser;
 pub mod paths;
+pub mod pdf_theme;
 pub mod references;
 pub mod types;
 pub mod ventilate;

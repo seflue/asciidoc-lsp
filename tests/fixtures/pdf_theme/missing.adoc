@@ -1,0 +1,4 @@
+= Missing Paths
+:pdf-themesdir: {docdir}/missing-themes
+:pdf-fontsdir: {docdir}/fonts,{docdir}/missing-fonts,GEM_FONTS_DIR
+:pdf-theme: custom

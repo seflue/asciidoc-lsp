@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::attributes::AttributeRegistry;
 use crate::diagnostics::collect_diagnostics;
 use crate::graph::{build_graph, build_graph_with_overrides, parse_single_file, IncludeGraph};
+use crate::pdf_theme::PdfResolution;
 use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DocumentModel, FileLocation};
 
@@ -180,6 +181,26 @@ impl Workspace {
             }
         }
         results
+    }
+
+    /// Resolve `pdf-theme`, `pdf-themesdir` or `pdf-fontsdir` as seen from
+    /// `file`: the entry on `line` when given, else the value a reference
+    /// in `file` sees. See [`crate::pdf_theme::resolve_pdf_attribute`].
+    #[must_use]
+    pub fn resolve_pdf_attribute(
+        &self,
+        file: &Path,
+        name: &str,
+        line: Option<usize>,
+    ) -> Option<PdfResolution> {
+        crate::pdf_theme::resolve_pdf_attribute(
+            &self.documents,
+            &self.include_graph,
+            &self.attributes,
+            file,
+            name,
+            line,
+        )
     }
 
     /// Find all include statements that reference the given target file.

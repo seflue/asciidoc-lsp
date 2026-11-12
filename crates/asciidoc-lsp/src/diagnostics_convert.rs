@@ -22,11 +22,15 @@ fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
     let end = positions::to_lsp_position(diag.line, line_text.len(), content);
 
     let severity = match &diag.kind {
-        DiagnosticKind::BrokenInclude { .. } => ls_types::DiagnosticSeverity::ERROR,
+        DiagnosticKind::BrokenInclude { .. }
+        | DiagnosticKind::PdfPathNotFound { .. }
+        | DiagnosticKind::PdfThemeYamlExtension { .. }
+        | DiagnosticKind::UnknownPdfTheme { .. } => ls_types::DiagnosticSeverity::ERROR,
         DiagnosticKind::BrokenXref { .. }
         | DiagnosticKind::DuplicateAnchor { .. }
         | DiagnosticKind::UndefinedAttribute { .. }
-        | DiagnosticKind::CircularInclude { .. } => ls_types::DiagnosticSeverity::WARNING,
+        | DiagnosticKind::CircularInclude { .. }
+        | DiagnosticKind::UnanchoredPdfPath { .. } => ls_types::DiagnosticSeverity::WARNING,
         DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::HINT,
     };
 
@@ -167,6 +171,48 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].severity, Some(ls_types::DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn test_convert_pdf_path_severities() {
+        let content = ":pdf-theme: custom\n";
+        let attribute = || "pdf-theme".to_string();
+        for (kind, severity) in [
+            (
+                DiagnosticKind::PdfPathNotFound {
+                    attribute: attribute(),
+                    path: PathBuf::from("/themes/custom-theme.yml"),
+                },
+                ls_types::DiagnosticSeverity::ERROR,
+            ),
+            (
+                DiagnosticKind::PdfThemeYamlExtension {
+                    value: "custom.yaml".into(),
+                },
+                ls_types::DiagnosticSeverity::ERROR,
+            ),
+            (
+                DiagnosticKind::UnknownPdfTheme {
+                    name: "custom".into(),
+                },
+                ls_types::DiagnosticSeverity::ERROR,
+            ),
+            (
+                DiagnosticKind::UnanchoredPdfPath {
+                    attribute: attribute(),
+                    value: "custom.yml".into(),
+                },
+                ls_types::DiagnosticSeverity::WARNING,
+            ),
+        ] {
+            let diags = vec![CoreDiagnostic {
+                file: PathBuf::from("/test.adoc"),
+                line: 1,
+                kind: kind.clone(),
+            }];
+            let result = convert_diagnostics(&diags, content);
+            assert_eq!(result[0].severity, Some(severity), "{kind:?}");
+        }
     }
 
     #[test]

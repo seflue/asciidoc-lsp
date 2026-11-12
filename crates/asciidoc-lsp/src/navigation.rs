@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::Position;
 use asciidoc_core::attributes::{AttributeHit, AttributeLayer, AttributeSource};
 use asciidoc_core::extractors::find_child_text;
 use asciidoc_core::paths::normalize_lexically;
+use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
 use asciidoc_core::workspace::Workspace;
 
@@ -222,11 +223,32 @@ pub fn resolve_references(
     }
 }
 
+/// Resolved PDF paths for hover: absolute paths as such, a bundled theme
+/// marked as one, anything unresolvable as written; `pdf-fontsdir` entries
+/// joined with `;`.
+fn pdf_paths_display(name: &str, paths: &[PdfPath]) -> String {
+    paths
+        .iter()
+        .map(|path| match path {
+            PdfPath::Absolute(path) => path.display().to_string(),
+            PdfPath::Builtin(theme) if name == PDF_THEME && is_builtin_theme(theme) => {
+                format!("{theme} (built-in theme)")
+            }
+            PdfPath::Builtin(value) | PdfPath::Relative(value) | PdfPath::Unknown(value) => {
+                value.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Resolve a hover request to a formatted Markdown string.
 ///
 /// Returns hover content for the node at the cursor position:
 /// - `AttributeRef`: value + definition location
 /// - `AttributeDef`: resolved value
+/// - `pdf-theme`, `pdf-themesdir`, `pdf-fontsdir` (reference or definition):
+///   resolved absolute path
 /// - `Xref`/`ShorthandXref`: section title + file
 /// - `Include`: resolved path + file info
 pub fn resolve_hover(
@@ -240,6 +262,23 @@ pub fn resolve_hover(
     let node_info = find_node_at_position(content, pos)?;
 
     match &node_info.kind {
+        NodeKind::AttributeRef { name } if is_pdf_path_attribute(name) => {
+            let resolution = workspace?.resolve_pdf_attribute(doc_path, name, None)?;
+            let mut text = format!(":{name}: {}", pdf_paths_display(name, &resolution.paths));
+            if let Some(source) = resolution.source {
+                let display_path = file_display_name(&source.file);
+                let _ = write!(text, "\n\nDefined in {display_path}:{}", source.line);
+            }
+            Some(text)
+        }
+        NodeKind::AttributeDef { name } if is_pdf_path_attribute(name) => {
+            let resolution =
+                workspace?.resolve_pdf_attribute(doc_path, name, Some(node_info.line))?;
+            Some(format!(
+                ":{name}: {}",
+                pdf_paths_display(name, &resolution.paths)
+            ))
+        }
         NodeKind::AttributeRef { name } => {
             let ws = workspace?;
             let value = ws.attributes().resolve(doc_path, name)?;

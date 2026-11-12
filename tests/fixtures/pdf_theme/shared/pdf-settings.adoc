@@ -1,0 +1,2 @@
+:pdf-themesdir: {docdir}/theme
+:pdf-fontsdir: {docdir}/fonts;GEM_FONTS_DIR

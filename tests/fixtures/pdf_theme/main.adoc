@@ -1,0 +1,5 @@
+= PDF Theme
+:pdf-theme: custom
+include::shared/pdf-settings.adoc[]
+
+The theme directory is {pdf-themesdir}.

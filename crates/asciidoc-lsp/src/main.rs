@@ -3624,4 +3624,66 @@ mod tests {
             "main.adoc:1"
         );
     }
+
+    /// Hover on `pdf-theme`, `pdf-themesdir` and `pdf-fontsdir` shows the
+    /// resolved absolute paths, also where the value is set in an included
+    /// file (committed fixture `tests/fixtures/pdf_theme`).
+    #[tokio::test]
+    async fn test_fixture_pdf_attribute_hover_shows_resolved_paths() {
+        let fx = fixture_dir("pdf_theme");
+        let path = |p: &str| fx.join(p).display().to_string();
+
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, ":pdf-theme:", 1)).await,
+            Some(format!(":pdf-theme: {}", path("theme/custom-theme.yml")))
+        );
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "{pdf-themesdir}", 2)).await,
+            Some(format!(
+                ":pdf-themesdir: {}\n\nDefined in pdf-settings.adoc:1",
+                path("theme")
+            ))
+        );
+
+        let shared = fx.join("shared/pdf-settings.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &shared).await;
+        assert_eq!(
+            hover_text(
+                service.inner(),
+                &uri,
+                position_of(&text, ":pdf-fontsdir:", 1)
+            )
+            .await,
+            Some(format!(":pdf-fontsdir: {};GEM_FONTS_DIR", path("fonts")))
+        );
+
+        let builtin = fx.join("no-themesdir.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &builtin).await;
+        assert_eq!(
+            hover_text(
+                service.inner(),
+                &uri,
+                position_of(&text, ":pdf-theme: default-sans", 1)
+            )
+            .await
+            .as_deref(),
+            Some(":pdf-theme: default-sans (built-in theme)")
+        );
+
+        // A relative value cannot be resolved: hover shows it as written.
+        let relative = fx.join("relative.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &relative).await;
+        assert_eq!(
+            hover_text(
+                service.inner(),
+                &uri,
+                position_of(&text, ":pdf-themesdir:", 1)
+            )
+            .await
+            .as_deref(),
+            Some(":pdf-themesdir: theme")
+        );
+    }
 }

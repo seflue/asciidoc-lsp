@@ -109,6 +109,25 @@ pub enum DiagnosticKind {
         path: String,
         cycle_through: PathBuf,
     },
+    /// `pdf-themesdir` / `pdf-fontsdir` directory or `pdf-theme` file
+    /// that does not exist.
+    PdfPathNotFound {
+        attribute: String,
+        path: PathBuf,
+    },
+    /// `pdf-theme` ending in `.yaml`: Asciidoctor PDF only loads `.yml`.
+    PdfThemeYamlExtension {
+        value: String,
+    },
+    /// `pdf-theme` name without `pdf-themesdir` that no bundled theme has.
+    UnknownPdfTheme {
+        name: String,
+    },
+    /// Relative PDF path: resolves against the build's working directory.
+    UnanchoredPdfPath {
+        attribute: String,
+        value: String,
+    },
     /// Reserved for future typo detection (Levenshtein against known attributes).
     /// Currently unused: ifdef/ifndef attributes are build-time-dependent,
     /// so the LSP cannot verify them.
@@ -153,6 +172,27 @@ impl fmt::Display for DiagnosticKind {
                     "Circular include: {} creates a cycle through {}",
                     path,
                     cycle_through.display()
+                )
+            }
+            DiagnosticKind::PdfPathNotFound { attribute, path } => {
+                write!(f, "{attribute}: not found: {}", path.display())
+            }
+            DiagnosticKind::PdfThemeYamlExtension { value } => {
+                write!(
+                    f,
+                    "pdf-theme: theme file must end in .yml, not .yaml: {value}"
+                )
+            }
+            DiagnosticKind::UnknownPdfTheme { name } => {
+                write!(
+                    f,
+                    "pdf-theme: '{name}' is not a built-in theme; set pdf-themesdir for a custom theme"
+                )
+            }
+            DiagnosticKind::UnanchoredPdfPath { attribute, value } => {
+                write!(
+                    f,
+                    "{attribute}: relative path '{value}' resolves against the build's working directory; anchor it with {{docdir}}"
                 )
             }
             DiagnosticKind::UndefinedConditionalAttr { name, directive } => {
