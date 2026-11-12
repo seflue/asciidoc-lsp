@@ -1,0 +1,4 @@
+ifdef::never-defined[]
+:in-false-ifdef: applied
+endif::[]
+ifdef::never-defined[:single-line: leaked]

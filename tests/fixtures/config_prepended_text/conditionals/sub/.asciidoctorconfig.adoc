@@ -1,0 +1,38 @@
+:defined-early: yes
+ifdef::defined-early[]
+:in-ifdef: applied
+endif::[]
+ifdef::never-defined[]
+:in-false-ifdef: leaked
+endif::[]
+ifndef::never-defined[]
+:in-ifndef: applied
+endif::[]
+ifdef::defined-early[:single-true: applied]
+ifdef::never-defined[:single-false: leaked]
+ifdef::env-asciidoc-lsp[:from-builtin: applied]
+ifdef::from-parent[:sees-parent: applied]
+ifdef::never-defined[]
+ifdef::defined-early[]
+:nested-in-false: leaked
+endif::[]
+:after-inner-endif: leaked
+endif::[]
+:after-nested: applied
+ifdef::defined-early+never-defined[:all-of: leaked]
+ifdef::never-defined,defined-early[:any-of: applied]
+ifndef::never-defined+defined-early[:ifndef-all-of: applied]
+ifndef::never-defined,defined-early[:ifndef-any-of: leaked]
+ifdef::later-defined[:before-definition: leaked]
+:later-defined: x
+:dropped: x
+:dropped!:
+ifdef::dropped[:sees-dropped: leaked]
+ifeval::[1 == 2]
+:in-ifeval: applied
+endif::[]
+ifdef::never-defined[]
+include::leak.adoc[]
+:!defined-early:
+endif::[]
+:defined-early-kept: {defined-early}

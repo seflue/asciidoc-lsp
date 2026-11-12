@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::types::AttributeDef;
+use crate::extractors::extract_conditionals;
+use crate::types::{AttributeDef, ConditionalDirective, ConditionalKind, ConditionalOperator};
 
 #[derive(Debug, Clone)]
 pub struct AttributeSource {
@@ -160,13 +161,13 @@ impl AttributeRegistry {
         chain_dirs.reverse(); // now root → dir order
 
         let mut merged = HashMap::new();
-        merge_config_chain(&chain_dirs, None, &mut merged);
+        merge_config_chain(&chain_dirs, None, &self.builtin, &mut merged);
         self.config_chains.insert(dir.to_path_buf(), merged);
 
         // A config file in `dir` gets the chain without itself (see `config_chain`).
         for config_path in config_files(dir) {
             let mut own = HashMap::new();
-            merge_config_chain(&chain_dirs, Some(&config_path), &mut own);
+            merge_config_chain(&chain_dirs, Some(&config_path), &self.builtin, &mut own);
             self.config_file_chains.insert(config_path, own);
         }
     }
@@ -558,6 +559,7 @@ impl From<&AttributeEntry> for AttributeHit {
 fn merge_config_chain(
     chain_dirs: &[PathBuf],
     exclude: Option<&Path>,
+    builtin: &HashMap<String, String>,
     merged: &mut HashMap<String, AttributeEntry>,
 ) {
     for chain_dir in chain_dirs {
@@ -580,13 +582,13 @@ fn merge_config_chain(
                 continue;
             }
 
-            apply_config_text(
-                &config_path,
-                &content,
-                merged,
-                &mut Vec::new(),
-                MAX_CONFIG_INCLUDE_DEPTH,
-            );
+            let mut read = ConfigRead {
+                builtin,
+                conditionals: config_path.extension().is_some_and(|ext| ext == "adoc"),
+                max_depth: MAX_CONFIG_INCLUDE_DEPTH,
+                stack: Vec::new(),
+            };
+            read.apply_text(&config_path, &content, merged);
         }
     }
 }
@@ -595,21 +597,70 @@ fn merge_config_chain(
 /// limit of its own.
 const MAX_CONFIG_INCLUDE_DEPTH: usize = 64;
 
-/// Apply the entries of `content`, the text of config file `file`, to
-/// `merged` in order. `stack` holds the canonical paths of the files being
-/// read, outermost first; an include nests at most `max_depth` levels and
-/// never re-enters a file on the stack. A missing target is skipped.
-fn apply_config_text(
-    file: &Path,
-    content: &str,
-    merged: &mut HashMap<String, AttributeEntry>,
-    stack: &mut Vec<PathBuf>,
+/// Reading one config file, with the files it includes, into a chain.
+struct ConfigRead<'a> {
+    /// Built-in attributes: defined for `ifdef`/`ifndef`.
+    builtin: &'a HashMap<String, String>,
+    /// Whether `ifdef`/`ifndef` are evaluated: only in `.asciidoctorconfig.adoc`.
+    /// Otherwise conditional lines are not read and block entries apply.
+    conditionals: bool,
+    /// How many levels includes nest below the config file at most.
     max_depth: usize,
-) {
-    stack.push(file.canonicalize().unwrap_or_else(|_| file.to_path_buf()));
-    for entry in parse_asciidoctorconfig(content) {
+    /// Canonical paths of the files being read, outermost first.
+    stack: Vec<PathBuf>,
+}
+
+impl ConfigRead<'_> {
+    /// Apply the entries of `content`, the text of `file`, to `merged` in
+    /// order. Entries in a false `ifdef`/`ifndef` branch do not apply.
+    fn apply_text(
+        &mut self,
+        file: &Path,
+        content: &str,
+        merged: &mut HashMap<String, AttributeEntry>,
+    ) {
+        self.stack
+            .push(file.canonicalize().unwrap_or_else(|_| file.to_path_buf()));
+        // One flag per open conditional block: whether its content applies.
+        let mut blocks: Vec<bool> = Vec::new();
+        for entry in parse_asciidoctorconfig(content) {
+            let active = blocks.iter().all(|applies| *applies);
+            match entry {
+                ConfigEntry::Conditional {
+                    directive,
+                    single_line,
+                } if self.conditionals => {
+                    let holds = active && self.condition_holds(&directive, merged);
+                    match single_line {
+                        Some(entries) if holds => {
+                            for entry in entries {
+                                self.apply_entry(file, entry, merged);
+                            }
+                        }
+                        Some(_) => {}
+                        None => blocks.push(holds),
+                    }
+                }
+                ConfigEntry::Ifeval if self.conditionals => blocks.push(true),
+                ConfigEntry::Endif if self.conditionals => {
+                    blocks.pop();
+                }
+                entry if active => self.apply_entry(file, entry, merged),
+                _ => {}
+            }
+        }
+        self.stack.pop();
+    }
+
+    /// Apply one attribute entry or include of `file`. `docdir` is locked
+    /// (see [`AttributeRegistry::docdir_layers`]): setting it is skipped.
+    fn apply_entry(
+        &mut self,
+        file: &Path,
+        entry: ConfigEntry,
+        merged: &mut HashMap<String, AttributeEntry>,
+    ) {
         match entry {
-            // `docdir` is locked (see `docdir_layers`): setting it is skipped.
             ConfigEntry::Set { name, .. } if name == DOCDIR => {}
             ConfigEntry::Set { name, value, line } => {
                 let substituted = substitute_with(merged, &value);
@@ -627,28 +678,52 @@ fn apply_config_text(
             ConfigEntry::Unset { name } => {
                 merged.remove(&name);
             }
-            ConfigEntry::Include { target } => {
-                if stack.len() > max_depth {
-                    continue;
-                }
-                let Some(dir) = file.parent() else {
-                    continue;
-                };
-                let target = dir.join(substitute_with(merged, &target));
-                let Ok(canonical) = target.canonicalize() else {
-                    continue;
-                };
-                if stack.contains(&canonical) {
-                    continue;
-                }
-                let Ok(included) = std::fs::read_to_string(&target) else {
-                    continue;
-                };
-                apply_config_text(&target, &included, merged, stack, max_depth);
-            }
+            ConfigEntry::Include { target } => self.include(file, &target, merged),
+            ConfigEntry::Conditional { .. } | ConfigEntry::Ifeval | ConfigEntry::Endif => {}
         }
     }
-    stack.pop();
+
+    /// Read the entries of `target`, included from `file`, in place. The
+    /// target resolves against the folder of `file`; a missing target, a
+    /// file on the stack and one nested deeper than `max_depth` are skipped.
+    fn include(&mut self, file: &Path, target: &str, merged: &mut HashMap<String, AttributeEntry>) {
+        if self.stack.len() > self.max_depth {
+            return;
+        }
+        let Some(dir) = file.parent() else {
+            return;
+        };
+        let target = dir.join(substitute_with(merged, target));
+        let Ok(canonical) = target.canonicalize() else {
+            return;
+        };
+        if self.stack.contains(&canonical) {
+            return;
+        }
+        let Ok(included) = std::fs::read_to_string(&target) else {
+            return;
+        };
+        self.apply_text(&target, &included, merged);
+    }
+
+    /// Whether the content of `directive` applies, by Asciidoctor's rules:
+    /// `,` needs any name, `+` all names defined (`ifndef` negates).
+    fn condition_holds(
+        &self,
+        directive: &ConditionalDirective,
+        merged: &HashMap<String, AttributeEntry>,
+    ) -> bool {
+        let defined = |name: &String| merged.contains_key(name) || self.builtin.contains_key(name);
+        let names = &directive.attributes;
+        let any = names.iter().any(defined);
+        let all = names.iter().all(defined);
+        match (directive.kind, directive.operator) {
+            (ConditionalKind::Ifdef, ConditionalOperator::And) => all,
+            (ConditionalKind::Ifdef, _) => any,
+            (ConditionalKind::Ifndef, ConditionalOperator::And) => !all,
+            (ConditionalKind::Ifndef, _) => !any,
+        }
+    }
 }
 
 /// Substitute all `{attr}` references in a string using the provided attribute map.
@@ -725,6 +800,16 @@ enum ConfigEntry {
     Unset { name: String },
     /// `include::target[...]`, target not yet substituted.
     Include { target: String },
+    /// `ifdef::`/`ifndef::`: opens a block, or with `single_line` the
+    /// entries of the single-line form `ifdef::name[:a: b]`.
+    Conditional {
+        directive: ConditionalDirective,
+        single_line: Option<Vec<ConfigEntry>>,
+    },
+    /// `ifeval::[...]`: opens a block, not evaluated.
+    Ifeval,
+    /// `endif::...[]`: closes the innermost block.
+    Endif,
 }
 
 /// Ends an attribute value that continues on the next line, as in Asciidoctor.
@@ -736,7 +821,29 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
     let mut lines = content.lines().enumerate().peekable();
     while let Some((idx, line)) = lines.next() {
         let line = line.trim();
-        if let Some(target) = include_target(line) {
+        if let Some(directive) = extract_conditionals(line).pop() {
+            let text = line
+                .split_once('[')
+                .and_then(|(_, rest)| rest.strip_suffix(']'))
+                .filter(|text| !text.is_empty());
+            let single_line = text.map(|text| {
+                let mut entries = parse_asciidoctorconfig(text);
+                for entry in &mut entries {
+                    if let ConfigEntry::Set { line, .. } = entry {
+                        *line = idx + 1;
+                    }
+                }
+                entries
+            });
+            result.push(ConfigEntry::Conditional {
+                directive,
+                single_line,
+            });
+        } else if line.starts_with("ifeval::[") && line.ends_with(']') {
+            result.push(ConfigEntry::Ifeval);
+        } else if line.starts_with("endif::") && line.ends_with(']') {
+            result.push(ConfigEntry::Endif);
+        } else if let Some(target) = include_target(line) {
             result.push(ConfigEntry::Include {
                 target: target.to_string(),
             });
@@ -1259,6 +1366,69 @@ mod tests {
         assert_eq!(registry.resolve(&doc, "after-include"), Some("s"));
     }
 
+    /// In `.asciidoctorconfig.adoc`, `ifdef`/`ifndef` (block and single-line
+    /// form) decide against the attributes defined so far: builtins, earlier
+    /// layers, earlier lines. Nothing in a false branch applies; `ifeval`
+    /// is not evaluated, its entries apply.
+    #[test]
+    fn test_config_adoc_conditionals_are_evaluated() {
+        let root = prepended_text_case("conditionals");
+        let sub = root.join("sub");
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&sub);
+        let doc = sub.join("doc.adoc");
+
+        for applied in [
+            "in-ifdef",
+            "in-ifndef",
+            "single-true",
+            "from-builtin",
+            "sees-parent",
+            "after-nested",
+            "any-of",
+            "ifndef-all-of",
+            "in-ifeval",
+        ] {
+            assert_eq!(
+                registry.resolve(&doc, applied),
+                Some("applied"),
+                "{applied}"
+            );
+        }
+        for skipped in [
+            "in-false-ifdef",
+            "single-false",
+            "nested-in-false",
+            "after-inner-endif",
+            "all-of",
+            "ifndef-any-of",
+            "before-definition",
+            "sees-dropped",
+            "from-skipped-include",
+        ] {
+            assert_eq!(registry.resolve(&doc, skipped), None, "{skipped}");
+        }
+        assert_eq!(registry.resolve(&doc, "defined-early-kept"), Some("yes"));
+        let source = registry.resolve_source(&doc, "single-true").unwrap();
+        assert_eq!(
+            (source.file, source.line),
+            (sub.join(".asciidoctorconfig.adoc"), 11)
+        );
+    }
+
+    /// In the plain `.asciidoctorconfig`, conditionals are not evaluated:
+    /// block entries apply, single-line entries are not read.
+    #[test]
+    fn test_config_plain_conditionals_are_not_evaluated() {
+        let root = prepended_text_case("conditionals_plain");
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let doc = root.join("doc.adoc");
+
+        assert_eq!(registry.resolve(&doc, "in-false-ifdef"), Some("applied"));
+        assert_eq!(registry.resolve(&doc, "single-line"), None);
+    }
+
     /// Includes nest at most `max_depth` levels below the config file.
     #[test]
     fn test_config_include_depth_is_limited() {
@@ -1274,7 +1444,14 @@ mod tests {
             },
         );
 
-        apply_config_text(&config, &content, &mut merged, &mut Vec::new(), 1);
+        let builtin = HashMap::new();
+        let mut read = ConfigRead {
+            builtin: &builtin,
+            conditionals: false,
+            max_depth: 1,
+            stack: Vec::new(),
+        };
+        read.apply_text(&config, &content, &mut merged);
 
         assert!(merged.contains_key("from-rel"));
         assert!(!merged.contains_key("from-nested"));
