@@ -637,35 +637,40 @@ impl LanguageServer for AsciiDocLsp {
             ws.is_some(),
         );
         let result =
-            navigation::resolve_goto_definition(&content, position, &doc_path, ws.as_ref());
+            navigation::resolve_goto_definitions(&content, position, &doc_path, ws.as_ref());
         // Drop the lock before building response
         drop(ws);
         tracing::debug!(?result, "goto_definition: result");
 
-        let Some((target_path, target_line)) = result else {
-            return Ok(None);
-        };
+        let client_uris = self.client_uris(uri);
+        let mut locations: Vec<Location> = result
+            .into_iter()
+            .filter_map(|(target_path, target_line)| {
+                let target_uri = result_uri(&target_path, &client_uris)?;
+                // Convert 1-indexed line to 0-indexed LSP position
+                // LSP uses u32 for line numbers; real-world files won't exceed u32::MAX lines.
+                #[allow(clippy::cast_possible_truncation)]
+                let lsp_line = (target_line as u32).saturating_sub(1);
+                let target_pos = Position {
+                    line: lsp_line,
+                    character: 0,
+                };
+                Some(Location {
+                    uri: target_uri,
+                    range: Range {
+                        start: target_pos,
+                        end: target_pos,
+                    },
+                })
+            })
+            .collect();
 
-        let Some(target_uri) = result_uri(&target_path, &self.client_uris(uri)) else {
-            return Ok(None);
-        };
-
-        // Convert 1-indexed line to 0-indexed LSP position
-        // LSP uses u32 for line numbers; real-world files won't exceed u32::MAX lines.
-        #[allow(clippy::cast_possible_truncation)]
-        let lsp_line = (target_line as u32).saturating_sub(1);
-        let target_pos = Position {
-            line: lsp_line,
-            character: 0,
-        };
-
-        Ok(Some(GotoDefinitionResponse::Scalar(Location {
-            uri: target_uri,
-            range: Range {
-                start: target_pos,
-                end: target_pos,
-            },
-        })))
+        // One target jumps directly; several let the client offer a choice.
+        Ok(match locations.len() {
+            0 => None,
+            1 => locations.pop().map(GotoDefinitionResponse::Scalar),
+            _ => Some(GotoDefinitionResponse::Array(locations)),
+        })
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {

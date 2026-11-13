@@ -1,0 +1,4 @@
+= Book
+include::../shared/attributes.adoc[]
+
+Value: {custom}

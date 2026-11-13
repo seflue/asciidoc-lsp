@@ -10,7 +10,7 @@ use asciidoc_core::extractors::find_child_text;
 use asciidoc_core::paths::normalize_lexically;
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
-use asciidoc_core::workspace::Workspace;
+use asciidoc_core::workspace::{AttributeDefinition, AttributeOrigin, Workspace};
 
 use crate::positions;
 
@@ -94,20 +94,56 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
     None
 }
 
-/// Resolve a go-to-definition request to a target file and line.
-///
-/// Returns `(target_path, target_line_1indexed)` or `None` if the node
-/// at the cursor is not a navigable reference or cannot be resolved.
-///
-/// Extracted from the `LanguageServer` handler for testability (V-8).
+/// The first target of [`resolve_goto_definitions`]: `(target_path,
+/// target_line_1indexed)`, or `None` if the node at the cursor is not a
+/// navigable reference or cannot be resolved.
+#[cfg(test)]
 pub fn resolve_goto_definition(
     content: &str,
     pos: Position,
     doc_path: &Path,
     workspace: Option<&Workspace>,
 ) -> Option<(PathBuf, usize)> {
-    let node_info = find_node_at_position(content, pos)?;
+    resolve_goto_definitions(content, pos, doc_path, workspace)
+        .into_iter()
+        .next()
+}
 
+/// Resolve a go-to-definition request to target files and lines
+/// (1-indexed). An attribute reference yields every definition, the one
+/// Asciidoctor uses first; everything else yields at most one target.
+///
+/// Extracted from the `LanguageServer` handler for testability (V-8).
+pub fn resolve_goto_definitions(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> Vec<(PathBuf, usize)> {
+    let Some(node_info) = find_node_at_position(content, pos) else {
+        return Vec::new();
+    };
+    if let NodeKind::AttributeRef { ref name } = node_info.kind {
+        let Some(ws) = workspace else {
+            return Vec::new();
+        };
+        return ws
+            .resolve_attribute(doc_path, node_info.line, name)
+            .locations
+            .into_iter()
+            .map(|source| (source.file, source.line))
+            .collect();
+    }
+    goto_target(&node_info, doc_path, workspace)
+        .into_iter()
+        .collect()
+}
+
+fn goto_target(
+    node_info: &NodeInfo,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+) -> Option<(PathBuf, usize)> {
     match node_info.kind {
         NodeKind::Include { ref path } => {
             let target = resolve_include_target(path, doc_path, workspace)?;
@@ -120,11 +156,6 @@ pub fn resolve_goto_definition(
             let resolved = resolve_xref_target(ws, doc_path, target, node_info.line).ok()?;
             Some((resolved.file, resolved.line))
         }
-        NodeKind::AttributeRef { ref name } => {
-            let ws = workspace?;
-            let source = ws.attributes().resolve_source(doc_path, name)?;
-            Some((source.file, source.line))
-        }
         NodeKind::Image { ref path, .. } => {
             let ImageTarget::Local { path: target, .. } =
                 resolve_image_target(path, doc_path, workspace)
@@ -134,8 +165,9 @@ pub fn resolve_goto_definition(
             let target_canon = target.canonicalize().ok()?;
             Some((target_canon, 1))
         }
-        NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => {
-            // Already on the definition — goto-definition is a no-op
+        NodeKind::AttributeRef { .. } | NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => {
+            // A reference is handled by `resolve_goto_definitions`; on a
+            // definition or anchor goto-definition is a no-op.
             None
         }
     }
@@ -159,7 +191,10 @@ pub fn resolve_references(
         NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
             let mut r = ws.find_all_attribute_usages(name);
             if include_declaration && matches!(node_info.kind, NodeKind::AttributeRef { .. }) {
-                if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
+                for source in ws
+                    .resolve_attribute(doc_path, node_info.line, name)
+                    .locations
+                {
                     r.push(FileLocation::new(source.file, source.line, 0, 0));
                 }
             }
@@ -245,9 +280,10 @@ fn pdf_paths_display(name: &str, paths: &[PdfPath]) -> String {
 /// Resolve a hover request to a formatted Markdown string.
 ///
 /// Returns hover content for the node at the cursor position:
-/// - `AttributeRef`: value + definition location; a relative path from an
-///   `.asciidoctorconfig` also resolved against the document's folder
-/// - `AttributeDef`: resolved value
+/// - `AttributeRef`: value + definition location; references in the value
+///   replaced, a relative path from an `.asciidoctorconfig` also resolved
+///   against the document's folder
+/// - `AttributeDef`: value, with references replaced as for `AttributeRef`
 /// - `pdf-theme`, `pdf-themesdir`, `pdf-fontsdir` (reference or definition):
 ///   resolved absolute path
 /// - `Xref`/`ShorthandXref`: section title + file
@@ -282,12 +318,12 @@ pub fn resolve_hover(
         }
         NodeKind::AttributeRef { name } => {
             let ws = workspace?;
-            let value = ws.attributes().resolve(doc_path, name)?;
-            let mut text = format!(":{name}: {value}");
-            if let Some(resolved) = config_relative_path(ws, doc_path, name, value) {
-                let _ = write!(text, "\n\nResolves to {}", resolved.display());
-            }
-            if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
+            // The definition `gd` jumps to first, also from an included file.
+            let definition = ws
+                .resolve_attribute(doc_path, node_info.line, name)
+                .effective?;
+            let mut text = definition_hover(ws, doc_path, name, &definition);
+            if let Some(source) = &definition.source {
                 let display_path = file_display_name(&source.file);
                 let _ = write!(text, "\n\nDefined in {display_path}:{}", source.line);
             }
@@ -295,8 +331,29 @@ pub fn resolve_hover(
         }
         NodeKind::AttributeDef { name } => {
             let ws = workspace?;
+            let file = doc_path
+                .canonicalize()
+                .unwrap_or_else(|_| doc_path.to_path_buf());
+            let here = ws
+                .resolve_attribute(doc_path, node_info.line, name)
+                .definitions
+                .into_iter()
+                .find(|definition| {
+                    definition.source.as_ref().is_some_and(|source| {
+                        source.line == node_info.line
+                            && (source.file == file || source.file == doc_path)
+                    })
+                });
+            if let Some(definition) = here {
+                return Some(definition_hover(ws, doc_path, name, &definition));
+            }
+            // Not in a workspace document, e.g. an `.asciidoctorconfig`.
             let value = ws.attributes().resolve(doc_path, name)?;
-            Some(format!(":{name}: {value}"))
+            let mut text = format!(":{name}: {value}");
+            if let Some(resolved) = resolved_value(ws, doc_path, name, value) {
+                let _ = write!(text, "\n\nResolves to {resolved}");
+            }
+            Some(text)
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             let ws = workspace?;
@@ -385,22 +442,53 @@ pub fn resolve_hover(
     }
 }
 
-/// A relative path value (`./`, `../`) from an `.asciidoctorconfig`, joined
-/// onto the document directory of `doc_path`: the config value is prepended
-/// text, so Asciidoctor resolves it where the document uses it.
-fn config_relative_path(
+/// Hover text for one definition: the entry as written (`:name!:` for an
+/// unset), then what it resolves to where it differs.
+fn definition_hover(
     ws: &Workspace,
     doc_path: &Path,
     name: &str,
-    value: &str,
-) -> Option<PathBuf> {
-    let registry = ws.attributes();
-    let is_relative = value.starts_with("./") || value.starts_with("../");
-    if !is_relative || registry.explain(doc_path, name).winner != Some(AttributeLayer::Config) {
+    definition: &AttributeDefinition,
+) -> String {
+    let (Some(raw), Some(value)) = (&definition.raw, &definition.value) else {
+        return format!(":{name}!:");
+    };
+    let mut text = format!(":{name}: {raw}");
+    let resolved = if definition.origin == AttributeOrigin::Config {
+        config_relative_path(ws, doc_path, value).map(|path| path.display().to_string())
+    } else {
+        None
+    }
+    .or_else(|| (value != raw).then(|| value.clone()));
+    if let Some(resolved) = resolved {
+        text.push_str("\n\nResolves to ");
+        text.push_str(&resolved);
+    }
+    text
+}
+
+/// What `value` of `name` resolves to for hover, if it differs from `value`:
+/// attribute references replaced from the registry, and a config-relative
+/// path made absolute.
+fn resolved_value(ws: &Workspace, doc_path: &Path, name: &str, value: &str) -> Option<String> {
+    let substituted = ws.attributes().substitute(doc_path, value);
+    if ws.attributes().explain(doc_path, name).winner == Some(AttributeLayer::Config) {
+        if let Some(path) = config_relative_path(ws, doc_path, &substituted) {
+            return Some(path.display().to_string());
+        }
+    }
+    (substituted != value).then_some(substituted)
+}
+
+/// A relative path value (`./`, `../`) from an `.asciidoctorconfig`, joined
+/// onto the document directory of `doc_path`: the config value is prepended
+/// text, so Asciidoctor resolves it where the document uses it.
+fn config_relative_path(ws: &Workspace, doc_path: &Path, value: &str) -> Option<PathBuf> {
+    if !(value.starts_with("./") || value.starts_with("../")) {
         return None;
     }
     Some(normalize_lexically(
-        &registry.doc_dir(doc_path)?.join(value),
+        &ws.attributes().doc_dir(doc_path)?.join(value),
     ))
 }
 
@@ -1071,8 +1159,11 @@ pub fn resolve_rename(
                     .push((loc.line, loc.col + 1, loc.end_col - 1));
             }
 
-            // Attribute definition: :name: → find columns via text search
-            if let Some(source) = ws.attributes().resolve_source(doc_path, name) {
+            // Attribute definitions: :name: → find columns via text search
+            for source in ws
+                .resolve_attribute(doc_path, node_info.line, name)
+                .locations
+            {
                 let file_content = read_content(&source.file, overrides);
                 let def_line = file_content
                     .lines()
@@ -1565,6 +1656,97 @@ mod tests {
             .canonicalize()
             .unwrap();
         assert_eq!(target, config_path);
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_attribute_defined_in_included_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main.adoc");
+        let attrs = tmp.path().join("attrs.adoc");
+        fs::write(&attrs, ":custom: value\n").unwrap();
+        let content = "= Main\ninclude::attrs.adoc[]\n\nSee {custom}.\n";
+        fs::write(&main, content).unwrap();
+
+        let ws = Workspace::build(tmp.path(), &main);
+        let pos = Position {
+            line: 3,
+            character: 6,
+        };
+
+        let (target, line) = resolve_goto_definition(content, pos, &main, Some(&ws)).unwrap();
+        assert_eq!(target, attrs.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_attribute_defined_in_sibling_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main.adoc");
+        let attrs = tmp.path().join("attrs.adoc");
+        let chapter = tmp.path().join("chapter.adoc");
+        fs::write(&attrs, ":custom: value\n").unwrap();
+        fs::write(
+            &main,
+            "= Main\ninclude::attrs.adoc[]\ninclude::chapter.adoc[]\n",
+        )
+        .unwrap();
+        let content = "== Chapter\n\nSee {custom}.\n";
+        fs::write(&chapter, content).unwrap();
+
+        // The server scans the whole workspace; `build` would only follow
+        // includes from `chapter.adoc` and never see `main.adoc`.
+        let mut ws = Workspace::new(tmp.path());
+        ws.scan_workspace();
+        let chapter = chapter.canonicalize().unwrap();
+        let pos = Position {
+            line: 2,
+            character: 6,
+        };
+
+        let (target, line) = resolve_goto_definition(content, pos, &chapter, Some(&ws)).unwrap();
+        assert_eq!(target, attrs.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_attribute_used_before_defining_include() {
+        // Asciidoctor leaves {custom} unresolved here; navigation still finds it.
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main.adoc");
+        let attrs = tmp.path().join("attrs.adoc");
+        fs::write(&attrs, ":custom: value\n").unwrap();
+        let content = "= Main\n\nSee {custom}.\n\ninclude::attrs.adoc[]\n";
+        fs::write(&main, content).unwrap();
+
+        let ws = Workspace::build(tmp.path(), &main);
+        let pos = Position {
+            line: 2,
+            character: 6,
+        };
+
+        let (target, line) = resolve_goto_definition(content, pos, &main, Some(&ws)).unwrap();
+        assert_eq!(target, attrs.canonicalize().unwrap());
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_goto_def_attribute_takes_last_definition_before_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main.adoc");
+        let attrs = tmp.path().join("attrs.adoc");
+        fs::write(&attrs, ":custom: first\n").unwrap();
+        let content = "= Main\ninclude::attrs.adoc[]\n\nSee {custom}.\n\n:custom: second\n";
+        fs::write(&main, content).unwrap();
+
+        let ws = Workspace::build(tmp.path(), &main);
+        let pos = Position {
+            line: 3,
+            character: 6,
+        };
+
+        let (target, line) = resolve_goto_definition(content, pos, &main, Some(&ws)).unwrap();
+        assert_eq!(target, attrs.canonicalize().unwrap());
         assert_eq!(line, 1);
     }
 
@@ -2487,6 +2669,298 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
         assert_eq!(hover, ":myattr: hello world");
+    }
+
+    // --- adoc-0168: hover substitutes references in attribute values ---
+
+    #[test]
+    fn test_hover_attribute_ref_substitutes_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let content =
+            "= Doc A\n:assets: doc/assets\n:imagesdir: {assets}/img\n\nSee {imagesdir}.\n";
+        fs::write(&a, content).unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let pos = Position {
+            line: 4,
+            character: 6,
+        };
+
+        let hover = resolve_hover(content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.starts_with(":imagesdir: {assets}/img\n\nResolves to doc/assets/img"),
+            "got: {hover}"
+        );
+    }
+
+    /// A scanned workspace of `files` (relative path, content), as the server
+    /// builds it, and the canonical path of each file.
+    fn scanned(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace, Vec<PathBuf>) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let path = tmp.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, content).unwrap();
+        }
+        let mut ws = Workspace::new(tmp.path());
+        ws.scan_workspace();
+        let paths = files
+            .iter()
+            .map(|(path, _)| tmp.path().join(path).canonicalize().unwrap())
+            .collect();
+        (tmp, ws, paths)
+    }
+
+    /// `See {name}.` puts the reference at character 5.
+    fn at_reference(line: u32) -> Position {
+        Position { line, character: 5 }
+    }
+
+    #[test]
+    fn test_hover_attribute_substitutes_previous_value_of_itself() {
+        let content = "= M\n:imagesdir: img\n:imagesdir: {imagesdir}/sub\n\nSee {imagesdir}.\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        let hover = resolve_hover(content, at_reference(4), &paths[0], Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            ":imagesdir: {imagesdir}/sub\n\nResolves to img/sub\n\nDefined in m.adoc:3"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_substitutes_values_from_other_files() {
+        // `{base}` is read in attrs.adoc, before chapter.adoc changes it.
+        let chapter = "== C\n\nSee {custom}.\n:base: LATER\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (
+                "main.adoc",
+                "= M\n:base: B\ninclude::attrs.adoc[]\ninclude::chapter.adoc[]\n",
+            ),
+            ("attrs.adoc", ":custom: {base}/x\n"),
+            ("chapter.adoc", chapter),
+        ]);
+        let hover = resolve_hover(chapter, at_reference(2), &paths[2], Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            ":custom: {base}/x\n\nResolves to B/x\n\nDefined in attrs.adoc:1"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_def_shows_its_own_value() {
+        let content = "= M\n:x: one\n:x: {x} two\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        let first = Position {
+            line: 1,
+            character: 1,
+        };
+        let second = Position {
+            line: 2,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(content, first, &paths[0], Some(&ws)).unwrap(),
+            ":x: one"
+        );
+        assert_eq!(
+            resolve_hover(content, second, &paths[0], Some(&ws)).unwrap(),
+            ":x: {x} two\n\nResolves to one two"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_same_line_reference_means_previous_value() {
+        let content = "= M\n:a: one\n:a: {a} two\n\nSee {a}.\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        let pos = Position {
+            line: 2,
+            character: 5,
+        };
+        let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
+        assert_eq!(hover, ":a: one\n\nDefined in m.adoc:2");
+    }
+
+    #[test]
+    fn test_hover_attribute_unset_before_reference() {
+        let content = "= M\n:x: one\n:x!:\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        let hover = resolve_hover(content, at_reference(4), &paths[0], Some(&ws)).unwrap();
+        assert_eq!(hover, ":x!:\n\nDefined in m.adoc:3");
+    }
+
+    #[test]
+    fn test_hover_attribute_document_value_is_not_a_config_path() {
+        let chapter = "== C\n\nSee {d}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (".asciidoctorconfig", ":d: ./cfgdir\n"),
+            (
+                "main.adoc",
+                "= M\ninclude::attrs.adoc[]\ninclude::sub/ch.adoc[]\n",
+            ),
+            ("attrs.adoc", ":d: ../docdir\n"),
+            ("sub/ch.adoc", chapter),
+        ]);
+        let hover = resolve_hover(chapter, at_reference(2), &paths[3], Some(&ws)).unwrap();
+        assert_eq!(hover, ":d: ../docdir\n\nDefined in attrs.adoc:1");
+    }
+
+    #[test]
+    fn test_goto_def_attribute_lists_effective_definition_first() {
+        // Last before the reference wins, then the rest in reading order.
+        let content = "= M\n:x: one\n:x: two\n\nSee {x}.\n\n:x: three\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        let m = &paths[0];
+        let targets = resolve_goto_definitions(content, at_reference(4), m, Some(&ws));
+        assert_eq!(
+            targets,
+            vec![(m.clone(), 3), (m.clone(), 2), (m.clone(), 7)]
+        );
+    }
+
+    #[test]
+    fn test_goto_def_attribute_config_comes_before_later_definition() {
+        let content = "= M\n\nSee {x}.\n\n:x: doc\n";
+        let (_tmp, ws, paths) =
+            scanned(&[(".asciidoctorconfig", ":x: cfg\n"), ("m.adoc", content)]);
+        let m = &paths[1];
+        let targets = resolve_goto_definitions(content, at_reference(2), m, Some(&ws));
+        assert_eq!(targets, vec![(paths[0].clone(), 1), (m.clone(), 5)]);
+        let hover = resolve_hover(content, at_reference(2), m, Some(&ws)).unwrap();
+        assert!(hover.starts_with(":x: cfg\n"), "got: {hover}");
+    }
+
+    #[test]
+    fn test_goto_def_attribute_in_second_top_level_document() {
+        let chapter = "== C\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("a-draft.adoc", "= A\ninclude::ch.adoc[]\n"),
+            ("b-book.adoc", "= B\n:x: book\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+        ]);
+        let targets = resolve_goto_definitions(chapter, at_reference(2), &paths[2], Some(&ws));
+        assert_eq!(targets, vec![(paths[1].clone(), 2)]);
+    }
+
+    #[test]
+    fn test_goto_def_attribute_offers_each_top_level_document() {
+        let chapter = "== C\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("a-draft.adoc", "= A\n:x: draft\ninclude::ch.adoc[]\n"),
+            ("b-book.adoc", "= B\n:x: book\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+        ]);
+        let targets = resolve_goto_definitions(chapter, at_reference(2), &paths[2], Some(&ws));
+        assert_eq!(targets, vec![(paths[0].clone(), 2), (paths[1].clone(), 2)]);
+        let hover = resolve_hover(chapter, at_reference(2), &paths[2], Some(&ws)).unwrap();
+        assert!(hover.starts_with(":x: draft\n"), "got: {hover}");
+    }
+
+    #[test]
+    fn test_goto_def_attribute_file_included_twice_is_read_twice() {
+        let content = "= M\ninclude::a.adoc[]\n:x: two\ninclude::a.adoc[]\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[("a.adoc", ":x: one\n"), ("m.adoc", content)]);
+        let target = resolve_goto_definition(content, at_reference(5), &paths[1], Some(&ws));
+        assert_eq!(target, Some((paths[0].clone(), 1)));
+    }
+
+    #[test]
+    fn test_goto_def_attribute_in_self_including_file() {
+        let content = "= S\ninclude::s.adoc[]\n:x: v\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[("s.adoc", content)]);
+        let target = resolve_goto_definition(content, at_reference(4), &paths[0], Some(&ws));
+        assert_eq!(target, Some((paths[0].clone(), 3)));
+    }
+
+    #[test]
+    fn test_rename_and_references_reach_definition_in_include() {
+        let chapter = "== C\n\nSee {custom}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (
+                "main.adoc",
+                "= M\ninclude::attrs.adoc[]\ninclude::ch.adoc[]\n",
+            ),
+            ("attrs.adoc", ":custom: v\n"),
+            ("ch.adoc", chapter),
+        ]);
+        let edits = resolve_rename(
+            chapter,
+            at_reference(2),
+            &paths[2],
+            Some(&ws),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(edits.contains_key(&paths[1]), "edits: {edits:?}");
+        let refs =
+            resolve_references(chapter, at_reference(2), &paths[2], Some(&ws), true).unwrap();
+        assert!(
+            refs.iter().any(|loc| loc.path == paths[1] && loc.line == 1),
+            "refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_ref_defined_in_sibling_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main.adoc");
+        let chapter = tmp.path().join("chapter.adoc");
+        fs::write(tmp.path().join("attrs.adoc"), ":custom: some value\n").unwrap();
+        fs::write(
+            &main,
+            "= Main\ninclude::attrs.adoc[]\ninclude::chapter.adoc[]\n",
+        )
+        .unwrap();
+        let content = "== Chapter\n\nSee {custom}.\n";
+        fs::write(&chapter, content).unwrap();
+
+        let mut ws = Workspace::new(tmp.path());
+        ws.scan_workspace();
+        let chapter = chapter.canonicalize().unwrap();
+        let pos = Position {
+            line: 2,
+            character: 6,
+        };
+
+        let hover = resolve_hover(content, pos, &chapter, Some(&ws)).unwrap();
+        assert_eq!(hover, ":custom: some value\n\nDefined in attrs.adoc:1");
+    }
+
+    #[test]
+    fn test_hover_attribute_def_substitutes_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let content = "= Doc A\n:assets: doc/assets\n:imagesdir: {assets}/img\n";
+        fs::write(&a, content).unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let pos = Position {
+            line: 2,
+            character: 3,
+        };
+
+        let hover = resolve_hover(content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            ":imagesdir: {assets}/img\n\nResolves to doc/assets/img"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_unknown_reference_adds_no_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let content = "= Doc A\n:imagesdir: {nowhere}/img\n";
+        fs::write(&a, content).unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let pos = Position {
+            line: 1,
+            character: 3,
+        };
+
+        let hover = resolve_hover(content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(hover, ":imagesdir: {nowhere}/img");
     }
 
     #[test]

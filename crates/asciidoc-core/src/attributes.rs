@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::extractors::extract_conditionals;
 use crate::types::{AttributeDef, ConditionalDirective, ConditionalKind, ConditionalOperator};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeSource {
     pub file: PathBuf,
     pub line: usize,
@@ -521,6 +521,34 @@ impl AttributeRegistry {
         known
     }
 
+    /// `name` as Asciidoctor knows it before the first line of the top-level
+    /// document `file`: from its config chain (prepended text), else built in.
+    #[must_use]
+    pub fn preset(&self, file: &Path, name: &str) -> Option<(AttributeLayer, AttributeHit)> {
+        if name == DOCDIR {
+            let layer = self.docdir_layers(file).into_iter().next()?;
+            return Some((
+                layer.layer,
+                AttributeHit {
+                    value: layer.value.to_string(),
+                    source: layer.source.cloned(),
+                },
+            ));
+        }
+        if let Some(entry) = self.config_chain(file).and_then(|chain| chain.get(name)) {
+            return Some((AttributeLayer::Config, AttributeHit::from(entry)));
+        }
+        self.builtin.get(name).map(|value| {
+            (
+                AttributeLayer::Builtin,
+                AttributeHit {
+                    value: value.clone(),
+                    source: None,
+                },
+            )
+        })
+    }
+
     /// Substitute all `{attr}` references in a string using `resolve()`.
     #[must_use]
     pub fn substitute(&self, file: &Path, input: &str) -> String {
@@ -733,10 +761,18 @@ fn substitute_with(attrs: &HashMap<String, AttributeEntry>, input: &str) -> Stri
     substitute_inner(input, |name| attrs.get(name).map(|e| e.value.as_str()))
 }
 
+/// [`substitute_inner`] with values the lookup owns.
+pub(crate) fn substitute_attributes(
+    input: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> String {
+    substitute_inner(input, lookup)
+}
+
 /// Common `{attr}` substitution logic. Walks the input character by character,
 /// replacing `{name}` with the result of `lookup(name)`. Undefined attributes
 /// are left as-is.
-fn substitute_inner<'a>(input: &str, lookup: impl Fn(&str) -> Option<&'a str>) -> String {
+fn substitute_inner<S: AsRef<str>>(input: &str, lookup: impl Fn(&str) -> Option<S>) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars();
 
@@ -753,7 +789,7 @@ fn substitute_inner<'a>(input: &str, lookup: impl Fn(&str) -> Option<&'a str>) -
             }
             if found_close && !name.is_empty() {
                 if let Some(val) = lookup(&name) {
-                    result.push_str(val);
+                    result.push_str(val.as_ref());
                 } else {
                     result.push('{');
                     result.push_str(&name);

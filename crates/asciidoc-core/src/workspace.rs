@@ -2,14 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::attributes::AttributeRegistry;
+use crate::attributes::{
+    substitute_attributes, AttributeLayer, AttributeRegistry, AttributeSource,
+};
 use crate::diagnostics::collect_diagnostics;
 use crate::graph::{
     build_graph, build_graph_with_overrides, include_edges, parse_single_file, IncludeGraph,
 };
 use crate::pdf_theme::PdfResolution;
 use crate::references::ReferenceIndex;
-use crate::types::{Diagnostic, DocumentModel, FileLocation};
+use crate::types::{AttributeDef, Diagnostic, DocumentModel, FileLocation};
 
 /// Recursively find all `.adoc` files under a directory, as `(path as
 /// reached, canonical path)` pairs in a stable order.
@@ -198,6 +200,43 @@ impl Workspace {
             name,
             line,
         )
+    }
+
+    /// How `name`, referenced on `line` of `file`, resolves: walks the include
+    /// tree of every top-level document that reaches `file` in Asciidoctor's
+    /// reading order (see [`AttributeResolution`]).
+    #[must_use]
+    pub fn resolve_attribute(&self, file: &Path, line: usize, name: &str) -> AttributeResolution {
+        let file = if self.documents.contains_key(file) {
+            file.to_path_buf()
+        } else {
+            file.canonicalize().unwrap_or_else(|_| file.to_path_buf())
+        };
+        let roots = self
+            .include_graph
+            .doc_roots(&self.documents)
+            .remove(&file)
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| vec![file.clone()]);
+        let walks = roots
+            .iter()
+            .map(|root| {
+                let mut walk = ReadingWalk {
+                    workspace: self,
+                    root,
+                    name,
+                    reference: (&file, line),
+                    values: HashMap::new(),
+                    current: None,
+                    at_reference: None,
+                    definitions: Vec::new(),
+                    stack: Vec::new(),
+                };
+                walk.visit(root);
+                (walk.effective(), walk.definitions)
+            })
+            .collect();
+        AttributeResolution::from_walks(walks)
     }
 
     /// Find all include statements that reference the given target file.
@@ -443,6 +482,29 @@ impl Workspace {
                 self.ensure_file(file, &overrides);
             }
         }
+        // Asciidoctor reads an include wherever it points, also outside the
+        // root (`include::../shared/attributes.adoc[]`), so the scan does too.
+        let mut stack: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        while let Some(file) = stack.pop() {
+            let targets: Vec<PathBuf> = self
+                .include_graph
+                .includes_of(&file)
+                .iter()
+                .map(|edge| edge.target.clone())
+                .filter(|target| {
+                    !self.documents.contains_key(target)
+                        && target.extension().is_some_and(|ext| ext == "adoc")
+                        && target.is_file()
+                })
+                .collect();
+            for target in targets {
+                if let Some(dir) = target.parent() {
+                    self.attributes.set_doc_dir(&target, dir);
+                }
+                self.ensure_file(&target, &overrides);
+                stack.push(target);
+            }
+        }
     }
 
     /// Build workspace with content overrides for open editor buffers.
@@ -463,6 +525,201 @@ impl Workspace {
         ws.reference_index = ReferenceIndex::build(&ws.documents, &ws.attributes);
         ws.recalculate_diagnostics();
         ws
+    }
+}
+
+/// Where an [`AttributeDefinition`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeOrigin {
+    /// An attribute entry in a document of the include tree.
+    Document,
+    /// An `.asciidoctorconfig`, prepended to the top-level document.
+    Config,
+    /// Built in (`docdir`, `env-asciidoc-lsp`).
+    Builtin,
+}
+
+/// One definition of an attribute, as Asciidoctor reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeDefinition {
+    /// Where it is written; `None` for a builtin.
+    pub source: Option<AttributeSource>,
+    pub origin: AttributeOrigin,
+    /// The value as written; `None` for an unset (`:name!:`, `:!name:`).
+    pub raw: Option<String>,
+    /// `raw` with the attribute values in effect at that point substituted.
+    pub value: Option<String>,
+}
+
+/// How one `{name}` reference resolves, from [`Workspace::resolve_attribute`].
+#[derive(Debug, Clone, Default)]
+pub struct AttributeResolution {
+    /// The definition Asciidoctor uses for the first top-level document (in
+    /// path order) that has one: the last definition before the reference
+    /// (an unset too), else the config or a builtin, else the first
+    /// definition after the reference (lenient, so navigation still works
+    /// when the order is wrong).
+    pub effective: Option<AttributeDefinition>,
+    /// Every definition met, per top-level document in reading order.
+    pub definitions: Vec<AttributeDefinition>,
+    /// Definition sites for navigation: the effective one of each top-level
+    /// document first, then the others in reading order, each once.
+    pub locations: Vec<AttributeSource>,
+}
+
+impl AttributeResolution {
+    fn from_walks(walks: Vec<(Option<AttributeDefinition>, Vec<AttributeDefinition>)>) -> Self {
+        let effective = walks.iter().find_map(|(effective, _)| effective.clone());
+        let mut locations: Vec<AttributeSource> = Vec::new();
+        let sources = walks
+            .iter()
+            .filter_map(|(effective, _)| effective.as_ref())
+            .chain(walks.iter().flat_map(|(_, definitions)| definitions))
+            .filter_map(|definition| definition.source.clone());
+        for source in sources {
+            if !locations.contains(&source) {
+                locations.push(source);
+            }
+        }
+        let definitions = walks
+            .into_iter()
+            .flat_map(|(_, definitions)| definitions)
+            .collect();
+        Self {
+            effective,
+            definitions,
+            locations,
+        }
+    }
+}
+
+/// Include depth at which [`ReadingWalk`] stops, as a guard on top of the
+/// cycle check.
+const MAX_WALK_DEPTH: usize = 64;
+
+/// Reading-order walk of one top-level document for
+/// [`Workspace::resolve_attribute`]. A file included twice is read twice.
+struct ReadingWalk<'a> {
+    workspace: &'a Workspace,
+    root: &'a Path,
+    name: &'a str,
+    reference: (&'a Path, usize),
+    /// Every attribute set so far, substituted; `None` once unset.
+    values: HashMap<String, Option<String>>,
+    /// The last definition of `name` so far.
+    current: Option<AttributeDefinition>,
+    /// `current` when the reference was reached, and how many definitions
+    /// of `name` came before it.
+    at_reference: Option<(Option<AttributeDefinition>, usize)>,
+    definitions: Vec<AttributeDefinition>,
+    /// Files being read, outermost first.
+    stack: Vec<PathBuf>,
+}
+
+/// One line of a document in reading order. On the same line a reference
+/// comes first: in `:a: {a}`, `{a}` means the earlier value.
+enum WalkStep<'a> {
+    Reference,
+    Definition(&'a AttributeDef),
+    Include(&'a Path),
+}
+
+/// The attribute name of an entry, and whether the entry unsets it.
+fn entry_name(name: &str) -> (&str, bool) {
+    name.strip_suffix('!')
+        .or_else(|| name.strip_prefix('!'))
+        .map_or((name, false), |name| (name, true))
+}
+
+impl<'a> ReadingWalk<'a> {
+    fn visit(&mut self, file: &Path) {
+        let workspace: &'a Workspace = self.workspace;
+        let Some(doc) = workspace.documents.get(file) else {
+            return;
+        };
+        if self.stack.len() >= MAX_WALK_DEPTH || self.stack.iter().any(|open| open == file) {
+            return;
+        }
+        self.stack.push(file.to_path_buf());
+        let mut steps: Vec<(usize, WalkStep<'a>)> = doc
+            .attributes
+            .iter()
+            .map(|attr| (attr.line, WalkStep::Definition(attr)))
+            .chain(
+                workspace
+                    .include_graph
+                    .includes_of(file)
+                    .iter()
+                    .map(|edge| (edge.line, WalkStep::Include(edge.target.as_path()))),
+            )
+            .collect();
+        if self.reference.0 == file && self.at_reference.is_none() {
+            steps.push((self.reference.1, WalkStep::Reference));
+        }
+        steps.sort_by_key(|(line, step)| (*line, !matches!(step, WalkStep::Reference)));
+        for (_, step) in steps {
+            match step {
+                WalkStep::Reference => {
+                    if self.at_reference.is_none() {
+                        self.at_reference = Some((self.current.clone(), self.definitions.len()));
+                    }
+                }
+                WalkStep::Definition(attr) => self.define(file, attr),
+                WalkStep::Include(target) => self.visit(target),
+            }
+        }
+        self.stack.pop();
+    }
+
+    fn define(&mut self, file: &Path, attr: &AttributeDef) {
+        let (name, unset) = entry_name(&attr.name);
+        let value = (!unset).then(|| self.substitute(&attr.value));
+        if name == self.name {
+            let definition = AttributeDefinition {
+                source: Some(AttributeSource {
+                    file: file.to_path_buf(),
+                    line: attr.line,
+                }),
+                origin: AttributeOrigin::Document,
+                raw: (!unset).then(|| attr.value.clone()),
+                value: value.clone(),
+            };
+            self.current = Some(definition.clone());
+            self.definitions.push(definition);
+        }
+        self.values.insert(name.to_string(), value);
+    }
+
+    /// `input` with the values in effect substituted; an unset or unknown
+    /// reference stays as written.
+    fn substitute(&self, input: &str) -> String {
+        substitute_attributes(input, |name| match self.values.get(name) {
+            Some(value) => value.clone(),
+            None => self
+                .workspace
+                .attributes
+                .preset(self.root, name)
+                .map(|(_, hit)| hit.value),
+        })
+    }
+
+    fn effective(&self) -> Option<AttributeDefinition> {
+        let (current, before) = self.at_reference.clone().unwrap_or((None, 0));
+        current
+            .or_else(|| {
+                let (layer, hit) = self.workspace.attributes.preset(self.root, self.name)?;
+                Some(AttributeDefinition {
+                    source: hit.source,
+                    origin: if layer == AttributeLayer::Config {
+                        AttributeOrigin::Config
+                    } else {
+                        AttributeOrigin::Builtin
+                    },
+                    raw: Some(hit.value.clone()),
+                    value: Some(hit.value),
+                })
+            })
+            .or_else(|| self.definitions.get(before).cloned())
     }
 }
 
@@ -2162,5 +2419,31 @@ mod tests {
         let ws = Workspace::build(&root, &root.join("docs/handbook/handbook.adoc"));
         assert!(ws.documents().contains_key(&intro));
         assert_eq!(broken_includes(&ws, &chapters), 0);
+    }
+
+    /// The scan follows includes out of the workspace root: Asciidoctor reads
+    /// `include::../shared/attributes.adoc[]` wherever it lies, so its
+    /// attribute definitions must be found too.
+    #[test]
+    fn test_fixture_attribute_defined_outside_root() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/attribute_outside_root")
+            .canonicalize()
+            .unwrap();
+        let main = fixture.join("book/main.adoc");
+        let shared = fixture.join("shared/attributes.adoc");
+
+        let mut ws = Workspace::new(&fixture.join("book"));
+        ws.scan_workspace();
+
+        assert!(ws.documents().contains_key(&shared));
+        let effective = ws.resolve_attribute(&main, 4, "custom").effective.unwrap();
+        assert_eq!(
+            effective.source,
+            Some(AttributeSource {
+                file: shared,
+                line: 1
+            })
+        );
     }
 }
