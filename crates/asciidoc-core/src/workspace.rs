@@ -202,11 +202,13 @@ impl Workspace {
         )
     }
 
-    /// How `name`, referenced on `line` of `file`, resolves: walks the include
-    /// tree of every top-level document that reaches `file` in Asciidoctor's
-    /// reading order (see [`AttributeResolution`]).
+    /// The attributes in effect on `line` of `file`, one scope per top-level
+    /// document that reaches `file`, in path order. Asciidoctor converts each
+    /// top-level document on its own, so each scope is correct for its
+    /// document and none is preferred (ADR-008). A file no document includes
+    /// is its own top-level document.
     #[must_use]
-    pub fn resolve_attribute(&self, file: &Path, line: usize, name: &str) -> AttributeResolution {
+    pub fn scopes_at(&self, file: &Path, line: usize) -> Vec<AttributeScope<'_>> {
         let file = if self.documents.contains_key(file) {
             file.to_path_buf()
         } else {
@@ -218,25 +220,35 @@ impl Workspace {
             .remove(&file)
             .filter(|roots| !roots.is_empty())
             .unwrap_or_else(|| vec![file.clone()]);
-        let walks = roots
-            .iter()
+        roots
+            .into_iter()
             .map(|root| {
                 let mut walk = ReadingWalk {
                     workspace: self,
-                    root,
-                    name,
                     reference: (&file, line),
-                    values: HashMap::new(),
-                    current: None,
+                    current: HashMap::new(),
                     at_reference: None,
                     definitions: Vec::new(),
                     stack: Vec::new(),
                 };
-                walk.visit(root);
-                (walk.effective(), walk.definitions)
+                walk.visit(&root);
+                let (at_reference, before_reference) = walk.at_reference.unwrap_or_default();
+                AttributeScope {
+                    workspace: self,
+                    document: root,
+                    at_reference,
+                    before_reference,
+                    definitions: walk.definitions,
+                }
             })
-            .collect();
-        AttributeResolution::from_walks(walks)
+            .collect()
+    }
+
+    /// How `name`, referenced on `line` of `file`, resolves in each
+    /// top-level document (see [`Self::scopes_at`]).
+    #[must_use]
+    pub fn resolve_attribute(&self, file: &Path, line: usize, name: &str) -> AttributeResolution {
+        AttributeResolution::from_scopes(&self.scopes_at(file, line), name)
     }
 
     /// Find all include statements that reference the given target file.
@@ -551,15 +563,89 @@ pub struct AttributeDefinition {
     pub value: Option<String>,
 }
 
+/// The attributes in effect at one position of a file, as one top-level
+/// document reads it. From [`Workspace::scopes_at`].
+#[derive(Debug, Clone)]
+pub struct AttributeScope<'a> {
+    workspace: &'a Workspace,
+    document: PathBuf,
+    /// The last definition of each name before the position (an unset too).
+    at_reference: HashMap<String, AttributeDefinition>,
+    /// How many entries of `definitions` come before the position.
+    before_reference: usize,
+    /// Every definition in reading order, with its name.
+    definitions: Vec<(String, AttributeDefinition)>,
+}
+
+impl AttributeScope<'_> {
+    /// The top-level document this scope belongs to.
+    #[must_use]
+    pub fn document(&self) -> &Path {
+        &self.document
+    }
+
+    /// The definition of `name` Asciidoctor uses at the position: the last
+    /// one before it (an unset too), else the config or a builtin, else the
+    /// first one after it (lenient, so navigation still works when the
+    /// order is wrong).
+    #[must_use]
+    pub fn definition(&self, name: &str) -> Option<AttributeDefinition> {
+        self.at_reference
+            .get(name)
+            .cloned()
+            .or_else(|| self.preset(name))
+            .or_else(|| {
+                self.definitions[self.before_reference..]
+                    .iter()
+                    .find(|(defined, _)| defined == name)
+                    .map(|(_, definition)| definition.clone())
+            })
+    }
+
+    /// `input` with the values in effect at the position substituted; an
+    /// unset or unknown reference stays as written.
+    #[must_use]
+    pub fn substitute(&self, input: &str) -> String {
+        substitute_attributes(input, |name| match self.at_reference.get(name) {
+            Some(definition) => definition.value.clone(),
+            None => self.preset(name).and_then(|definition| definition.value),
+        })
+    }
+
+    /// Every definition of `name` in the document, in reading order.
+    pub fn definitions<'s>(
+        &'s self,
+        name: &'s str,
+    ) -> impl Iterator<Item = &'s AttributeDefinition> + 's {
+        self.definitions
+            .iter()
+            .filter(move |(defined, _)| defined == name)
+            .map(|(_, definition)| definition)
+    }
+
+    /// `name` from the config chain or built in, before the document's
+    /// first line.
+    fn preset(&self, name: &str) -> Option<AttributeDefinition> {
+        let (layer, hit) = self.workspace.attributes.preset(&self.document, name)?;
+        Some(AttributeDefinition {
+            source: hit.source,
+            origin: if layer == AttributeLayer::Config {
+                AttributeOrigin::Config
+            } else {
+                AttributeOrigin::Builtin
+            },
+            raw: Some(hit.value.clone()),
+            value: Some(hit.value),
+        })
+    }
+}
+
 /// How one `{name}` reference resolves, from [`Workspace::resolve_attribute`].
 #[derive(Debug, Clone, Default)]
 pub struct AttributeResolution {
-    /// The definition Asciidoctor uses for the first top-level document (in
-    /// path order) that has one: the last definition before the reference
-    /// (an unset too), else the config or a builtin, else the first
-    /// definition after the reference (lenient, so navigation still works
-    /// when the order is wrong).
-    pub effective: Option<AttributeDefinition>,
+    /// Per top-level document (path order): the definition Asciidoctor uses
+    /// there (see [`AttributeScope::definition`]), `None` where it has none.
+    pub effective: Vec<(PathBuf, Option<AttributeDefinition>)>,
     /// Every definition met, per top-level document in reading order.
     pub definitions: Vec<AttributeDefinition>,
     /// Definition sites for navigation: the effective one of each top-level
@@ -568,23 +654,26 @@ pub struct AttributeResolution {
 }
 
 impl AttributeResolution {
-    fn from_walks(walks: Vec<(Option<AttributeDefinition>, Vec<AttributeDefinition>)>) -> Self {
-        let effective = walks.iter().find_map(|(effective, _)| effective.clone());
-        let mut locations: Vec<AttributeSource> = Vec::new();
-        let sources = walks
+    fn from_scopes(scopes: &[AttributeScope<'_>], name: &str) -> Self {
+        let effective: Vec<(PathBuf, Option<AttributeDefinition>)> = scopes
             .iter()
-            .filter_map(|(effective, _)| effective.as_ref())
-            .chain(walks.iter().flat_map(|(_, definitions)| definitions))
+            .map(|scope| (scope.document.clone(), scope.definition(name)))
+            .collect();
+        let definitions: Vec<AttributeDefinition> = scopes
+            .iter()
+            .flat_map(|scope| scope.definitions(name).cloned())
+            .collect();
+        let mut locations: Vec<AttributeSource> = Vec::new();
+        let sources = effective
+            .iter()
+            .filter_map(|(_, definition)| definition.as_ref())
+            .chain(&definitions)
             .filter_map(|definition| definition.source.clone());
         for source in sources {
             if !locations.contains(&source) {
                 locations.push(source);
             }
         }
-        let definitions = walks
-            .into_iter()
-            .flat_map(|(_, definitions)| definitions)
-            .collect();
         Self {
             effective,
             definitions,
@@ -598,21 +687,19 @@ impl AttributeResolution {
 const MAX_WALK_DEPTH: usize = 64;
 
 /// Reading-order walk of one top-level document for
-/// [`Workspace::resolve_attribute`]. A file included twice is read twice.
+/// [`Workspace::scopes_at`]. A file included twice is read twice.
 struct ReadingWalk<'a> {
     workspace: &'a Workspace,
-    root: &'a Path,
-    name: &'a str,
     reference: (&'a Path, usize),
-    /// Every attribute set so far, substituted; `None` once unset.
-    values: HashMap<String, Option<String>>,
-    /// The last definition of `name` so far.
-    current: Option<AttributeDefinition>,
+    /// The last definition of each name so far; its `value` is `None` once
+    /// unset.
+    current: HashMap<String, AttributeDefinition>,
     /// `current` when the reference was reached, and how many definitions
-    /// of `name` came before it.
-    at_reference: Option<(Option<AttributeDefinition>, usize)>,
-    definitions: Vec<AttributeDefinition>,
-    /// Files being read, outermost first.
+    /// came before it.
+    at_reference: Option<(HashMap<String, AttributeDefinition>, usize)>,
+    definitions: Vec<(String, AttributeDefinition)>,
+    /// Files being read, outermost first; the first is the top-level
+    /// document.
     stack: Vec<PathBuf>,
 }
 
@@ -673,53 +760,32 @@ impl<'a> ReadingWalk<'a> {
 
     fn define(&mut self, file: &Path, attr: &AttributeDef) {
         let (name, unset) = entry_name(&attr.name);
-        let value = (!unset).then(|| self.substitute(&attr.value));
-        if name == self.name {
-            let definition = AttributeDefinition {
-                source: Some(AttributeSource {
-                    file: file.to_path_buf(),
-                    line: attr.line,
-                }),
-                origin: AttributeOrigin::Document,
-                raw: (!unset).then(|| attr.value.clone()),
-                value: value.clone(),
-            };
-            self.current = Some(definition.clone());
-            self.definitions.push(definition);
-        }
-        self.values.insert(name.to_string(), value);
+        let definition = AttributeDefinition {
+            source: Some(AttributeSource {
+                file: file.to_path_buf(),
+                line: attr.line,
+            }),
+            origin: AttributeOrigin::Document,
+            raw: (!unset).then(|| attr.value.clone()),
+            value: (!unset).then(|| self.substitute(&attr.value)),
+        };
+        self.current.insert(name.to_string(), definition.clone());
+        self.definitions.push((name.to_string(), definition));
     }
 
     /// `input` with the values in effect substituted; an unset or unknown
     /// reference stays as written.
     fn substitute(&self, input: &str) -> String {
-        substitute_attributes(input, |name| match self.values.get(name) {
-            Some(value) => value.clone(),
-            None => self
-                .workspace
+        substitute_attributes(input, |name| {
+            if let Some(definition) = self.current.get(name) {
+                return definition.value.clone();
+            }
+            let root = self.stack.first()?;
+            self.workspace
                 .attributes
-                .preset(self.root, name)
-                .map(|(_, hit)| hit.value),
+                .preset(root, name)
+                .map(|(_, hit)| hit.value)
         })
-    }
-
-    fn effective(&self) -> Option<AttributeDefinition> {
-        let (current, before) = self.at_reference.clone().unwrap_or((None, 0));
-        current
-            .or_else(|| {
-                let (layer, hit) = self.workspace.attributes.preset(self.root, self.name)?;
-                Some(AttributeDefinition {
-                    source: hit.source,
-                    origin: if layer == AttributeLayer::Config {
-                        AttributeOrigin::Config
-                    } else {
-                        AttributeOrigin::Builtin
-                    },
-                    raw: Some(hit.value.clone()),
-                    value: Some(hit.value),
-                })
-            })
-            .or_else(|| self.definitions.get(before).cloned())
     }
 }
 
@@ -2437,9 +2503,10 @@ mod tests {
         ws.scan_workspace();
 
         assert!(ws.documents().contains_key(&shared));
-        let effective = ws.resolve_attribute(&main, 4, "custom").effective.unwrap();
+        let scopes = ws.scopes_at(&main, 4);
+        assert_eq!(scopes.len(), 1);
         assert_eq!(
-            effective.source,
+            scopes[0].definition("custom").unwrap().source,
             Some(AttributeSource {
                 file: shared,
                 line: 1

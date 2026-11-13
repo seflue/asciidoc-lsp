@@ -318,16 +318,31 @@ pub fn resolve_hover(
         }
         NodeKind::AttributeRef { name } => {
             let ws = workspace?;
-            // The definition `gd` jumps to first, also from an included file.
-            let definition = ws
+            let effective = ws
                 .resolve_attribute(doc_path, node_info.line, name)
-                .effective?;
-            let mut text = definition_hover(ws, doc_path, name, &definition);
-            if let Some(source) = &definition.source {
-                let display_path = file_display_name(&source.file);
-                let _ = write!(text, "\n\nDefined in {display_path}:{}", source.line);
+                .effective;
+            if effective.iter().all(|(_, definition)| definition.is_none()) {
+                return None;
             }
-            Some(text)
+            let texts: Vec<(PathBuf, String)> = effective
+                .into_iter()
+                .map(|(document, definition)| {
+                    let text = definition.map_or_else(
+                        || "not set".to_string(),
+                        |definition| {
+                            let mut text = definition_hover(ws, doc_path, name, &definition);
+                            if let Some(source) = &definition.source {
+                                let display_path = file_display_name(&source.file);
+                                let _ =
+                                    write!(text, "\n\nDefined in {display_path}:{}", source.line);
+                            }
+                            text
+                        },
+                    );
+                    (document, text)
+                })
+                .collect();
+            Some(per_document_hover(texts))
         }
         NodeKind::AttributeDef { name } => {
             let ws = workspace?;
@@ -440,6 +455,23 @@ pub fn resolve_hover(
         }
         NodeKind::Anchor { .. } => None,
     }
+}
+
+/// Hover text from one text per top-level document: the text alone when all
+/// agree, else each one under the name of its document (ADR-008).
+fn per_document_hover(texts: Vec<(PathBuf, String)>) -> String {
+    if texts.windows(2).all(|pair| pair[0].1 == pair[1].1) {
+        return texts
+            .into_iter()
+            .next()
+            .map(|(_, text)| text)
+            .unwrap_or_default();
+    }
+    texts
+        .iter()
+        .map(|(document, text)| format!("In {}:\n{text}", file_display_name(document)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Hover text for one definition: the entry as written (`:name!:` for an
@@ -2852,8 +2884,59 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         ]);
         let targets = resolve_goto_definitions(chapter, at_reference(2), &paths[2], Some(&ws));
         assert_eq!(targets, vec![(paths[0].clone(), 2), (paths[1].clone(), 2)]);
+    }
+
+    #[test]
+    fn test_hover_attribute_shows_each_top_level_document_that_differs() {
+        // Asciidoctor converts each top-level document on its own: both
+        // values are correct, neither wins.
+        let chapter = "== C\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("a-draft.adoc", "= A\n:x: draft\ninclude::ch.adoc[]\n"),
+            ("b-book.adoc", "= B\n:x: book\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+        ]);
         let hover = resolve_hover(chapter, at_reference(2), &paths[2], Some(&ws)).unwrap();
-        assert!(hover.starts_with(":x: draft\n"), "got: {hover}");
+        assert_eq!(
+            hover,
+            "In a-draft.adoc:\n:x: draft\n\nDefined in a-draft.adoc:2\n\n\
+             In b-book.adoc:\n:x: book\n\nDefined in b-book.adoc:2"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_names_top_level_document_without_value() {
+        let chapter = "== C\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("a-draft.adoc", "= A\ninclude::ch.adoc[]\n"),
+            ("b-book.adoc", "= B\n:x: book\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+        ]);
+        let hover = resolve_hover(chapter, at_reference(2), &paths[2], Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            "In a-draft.adoc:\nnot set\n\n\
+             In b-book.adoc:\n:x: book\n\nDefined in b-book.adoc:2"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_shows_one_value_when_top_level_documents_agree() {
+        let chapter = "== C\n\nSee {x}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (
+                "a-draft.adoc",
+                "= A\ninclude::attrs.adoc[]\ninclude::ch.adoc[]\n",
+            ),
+            ("attrs.adoc", ":x: shared\n"),
+            (
+                "b-book.adoc",
+                "= B\ninclude::attrs.adoc[]\ninclude::ch.adoc[]\n",
+            ),
+            ("ch.adoc", chapter),
+        ]);
+        let hover = resolve_hover(chapter, at_reference(2), &paths[3], Some(&ws)).unwrap();
+        assert_eq!(hover, ":x: shared\n\nDefined in attrs.adoc:1");
     }
 
     #[test]

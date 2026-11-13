@@ -3775,9 +3775,14 @@ mod tests {
         let chapters = fx.join("docs/shared/chapters.adoc");
         let (service, _socket, uri, text) = open_fixture(&fx, &chapters).await;
         let server = service.inner();
+        // Each top-level document has its own docdir (ADR-008).
         assert_eq!(
             hover_text(server, &uri, position_of(&text, "{docdir}", 2)).await,
-            Some(format!(":docdir: {}", path("docs/handbook")))
+            Some(format!(
+                "In handbook.adoc:\n:docdir: {}\n\nIn guide.adoc:\n:docdir: {}",
+                path("docs/handbook"),
+                path("docs/print/guide")
+            ))
         );
         assert_eq!(
             definition_at(server, &uri, position_of(&text, "chapters/intro", 2), &fx).await,
