@@ -31,8 +31,22 @@ pub fn resolve_doc_target(
     target: &str,
     registry: &AttributeRegistry,
 ) -> Option<PathBuf> {
-    let joined = resolve_doc_path(source, target, registry)?;
-    Some(joined.canonicalize().unwrap_or(joined))
+    resolve_doc_path(source, target, registry).map(canonicalize_if_exists)
+}
+
+/// Steps 2–3 of [`resolve_doc_target`] for a target already substituted: join
+/// it onto the document directory `dir` and pop `..` segments textually.
+/// Symlinks are kept.
+#[must_use]
+pub fn join_doc_path(dir: &Path, substituted: &str) -> PathBuf {
+    normalize_lexically(&dir.join(substituted))
+}
+
+/// Step 4 of [`resolve_doc_target`]: the canonical form of `path`, or `path`
+/// itself when it does not exist on disk.
+#[must_use]
+pub fn canonicalize_if_exists(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 /// Steps 1–3 of [`resolve_doc_target`]: the target as Asciidoctor sees it,
@@ -49,7 +63,7 @@ pub fn resolve_doc_path(
     registry: &AttributeRegistry,
 ) -> Option<PathBuf> {
     let base = registry.doc_dir(source)?;
-    let join = |resolved: String| normalize_lexically(&base.join(resolved));
+    let join = |resolved: String| join_doc_path(base, &resolved);
     let docdirs = registry.docdirs(source);
     if docdirs.len() < 2 || !target.contains("{docdir}") {
         return Some(join(registry.substitute(source, target)));

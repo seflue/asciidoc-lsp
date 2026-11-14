@@ -231,27 +231,34 @@ impl Workspace {
     /// `name` before the first line of `document`: from its config chain,
     /// else built in. In a preview `docdir` is the document's own folder,
     /// not that of a document including it.
-    fn preset(
-        &self,
-        document: &Path,
-        name: &str,
-        preview: bool,
-    ) -> Option<(AttributeLayer, AttributeHit)> {
-        if preview && name == DOCDIR {
+    fn preset(&self, document: &Path, name: &str, preview: bool) -> Option<AttributeDefinition> {
+        let (layer, hit) = if preview && name == DOCDIR {
             let dir = self.attributes.doc_dir(document)?;
-            return Some((
+            (
                 AttributeLayer::Builtin,
                 AttributeHit {
                     value: dir.display().to_string(),
                     source: None,
                 },
-            ));
-        }
-        self.attributes.preset(document, name)
+            )
+        } else {
+            self.attributes.preset(document, name)?
+        };
+        Some(AttributeDefinition {
+            source: hit.source,
+            origin: if layer == AttributeLayer::Config {
+                AttributeOrigin::Config
+            } else {
+                AttributeOrigin::Builtin
+            },
+            raw: Some(hit.value.clone()),
+            value: Some(hit.value),
+        })
     }
 
     /// `file` as the workspace indexes it: as given, else canonical.
-    fn indexed_path(&self, file: &Path) -> PathBuf {
+    #[must_use]
+    pub fn indexed_path(&self, file: &Path) -> PathBuf {
         if self.documents.contains_key(file) {
             file.to_path_buf()
         } else {
@@ -291,11 +298,28 @@ impl Workspace {
         }
     }
 
-    /// How `name`, referenced on `line` of `file`, resolves in each
-    /// top-level document (see [`Self::scopes_at`]).
+    /// Where `name`, referenced on `line` of `file`, is defined for
+    /// navigation: the definition Asciidoctor uses in each top-level
+    /// document (see [`Self::scopes_at`]) first, then the others in reading
+    /// order, each site once.
     #[must_use]
-    pub fn resolve_attribute(&self, file: &Path, line: usize, name: &str) -> AttributeResolution {
-        AttributeResolution::from_scopes(&self.scopes_at(file, line), name)
+    pub fn definition_sites(&self, file: &Path, line: usize, name: &str) -> Vec<AttributeSource> {
+        let scopes = self.scopes_at(file, line);
+        let effective: Vec<AttributeDefinition> = scopes
+            .iter()
+            .filter_map(|scope| scope.definition(name))
+            .collect();
+        let mut sites: Vec<AttributeSource> = Vec::new();
+        let sources = effective
+            .iter()
+            .chain(scopes.iter().flat_map(|scope| scope.definitions(name)))
+            .filter_map(|definition| definition.source.clone());
+        for source in sources {
+            if !sites.contains(&source) {
+                sites.push(source);
+            }
+        }
+        sites
     }
 
     /// Find all include statements that reference the given target file.
@@ -650,7 +674,7 @@ impl AttributeScope<'_> {
         self.at_reference
             .get(name)
             .cloned()
-            .or_else(|| self.preset(name))
+            .or_else(|| self.workspace.preset(&self.document, name, self.preview))
             .or_else(|| {
                 self.definitions[self.before_reference..]
                     .iter()
@@ -665,10 +689,9 @@ impl AttributeScope<'_> {
     /// count.
     #[must_use]
     pub fn value(&self, name: &str) -> Option<String> {
-        match self.at_reference.get(name) {
-            Some(definition) => definition.value.clone(),
-            None => self.preset(name).and_then(|definition| definition.value),
-        }
+        value_of(&self.at_reference, name, || {
+            self.workspace.preset(&self.document, name, self.preview)
+        })
     }
 
     /// `input` with the values in effect at the position substituted; an
@@ -689,62 +712,40 @@ impl AttributeScope<'_> {
             .map(|(_, definition)| definition)
     }
 
-    /// `name` from the config chain or built in, before the document's
-    /// first line.
-    fn preset(&self, name: &str) -> Option<AttributeDefinition> {
-        let (layer, hit) = self.workspace.preset(&self.document, name, self.preview)?;
-        Some(AttributeDefinition {
-            source: hit.source,
-            origin: if layer == AttributeLayer::Config {
-                AttributeOrigin::Config
-            } else {
-                AttributeOrigin::Builtin
-            },
-            raw: Some(hit.value.clone()),
-            value: Some(hit.value),
-        })
+    /// Every attribute the scope knows, sorted by name, each with the
+    /// definition [`Self::definition`] picks: those in the document and its
+    /// includes (after the position too), the config chain and builtins.
+    #[must_use]
+    pub fn known(&self) -> Vec<(String, AttributeDefinition)> {
+        let mut names: Vec<&str> = self
+            .workspace
+            .attributes
+            .preset_names(&self.document)
+            .into_iter()
+            .chain(self.definitions.iter().map(|(name, _)| name.as_str()))
+            .collect();
+        if self.preview {
+            names.push(DOCDIR);
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+            .into_iter()
+            .filter_map(|name| Some((name.to_string(), self.definition(name)?)))
+            .collect()
     }
 }
 
-/// How one `{name}` reference resolves, from [`Workspace::resolve_attribute`].
-#[derive(Debug, Clone, Default)]
-pub struct AttributeResolution {
-    /// Per top-level document (path order): the definition Asciidoctor uses
-    /// there (see [`AttributeScope::definition`]), `None` where it has none.
-    pub effective: Vec<(PathBuf, Option<AttributeDefinition>)>,
-    /// Every definition met, per top-level document in reading order.
-    pub definitions: Vec<AttributeDefinition>,
-    /// Definition sites for navigation: the effective one of each top-level
-    /// document first, then the others in reading order, each once.
-    pub locations: Vec<AttributeSource>,
-}
-
-impl AttributeResolution {
-    fn from_scopes(scopes: &[AttributeScope<'_>], name: &str) -> Self {
-        let effective: Vec<(PathBuf, Option<AttributeDefinition>)> = scopes
-            .iter()
-            .map(|scope| (scope.document.clone(), scope.definition(name)))
-            .collect();
-        let definitions: Vec<AttributeDefinition> = scopes
-            .iter()
-            .flat_map(|scope| scope.definitions(name).cloned())
-            .collect();
-        let mut locations: Vec<AttributeSource> = Vec::new();
-        let sources = effective
-            .iter()
-            .filter_map(|(_, definition)| definition.as_ref())
-            .chain(&definitions)
-            .filter_map(|definition| definition.source.clone());
-        for source in sources {
-            if !locations.contains(&source) {
-                locations.push(source);
-            }
-        }
-        Self {
-            effective,
-            definitions,
-            locations,
-        }
+/// The value of `name` given the last definition of each name so far: its
+/// value (`None` once unset), else that of `preset`.
+fn value_of(
+    current: &HashMap<String, AttributeDefinition>,
+    name: &str,
+    preset: impl FnOnce() -> Option<AttributeDefinition>,
+) -> Option<String> {
+    match current.get(name) {
+        Some(definition) => definition.value.clone(),
+        None => preset().and_then(|definition| definition.value),
     }
 }
 
@@ -845,13 +846,10 @@ impl<'a> ReadingWalk<'a> {
     /// reference stays as written.
     fn substitute(&self, input: &str) -> String {
         substitute_attributes(input, |name| {
-            if let Some(definition) = self.current.get(name) {
-                return definition.value.clone();
-            }
-            let root = self.stack.first()?;
-            self.workspace
-                .preset(root, name, self.preview)
-                .map(|(_, hit)| hit.value)
+            value_of(&self.current, name, || {
+                let root = self.stack.first()?;
+                self.workspace.preset(root, name, self.preview)
+            })
         })
     }
 }
@@ -2510,11 +2508,14 @@ mod tests {
         assert!(ws.documents.contains_key(&config));
         let attrs = ws.attributes();
 
-        let own = attrs.explain(&config, "adoc-only");
-        assert!(own.config.hit.is_none());
-        assert_eq!(own.winner, Some(crate::attributes::AttributeLayer::PerFile));
-        let shared = attrs.explain(&config, "shared");
-        assert_eq!(shared.config.hit.unwrap().value, "plain");
+        assert!(attrs.preset(&config, "adoc-only").is_none());
+        assert_eq!(
+            attrs.resolve_source(&config, "adoc-only").map(|s| s.file),
+            Some(config.clone())
+        );
+        let (layer, shared) = attrs.preset(&config, "shared").unwrap();
+        assert_eq!(layer, AttributeLayer::Config);
+        assert_eq!(shared.value, "plain");
         assert_eq!(attrs.resolve(&config, "shared"), Some("adoc"));
         let root_dir = root.display().to_string();
         assert_eq!(
@@ -2552,6 +2553,63 @@ mod tests {
         let ws = Workspace::build(&root, &root.join("docs/handbook/handbook.adoc"));
         assert!(ws.documents().contains_key(&intro));
         assert_eq!(broken_includes(&ws, &chapters), 0);
+    }
+
+    /// Every attribute a scope knows: definitions from the document and its
+    /// includes, before and after the position, then the config chain and
+    /// builtins, each name once with the definition the scope uses.
+    #[test]
+    fn test_scope_known_lists_included_config_and_builtin_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":imagesdir: img\n").unwrap();
+        fs::write(root.join("attrs.adoc"), ":product: Widget\n").unwrap();
+        let main = root.join("main.adoc");
+        fs::write(
+            &main,
+            "= Main\ninclude::attrs.adoc[]\n\nText.\n\n:late: later\n",
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+
+        let scopes = ws.scopes_at(&main, 4);
+        let known = scopes[0].known();
+
+        let value = |name: &str| {
+            known
+                .iter()
+                .find(|(known_name, _)| known_name == name)
+                .and_then(|(_, definition)| definition.value.clone())
+        };
+        assert_eq!(value("product").as_deref(), Some("Widget"));
+        assert_eq!(value("late").as_deref(), Some("later"));
+        assert_eq!(value("imagesdir").as_deref(), Some("img"));
+        assert_eq!(value("docdir"), Some(root.display().to_string()));
+        let names: Vec<&str> = known.iter().map(|(name, _)| name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "sorted by name, each once");
+    }
+
+    /// Definition sites list the definition in effect first, then the others
+    /// in reading order, each once.
+    #[test]
+    fn test_definition_sites_lists_effective_first_then_the_rest_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("main.adoc");
+        fs::write(&main, ":v: one\n\nText.\n\n:v: two\n").unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+
+        let site = |line| AttributeSource {
+            file: main.clone(),
+            line,
+        };
+        assert_eq!(ws.definition_sites(&main, 3, "v"), vec![site(1), site(5)]);
+        assert_eq!(ws.definition_sites(&main, 6, "v"), vec![site(5), site(1)]);
     }
 
     /// The scan follows includes out of the workspace root: Asciidoctor reads

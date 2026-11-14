@@ -153,6 +153,23 @@ impl ReferenceIndex {
         documents: &HashMap<PathBuf, DocumentModel>,
         registry: &AttributeRegistry,
     ) -> Result<ResolvedXref, DiagnosticKind> {
+        self.resolve_xref_with(xref, documents, |file| {
+            resolve_doc_target(source_file, file, registry)
+        })
+    }
+
+    /// [`Self::resolve_xref`] with the file part of the target resolved by
+    /// `resolve_file` (attribute substitution and joining onto the
+    /// document directory), so the caller picks the attribute scope.
+    ///
+    /// # Errors
+    /// Returns a `DiagnosticKind::BrokenXref` if the target file or anchor cannot be found.
+    pub fn resolve_xref_with(
+        &self,
+        xref: &Xref,
+        documents: &HashMap<PathBuf, DocumentModel>,
+        resolve_file: impl FnOnce(&str) -> Option<PathBuf>,
+    ) -> Result<ResolvedXref, DiagnosticKind> {
         let (file_part, anchor_part) = parse_xref_target(&xref.target);
 
         if let Some(file_ref) = file_part {
@@ -166,7 +183,7 @@ impl ReferenceIndex {
             // 2. Fall back to a workspace-wide lookup by trailing components
             //    or bare filename, so `xref:doc.adoc[]` keeps working from any
             //    depth.
-            let resolved_path = resolve_doc_target(source_file, file_ref, registry);
+            let resolved_path = resolve_file(file_ref);
             let target_file = resolved_path
                 .as_ref()
                 .and_then(|p| documents.keys().find(|key| *key == p))
@@ -644,6 +661,37 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.file, target);
         assert_eq!(resolved.line, 3);
+    }
+
+    /// The caller decides where the file part of an xref points (one
+    /// attribute scope, ADR-008); the anchor lookup stays the same.
+    #[test]
+    fn test_resolve_xref_with_caller_resolved_file() {
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let mut documents = HashMap::new();
+        documents.insert(
+            PathBuf::from("/web/doc.adoc"),
+            DocumentModel::test("/web/doc.adoc").with_anchors(vec![Anchor {
+                id: "x".into(),
+                reftext: None,
+                line: 5,
+            }]),
+        );
+        let index = ReferenceIndex::build(&documents, &registry);
+        let xref = Xref {
+            target: "{edition}/doc.adoc#x".into(),
+            display_text: None,
+            line: 1,
+        };
+
+        let resolved = index
+            .resolve_xref_with(&xref, &documents, |file| {
+                (file == "{edition}/doc.adoc").then(|| PathBuf::from("/web/doc.adoc"))
+            })
+            .unwrap();
+
+        assert_eq!(resolved.file, PathBuf::from("/web/doc.adoc"));
+        assert_eq!(resolved.line, 5);
     }
 
     // --- Incremental updates (add_file / remove_file) ---

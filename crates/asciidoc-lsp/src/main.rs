@@ -2,7 +2,10 @@ mod completion;
 mod diagnostics_convert;
 mod navigation;
 mod positions;
+mod scopes;
 mod symbols;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -952,7 +955,8 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         let ws = self.workspace.lock();
-        let items = completion::resolve_completions(ctx, &doc_path, ws.as_ref());
+        let line = position.line as usize + 1;
+        let items = completion::resolve_completions(ctx, &doc_path, line, ws.as_ref());
 
         if items.is_empty() {
             Ok(None)
@@ -1463,13 +1467,14 @@ mod tests {
             character: 12,
         };
 
-        let result = navigation::resolve_goto_definition(&content, pos, &index, Some(&ws));
-        assert!(
-            result.is_some(),
-            "goto-definition on include should resolve"
+        let targets = navigation::resolve_goto_definitions(&content, pos, &index, Some(&ws));
+        assert_eq!(
+            targets.len(),
+            1,
+            "goto-definition on include should resolve to one target, got: {targets:?}"
         );
 
-        let (target, line) = result.unwrap();
+        let (target, line) = targets.into_iter().next().unwrap();
         assert!(
             target
                 .to_string_lossy()
@@ -1498,13 +1503,14 @@ mod tests {
             character: 14, // inside "cli-source-dir"
         };
 
-        let result = navigation::resolve_goto_definition(&content, pos, &file, Some(&ws));
-        assert!(
-            result.is_some(),
-            "goto-definition on {{cli-source-dir}} should resolve to .asciidoctorconfig"
+        let targets = navigation::resolve_goto_definitions(&content, pos, &file, Some(&ws));
+        assert_eq!(
+            targets.len(),
+            1,
+            "goto-definition on {{cli-source-dir}} should resolve to .asciidoctorconfig, got: {targets:?}"
         );
 
-        let (target, line) = result.unwrap();
+        let (target, line) = targets.into_iter().next().unwrap();
         assert!(
             target.to_string_lossy().contains(".asciidoctorconfig"),
             "target should be .asciidoctorconfig, got: {:?}",
@@ -1641,10 +1647,8 @@ mod tests {
         assert_eq!(doc.attribute_refs.len(), 1);
 
         // Config chain should be loaded
-        assert_eq!(
-            ws.attributes().resolve(&standalone_canon, "myattr"),
-            Some("val")
-        );
+        let scopes = ws.scopes_at(&standalone_canon, 4);
+        assert_eq!(scopes[0].value("myattr").as_deref(), Some("val"));
     }
 
     #[test]
@@ -2481,8 +2485,7 @@ mod tests {
         assert_eq!(request["paths_differ"], true);
         assert_eq!(request["in_documents_raw"], false);
         assert_eq!(request["in_documents_canonical"], true);
-        assert_eq!(report["resolution"]["per_file"]["registered"], true);
-        assert_eq!(report["resolution"]["value"], "value");
+        assert_eq!(report["resolution"]["scopes"][0]["value"], "value");
     }
 
     #[tokio::test]
@@ -2808,7 +2811,10 @@ mod tests {
                 report["request"]["canonical_path"],
                 canonical.display().to_string()
             );
-            assert_eq!(report["resolution"]["winner"], "per_file", "{name}");
+            assert_eq!(
+                report["resolution"]["scopes"][0]["definition"]["origin"], "document",
+                "{name}"
+            );
         }
     }
 
@@ -2934,8 +2940,9 @@ mod tests {
     // through `config/book-link` before `book/` (asserted in the core test
     // `test_fixture_scan_reaches_book_through_the_link_first`).
     // `include::../part-up.adoc[]` reaches `part-up.adoc` from the real folder
-    // and `config/part-up.adoc` from the link; only the link side gets
-    // `imagesdir` from `config/.asciidoctorconfig`.
+    // and `config/part-up.adoc` from the link; only the preview of the link
+    // side gets `imagesdir` from `config/.asciidoctorconfig`, the build of
+    // `via-link.adoc`, which includes the file, does not (ADR-008).
 
     fn first_include_target(server: &AsciiDocLsp, file: &Path) -> PathBuf {
         let ws = server.workspace.lock();
@@ -2947,8 +2954,10 @@ mod tests {
     /// Option A: a file inside the root that a folder link inside the root
     /// also reaches resolves from its real folder while unopened (the scan
     /// keeps the canonical folder, though it reaches the file through the
-    /// link), and from the link's folder, config chain
-    /// included, once opened through the link.
+    /// link), and from the link's folder once opened through the link. The
+    /// link folder's config chain enters only through the preview scope of
+    /// the file (ADR-008); the scope of the including document `via-link.adoc`
+    /// does not get it.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_file_behind_folder_link_resolves_from_real_folder_until_opened_through_it(
@@ -2961,10 +2970,10 @@ mod tests {
         let scanned_include = first_include_target(server, &canonical);
         let scanned_imagesdir = {
             let ws = server.workspace.lock();
-            let attributes = ws.as_ref().unwrap().attributes();
-            attributes
-                .resolve(&canonical, "imagesdir")
-                .map(str::to_owned)
+            let scopes = ws.as_ref().unwrap().scopes_at(&canonical, 1);
+            scopes[0]
+                .definition("imagesdir")
+                .and_then(|definition| definition.value)
         };
 
         let link = real.join("config/book-link/twice.adoc");
@@ -3090,7 +3099,10 @@ mod tests {
             attributes.doc_dir(&outside),
             Some(real.join("docs").as_path())
         );
-        assert_eq!(attributes.resolve(&outside, "imagesdir"), None);
+        let scopes = ws.as_ref().unwrap().scopes_at(&outside, 1);
+        assert!(scopes
+            .iter()
+            .all(|scope| scope.value("imagesdir").is_none()));
     }
 
     /// adoc-0139, Verify "inline image has hover and gd like the block macro".
@@ -3154,9 +3166,12 @@ mod tests {
                 "scenario {name}"
             );
             assert_eq!(target, None, "scenario {name}");
-            assert_eq!(report["resolution"]["remote"], true, "scenario {name}");
             assert_eq!(
-                report["resolution"]["canonical_target"],
+                report["resolution"]["scopes"][0]["remote"], true,
+                "scenario {name}"
+            );
+            assert_eq!(
+                report["resolution"]["scopes"][0]["canonical_target"],
                 serde_json::Value::Null,
                 "scenario {name}"
             );
@@ -3208,7 +3223,7 @@ mod tests {
 
             let target = target.uri.to_file_path().unwrap();
             assert_eq!(
-                report["resolution"]["canonical_target"],
+                report["resolution"]["scopes"][0]["canonical_target"],
                 target.display().to_string(),
                 "scenario {name}, {needle}"
             );

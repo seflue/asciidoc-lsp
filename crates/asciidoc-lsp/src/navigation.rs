@@ -5,14 +5,18 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
-use asciidoc_core::attributes::{AttributeHit, AttributeLayer, AttributeSource, DOCDIR};
+use asciidoc_core::attributes::AttributeSource;
 use asciidoc_core::extractors::find_child_text;
-use asciidoc_core::paths::normalize_lexically;
+use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
 use asciidoc_core::workspace::{AttributeDefinition, AttributeOrigin, AttributeScope, Workspace};
 
 use crate::positions;
+use crate::scopes::{
+    collapse_if_agree, document_dir, file_display_name, path_scopes, scope_image_base, scope_label,
+    unique_in_order, DocTarget,
+};
 
 /// Classification of a node found at a cursor position.
 #[derive(Debug, PartialEq)]
@@ -94,24 +98,10 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
     None
 }
 
-/// The first target of [`resolve_goto_definitions`]: `(target_path,
-/// target_line_1indexed)`, or `None` if the node at the cursor is not a
-/// navigable reference or cannot be resolved.
-#[cfg(test)]
-pub fn resolve_goto_definition(
-    content: &str,
-    pos: Position,
-    doc_path: &Path,
-    workspace: Option<&Workspace>,
-) -> Option<(PathBuf, usize)> {
-    resolve_goto_definitions(content, pos, doc_path, workspace)
-        .into_iter()
-        .next()
-}
-
 /// Resolve a go-to-definition request to target files and lines
 /// (1-indexed). An attribute reference yields every definition, the one
-/// Asciidoctor uses first; everything else yields at most one target.
+/// Asciidoctor uses first; an include, xref or image yields each scope's
+/// existing target once (ADR-008).
 ///
 /// Extracted from the `LanguageServer` handler for testability (V-8).
 pub fn resolve_goto_definitions(
@@ -123,63 +113,48 @@ pub fn resolve_goto_definitions(
     let Some(node_info) = find_node_at_position(content, pos) else {
         return Vec::new();
     };
-    if let NodeKind::AttributeRef { ref name } = node_info.kind {
-        let Some(ws) = workspace else {
-            return Vec::new();
-        };
-        return ws
-            .resolve_attribute(doc_path, node_info.line, name)
-            .locations
-            .into_iter()
-            .map(|source| (source.file, source.line))
-            .collect();
-    }
-    if let NodeKind::Image { ref path, .. } = node_info.kind {
-        // Each top-level document's file, each once.
-        let mut targets: Vec<(PathBuf, usize)> = Vec::new();
-        for (_, target) in resolve_image_targets(path, doc_path, workspace, node_info.line) {
-            let ImageTarget::Local { path: target, .. } = target else {
-                continue;
-            };
-            if let Ok(canonical) = target.canonicalize() {
-                if !targets.iter().any(|(known, _)| *known == canonical) {
-                    targets.push((canonical, 1));
-                }
-            }
-        }
-        return targets;
-    }
-    goto_target(&node_info, doc_path, workspace)
-        .into_iter()
-        .collect()
-}
-
-fn goto_target(
-    node_info: &NodeInfo,
-    doc_path: &Path,
-    workspace: Option<&Workspace>,
-) -> Option<(PathBuf, usize)> {
     match node_info.kind {
+        NodeKind::AttributeRef { ref name } => {
+            let Some(ws) = workspace else {
+                return Vec::new();
+            };
+            ws.definition_sites(doc_path, node_info.line, name)
+                .into_iter()
+                .map(|source| (source.file, source.line))
+                .collect()
+        }
+        NodeKind::Image { ref path, .. } => {
+            // Each scope's file, each once.
+            unique_in_order(
+                resolve_image_targets(path, doc_path, workspace, node_info.line)
+                    .into_iter()
+                    .filter_map(|(_, target)| match target {
+                        ImageTarget::Local { path: target, .. } => target.canonicalize().ok(),
+                        ImageTarget::Remote { .. } => None,
+                    })
+                    .map(|canonical| (canonical, 1)),
+            )
+        }
         NodeKind::Include { ref path } => {
-            let target = resolve_include_target(path, doc_path, workspace)?;
-            // Require an existing on-disk file.
-            let target_canon = target.canonicalize().ok()?;
-            Some((target_canon, 1))
+            let targets = resolve_doc_targets(path, doc_path, workspace, node_info.line);
+            existing_targets(&targets)
+                .into_iter()
+                .map(|file| (file, 1))
+                .collect()
         }
         NodeKind::Xref { ref target } | NodeKind::ShorthandXref { ref target } => {
-            let ws = workspace?;
-            let resolved = resolve_xref_target(ws, doc_path, target, node_info.line).ok()?;
-            Some((resolved.file, resolved.line))
+            let Some(ws) = workspace else {
+                return Vec::new();
+            };
+            unique_in_order(
+                resolve_xref_targets(ws, doc_path, target, node_info.line)
+                    .into_iter()
+                    .filter_map(|(_, resolved)| resolved.ok())
+                    .map(|resolved| (resolved.file, resolved.line)),
+            )
         }
-        NodeKind::AttributeRef { .. }
-        | NodeKind::Image { .. }
-        | NodeKind::AttributeDef { .. }
-        | NodeKind::Anchor { .. } => {
-            // A reference or an image is handled by
-            // `resolve_goto_definitions`; on a definition or anchor
-            // goto-definition is a no-op.
-            None
-        }
+        // On a definition or anchor goto-definition is a no-op.
+        NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => Vec::new(),
     }
 }
 
@@ -201,25 +176,20 @@ pub fn resolve_references(
         NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
             let mut r = ws.find_all_attribute_usages(name);
             if include_declaration && matches!(node_info.kind, NodeKind::AttributeRef { .. }) {
-                for source in ws
-                    .resolve_attribute(doc_path, node_info.line, name)
-                    .locations
-                {
+                for source in ws.definition_sites(doc_path, node_info.line, name) {
                     r.push(FileLocation::new(source.file, source.line, 0, 0));
                 }
             }
             r
         }
         NodeKind::Include { path } => {
-            let target = asciidoc_core::paths::resolve_doc_target(doc_path, path, ws.attributes())?;
-            let target_canonical = target.canonicalize().ok()?;
-            let filename = target_canonical
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("");
-
-            let mut r = ws.find_all_include_references(&target_canonical);
-            r.extend(ws.find_all_file_xrefs(filename));
+            let targets = resolve_doc_targets(path, doc_path, Some(ws), node_info.line);
+            let mut r = Vec::new();
+            for target in existing_targets(&targets) {
+                let filename = target.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                r.extend(ws.find_all_include_references(&target));
+                r.extend(ws.find_all_file_xrefs(filename));
+            }
             r
         }
         NodeKind::Anchor { id } => {
@@ -328,9 +298,11 @@ pub fn resolve_hover(
         }
         NodeKind::AttributeRef { name } => {
             let ws = workspace?;
-            let effective = ws
-                .resolve_attribute(doc_path, node_info.line, name)
-                .effective;
+            let effective: Vec<(PathBuf, Option<AttributeDefinition>)> = ws
+                .scopes_at(doc_path, node_info.line)
+                .iter()
+                .map(|scope| (scope.document().to_path_buf(), scope.definition(name)))
+                .collect();
             if effective.iter().all(|(_, definition)| definition.is_none()) {
                 return None;
             }
@@ -356,105 +328,75 @@ pub fn resolve_hover(
         }
         NodeKind::AttributeDef { name } => {
             let ws = workspace?;
-            let file = doc_path
-                .canonicalize()
-                .unwrap_or_else(|_| doc_path.to_path_buf());
-            let here = ws
-                .resolve_attribute(doc_path, node_info.line, name)
-                .definitions
-                .into_iter()
-                .find(|definition| {
-                    definition.source.as_ref().is_some_and(|source| {
-                        source.line == node_info.line
-                            && (source.file == file || source.file == doc_path)
-                    })
-                });
-            if let Some(definition) = here {
-                return Some(definition_hover(ws, doc_path, name, &definition));
-            }
-            // Not in a workspace document, e.g. an `.asciidoctorconfig`.
-            let value = ws.attributes().resolve(doc_path, name)?;
-            let mut text = format!(":{name}: {value}");
-            if let Some(resolved) = resolved_value(ws, doc_path, name, value) {
-                let _ = write!(text, "\n\nResolves to {resolved}");
-            }
-            Some(text)
+            let file = ws.indexed_path(doc_path);
+            let config_value = ws
+                .attributes()
+                .is_config_file(&file)
+                .then(|| config_entry_value(content, node_info.line, name))
+                .flatten();
+            let texts: Vec<(String, String)> = ws
+                .scopes_at(doc_path, node_info.line)
+                .iter()
+                .filter_map(|scope| {
+                    let text = if let Some(raw) = &config_value {
+                        config_definition_hover(ws, doc_path, scope, name, raw, node_info.line)
+                    } else {
+                        let definition = scope.definitions(name).find(|definition| {
+                            definition.source.as_ref().is_some_and(|source| {
+                                source.line == node_info.line && source.file == file
+                            })
+                        })?;
+                        definition_hover(ws, doc_path, name, definition)
+                    };
+                    Some((scope_label(scope), text))
+                })
+                .collect();
+            (!texts.is_empty()).then(|| per_document_hover(texts))
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             let ws = workspace?;
-            let xref = asciidoc_core::types::Xref {
-                target: target.clone(),
-                display_text: None,
-                line: node_info.line,
-            };
-            let resolved = ws
-                .reference_index()
-                .resolve_xref(
-                    &xref,
-                    doc_path,
-                    ws.include_graph(),
-                    ws.documents(),
-                    ws.attributes(),
-                )
-                .ok()?;
-
-            // Find section title at the resolved location
-            let section_title = ws.documents().get(&resolved.file).and_then(|doc| {
-                doc.sections
-                    .iter()
-                    .find(|s| s.line == resolved.line)
-                    .map(|s| s.title.clone())
-            });
-
-            let display_path = file_display_name(&resolved.file);
-
-            if let Some(title) = section_title {
-                Some(format!(
-                    "\u{2192} {title}\n\n{display_path}:{}",
-                    resolved.line
-                ))
-            } else {
-                // Anchor without section (explicit anchor)
-                let anchor_id = target.rsplit('#').next().unwrap_or(target);
-                Some(format!(
-                    "[[{anchor_id}]]\n\n{display_path}:{}",
-                    resolved.line
-                ))
+            let resolved = resolve_xref_targets(ws, doc_path, target, node_info.line);
+            if resolved.iter().all(|(_, resolved)| resolved.is_err()) {
+                return None;
             }
+            let texts: Vec<(String, String)> = resolved
+                .into_iter()
+                .map(|(label, resolved)| {
+                    let text = resolved.map_or_else(
+                        |_| "\u{2717} Target not found".to_string(),
+                        |resolved| xref_hover(ws, target, &resolved),
+                    );
+                    (label, text)
+                })
+                .collect();
+            Some(per_document_hover(texts))
         }
         NodeKind::Include { path } => {
-            let resolved_path = if let Some(ws) = workspace {
-                ws.attributes().substitute(doc_path, path)
-            } else {
-                path.clone()
-            };
-            let target = if let Some(ws) = workspace {
-                asciidoc_core::paths::resolve_doc_target(doc_path, path, ws.attributes())?
-            } else {
-                doc_path.parent()?.join(&resolved_path)
-            };
-
-            let mut text = format!("include::{resolved_path}[]");
-            if target.exists() {
-                let section_count = workspace
-                    .and_then(|ws| ws.documents().get(&target.canonicalize().ok()?))
-                    .map_or(0, |doc| doc.sections.len());
-                let _ = write!(text, "\n\n\u{2713} File exists | {section_count} sections");
-            } else {
-                text.push_str("\n\n\u{2717} File not found");
-            }
-            Some(text)
+            let mut targets = resolve_doc_targets(path, doc_path, workspace, node_info.line);
+            // Scopes that reach the same file agree, however they spell it.
+            collapse_if_agree(&mut targets, |a, b| a.path == b.path);
+            let texts: Vec<(String, String)> = targets
+                .into_iter()
+                .map(|target| {
+                    let mut text = format!("include::{}[]", target.substituted);
+                    if target.path.exists() {
+                        let section_count = workspace
+                            .and_then(|ws| ws.documents().get(&target.path))
+                            .map_or(0, |doc| doc.sections.len());
+                        let _ = write!(text, "\n\n\u{2713} File exists | {section_count} sections");
+                    } else {
+                        text.push_str("\n\n\u{2717} File not found");
+                    }
+                    (target.label, text)
+                })
+                .collect();
+            (!texts.is_empty()).then(|| per_document_hover(texts))
         }
         NodeKind::Image { path, inline } => {
             let macro_form = if *inline { "image:" } else { "image::" };
             let mut targets = resolve_image_targets(path, doc_path, workspace, node_info.line);
             // Scopes that reach the same file agree, however they spell it.
-            if targets
-                .windows(2)
-                .all(|pair| pair[0].1.same_place(&pair[1].1))
-            {
-                targets.truncate(1);
-            }
+            collapse_if_agree(&mut targets, |a, b| a.1.same_place(&b.1));
             let texts: Vec<(String, String)> = targets
                 .into_iter()
                 .map(|(label, target)| {
@@ -481,15 +423,31 @@ pub fn resolve_hover(
     }
 }
 
+/// Hover text for an xref that resolves: the section title, or the anchor
+/// for an anchor outside a section title, then file and line.
+fn xref_hover(ws: &Workspace, target: &str, resolved: &ResolvedXref) -> String {
+    let section_title = ws.documents().get(&resolved.file).and_then(|doc| {
+        doc.sections
+            .iter()
+            .find(|s| s.line == resolved.line)
+            .map(|s| s.title.clone())
+    });
+    let display_path = file_display_name(&resolved.file);
+    if let Some(title) = section_title {
+        format!("\u{2192} {title}\n\n{display_path}:{}", resolved.line)
+    } else {
+        // Anchor without section (explicit anchor)
+        let anchor_id = target.rsplit('#').next().unwrap_or(target);
+        format!("[[{anchor_id}]]\n\n{display_path}:{}", resolved.line)
+    }
+}
+
 /// Hover text from one text per scope, each with its label: the text alone
 /// when all agree, else each one under its label (ADR-008).
-fn per_document_hover(texts: Vec<(String, String)>) -> String {
-    if texts.windows(2).all(|pair| pair[0].1 == pair[1].1) {
-        return texts
-            .into_iter()
-            .next()
-            .map(|(_, text)| text)
-            .unwrap_or_default();
+fn per_document_hover(mut texts: Vec<(String, String)>) -> String {
+    collapse_if_agree(&mut texts, |a, b| a.1 == b.1);
+    if let [(_, text)] = texts.as_slice() {
+        return text.clone();
     }
     texts
         .iter()
@@ -523,17 +481,48 @@ fn definition_hover(
     text
 }
 
-/// What `value` of `name` resolves to for hover, if it differs from `value`:
-/// attribute references replaced from the registry, and a config-relative
-/// path made absolute.
-fn resolved_value(ws: &Workspace, doc_path: &Path, name: &str, value: &str) -> Option<String> {
-    let substituted = ws.attributes().substitute(doc_path, value);
-    if ws.attributes().explain(doc_path, name).winner == Some(AttributeLayer::Config) {
-        if let Some(path) = config_relative_path(ws, doc_path, &substituted) {
-            return Some(path.display().to_string());
-        }
+/// The value written on `line` (1-based) of a config file for `name`.
+fn config_entry_value(content: &str, line: usize, name: &str) -> Option<String> {
+    let text = content.lines().nth(line.checked_sub(1)?)?;
+    let value = text
+        .strip_prefix(':')?
+        .strip_prefix(name)?
+        .strip_prefix(':')?;
+    Some(value.trim().to_string())
+}
+
+/// Hover text for the entry `:name: raw` on `line` of the config file
+/// `doc_path`: the line as written, then what it overrides. A config file
+/// sees the chain without itself, so `scope` holds only what is above it.
+fn config_definition_hover(
+    ws: &Workspace,
+    doc_path: &Path,
+    scope: &AttributeScope<'_>,
+    name: &str,
+    raw: &str,
+    line: usize,
+) -> String {
+    let definition = AttributeDefinition {
+        source: Some(AttributeSource {
+            file: ws.indexed_path(doc_path),
+            line,
+        }),
+        origin: AttributeOrigin::Config,
+        raw: Some(raw.to_string()),
+        value: Some(scope.substitute(raw)),
+    };
+    let mut text = definition_hover(ws, doc_path, name, &definition);
+    if let Some(above) = scope.definition(name) {
+        let entry = above
+            .raw
+            .map_or_else(|| format!(":{name}!:"), |raw| format!(":{name}: {raw}"));
+        let from = above
+            .source
+            .map(|source| format!(" ({})", file_display_name(&source.file)))
+            .unwrap_or_default();
+        text = format!("{text}\n\nOverrides {entry}{from}");
     }
-    (substituted != value).then_some(substituted)
+    text
 }
 
 /// A relative path value (`./`, `../`) from an `.asciidoctorconfig`, joined
@@ -546,46 +535,6 @@ fn config_relative_path(ws: &Workspace, doc_path: &Path, value: &str) -> Option<
     Some(normalize_lexically(
         &ws.attributes().doc_dir(doc_path)?.join(value),
     ))
-}
-
-/// Resolve the base directory and imagesdir for image paths.
-///
-/// Returns `(base_dir, resolved_imagesdir)` where `base_dir` is `doc_dir / imagesdir`
-/// (or just `doc_dir` if imagesdir is empty/unset). `doc_dir` is the document
-/// directory from the workspace (a symlink's folder for a symlinked document).
-pub(crate) fn resolve_image_base_dir(
-    doc_path: &Path,
-    workspace: Option<&Workspace>,
-) -> (PathBuf, String) {
-    let imagesdir_raw = workspace
-        .and_then(|ws| ws.attributes().resolve(doc_path, "imagesdir"))
-        .unwrap_or("");
-    let imagesdir = if let Some(ws) = workspace {
-        ws.attributes().substitute(doc_path, imagesdir_raw)
-    } else {
-        imagesdir_raw.to_string()
-    };
-    let base = image_base_dir(image_doc_dir(doc_path, workspace), &imagesdir);
-    (base, imagesdir)
-}
-
-/// The folder an image path starts from before `imagesdir`: the document
-/// directory from the workspace (a symlink's folder for a symlinked
-/// document).
-fn image_doc_dir<'a>(doc_path: &'a Path, workspace: Option<&'a Workspace>) -> &'a Path {
-    workspace
-        .and_then(|ws| ws.attributes().doc_dir(doc_path))
-        .or_else(|| doc_path.parent())
-        .unwrap_or(doc_path)
-}
-
-/// `doc_dir / imagesdir`, or `doc_dir` alone when `imagesdir` is empty.
-fn image_base_dir(doc_dir: &Path, imagesdir: &str) -> PathBuf {
-    if imagesdir.is_empty() {
-        doc_dir.to_path_buf()
-    } else {
-        normalize_lexically(&doc_dir.join(imagesdir))
-    }
 }
 
 /// Where an image macro points after attribute substitution and `imagesdir`.
@@ -612,21 +561,6 @@ fn is_remote_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
-/// Resolve an image macro's path to a file or a remote URL.
-fn resolve_image_target(
-    image_path: &str,
-    doc_path: &Path,
-    workspace: Option<&Workspace>,
-) -> ImageTarget {
-    let resolved_path = if let Some(ws) = workspace {
-        ws.attributes().substitute(doc_path, image_path)
-    } else {
-        image_path.to_string()
-    };
-    let (base, imagesdir) = resolve_image_base_dir(doc_path, workspace);
-    image_target(&resolved_path, &base, &imagesdir)
-}
-
 /// Where an image macro on `line` points, per top-level document and, for
 /// a file others include, in the editor's preview of it (ADR-008): target,
 /// `imagesdir` and `docdir` take the values in effect there. Each target
@@ -638,32 +572,18 @@ fn resolve_image_targets(
     workspace: Option<&Workspace>,
     line: usize,
 ) -> Vec<(String, ImageTarget)> {
+    let file_dir = document_dir(doc_path, workspace);
     let Some(ws) = workspace else {
-        let target = resolve_image_target(image_path, doc_path, None);
+        let target = image_target(image_path, file_dir, "");
         return vec![(file_display_name(doc_path), target)];
     };
-    let file_dir = image_doc_dir(doc_path, workspace);
-    ws.scopes_at(doc_path, line)
-        .into_iter()
-        .chain(ws.preview_scope_at(doc_path, line))
+    path_scopes(ws, doc_path, line)
         .map(|scope| {
-            let imagesdir = scope.value("imagesdir").unwrap_or_default();
-            let docdir = scope.value(DOCDIR).map(PathBuf::from);
-            let base = image_base_dir(docdir.as_deref().unwrap_or(file_dir), &imagesdir);
+            let (base, imagesdir) = scope_image_base(&scope, file_dir);
             let target = image_target(&scope.substitute(image_path), &base, &imagesdir);
             (scope_label(&scope), target)
         })
         .collect()
-}
-
-/// How a hover names a scope: its document, marked when it is a preview.
-fn scope_label(scope: &AttributeScope<'_>) -> String {
-    let name = file_display_name(scope.document());
-    if scope.is_preview() {
-        format!("{name} (preview)")
-    } else {
-        name
-    }
 }
 
 /// An image target from its substituted path, the folder it resolves
@@ -678,45 +598,73 @@ fn image_target(resolved_path: &str, base: &Path, imagesdir: &str) -> ImageTarge
         return ImageTarget::Remote { url: display };
     }
     ImageTarget::Local {
-        path: normalize_lexically(&base.join(resolved_path)),
+        path: join_doc_path(base, resolved_path),
         display,
     }
 }
 
-/// Resolve an include macro's path to a filesystem target, without checking
-/// that it exists. Shared by go-to-definition and the explain report.
-fn resolve_include_target(
-    include_path: &str,
+/// Where an include or xref file path on `line` points, per top-level
+/// document and, for a file others include, in the editor's preview of it
+/// (ADR-008), without checking that it exists. Each target comes with its
+/// scope's label and the path as substituted there; canonical when it
+/// exists. Without a workspace, one target with the label of `doc_path`.
+fn resolve_doc_targets(
+    target_path: &str,
     doc_path: &Path,
     workspace: Option<&Workspace>,
-) -> Option<PathBuf> {
-    if let Some(ws) = workspace {
-        asciidoc_core::paths::resolve_doc_target(doc_path, include_path, ws.attributes())
-    } else {
-        doc_path.parent().map(|dir| dir.join(include_path))
-    }
+    line: usize,
+) -> Vec<DocTarget> {
+    let dir = document_dir(doc_path, workspace);
+    let Some(ws) = workspace else {
+        return vec![DocTarget::new(
+            file_display_name(doc_path),
+            target_path,
+            dir,
+        )];
+    };
+    path_scopes(ws, doc_path, line)
+        .map(|scope| DocTarget::new(scope_label(&scope), &scope.substitute(target_path), dir))
+        .collect()
 }
 
-/// Resolve an xref target through the workspace reference index.
-/// Shared by go-to-definition and the explain report.
-fn resolve_xref_target(
+/// The distinct existing files among `targets`, in order.
+fn existing_targets(targets: &[DocTarget]) -> Vec<PathBuf> {
+    unique_in_order(
+        targets
+            .iter()
+            .filter(|target| target.path.exists())
+            .map(|target| target.path.clone()),
+    )
+}
+
+/// How an xref on `line` resolves, per top-level document and, for a file
+/// others include, in the editor's preview of it (ADR-008), each with its
+/// scope's label. Shared by go-to-definition, hover and the explain report.
+fn resolve_xref_targets(
     ws: &Workspace,
     doc_path: &Path,
     target: &str,
     line: usize,
-) -> Result<ResolvedXref, DiagnosticKind> {
+) -> Vec<(String, Result<ResolvedXref, DiagnosticKind>)> {
     let xref = asciidoc_core::types::Xref {
         target: target.to_string(),
         display_text: None,
         line,
     };
-    ws.reference_index().resolve_xref(
-        &xref,
-        doc_path,
-        ws.include_graph(),
-        ws.documents(),
-        ws.attributes(),
-    )
+    let dir = document_dir(doc_path, Some(ws));
+    path_scopes(ws, doc_path, line)
+        .map(|scope| {
+            let resolved = ws
+                .reference_index()
+                .resolve_xref_with(&xref, ws.documents(), |file| {
+                    Some(canonicalize_if_exists(join_doc_path(
+                        dir,
+                        &scope.substitute(file),
+                    )))
+                });
+            (scope_label(&scope), resolved)
+        })
+        .collect()
 }
 
 /// Build a debug report of what go-to-definition and hover see at `pos`.
@@ -738,17 +686,21 @@ pub fn explain_position(
     let resolution = node_info.as_ref().map_or(Value::Null, |info| {
         explain_resolution(info, lookup_path, workspace)
     });
+    let line = pos.line as usize + 1;
     let known_attributes: Vec<Value> = workspace
         .map(|ws| {
-            ws.attributes()
-                .known_attributes(lookup_path)
-                .into_iter()
-                .map(|k| {
-                    json!({
-                        "name": k.name,
-                        "value": k.value,
-                        "layer": layer_name(k.layer),
-                        "source": source_json(k.source.as_ref()),
+            ws.scopes_at(lookup_path, line)
+                .iter()
+                .flat_map(|scope| {
+                    let label = scope_label(scope);
+                    scope.known().into_iter().map(move |(name, definition)| {
+                        json!({
+                            "scope": label,
+                            "name": name,
+                            "value": definition.value,
+                            "origin": origin_name(definition.origin),
+                            "source": source_json(definition.source.as_ref()),
+                        })
                     })
                 })
                 .collect()
@@ -817,9 +769,10 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Workspace>) -> Value {
     let no_workspace = || json!({ "error": "no workspace" });
     match &info.kind {
-        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
-            workspace.map_or_else(no_workspace, |ws| explain_attribute(ws, doc_path, name))
-        }
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => workspace
+            .map_or_else(no_workspace, |ws| {
+                explain_attribute(ws, doc_path, name, info.line)
+            }),
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => workspace
             .map_or_else(no_workspace, |ws| {
                 explain_xref(ws, doc_path, target, info.line)
@@ -835,78 +788,98 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
             json!({ "definition": definition })
         }),
         NodeKind::Include { path } => {
-            let target = resolve_include_target(path, doc_path, workspace);
-            // Same existence gate as go-to-definition: the path gd returns.
-            let canonical_target = target.as_deref().and_then(|t| t.canonicalize().ok());
-            json!({
-                "target": target.as_deref().map(path_string),
-                "canonical_target": canonical_target.as_deref().map(path_string),
-                "exists": target.as_deref().is_some_and(Path::exists),
-            })
+            let scopes: Vec<Value> = resolve_doc_targets(path, doc_path, workspace, info.line)
+                .into_iter()
+                .map(|target| {
+                    // Same existence gate as go-to-definition: the path gd returns.
+                    let exists = target.path.exists();
+                    json!({
+                        "scope": target.label,
+                        "target": path_string(&target.joined),
+                        "canonical_target": exists.then(|| path_string(&target.path)),
+                        "exists": exists,
+                    })
+                })
+                .collect();
+            json!({ "scopes": scopes })
         }
         NodeKind::Image { path, .. } => {
-            match resolve_image_target(path, doc_path, workspace) {
-                ImageTarget::Remote { url } => json!({
-                    "remote": true,
-                    "target": null,
-                    "canonical_target": null,
-                    "display": url,
-                    "exists": null,
-                }),
-                ImageTarget::Local {
-                    path: target,
-                    display,
-                } => {
-                    // Same existence gate as go-to-definition: the path gd returns.
-                    let canonical_target = target.canonicalize().ok();
-                    json!({
-                        "remote": false,
-                        "target": path_string(&target),
-                        "canonical_target": canonical_target.as_deref().map(path_string),
-                        "display": display,
-                        "exists": target.exists(),
-                    })
-                }
-            }
+            let scopes: Vec<Value> = resolve_image_targets(path, doc_path, workspace, info.line)
+                .into_iter()
+                .map(|(label, target)| explain_image(&label, target))
+                .collect();
+            json!({ "scopes": scopes })
         }
     }
 }
 
-fn explain_attribute(ws: &Workspace, doc_path: &Path, name: &str) -> Value {
-    let registry = ws.attributes();
-    let explanation = registry.explain(doc_path, name);
+fn explain_image(label: &str, target: ImageTarget) -> Value {
+    match target {
+        ImageTarget::Remote { url } => json!({
+            "scope": label,
+            "remote": true,
+            "target": null,
+            "canonical_target": null,
+            "display": url,
+            "exists": null,
+        }),
+        ImageTarget::Local {
+            path: target,
+            display,
+        } => {
+            // Same existence gate as go-to-definition: the path gd returns.
+            let canonical_target = target.canonicalize().ok();
+            json!({
+                "scope": label,
+                "remote": false,
+                "target": path_string(&target),
+                "canonical_target": canonical_target.as_deref().map(path_string),
+                "display": display,
+                "exists": target.exists(),
+            })
+        }
+    }
+}
+
+/// `name` on `line` per top-level document (ADR-008: no preview scope for
+/// attribute values).
+fn explain_attribute(ws: &Workspace, doc_path: &Path, name: &str, line: usize) -> Value {
+    let scopes: Vec<Value> = ws
+        .scopes_at(doc_path, line)
+        .iter()
+        .map(|scope| {
+            json!({
+                "scope": scope_label(scope),
+                "value": scope.value(name),
+                "definition": scope.definition(name).as_ref().map(definition_json),
+            })
+        })
+        .collect();
+    json!({ "name": name, "scopes": scopes })
+}
+
+fn definition_json(definition: &AttributeDefinition) -> Value {
     json!({
-        "name": name,
-        "value": registry.resolve(doc_path, name),
-        "winner": explanation.winner.map(layer_name),
-        "per_file": {
-            "registered": explanation.per_file.registered,
-            "hit": hit_json(explanation.per_file.hit.as_ref()),
-        },
-        "config": {
-            "dir": explanation.config.dir.as_deref().map(path_string),
-            "chain_cached": explanation.config.chain_cached,
-            "hit": hit_json(explanation.config.hit.as_ref()),
-        },
-        "builtin": explanation.builtin,
+        "origin": origin_name(definition.origin),
+        "raw": definition.raw,
+        "value": definition.value,
+        "source": source_json(definition.source.as_ref()),
     })
 }
 
 fn explain_xref(ws: &Workspace, doc_path: &Path, target: &str, line: usize) -> Value {
-    match resolve_xref_target(ws, doc_path, target, line) {
-        Ok(resolved) => json!({
-            "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
-            "error": null,
-        }),
-        Err(e) => json!({ "resolved": null, "error": e.to_string() }),
-    }
-}
-
-fn hit_json(hit: Option<&AttributeHit>) -> Value {
-    hit.map_or(
-        Value::Null,
-        |h| json!({ "value": h.value, "source": source_json(h.source.as_ref()) }),
-    )
+    let scopes: Vec<Value> = resolve_xref_targets(ws, doc_path, target, line)
+        .into_iter()
+        .map(|(label, resolved)| match resolved {
+            Ok(resolved) => json!({
+                "scope": label,
+                "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
+                "error": null,
+            }),
+            Err(e) => json!({ "scope": label, "resolved": null, "error": e.to_string() }),
+        })
+        .collect();
+    json!({ "scopes": scopes })
 }
 
 fn source_json(source: Option<&AttributeSource>) -> Value {
@@ -916,12 +889,12 @@ fn source_json(source: Option<&AttributeSource>) -> Value {
     )
 }
 
-/// Stable report name of an attribute layer, independent of Rust's `Debug`.
-fn layer_name(layer: AttributeLayer) -> &'static str {
-    match layer {
-        AttributeLayer::PerFile => "per_file",
-        AttributeLayer::Config => "config",
-        AttributeLayer::Builtin => "builtin",
+/// Stable report name of an attribute origin, independent of Rust's `Debug`.
+fn origin_name(origin: AttributeOrigin) -> &'static str {
+    match origin {
+        AttributeOrigin::Document => "document",
+        AttributeOrigin::Config => "config",
+        AttributeOrigin::Builtin => "builtin",
     }
 }
 
@@ -936,14 +909,6 @@ fn anchor_kind_name(kind: AnchorKind) -> &'static str {
 
 fn path_string(path: &Path) -> String {
     path.display().to_string()
-}
-
-/// Extract a display-friendly filename from a path.
-fn file_display_name(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |f| f.to_string_lossy().into_owned(),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,10 +1248,7 @@ pub fn resolve_rename(
             }
 
             // Attribute definitions: :name: → find columns via text search
-            for source in ws
-                .resolve_attribute(doc_path, node_info.line, name)
-                .locations
-            {
+            for source in ws.definition_sites(doc_path, node_info.line, name) {
                 let file_content = read_content(&source.file, overrides);
                 let def_line = file_content
                     .lines()
@@ -1486,6 +1448,7 @@ fn find_attr_def_columns(line_text: &str, name: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scanned;
     use rstest::rstest;
     use std::fs;
 
@@ -1556,7 +1519,7 @@ mod tests {
         assert!(find_node_at_position(content, pos).is_none());
     }
 
-    // --- Task 4.2: resolve_goto_definition for include ---
+    // --- Task 4.2: resolve_goto_definitions for include ---
 
     #[test]
     fn test_goto_def_include() {
@@ -1573,9 +1536,10 @@ mod tests {
             character: 12,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, None).unwrap();
-        assert_eq!(target, b.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, None),
+            vec![(b.canonicalize().unwrap(), 1)]
+        );
     }
 
     #[test]
@@ -1590,10 +1554,10 @@ mod tests {
             character: 12,
         };
 
-        assert!(resolve_goto_definition(&content, pos, &a, None).is_none());
+        assert!(resolve_goto_definitions(&content, pos, &a, None).is_empty());
     }
 
-    // --- Task 4.3: resolve_goto_definition for xref ---
+    // --- Task 4.3: resolve_goto_definitions for xref ---
 
     #[test]
     fn test_goto_def_xref_file_anchor() {
@@ -1616,9 +1580,10 @@ mod tests {
             character: 12,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, b.canonicalize().unwrap());
-        assert_eq!(line, 1); // [[my-anchor]] is on line 1
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(b.canonicalize().unwrap(), 1)]
+        );
     }
 
     // adoc-0125: xrefs in default (`|`) and AsciiDoc (`a|`) table cells.
@@ -1646,9 +1611,10 @@ mod tests {
             character,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, b);
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(b, 1)]
+        );
     }
 
     #[test]
@@ -1668,9 +1634,10 @@ mod tests {
             character: 8,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, b.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(b.canonicalize().unwrap(), 1)]
+        );
     }
 
     #[test]
@@ -1686,7 +1653,7 @@ mod tests {
             character: 8,
         };
 
-        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+        assert!(resolve_goto_definitions(&content, pos, &a, Some(&ws)).is_empty());
     }
 
     #[test]
@@ -1703,7 +1670,7 @@ mod tests {
             character: 1,
         };
 
-        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+        assert!(resolve_goto_definitions(&content, pos, &a, Some(&ws)).is_empty());
     }
 
     #[test]
@@ -1727,166 +1694,144 @@ mod tests {
             character: 8,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, b.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(b.canonicalize().unwrap(), 1)]
+        );
     }
 
-    // --- Task 3.1: resolve_goto_definition for attribute references ---
+    // --- Task 3.1: resolve_goto_definitions for attribute references ---
 
     #[test]
     fn test_goto_def_attribute_doc_header() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.adoc");
-        fs::write(&a, "= Doc A\n:author: Alice\n\nWritten by {author}.\n").unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
-        let content = fs::read_to_string(&a).unwrap();
+        let content = "= Doc A\n:author: Alice\n\nWritten by {author}.\n";
+        let (_tmp, ws, paths) = scanned(&[("a.adoc", content)]);
         // character 12 = 'a' in "{author}" on line 3 (0-indexed)
         let pos = Position {
             line: 3,
             character: 12,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, a.canonicalize().unwrap());
-        assert_eq!(line, 2); // :author: is on line 2 (1-indexed)
+        // :author: is on line 2 (1-indexed)
+        assert_eq!(
+            resolve_goto_definitions(content, pos, &paths[0], Some(&ws)),
+            vec![(paths[0].clone(), 2)]
+        );
     }
 
     #[test]
     fn test_goto_def_attribute_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(
-            tmp.path().join(".asciidoctorconfig"),
-            ":imagesdir: images\n",
-        )
-        .unwrap();
-        let a = tmp.path().join("a.adoc");
-        fs::write(&a, "= Doc A\n\nImages in {imagesdir} folder.\n").unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
-        let content = fs::read_to_string(&a).unwrap();
+        let content = "= Doc A\n\nImages in {imagesdir} folder.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (".asciidoctorconfig", ":imagesdir: images\n"),
+            ("a.adoc", content),
+        ]);
         // character 11 = 'i' in "{imagesdir}" on line 2 (0-indexed)
         let pos = Position {
             line: 2,
             character: 11,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        let config_path = tmp
-            .path()
-            .join(".asciidoctorconfig")
-            .canonicalize()
-            .unwrap();
-        assert_eq!(target, config_path);
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(content, pos, &paths[1], Some(&ws)),
+            vec![(paths[0].clone(), 1)]
+        );
     }
 
     #[test]
     fn test_goto_def_attribute_defined_in_included_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let main = tmp.path().join("main.adoc");
-        let attrs = tmp.path().join("attrs.adoc");
-        fs::write(&attrs, ":custom: value\n").unwrap();
         let content = "= Main\ninclude::attrs.adoc[]\n\nSee {custom}.\n";
-        fs::write(&main, content).unwrap();
-
-        let ws = Workspace::build(tmp.path(), &main);
+        let (_tmp, ws, paths) =
+            scanned(&[("attrs.adoc", ":custom: value\n"), ("main.adoc", content)]);
         let pos = Position {
             line: 3,
             character: 6,
         };
 
-        let (target, line) = resolve_goto_definition(content, pos, &main, Some(&ws)).unwrap();
-        assert_eq!(target, attrs.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(content, pos, &paths[1], Some(&ws)),
+            vec![(paths[0].clone(), 1)]
+        );
     }
 
+    /// The attribute, its definition, the include and the rename and
+    /// references that reach the definition, with the definition in a file
+    /// included next to the chapter that uses it.
     #[test]
-    fn test_goto_def_attribute_defined_in_sibling_include() {
-        let tmp = tempfile::tempdir().unwrap();
-        let main = tmp.path().join("main.adoc");
-        let attrs = tmp.path().join("attrs.adoc");
-        let chapter = tmp.path().join("chapter.adoc");
-        fs::write(&attrs, ":custom: value\n").unwrap();
-        fs::write(
-            &main,
-            "= Main\ninclude::attrs.adoc[]\ninclude::chapter.adoc[]\n",
-        )
-        .unwrap();
-        let content = "== Chapter\n\nSee {custom}.\n";
-        fs::write(&chapter, content).unwrap();
+    fn test_attribute_defined_in_sibling_include_is_reachable() {
+        let chapter = "== Chapter\n\nSee {custom}.\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (
+                "main.adoc",
+                "= Main\ninclude::attrs.adoc[]\ninclude::chapter.adoc[]\n",
+            ),
+            ("attrs.adoc", ":custom: some value\n"),
+            ("chapter.adoc", chapter),
+        ]);
+        let (attrs, chapter_path) = (&paths[1], &paths[2]);
+        let pos = at_reference(2);
 
-        // The server scans the whole workspace; `build` would only follow
-        // includes from `chapter.adoc` and never see `main.adoc`.
-        let mut ws = Workspace::new(tmp.path());
-        ws.scan_workspace();
-        let chapter = chapter.canonicalize().unwrap();
-        let pos = Position {
-            line: 2,
-            character: 6,
-        };
-
-        let (target, line) = resolve_goto_definition(content, pos, &chapter, Some(&ws)).unwrap();
-        assert_eq!(target, attrs.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(chapter, pos, chapter_path, Some(&ws)),
+            vec![(attrs.clone(), 1)]
+        );
+        assert_eq!(
+            resolve_hover(chapter, pos, chapter_path, Some(&ws)).unwrap(),
+            ":custom: some value\n\nDefined in attrs.adoc:1"
+        );
+        let edits = resolve_rename(chapter, pos, chapter_path, Some(&ws), &HashMap::new()).unwrap();
+        assert!(edits.contains_key(attrs), "edits: {edits:?}");
+        let refs = resolve_references(chapter, pos, chapter_path, Some(&ws), true).unwrap();
+        assert!(
+            refs.iter().any(|loc| loc.path == *attrs && loc.line == 1),
+            "refs: {refs:?}"
+        );
     }
 
     #[test]
     fn test_goto_def_attribute_used_before_defining_include() {
         // Asciidoctor leaves {custom} unresolved here; navigation still finds it.
-        let tmp = tempfile::tempdir().unwrap();
-        let main = tmp.path().join("main.adoc");
-        let attrs = tmp.path().join("attrs.adoc");
-        fs::write(&attrs, ":custom: value\n").unwrap();
         let content = "= Main\n\nSee {custom}.\n\ninclude::attrs.adoc[]\n";
-        fs::write(&main, content).unwrap();
-
-        let ws = Workspace::build(tmp.path(), &main);
+        let (_tmp, ws, paths) =
+            scanned(&[("attrs.adoc", ":custom: value\n"), ("main.adoc", content)]);
         let pos = Position {
             line: 2,
             character: 6,
         };
 
-        let (target, line) = resolve_goto_definition(content, pos, &main, Some(&ws)).unwrap();
-        assert_eq!(target, attrs.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(content, pos, &paths[1], Some(&ws)),
+            vec![(paths[0].clone(), 1)]
+        );
     }
 
     #[test]
     fn test_goto_def_attribute_takes_last_definition_before_reference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let main = tmp.path().join("main.adoc");
-        let attrs = tmp.path().join("attrs.adoc");
-        fs::write(&attrs, ":custom: first\n").unwrap();
         let content = "= Main\ninclude::attrs.adoc[]\n\nSee {custom}.\n\n:custom: second\n";
-        fs::write(&main, content).unwrap();
-
-        let ws = Workspace::build(tmp.path(), &main);
+        let (_tmp, ws, paths) =
+            scanned(&[("attrs.adoc", ":custom: first\n"), ("main.adoc", content)]);
         let pos = Position {
             line: 3,
             character: 6,
         };
 
-        let (target, line) = resolve_goto_definition(content, pos, &main, Some(&ws)).unwrap();
-        assert_eq!(target, attrs.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        // Effective definition first, then the later one in reading order.
+        assert_eq!(
+            resolve_goto_definitions(content, pos, &paths[1], Some(&ws)),
+            vec![(paths[0].clone(), 1), (paths[1].clone(), 6)]
+        );
     }
 
     #[test]
     fn test_goto_def_attribute_undefined() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.adoc");
-        fs::write(&a, "= Doc A\n\nSee {nonexistent} here.\n").unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
-        let content = fs::read_to_string(&a).unwrap();
+        let content = "= Doc A\n\nSee {nonexistent} here.\n";
+        let (_tmp, ws, paths) = scanned(&[("a.adoc", content)]);
         let pos = Position {
             line: 2,
             character: 5,
         };
 
-        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+        assert!(resolve_goto_definitions(content, pos, &paths[0], Some(&ws)).is_empty());
     }
 
     // --- Task 2.1: find_node_at_position for {attribute} references ---
@@ -2168,8 +2113,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         assert_eq!(
-            resolve_goto_definition(&content, pos, &config, Some(&ws)),
-            Some((config.clone(), 2))
+            resolve_goto_definitions(&content, pos, &config, Some(&ws)),
+            vec![(config.clone(), 2)]
         );
         let refs = resolve_references(&content, pos, &config, Some(&ws), true).unwrap();
         let found: Vec<(&Path, usize)> = refs
@@ -2656,7 +2601,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0033 Task 2.1: resolve_goto_definition for image ---
+    // --- adoc-0033 Task 2.1: resolve_goto_definitions for image ---
 
     #[test]
     fn test_goto_def_image_simple() {
@@ -2673,9 +2618,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 10,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, None).unwrap();
-        assert_eq!(target, img.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, None),
+            vec![(img.canonicalize().unwrap(), 1)]
+        );
     }
 
     #[test]
@@ -2702,9 +2648,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 10,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, img.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(img.canonicalize().unwrap(), 1)]
+        );
     }
 
     #[test]
@@ -2728,9 +2675,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 20,
         };
 
-        let (target, line) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, img.canonicalize().unwrap());
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(img.canonicalize().unwrap(), 1)]
+        );
     }
 
     // --- adoc-0030: resolve_hover tests ---
@@ -2817,24 +2765,6 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    /// A scanned workspace of `files` (relative path, content), as the server
-    /// builds it, and the canonical path of each file.
-    fn scanned(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace, Vec<PathBuf>) {
-        let tmp = tempfile::tempdir().unwrap();
-        for (path, content) in files {
-            let path = tmp.path().join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, content).unwrap();
-        }
-        let mut ws = Workspace::new(tmp.path());
-        ws.scan_workspace();
-        let paths = files
-            .iter()
-            .map(|(path, _)| tmp.path().join(path).canonicalize().unwrap())
-            .collect();
-        (tmp, ws, paths)
-    }
-
     /// `See {name}.` puts the reference at character 5.
     fn at_reference(line: u32) -> Position {
         Position { line, character: 5 }
@@ -2890,6 +2820,160 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             resolve_hover(content, second, &paths[0], Some(&ws)).unwrap(),
             ":x: {x} two\n\nResolves to one two"
         );
+    }
+
+    #[test]
+    fn test_hover_attribute_def_in_shared_file_shows_each_master() {
+        let shared = ":custom: {base}/x\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("m1.adoc", "= M1\n:base: A\ninclude::shared.adoc[]\n"),
+            ("m2.adoc", "= M2\n:base: B\ninclude::shared.adoc[]\n"),
+            ("shared.adoc", shared),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(shared, pos, &paths[2], Some(&ws)).unwrap(),
+            "In m1.adoc:\n:custom: {base}/x\n\nResolves to A/x\n\n\
+             In m2.adoc:\n:custom: {base}/x\n\nResolves to B/x"
+        );
+    }
+
+    /// A definition hover shows the line under the cursor. In a config file
+    /// the chain above it (without the file itself) only adds what the line
+    /// overrides.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_shows_its_own_line_and_what_it_overrides() {
+        let child = ":d: down\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (".asciidoctorconfig", ":d: ./up\n"),
+            ("sub/.asciidoctorconfig", child),
+            ("sub/b.adoc", "= B\n"),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
+            ":d: down\n\nOverrides :d: ./up (.asciidoctorconfig)"
+        );
+    }
+
+    /// The line's own value is substituted against the chain above, so a
+    /// reference to the overridden name reads the parent's value.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_substitutes_against_the_config_above() {
+        let child = ":d: {d}/more\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (".asciidoctorconfig", ":d: ./up\n"),
+            ("sub/.asciidoctorconfig", child),
+            ("sub/b.adoc", "= B\n"),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        let sub = paths[1].parent().unwrap();
+        assert_eq!(
+            resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
+            format!(
+                ":d: {{d}}/more\n\nResolves to {}/up/more\n\nOverrides :d: ./up (.asciidoctorconfig)",
+                sub.display()
+            )
+        );
+    }
+
+    /// Both config files of one folder load, the one without extension last:
+    /// it overrides its sibling.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_overrides_its_sibling_config() {
+        let plain = ":d: plain\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (".asciidoctorconfig.adoc", ":d: adoc\n"),
+            (".asciidoctorconfig", plain),
+            ("a.adoc", "= A\n"),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(plain, pos, &paths[1], Some(&ws)).unwrap(),
+            ":d: plain\n\nOverrides :d: adoc (.asciidoctorconfig.adoc)"
+        );
+    }
+
+    /// A definition in the `.adoc` config file shows its own line too, not
+    /// the definition of a config above.
+    #[test]
+    fn test_hover_attribute_def_in_adoc_config_file_shows_its_own_line() {
+        let child = ":d: down\n";
+        let (_tmp, ws, paths) = scanned(&[
+            (".asciidoctorconfig", ":d: up\n"),
+            ("sub/.asciidoctorconfig.adoc", child),
+            ("sub/b.adoc", "= B\n"),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
+            ":d: down\n\nOverrides :d: up (.asciidoctorconfig)"
+        );
+    }
+
+    /// A path with `..` is not the key the workspace indexes: the cursor line
+    /// must still be matched to the document's own definition.
+    #[test]
+    fn test_hover_attribute_def_with_non_canonical_path() {
+        let content = "= M\n:x: one\n:x: {x} two\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content), ("sub/b.adoc", "= B\n")]);
+        let non_canonical = paths[0]
+            .parent()
+            .unwrap()
+            .join("sub")
+            .join("..")
+            .join("m.adoc");
+        let pos = Position {
+            line: 2,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(content, pos, &non_canonical, Some(&ws)).unwrap(),
+            ":x: {x} two\n\nResolves to one two"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_def_in_config_file_without_config_above_shows_its_own_line() {
+        let config = ":d: only\n";
+        let (_tmp, ws, paths) = scanned(&[(".asciidoctorconfig", config), ("a.adoc", "= A\n")]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(config, pos, &paths[0], Some(&ws)).unwrap(),
+            ":d: only"
+        );
+    }
+
+    #[test]
+    fn test_hover_attribute_def_in_file_outside_workspace_is_none() {
+        let (_tmp, ws, _paths) = scanned(&[("a.adoc", "= A\n")]);
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("o.adoc");
+        let content = "= O\n:y: v\n";
+        fs::write(&file, content).unwrap();
+        let pos = Position {
+            line: 1,
+            character: 1,
+        };
+        assert!(resolve_hover(content, pos, &file, Some(&ws)).is_none());
     }
 
     #[test]
@@ -3037,6 +3121,77 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(targets, vec![(paths[3].clone(), 1)]);
     }
 
+    /// An include target takes the attribute values of each top-level
+    /// document and of the editor's preview, like an image (ADR-008).
+    #[test]
+    fn test_hover_include_shows_preview_of_included_file_where_it_breaks() {
+        let chapter = "== C\n\ninclude::{parts}/p.adoc[]\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("book.adoc", "= B\n:parts: parts\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+            ("parts/p.adoc", "Text.\n"),
+        ]);
+        let pos = Position {
+            line: 2,
+            character: 2,
+        };
+        let hover = resolve_hover(chapter, pos, &paths[1], Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            "In book.adoc:\ninclude::parts/p.adoc[]\n\n\u{2713} File exists | 0 sections\n\n\
+             In ch.adoc (preview):\ninclude::{parts}/p.adoc[]\n\n\u{2717} File not found"
+        );
+        let targets = resolve_goto_definitions(chapter, pos, &paths[1], Some(&ws));
+        assert_eq!(targets, vec![(paths[2].clone(), 1)]);
+    }
+
+    /// Two top-level documents point the same include at different files:
+    /// goto offers both.
+    #[test]
+    fn test_goto_def_include_offers_each_top_level_document() {
+        let chapter = "== C\n\ninclude::{edition}/p.adoc[]\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("a-print.adoc", "= A\n:edition: print\ninclude::ch.adoc[]\n"),
+            ("b-web.adoc", "= B\n:edition: web\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+            ("print/p.adoc", "Print.\n"),
+            ("web/p.adoc", "Web.\n"),
+        ]);
+        let pos = Position {
+            line: 2,
+            character: 2,
+        };
+        let targets = resolve_goto_definitions(chapter, pos, &paths[2], Some(&ws));
+        assert_eq!(targets, vec![(paths[3].clone(), 1), (paths[4].clone(), 1)]);
+    }
+
+    /// An xref's file part takes each top-level document's values: goto
+    /// offers both targets, hover names the document for each.
+    #[test]
+    fn test_xref_offers_each_top_level_document() {
+        let chapter = "== C\n\nSee xref:{edition}/p.adoc[].\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("a-print.adoc", "= A\n:edition: print\ninclude::ch.adoc[]\n"),
+            ("b-web.adoc", "= B\n:edition: web\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", chapter),
+            ("print/p.adoc", "= Print\n"),
+            ("web/p.adoc", "= Web\n"),
+        ]);
+        let pos = Position {
+            line: 2,
+            character: 6,
+        };
+        let targets = resolve_goto_definitions(chapter, pos, &paths[2], Some(&ws));
+        assert_eq!(targets, vec![(paths[3].clone(), 1), (paths[4].clone(), 1)]);
+        let hover = resolve_hover(chapter, pos, &paths[2], Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            "In a-print.adoc:\n\u{2192} Print\n\np.adoc:1\n\n\
+             In b-web.adoc:\n\u{2192} Web\n\np.adoc:1\n\n\
+             In ch.adoc (preview):\n\u{2717} Target not found"
+        );
+    }
+
     #[test]
     fn test_hover_attribute_names_top_level_document_without_value() {
         let chapter = "== C\n\nSee {x}.\n";
@@ -3076,86 +3231,29 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     fn test_goto_def_attribute_file_included_twice_is_read_twice() {
         let content = "= M\ninclude::a.adoc[]\n:x: two\ninclude::a.adoc[]\n\nSee {x}.\n";
         let (_tmp, ws, paths) = scanned(&[("a.adoc", ":x: one\n"), ("m.adoc", content)]);
-        let target = resolve_goto_definition(content, at_reference(5), &paths[1], Some(&ws));
-        assert_eq!(target, Some((paths[0].clone(), 1)));
+        let targets = resolve_goto_definitions(content, at_reference(5), &paths[1], Some(&ws));
+        // The second read of a.adoc is the effective one; `:x: two` follows.
+        assert_eq!(targets, vec![(paths[0].clone(), 1), (paths[1].clone(), 3)]);
     }
 
     #[test]
     fn test_goto_def_attribute_in_self_including_file() {
         let content = "= S\ninclude::s.adoc[]\n:x: v\n\nSee {x}.\n";
         let (_tmp, ws, paths) = scanned(&[("s.adoc", content)]);
-        let target = resolve_goto_definition(content, at_reference(4), &paths[0], Some(&ws));
-        assert_eq!(target, Some((paths[0].clone(), 3)));
-    }
-
-    #[test]
-    fn test_rename_and_references_reach_definition_in_include() {
-        let chapter = "== C\n\nSee {custom}.\n";
-        let (_tmp, ws, paths) = scanned(&[
-            (
-                "main.adoc",
-                "= M\ninclude::attrs.adoc[]\ninclude::ch.adoc[]\n",
-            ),
-            ("attrs.adoc", ":custom: v\n"),
-            ("ch.adoc", chapter),
-        ]);
-        let edits = resolve_rename(
-            chapter,
-            at_reference(2),
-            &paths[2],
-            Some(&ws),
-            &HashMap::new(),
-        )
-        .unwrap();
-        assert!(edits.contains_key(&paths[1]), "edits: {edits:?}");
-        let refs =
-            resolve_references(chapter, at_reference(2), &paths[2], Some(&ws), true).unwrap();
-        assert!(
-            refs.iter().any(|loc| loc.path == paths[1] && loc.line == 1),
-            "refs: {refs:?}"
-        );
-    }
-
-    #[test]
-    fn test_hover_attribute_ref_defined_in_sibling_include() {
-        let tmp = tempfile::tempdir().unwrap();
-        let main = tmp.path().join("main.adoc");
-        let chapter = tmp.path().join("chapter.adoc");
-        fs::write(tmp.path().join("attrs.adoc"), ":custom: some value\n").unwrap();
-        fs::write(
-            &main,
-            "= Main\ninclude::attrs.adoc[]\ninclude::chapter.adoc[]\n",
-        )
-        .unwrap();
-        let content = "== Chapter\n\nSee {custom}.\n";
-        fs::write(&chapter, content).unwrap();
-
-        let mut ws = Workspace::new(tmp.path());
-        ws.scan_workspace();
-        let chapter = chapter.canonicalize().unwrap();
-        let pos = Position {
-            line: 2,
-            character: 6,
-        };
-
-        let hover = resolve_hover(content, pos, &chapter, Some(&ws)).unwrap();
-        assert_eq!(hover, ":custom: some value\n\nDefined in attrs.adoc:1");
+        let targets = resolve_goto_definitions(content, at_reference(4), &paths[0], Some(&ws));
+        assert_eq!(targets, vec![(paths[0].clone(), 3)]);
     }
 
     #[test]
     fn test_hover_attribute_def_substitutes_references() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.adoc");
         let content = "= Doc A\n:assets: doc/assets\n:imagesdir: {assets}/img\n";
-        fs::write(&a, content).unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
+        let (_tmp, ws, paths) = scanned(&[("a.adoc", content)]);
         let pos = Position {
             line: 2,
             character: 3,
         };
 
-        let hover = resolve_hover(content, pos, &a, Some(&ws)).unwrap();
+        let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
         assert_eq!(
             hover,
             ":imagesdir: {assets}/img\n\nResolves to doc/assets/img"
@@ -3164,18 +3262,14 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
     #[test]
     fn test_hover_attribute_unknown_reference_adds_no_resolution() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.adoc");
         let content = "= Doc A\n:imagesdir: {nowhere}/img\n";
-        fs::write(&a, content).unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
+        let (_tmp, ws, paths) = scanned(&[("a.adoc", content)]);
         let pos = Position {
             line: 1,
             character: 3,
         };
 
-        let hover = resolve_hover(content, pos, &a, Some(&ws)).unwrap();
+        let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
         assert_eq!(hover, ":imagesdir: {nowhere}/img");
     }
 
@@ -3476,9 +3570,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
         assert_eq!(hover, "image:img/logo.png[]\n\n\u{2713} File exists");
-        let (target, line) = resolve_goto_definition(doc, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(target, img.join("logo.png"));
-        assert_eq!(line, 1);
+        assert_eq!(
+            resolve_goto_definitions(doc, pos, &a, Some(&ws)),
+            vec![(img.join("logo.png"), 1)]
+        );
     }
 
     #[test]
@@ -3495,7 +3590,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
         assert_eq!(hover, "image:missing.png[]\n\n\u{2717} File not found");
-        assert!(resolve_goto_definition(doc, pos, &a, Some(&ws)).is_none());
+        assert!(resolve_goto_definitions(doc, pos, &a, Some(&ws)).is_empty());
     }
 
     #[rstest]
@@ -3543,10 +3638,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             resolve_hover(doc, pos, &a, Some(&ws)).unwrap(),
             format!("{macro_form}{url}[]")
         );
-        assert!(resolve_goto_definition(doc, pos, &a, Some(&ws)).is_none());
+        assert!(resolve_goto_definitions(doc, pos, &a, Some(&ws)).is_empty());
 
         let report = explain_position(doc, pos, &a, &a, Some(&ws));
-        let res = &report["resolution"];
+        let res = &report["resolution"]["scopes"][0];
         assert_eq!(report["node"]["kind"], "image");
         assert_eq!(res["remote"], true);
         assert_eq!(res["display"], url);
@@ -3647,7 +3742,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 10,
         };
 
-        assert!(resolve_goto_definition(&content, pos, &a, None).is_none());
+        assert!(resolve_goto_definitions(&content, pos, &a, None).is_empty());
     }
 
     // --- adoc-0036: Column-finder helpers ---
@@ -4343,14 +4438,15 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(report["node"]["kind"], "attribute_ref");
         assert_eq!(report["node"]["line"], 4);
         assert_eq!(report["node"]["fields"]["name"], "author");
-        let res = &report["resolution"];
+        assert_eq!(report["resolution"]["name"], "author");
+        let scopes = report["resolution"]["scopes"].as_array().unwrap();
+        assert_eq!(scopes.len(), 1);
+        let res = &scopes[0];
+        assert_eq!(res["scope"], "a.adoc");
         assert_eq!(res["value"], "Alice");
-        assert_eq!(res["winner"], "per_file");
-        assert_eq!(res["per_file"]["registered"], true);
-        assert_eq!(res["per_file"]["hit"]["value"], "Alice");
-        assert_eq!(res["per_file"]["hit"]["source"]["line"], 2);
-        assert_eq!(res["config"]["dir"], path_string(&root));
-        assert!(res["builtin"].is_null());
+        assert_eq!(res["definition"]["origin"], "document");
+        assert_eq!(res["definition"]["raw"], "Alice");
+        assert_eq!(res["definition"]["source"]["line"], 2);
     }
 
     #[test]
@@ -4369,8 +4465,11 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         assert_eq!(report["node"]["kind"], "attribute_def");
         assert_eq!(report["node"]["fields"]["name"], "author");
-        assert_eq!(report["resolution"]["value"], "Alice");
-        assert_eq!(report["resolution"]["winner"], "per_file");
+        // The value before the entry: on its own line it is not set yet.
+        let res = &report["resolution"]["scopes"][0];
+        assert!(res["value"].is_null());
+        assert_eq!(res["definition"]["origin"], "document");
+        assert_eq!(res["definition"]["value"], "Alice");
     }
 
     #[test]
@@ -4395,9 +4494,12 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         assert_eq!(report["node"]["kind"], "xref");
         assert_eq!(report["node"]["fields"]["target"], "b.adoc#my-anchor");
-        assert_eq!(report["resolution"]["resolved"]["file"], path_string(&b));
-        assert_eq!(report["resolution"]["resolved"]["line"], 1);
-        assert!(report["resolution"]["error"].is_null());
+        assert_eq!(
+            report["resolution"]["scopes"][0]["resolved"]["file"],
+            path_string(&b)
+        );
+        assert_eq!(report["resolution"]["scopes"][0]["resolved"]["line"], 1);
+        assert!(report["resolution"]["scopes"][0]["error"].is_null());
     }
 
     #[test]
@@ -4415,9 +4517,9 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(report["node"]["kind"], "shorthand_xref");
-        assert!(report["resolution"]["resolved"].is_null());
+        assert!(report["resolution"]["scopes"][0]["resolved"].is_null());
         assert_eq!(
-            report["resolution"]["error"],
+            report["resolution"]["scopes"][0]["error"],
             "Broken cross-reference: nonexistent-anchor"
         );
     }
@@ -4440,12 +4542,15 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         assert_eq!(report["node"]["kind"], "include");
         assert_eq!(report["node"]["fields"]["path"], "sub.adoc");
-        assert_eq!(report["resolution"]["target"], path_string(&b));
-        assert_eq!(report["resolution"]["exists"], true);
-        let (gd_target, _) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
+        assert_eq!(report["resolution"]["scopes"][0]["target"], path_string(&b));
+        assert_eq!(report["resolution"]["scopes"][0]["exists"], true);
         assert_eq!(
-            report["resolution"]["canonical_target"],
-            path_string(&gd_target)
+            report["resolution"]["scopes"][0]["canonical_target"],
+            path_string(&b)
+        );
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(b, 1)]
         );
     }
 
@@ -4464,12 +4569,12 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
         assert_eq!(
-            report["resolution"]["target"],
+            report["resolution"]["scopes"][0]["target"],
             path_string(&root.join("missing.adoc"))
         );
-        assert_eq!(report["resolution"]["exists"], false);
-        assert!(report["resolution"]["canonical_target"].is_null());
-        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+        assert_eq!(report["resolution"]["scopes"][0]["exists"], false);
+        assert!(report["resolution"]["scopes"][0]["canonical_target"].is_null());
+        assert!(resolve_goto_definitions(&content, pos, &a, Some(&ws)).is_empty());
     }
 
     #[cfg(unix)]
@@ -4493,14 +4598,16 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         // so the symlinked raw target and gd's canonical path differ.
         let report = explain_position(&content, pos, &a, &a, None);
 
-        let res = &report["resolution"];
+        let res = &report["resolution"]["scopes"][0];
         assert_eq!(
             res["target"],
             path_string(&root.join("link").join("sub.adoc"))
         );
         assert_eq!(res["canonical_target"], path_string(&sub));
-        let (gd_target, _) = resolve_goto_definition(&content, pos, &a, None).unwrap();
-        assert_eq!(res["canonical_target"], path_string(&gd_target));
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, None),
+            vec![(sub, 1)]
+        );
     }
 
     #[test]
@@ -4520,14 +4627,14 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(report["node"]["kind"], "image");
         assert_eq!(report["node"]["fields"]["path"], "logo.png");
         assert_eq!(
-            report["resolution"]["target"],
+            report["resolution"]["scopes"][0]["target"],
             path_string(&root.join("img").join("logo.png"))
         );
-        assert_eq!(report["resolution"]["display"], "img/logo.png");
-        assert_eq!(report["resolution"]["exists"], false);
-        assert_eq!(report["resolution"]["remote"], false);
-        assert!(report["resolution"]["canonical_target"].is_null());
-        assert!(resolve_goto_definition(&content, pos, &a, Some(&ws)).is_none());
+        assert_eq!(report["resolution"]["scopes"][0]["display"], "img/logo.png");
+        assert_eq!(report["resolution"]["scopes"][0]["exists"], false);
+        assert_eq!(report["resolution"]["scopes"][0]["remote"], false);
+        assert!(report["resolution"]["scopes"][0]["canonical_target"].is_null());
+        assert!(resolve_goto_definitions(&content, pos, &a, Some(&ws)).is_empty());
     }
 
     #[cfg(unix)]
@@ -4550,14 +4657,16 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let report = explain_position(&content, pos, &a, &a, Some(&ws));
 
-        let res = &report["resolution"];
+        let res = &report["resolution"]["scopes"][0];
         assert_eq!(
             res["target"],
             path_string(&root.join("link").join("logo.png"))
         );
         assert_eq!(res["canonical_target"], path_string(&logo));
-        let (gd_target, _) = resolve_goto_definition(&content, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(res["canonical_target"], path_string(&gd_target));
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(logo, 1)]
+        );
     }
 
     #[test]
@@ -4608,17 +4717,18 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let known = report["known_attributes"].as_array().unwrap();
         let author = known.iter().find(|k| k["name"] == "author").unwrap();
         assert_eq!(author["value"], "Alice");
-        assert_eq!(author["layer"], "per_file");
+        assert_eq!(author["scope"], "a.adoc");
+        assert_eq!(author["origin"], "document");
         assert_eq!(author["source"]["line"], 2);
         let docdir = known.iter().find(|k| k["name"] == "docdir").unwrap();
-        assert_eq!(docdir["layer"], "builtin");
+        assert_eq!(docdir["origin"], "builtin");
     }
 
     #[test]
-    fn test_explain_layer_names_are_stable_snake_case() {
-        assert_eq!(layer_name(AttributeLayer::PerFile), "per_file");
-        assert_eq!(layer_name(AttributeLayer::Config), "config");
-        assert_eq!(layer_name(AttributeLayer::Builtin), "builtin");
+    fn test_explain_origin_names_are_stable_snake_case() {
+        assert_eq!(origin_name(AttributeOrigin::Document), "document");
+        assert_eq!(origin_name(AttributeOrigin::Config), "config");
+        assert_eq!(origin_name(AttributeOrigin::Builtin), "builtin");
     }
 
     #[test]
@@ -4706,14 +4816,12 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(req["paths_differ"], true);
         assert_eq!(req["in_documents_raw"], false);
         assert_eq!(req["in_documents_canonical"], true);
-        assert_eq!(report["resolution"]["per_file"]["registered"], false);
-        assert!(report["resolution"]["value"].is_null());
+        assert_eq!(report["resolution"]["scopes"][0]["value"], "Alice");
 
         let fixed = explain_position(&content, pos, &raw, &a, Some(&ws));
 
         assert_eq!(fixed["request"]["raw_path"], path_string(&raw));
         assert_eq!(fixed["request"]["lookup_path"], path_string(&a));
-        assert_eq!(fixed["resolution"]["per_file"]["registered"], true);
-        assert_eq!(fixed["resolution"]["value"], "Alice");
+        assert_eq!(fixed["resolution"]["scopes"][0]["value"], "Alice");
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::{
@@ -5,9 +6,10 @@ use tower_lsp_server::ls_types::{
     TextEdit,
 };
 
-use asciidoc_core::workspace::Workspace;
+use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 use crate::positions;
+use crate::scopes::{collapse_if_agree, document_dir, path_scopes, scope_image_base, scope_label};
 
 // ---------------------------------------------------------------------------
 // Syntax Completion Catalog
@@ -260,6 +262,16 @@ impl TargetSpan {
             },
         }
     }
+}
+
+/// How an anchor completion edits the line: what follows the anchor
+/// (`closing`), the typed target it replaces (`span`) and an existing `[…]`
+/// block it takes over (`trailing`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnchorEdit<'a> {
+    pub closing: &'a str,
+    pub span: TargetSpan,
+    pub trailing: Option<TrailingBrackets>,
 }
 
 /// Classification of a completion trigger context.
@@ -611,12 +623,17 @@ pub(crate) fn resolve_xref_completions(
         return Vec::new();
     };
 
+    let edit = AnchorEdit {
+        closing,
+        span,
+        trailing,
+    };
     let mut items: Vec<CompletionItem> = ws
         .reference_index()
         .anchors()
         .iter()
         .filter(|(id, _)| id.starts_with(prefix))
-        .map(|(id, loc)| anchor_completion_item(id, loc, closing, span, trailing))
+        .map(|(id, loc)| anchor_completion_item(id, loc, edit))
         .collect();
 
     items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -634,10 +651,9 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     file: &str,
     anchor_prefix: &str,
     doc_path: &Path,
+    line: usize,
     ws: Option<&Workspace>,
-    closing: &str,
-    span: TargetSpan,
-    trailing: Option<TrailingBrackets>,
+    edit: AnchorEdit<'_>,
 ) -> Vec<CompletionItem> {
     let Some(ws) = ws else {
         return Vec::new();
@@ -658,27 +674,38 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
                     std::fs::canonicalize(&loc.file).unwrap_or_else(|_| loc.file.clone());
                 loc_canonical == doc_canonical
             })
-            .map(|(id, loc)| anchor_completion_item(id, loc, closing, span, trailing))
+            .map(|(id, loc)| anchor_completion_item(id, loc, edit))
             .collect();
         items.sort_by(|a, b| a.label.cmp(&b.label));
         return items;
     }
 
-    let resolved = ws.attributes().substitute(doc_path, file);
-    if resolved.contains('{') {
+    // The file as each scope reads it (ADR-008); anchors of any of them.
+    let base = document_dir(doc_path, Some(ws));
+    let resolved: Vec<String> = path_scopes(ws, doc_path, line)
+        .map(|scope| scope.substitute(file))
+        .filter(|resolved| !resolved.contains('{'))
+        .collect();
+    if resolved.is_empty() {
         return Vec::new();
     }
 
     // Only keep canonical (existing-on-disk) results — downstream compares
     // against `std::fs::canonicalize(&loc.file)` for equality.
-    let canonical_target =
-        asciidoc_core::paths::resolve_doc_target(doc_path, file, ws.attributes())
-            .and_then(|p| std::fs::canonicalize(p).ok());
+    let canonical_targets: Vec<PathBuf> = resolved
+        .iter()
+        .filter_map(|resolved| {
+            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(base, resolved)).ok()
+        })
+        .collect();
 
-    let resolved_path = Path::new(&resolved);
-    let resolved_filename = resolved_path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string());
+    let matches_file = |loc_file: &Path, resolved: &str| {
+        let resolved_path = Path::new(resolved);
+        loc_file.ends_with(resolved_path)
+            || resolved_path
+                .file_name()
+                .is_some_and(|filename| loc_file.file_name().is_some_and(|f| f == filename))
+    };
 
     let mut items: Vec<CompletionItem> = ws
         .reference_index()
@@ -688,41 +715,20 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
             if !id.starts_with(anchor_prefix) {
                 return false;
             }
-            if let Some(target) = &canonical_target {
-                if let Ok(loc_canonical) = std::fs::canonicalize(&loc.file) {
-                    if loc_canonical == *target {
-                        return true;
-                    }
-                }
-            }
-            if loc.file.ends_with(resolved_path) {
-                return true;
-            }
-            if let Some(filename) = &resolved_filename {
-                if loc
-                    .file
-                    .file_name()
-                    .is_some_and(|f| f.to_string_lossy() == *filename)
-                {
+            if let Ok(loc_canonical) = std::fs::canonicalize(&loc.file) {
+                if canonical_targets.contains(&loc_canonical) {
                     return true;
                 }
             }
-            false
+            resolved
+                .iter()
+                .any(|resolved| matches_file(&loc.file, resolved))
         })
-        .map(|(id, loc)| anchor_completion_item(id, loc, closing, span, trailing))
+        .map(|(id, loc)| anchor_completion_item(id, loc, edit))
         .collect();
 
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items
-}
-
-/// The directory relative paths in `doc_path` resolve against: the
-/// workspace's document directory, else `doc_path`'s parent.
-fn document_dir(doc_path: &Path, ws: Option<&Workspace>) -> PathBuf {
-    ws.and_then(|ws| ws.attributes().doc_dir(doc_path))
-        .or_else(|| doc_path.parent())
-        .unwrap_or(doc_path)
-        .to_path_buf()
 }
 
 /// Resolve xref path completions: `.adoc` files relative to the document directory.
@@ -730,11 +736,15 @@ fn document_dir(doc_path: &Path, ws: Option<&Workspace>) -> PathBuf {
 pub(crate) fn resolve_xref_path_completions(
     prefix: &str,
     doc_path: &Path,
+    line: usize,
     ws: Option<&Workspace>,
     closing: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
     let base = document_dir(doc_path, ws);
+    let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |_| {
+        base.to_path_buf()
+    });
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
     // When brackets already follow the cursor (`closing == ""`): drop the bracket
@@ -746,9 +756,7 @@ pub(crate) fn resolve_xref_path_completions(
     };
     resolve_path_completions(
         prefix,
-        doc_path,
-        ws,
-        &base,
+        &listings,
         PathCompletionFilter::Adoc,
         file_snippet,
         span,
@@ -758,10 +766,13 @@ pub(crate) fn resolve_xref_path_completions(
 fn anchor_completion_item(
     id: &str,
     loc: &asciidoc_core::types::AnchorLocation,
-    closing: &str,
-    span: TargetSpan,
-    trailing: Option<TrailingBrackets>,
+    edit: AnchorEdit<'_>,
 ) -> CompletionItem {
+    let AnchorEdit {
+        closing,
+        span,
+        trailing,
+    } = edit;
     let filename = loc
         .file
         .file_name()
@@ -832,19 +843,64 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 ///   with the full path, so clients need not guess where the path starts.
 fn resolve_path_completions(
     prefix: &str,
-    doc_path: &Path,
-    ws: Option<&Workspace>,
-    base_dir: &Path,
+    listings: &[PathListing],
     ext_filter: PathCompletionFilter,
     file_snippet: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    // Attribute substitution: resolve {attr} references in prefix
-    let resolved_prefix = match ws {
-        Some(ws) => ws.attributes().substitute(doc_path, prefix),
-        None => prefix.to_string(),
-    };
+    let mut items: Vec<CompletionItem> = Vec::new();
+    for listing in listings {
+        for item in list_path_items(prefix, listing, ext_filter, file_snippet, span) {
+            if !items.iter().any(|known| known.label == item.label) {
+                items.push(item);
+            }
+        }
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items
+}
 
+/// Where one attribute scope lists path candidates: the folder the path
+/// starts from and the typed prefix with that scope's values substituted.
+struct PathListing {
+    base_dir: PathBuf,
+    resolved_prefix: String,
+}
+
+/// One [`PathListing`] per scope of `doc_path` on `line` (ADR-008), each
+/// starting from `base_dir(scope)`; without a workspace one from
+/// `fallback_base` with `prefix` as typed.
+fn path_listings(
+    prefix: &str,
+    doc_path: &Path,
+    line: usize,
+    ws: Option<&Workspace>,
+    fallback_base: PathBuf,
+    base_dir: impl Fn(&AttributeScope<'_>) -> PathBuf,
+) -> Vec<PathListing> {
+    let Some(ws) = ws else {
+        return vec![PathListing {
+            base_dir: fallback_base,
+            resolved_prefix: prefix.to_string(),
+        }];
+    };
+    path_scopes(ws, doc_path, line)
+        .map(|scope| PathListing {
+            base_dir: base_dir(&scope),
+            resolved_prefix: scope.substitute(prefix),
+        })
+        .collect()
+}
+
+/// The candidates of one [`PathListing`] for the typed `prefix`.
+fn list_path_items(
+    prefix: &str,
+    listing: &PathListing,
+    ext_filter: PathCompletionFilter,
+    file_snippet: &str,
+    span: TargetSpan,
+) -> Vec<CompletionItem> {
+    let resolved_prefix = &listing.resolved_prefix;
     // Bail on unresolved attributes (still contains `{`)
     if resolved_prefix.contains('{') {
         return Vec::new();
@@ -860,13 +916,13 @@ fn resolve_path_completions(
         None => ("", resolved_prefix.as_str()),
     };
 
-    let list_dir = asciidoc_core::paths::normalize_lexically(&base_dir.join(resolved_dir));
+    let list_dir = asciidoc_core::paths::normalize_lexically(&listing.base_dir.join(resolved_dir));
 
     let Ok(entries) = std::fs::read_dir(&list_dir) else {
         return Vec::new();
     };
 
-    let mut items: Vec<CompletionItem> = entries
+    entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -922,10 +978,7 @@ fn resolve_path_completions(
                 })
             }
         })
-        .collect();
-
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items
+        .collect()
 }
 
 /// Resolve include-path completions by listing `.adoc` files and subdirectories
@@ -933,16 +986,18 @@ fn resolve_path_completions(
 pub(crate) fn resolve_include_completions(
     prefix: &str,
     doc_path: &Path,
+    line: usize,
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
     let base = document_dir(doc_path, ws);
+    let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |_| {
+        base.to_path_buf()
+    });
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(
         prefix,
-        doc_path,
-        ws,
-        &base,
+        &listings,
         PathCompletionFilter::Adoc,
         "[${1:opts}]",
         span,
@@ -954,16 +1009,23 @@ pub(crate) fn resolve_include_completions(
 pub(crate) fn resolve_image_completions(
     prefix: &str,
     doc_path: &Path,
+    line: usize,
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let (base, _) = super::navigation::resolve_image_base_dir(doc_path, ws);
+    let file_dir = document_dir(doc_path, ws);
+    let listings = path_listings(
+        prefix,
+        doc_path,
+        line,
+        ws,
+        file_dir.to_path_buf(),
+        |scope| scope_image_base(scope, file_dir).0,
+    );
     // Cursor lands inside `[]` on the `alt` placeholder for image alt text.
     resolve_path_completions(
         prefix,
-        doc_path,
-        ws,
-        &base,
+        &listings,
         PathCompletionFilter::Image,
         "[${1:alt}]",
         span,
@@ -981,28 +1043,49 @@ pub(crate) fn resolve_image_completions(
 pub(crate) fn resolve_attribute_completions(
     prefix: &str,
     doc_path: &Path,
+    line: usize,
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
     let Some(ws) = ws else {
         return Vec::new();
     };
 
-    let mut items: Vec<CompletionItem> = ws
-        .attributes()
-        .all_attributes(doc_path)
-        .into_iter()
-        .filter(|(name, _)| name.starts_with(prefix))
-        .map(|(name, value)| CompletionItem {
-            label: name.to_string(),
-            kind: Some(CompletionItemKind::VARIABLE),
-            detail: Some(value.to_string()),
-            insert_text: Some(format!("{name}}}")),
-            ..Default::default()
-        })
-        .collect();
+    // Name → (scope label, value) of each top-level document that sets it.
+    let mut values: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for scope in ws.scopes_at(doc_path, line) {
+        let label = scope_label(&scope);
+        for (name, definition) in scope.known() {
+            let Some(value) = definition.value else {
+                continue;
+            };
+            if name.starts_with(prefix) {
+                values.entry(name).or_default().push((label.clone(), value));
+            }
+        }
+    }
 
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items
+    values
+        .into_iter()
+        .map(|(name, mut values)| {
+            collapse_if_agree(&mut values, |a, b| a.1 == b.1);
+            let detail = if let [(_, value)] = values.as_slice() {
+                value.clone()
+            } else {
+                values
+                    .iter()
+                    .map(|(label, value)| format!("{label}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            CompletionItem {
+                insert_text: Some(format!("{name}}}")),
+                label: name,
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(detail),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Resolve block macro completions filtered by prefix.
@@ -1103,9 +1186,13 @@ fn resolve_syntax_catalog(
 /// - `Xref` → `resolve_xref_completions`
 /// - `IncludePath` → `resolve_include_completions` (uses `doc_path` for relative listing)
 /// - `Attribute` → `resolve_attribute_completions`
+///
+/// `line` (1-based) is where the completion happens: attribute values are
+/// those in effect there (ADR-008).
 pub(crate) fn resolve_completions(
     ctx: CompletionContext,
     doc_path: &Path,
+    line: usize,
     ws: Option<&Workspace>,
 ) -> Vec<CompletionItem> {
     match ctx {
@@ -1127,7 +1214,7 @@ pub(crate) fn resolve_completions(
             // Some, anchor items use TextEdit so the existing label is selected.
             let mut items = resolve_xref_completions(&prefix, ws, closing, span, trailing);
             items.extend(resolve_xref_path_completions(
-                &prefix, doc_path, ws, closing, span,
+                &prefix, doc_path, line, ws, closing, span,
             ));
             items.sort_by(|a, b| a.label.cmp(&b.label));
             items
@@ -1142,19 +1229,22 @@ pub(crate) fn resolve_completions(
             &file,
             &anchor_prefix,
             doc_path,
+            line,
             ws,
-            closing,
-            span,
-            trailing,
+            AnchorEdit {
+                closing,
+                span,
+                trailing,
+            },
         ),
         CompletionContext::IncludePath { prefix, span } => {
-            resolve_include_completions(&prefix, doc_path, ws, span)
+            resolve_include_completions(&prefix, doc_path, line, ws, span)
         }
         CompletionContext::ImagePath { prefix, span } => {
-            resolve_image_completions(&prefix, doc_path, ws, span)
+            resolve_image_completions(&prefix, doc_path, line, ws, span)
         }
         CompletionContext::Attribute { prefix } => {
-            resolve_attribute_completions(&prefix, doc_path, ws)
+            resolve_attribute_completions(&prefix, doc_path, line, ws)
         }
         CompletionContext::BlockMacro { prefix } => resolve_block_macro_completions(&prefix),
         CompletionContext::Admonition { prefix } => resolve_admonition_completions(&prefix),
@@ -1176,6 +1266,7 @@ pub(crate) fn resolve_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scanned;
     use rstest::rstest;
 
     /// Span for resolver tests that don't look at where the target starts.
@@ -1456,10 +1547,13 @@ mod tests {
             "b.adoc",
             "",
             &doc_path,
+            1,
             Some(&ws),
-            "[]",
-            AT_LINE_START,
-            None,
+            AnchorEdit {
+                closing: "[]",
+                span: AT_LINE_START,
+                trailing: None,
+            },
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "sec2");
@@ -1492,8 +1586,18 @@ mod tests {
             ),
         ]);
 
-        let items =
-            resolve_xref_cross_anchor_completions("", "", &a, Some(&ws), ">>", AT_LINE_START, None);
+        let items = resolve_xref_cross_anchor_completions(
+            "",
+            "",
+            &a,
+            1,
+            Some(&ws),
+            AnchorEdit {
+                closing: ">>",
+                span: AT_LINE_START,
+                trailing: None,
+            },
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "here");
         assert_eq!(new_text(&items[0]), "here>>");
@@ -1505,7 +1609,7 @@ mod tests {
     fn test_xref_path_lists_adoc_siblings() {
         let dir = setup_include_dir();
         let doc = dir.path().join("a.adoc");
-        let items = resolve_xref_path_completions("", &doc, None, "[]", AT_LINE_START);
+        let items = resolve_xref_path_completions("", &doc, 1, None, "[]", AT_LINE_START);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"a.adoc"));
         assert!(labels.contains(&"b.adoc"));
@@ -1522,7 +1626,7 @@ mod tests {
         let doc = dir.path().join("a.adoc");
         // `See xref:chapters/` with the cursor at the end of the line
         let typed = span(9, 18);
-        let items = resolve_xref_path_completions("chapters/", &doc, None, "[]", typed);
+        let items = resolve_xref_path_completions("chapters/", &doc, 1, None, "[]", typed);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["intro.adoc"]);
         let intro = &items[0];
@@ -1538,7 +1642,7 @@ mod tests {
         let doc = dir.path().join("a.adoc");
         // `xref:chapters/in` with the cursor at the end of the line
         let typed = span(5, 16);
-        let items = resolve_xref_path_completions("chapters/in", &doc, None, "[]", typed);
+        let items = resolve_xref_path_completions("chapters/in", &doc, 1, None, "[]", typed);
         assert_eq!(items.len(), 1);
         assert_eq!(edit(&items[0]).range, cols(5, 16));
         assert_eq!(new_text(&items[0]), "chapters/intro.adoc${1}[${2:label}]");
@@ -1550,7 +1654,7 @@ mod tests {
         let doc = dir.path().join("a.adoc");
         // `xref:chap` with the cursor at the end of the line
         let typed = span(5, 9);
-        let items = resolve_xref_path_completions("chap", &doc, None, "[]", typed);
+        let items = resolve_xref_path_completions("chap", &doc, 1, None, "[]", typed);
         let folder = items.iter().find(|i| i.label == "chapters/").unwrap();
         assert_eq!(edit(folder).range, cols(5, 9));
         assert_eq!(new_text(folder), "chapters/");
@@ -1572,7 +1676,7 @@ mod tests {
         // `Ü` is two bytes but one UTF-16 unit: the path starts at column 10.
         let content = "Über xref:chapters/";
         let ctx = detect_completion_context(content, Position::new(0, 19)).unwrap();
-        let items = resolve_completions(ctx, &doc, Some(&ws));
+        let items = resolve_completions(ctx, &doc, 1, Some(&ws));
         let intro = items.iter().find(|i| i.label == "intro.adoc").unwrap();
         assert_eq!(
             edit(intro).range,
@@ -1581,7 +1685,7 @@ mod tests {
 
         let content = "Über xref:_go";
         let ctx = detect_completion_context(content, Position::new(0, 13)).unwrap();
-        let items = resolve_completions(ctx, &doc, Some(&ws));
+        let items = resolve_completions(ctx, &doc, 1, Some(&ws));
         let goals = items.iter().find(|i| i.label == "_goals").unwrap();
         assert_eq!(
             edit(goals).range,
@@ -1607,7 +1711,7 @@ mod tests {
         // re-emits the label slot.
         let content = "xref:b[Text]";
         let ctx = detect_completion_context(content, Position::new(0, 6)).unwrap();
-        let items = resolve_completions(ctx, &doc, Some(&ws));
+        let items = resolve_completions(ctx, &doc, 1, Some(&ws));
         let path = items.iter().find(|i| i.label == "b.adoc").unwrap();
         assert_eq!(edit(path).range, cols(5, 6));
         assert_eq!(new_text(path), "b.adoc");
@@ -1631,14 +1735,14 @@ mod tests {
         // `Ü` is two bytes but one UTF-16 unit.
         let content = "Über xref:chapters/intro.adoc#_go";
         let ctx = detect_completion_context(content, Position::new(0, 33)).unwrap();
-        let items = resolve_completions(ctx, &doc, Some(&ws));
+        let items = resolve_completions(ctx, &doc, 1, Some(&ws));
         let goals = items.iter().find(|i| i.label == "_goals").unwrap();
         assert_eq!(edit(goals).range, cols(30, 33));
         assert_eq!(new_text(goals), "_goals[${1:label}]");
 
         let content = "Über <<chapters/intro.adoc#_go";
         let ctx = detect_completion_context(content, Position::new(0, 30)).unwrap();
-        let items = resolve_completions(ctx, &doc, Some(&ws));
+        let items = resolve_completions(ctx, &doc, 1, Some(&ws));
         let goals = items.iter().find(|i| i.label == "_goals").unwrap();
         assert_eq!(edit(goals).range, cols(27, 30));
         assert_eq!(new_text(goals), "_goals>>");
@@ -1652,7 +1756,7 @@ mod tests {
         let doc = dir.path().join("doc.adoc");
         let content = "Ü image:sub/";
         let ctx = detect_completion_context(content, Position::new(0, 12)).unwrap();
-        let items = resolve_completions(ctx, &doc, None);
+        let items = resolve_completions(ctx, &doc, 1, None);
         let pic = items.iter().find(|i| i.label == "pic.png").unwrap();
         assert_eq!(edit(pic).range, cols(8, 12));
         assert_eq!(new_text(pic), "sub/pic.png[${1:alt}]");
@@ -1676,7 +1780,7 @@ mod tests {
     fn test_include_completions_files() {
         let dir = setup_include_dir();
         let doc_file = dir.path().join("dummy.adoc");
-        let items = resolve_include_completions("", &doc_file, None, AT_LINE_START);
+        let items = resolve_include_completions("", &doc_file, 1, None, AT_LINE_START);
         // Should contain a.adoc, b.adoc, and chapters/
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"a.adoc"), "missing a.adoc in {:?}", labels);
@@ -1703,7 +1807,7 @@ mod tests {
     fn test_include_completions_prefix_filter() {
         let dir = setup_include_dir();
         let doc_file = dir.path().join("dummy.adoc");
-        let items = resolve_include_completions("chap", &doc_file, None, AT_LINE_START);
+        let items = resolve_include_completions("chap", &doc_file, 1, None, AT_LINE_START);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "chapters/");
     }
@@ -1714,7 +1818,7 @@ mod tests {
         let doc_file = dir.path().join("dummy.adoc");
         // `include::chapters/` with the cursor at the end of the line
         let typed = span(9, 18);
-        let items = resolve_include_completions("chapters/", &doc_file, None, typed);
+        let items = resolve_include_completions("chapters/", &doc_file, 1, None, typed);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "intro.adoc");
         assert_eq!(edit(&items[0]).range, cols(9, 18));
@@ -1756,7 +1860,7 @@ mod tests {
         let (_dir, ws, doc_file) = setup_include_attr_dir();
         // `include::{source-dir}/` with the cursor at the end of the line
         let typed = span(9, 22);
-        let items = resolve_include_completions("{source-dir}/", &doc_file, Some(&ws), typed);
+        let items = resolve_include_completions("{source-dir}/", &doc_file, 1, Some(&ws), typed);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"module-a.adoc"),
@@ -1777,7 +1881,8 @@ mod tests {
     #[test]
     fn test_include_completions_with_unresolved_attr() {
         let (_dir, ws, doc_file) = setup_include_attr_dir();
-        let items = resolve_include_completions("{unknown}/", &doc_file, Some(&ws), AT_LINE_START);
+        let items =
+            resolve_include_completions("{unknown}/", &doc_file, 1, Some(&ws), AT_LINE_START);
         assert!(items.is_empty(), "expected empty, got {:?}", items);
     }
 
@@ -1787,6 +1892,7 @@ mod tests {
         let items = resolve_include_completions(
             "{source-dir}/module-a",
             &doc_file,
+            1,
             Some(&ws),
             AT_LINE_START,
         );
@@ -1799,7 +1905,7 @@ mod tests {
     fn test_include_completions_no_attr_with_workspace() {
         let (_dir, ws, doc_file) = setup_include_attr_dir();
         // No attribute in prefix — should work like before, even with workspace present
-        let items = resolve_include_completions("src/", &doc_file, Some(&ws), AT_LINE_START);
+        let items = resolve_include_completions("src/", &doc_file, 1, Some(&ws), AT_LINE_START);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"module-a.adoc"),
@@ -1813,48 +1919,88 @@ mod tests {
         );
     }
 
+    // --- Completion over several attribute scopes (ADR-008) ---
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    /// Two top-level documents point `{edition}` at different folders: the
+    /// candidates of both are offered.
+    #[test]
+    fn test_include_completions_offer_union_of_top_level_documents() {
+        let (_dir, ws, paths) = scanned(&[
+            ("a-print.adoc", "= A\n:edition: print\ninclude::ch.adoc[]\n"),
+            ("b-web.adoc", "= B\n:edition: web\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", "== C\n\ninclude::{edition}/\n"),
+            ("print/p.adoc", ""),
+            ("web/w.adoc", ""),
+        ]);
+        let items =
+            resolve_include_completions("{edition}/", &paths[2], 3, Some(&ws), AT_LINE_START);
+        assert_eq!(labels(&items), vec!["p.adoc", "w.adoc"]);
+    }
+
+    /// An image folder set by one top-level document and another by the
+    /// chapter's own preview: both are listed.
+    #[test]
+    fn test_image_completions_offer_union_with_preview() {
+        let (_dir, ws, paths) = scanned(&[
+            ("book.adoc", "= B\n:imagesdir: img\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", "== C\n\nimage::\n"),
+            ("img/book.png", ""),
+            ("own.png", ""),
+        ]);
+        let items = resolve_image_completions("", &paths[1], 3, Some(&ws), AT_LINE_START);
+        let labels = labels(&items);
+        assert!(labels.contains(&"book.png"), "{labels:?}");
+        assert!(labels.contains(&"own.png"), "{labels:?}");
+    }
+
+    /// Attribute names come from every top-level document; the value is
+    /// shown per document where they differ.
+    #[test]
+    fn test_attribute_completions_offer_union_of_top_level_documents() {
+        let (_dir, ws, paths) = scanned(&[
+            (
+                "a-draft.adoc",
+                "= A\n:x: draft\n:only-a: 1\ninclude::ch.adoc[]\n",
+            ),
+            ("b-book.adoc", "= B\n:x: book\ninclude::ch.adoc[]\n"),
+            ("ch.adoc", "== C\n\n{\n"),
+        ]);
+        let items = resolve_attribute_completions("", &paths[2], 3, Some(&ws));
+        let detail = |name: &str| {
+            items
+                .iter()
+                .find(|i| i.label == name)
+                .and_then(|i| i.detail.clone())
+        };
+        assert_eq!(detail("only-a").as_deref(), Some("1"));
+        assert_eq!(
+            detail("x").as_deref(),
+            Some("a-draft.adoc: draft, b-book.adoc: book")
+        );
+        assert_eq!(labels(&items).iter().filter(|l| **l == "x").count(), 1);
+    }
+
     // --- Phase 4: resolve_attribute_completions ---
 
-    use asciidoc_core::types::AttributeDef;
-
-    /// Helper: build a Workspace with config (.asciidoctorconfig) + per-file attributes.
-    /// Returns (tempdir, workspace, file_path) — file_path is under the tempdir.
-    fn ws_with_config_and_file_attrs(
-        config_content: &str,
-        file_attrs: Vec<AttributeDef>,
-    ) -> (TempDir, Workspace, PathBuf) {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        std::fs::write(root.join(".asciidoctorconfig"), config_content).unwrap();
-
-        let file = root.join("doc.adoc");
-        let mut attrs = AttributeRegistry::new(&root);
-        attrs.ensure_config_for_dir(&root);
-        attrs.register_file_attributes(&file, &file_attrs);
-
-        let ws = Workspace::new_with(
-            root.clone(),
-            attrs,
-            IncludeGraph::new(),
-            ReferenceIndex::new(),
-            HashMap::new(),
-            HashMap::new(),
-        );
-        (dir, ws, file)
+    /// A scanned workspace with `.asciidoctorconfig` and a document
+    /// `doc.adoc` that sets `:author: Alice`; returns the document's path.
+    fn config_and_author_doc() -> (TempDir, Workspace, PathBuf) {
+        let (dir, ws, mut paths) = scanned(&[
+            (".asciidoctorconfig", ":imagesdir: images\n"),
+            ("doc.adoc", "= Doc\n:author: Alice\n"),
+        ]);
+        (dir, ws, paths.remove(1))
     }
 
     #[test]
     fn test_attribute_completions_basic() {
-        let (_dir, ws, file) = ws_with_config_and_file_attrs(
-            ":imagesdir: images\n",
-            vec![AttributeDef {
-                name: "author".into(),
-                value: "Alice".into(),
-                line: 2,
-            }],
-        );
+        let (_dir, ws, file) = config_and_author_doc();
 
-        let items = resolve_attribute_completions("", &file, Some(&ws));
+        let items = resolve_attribute_completions("", &file, 1, Some(&ws));
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         // Builtin
         assert!(labels.contains(&"docdir"), "missing docdir in {:?}", labels);
@@ -1878,16 +2024,9 @@ mod tests {
 
     #[test]
     fn test_attribute_completions_prefix_filter() {
-        let (_dir, ws, file) = ws_with_config_and_file_attrs(
-            ":imagesdir: images\n",
-            vec![AttributeDef {
-                name: "author".into(),
-                value: "Alice".into(),
-                line: 2,
-            }],
-        );
+        let (_dir, ws, file) = config_and_author_doc();
 
-        let items = resolve_attribute_completions("im", &file, Some(&ws));
+        let items = resolve_attribute_completions("im", &file, 1, Some(&ws));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "imagesdir");
     }
@@ -1895,7 +2034,7 @@ mod tests {
     #[test]
     fn test_attribute_completions_no_workspace() {
         let file = Path::new("/tmp/doc.adoc");
-        let items = resolve_attribute_completions("", file, None);
+        let items = resolve_attribute_completions("", file, 1, None);
         assert!(items.is_empty());
     }
 
@@ -1919,7 +2058,7 @@ mod tests {
             trailing: None,
         };
 
-        let items = resolve_completions(ctx, doc_path, Some(&ws));
+        let items = resolve_completions(ctx, doc_path, 1, Some(&ws));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "my-anchor");
     }
@@ -1934,7 +2073,7 @@ mod tests {
             span: AT_LINE_START,
         };
 
-        let items = resolve_completions(ctx, &doc_file, None);
+        let items = resolve_completions(ctx, &doc_file, 1, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"a.adoc"));
         assert!(labels.contains(&"b.adoc"));
@@ -1943,19 +2082,12 @@ mod tests {
 
     #[test]
     fn test_resolve_completions_attribute() {
-        let (_dir, ws, file) = ws_with_config_and_file_attrs(
-            ":imagesdir: images\n",
-            vec![AttributeDef {
-                name: "author".into(),
-                value: "Alice".into(),
-                line: 2,
-            }],
-        );
+        let (_dir, ws, file) = config_and_author_doc();
         let ctx = CompletionContext::Attribute {
             prefix: "im".into(),
         };
 
-        let items = resolve_completions(ctx, &file, Some(&ws));
+        let items = resolve_completions(ctx, &file, 1, Some(&ws));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "imagesdir");
     }
@@ -2296,7 +2428,7 @@ mod tests {
         let ctx = CompletionContext::BlockMacro {
             prefix: "im".into(),
         };
-        let items = resolve_completions(ctx, doc_path, None);
+        let items = resolve_completions(ctx, doc_path, 1, None);
         assert!(!items.is_empty());
         assert_eq!(items[0].label, "image::");
     }
@@ -2307,7 +2439,7 @@ mod tests {
         let ctx = CompletionContext::Admonition {
             prefix: "NO".into(),
         };
-        let items = resolve_completions(ctx, doc_path, None);
+        let items = resolve_completions(ctx, doc_path, 1, None);
         assert!(!items.is_empty());
         assert_eq!(items[0].label, "NOTE:");
     }
@@ -2318,7 +2450,7 @@ mod tests {
         let ctx = CompletionContext::DocumentAttribute {
             prefix: "to".into(),
         };
-        let items = resolve_completions(ctx, doc_path, None);
+        let items = resolve_completions(ctx, doc_path, 1, None);
         assert!(!items.is_empty());
         assert_eq!(items[0].label, "toc");
     }
@@ -2329,7 +2461,7 @@ mod tests {
         let ctx = CompletionContext::InlineMacro {
             macro_name: "kbd".into(),
         };
-        let items = resolve_completions(ctx, doc_path, None);
+        let items = resolve_completions(ctx, doc_path, 1, None);
         assert!(!items.is_empty());
         assert_eq!(items[0].label, "kbd:");
     }
@@ -2536,7 +2668,7 @@ mod tests {
             word_start_col: 5,
             cursor_col: 8,
         };
-        let items = resolve_completions(ctx, doc_path, None);
+        let items = resolve_completions(ctx, doc_path, 1, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "kbd:");
     }
@@ -2752,7 +2884,7 @@ mod tests {
     fn test_resolve_image_empty_dir() {
         let dir = TempDir::new().unwrap();
         let doc_file = dir.path().join("doc.adoc");
-        let items = resolve_image_completions("", &doc_file, None, AT_LINE_START);
+        let items = resolve_image_completions("", &doc_file, 1, None, AT_LINE_START);
         assert!(items.is_empty(), "empty dir should yield no completions");
     }
 
@@ -2764,7 +2896,7 @@ mod tests {
         std::fs::write(dir.path().join("readme.txt"), b"").unwrap();
         let doc_file = dir.path().join("doc.adoc");
 
-        let items = resolve_image_completions("", &doc_file, None, AT_LINE_START);
+        let items = resolve_image_completions("", &doc_file, 1, None, AT_LINE_START);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"foto.png"),
@@ -2807,7 +2939,7 @@ mod tests {
             HashMap::new(),
         );
 
-        let items = resolve_image_completions("", &file, Some(&ws), AT_LINE_START);
+        let items = resolve_image_completions("", &file, 1, Some(&ws), AT_LINE_START);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"banner.jpg"),
@@ -2829,7 +2961,7 @@ mod tests {
 
         // `image::sub/` with the cursor at the end of the line
         let typed = span(7, 11);
-        let items = resolve_image_completions("sub/", &doc_file, None, typed);
+        let items = resolve_image_completions("sub/", &doc_file, 1, None, typed);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "icon.gif");
         assert_eq!(edit(&items[0]).range, cols(7, 11));
@@ -2843,7 +2975,7 @@ mod tests {
         std::fs::write(dir.path().join("diagram.svg"), b"").unwrap();
         let doc_file = dir.path().join("doc.adoc");
 
-        let items = resolve_image_completions("foto", &doc_file, None, AT_LINE_START);
+        let items = resolve_image_completions("foto", &doc_file, 1, None, AT_LINE_START);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "foto.png");
     }
@@ -2861,7 +2993,7 @@ mod tests {
             prefix: "".into(),
             span: AT_LINE_START,
         };
-        let items = resolve_completions(ctx, &doc_file, None);
+        let items = resolve_completions(ctx, &doc_file, 1, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"screenshot.png"),
