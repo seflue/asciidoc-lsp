@@ -2980,11 +2980,16 @@ mod tests {
             include.map(|l| l.uri),
             Some(file_uri(&real.join("config/part-up.adoc")))
         );
-        // `imagesdir` comes from the chain of `config/`; its literal `../assets`
-        // resolves from the link folder to `config/assets`, as in Asciidoctor.
+        // `via-link.adoc` includes the file, so its build has no `imagesdir`.
+        // The preview of the file takes `imagesdir` from the chain of
+        // `config/`; its literal `../assets` resolves from the link folder to
+        // `config/assets`, as in Asciidoctor (ADR-008).
         assert_eq!(
             image.as_deref(),
-            Some("image::../assets/logo.svg[]\n\n✗ File not found")
+            Some(
+                "In via-link.adoc:\nimage::logo.svg[]\n\n✗ File not found\n\n\
+                 In twice.adoc (preview):\nimage::../assets/logo.svg[]\n\n✗ File not found"
+            )
         );
     }
 
@@ -3761,6 +3766,30 @@ mod tests {
                 .await
                 .as_deref(),
             Some(":imagesdir: ./images")
+        );
+    }
+
+    /// `imagesdir` and attributes in an image target come from an included
+    /// file outside the workspace root (committed fixture
+    /// `tests/fixtures/imagesdir_from_include`).
+    #[tokio::test]
+    async fn test_fixture_imagesdir_from_included_file() {
+        let fx = fixture_dir("imagesdir_from_include");
+        let root = fx.join("doc");
+        let (service, _socket, uri, text) = open_fixture(&root, &root.join("main.adoc")).await;
+        let server = service.inner();
+
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "pic.png", 0)).await,
+            Some("image::images/pic.png[]\n\n\u{2713} File exists".to_string())
+        );
+        assert_eq!(
+            definition_at(server, &uri, position_of(&text, "pic.png", 0), &root).await,
+            "images/pic.png:0"
+        );
+        assert_eq!(
+            hover_text(server, &uri, position_of(&text, "/ok.png", 1)).await,
+            Some("image::images/icons/ok.png[]\n\n\u{2713} File exists".to_string())
         );
     }
 

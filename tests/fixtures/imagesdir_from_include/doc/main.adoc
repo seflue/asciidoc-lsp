@@ -1,0 +1,6 @@
+= Main
+include::../shared/attributes.adoc[]
+
+image::pic.png[]
+
+image::{icons}/ok.png[]

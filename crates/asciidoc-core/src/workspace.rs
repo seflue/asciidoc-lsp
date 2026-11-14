@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::attributes::{
-    substitute_attributes, AttributeLayer, AttributeRegistry, AttributeSource,
+    substitute_attributes, AttributeHit, AttributeLayer, AttributeRegistry, AttributeSource, DOCDIR,
 };
 use crate::diagnostics::collect_diagnostics;
 use crate::graph::{
@@ -209,39 +209,86 @@ impl Workspace {
     /// is its own top-level document.
     #[must_use]
     pub fn scopes_at(&self, file: &Path, line: usize) -> Vec<AttributeScope<'_>> {
-        let file = if self.documents.contains_key(file) {
+        let file = self.indexed_path(file);
+        self.top_level_documents_of(&file)
+            .unwrap_or_else(|| vec![file.clone()])
+            .into_iter()
+            .map(|root| self.scope(root, &file, line, false))
+            .collect()
+    }
+
+    /// The attributes in effect on `line` of `file` when the editor previews
+    /// `file` on its own: its own config chain, its own folder as `docdir`,
+    /// nothing from the documents that include it. `None` for a top-level
+    /// document, whose preview is its [`Self::scopes_at`] scope (ADR-008).
+    #[must_use]
+    pub fn preview_scope_at(&self, file: &Path, line: usize) -> Option<AttributeScope<'_>> {
+        let file = self.indexed_path(file);
+        self.top_level_documents_of(&file)?;
+        Some(self.scope(file.clone(), &file, line, true))
+    }
+
+    /// `name` before the first line of `document`: from its config chain,
+    /// else built in. In a preview `docdir` is the document's own folder,
+    /// not that of a document including it.
+    fn preset(
+        &self,
+        document: &Path,
+        name: &str,
+        preview: bool,
+    ) -> Option<(AttributeLayer, AttributeHit)> {
+        if preview && name == DOCDIR {
+            let dir = self.attributes.doc_dir(document)?;
+            return Some((
+                AttributeLayer::Builtin,
+                AttributeHit {
+                    value: dir.display().to_string(),
+                    source: None,
+                },
+            ));
+        }
+        self.attributes.preset(document, name)
+    }
+
+    /// `file` as the workspace indexes it: as given, else canonical.
+    fn indexed_path(&self, file: &Path) -> PathBuf {
+        if self.documents.contains_key(file) {
             file.to_path_buf()
         } else {
             file.canonicalize().unwrap_or_else(|_| file.to_path_buf())
-        };
-        let roots = self
-            .include_graph
+        }
+    }
+
+    /// The top-level documents that include `file`; `None` when there are
+    /// none, so `file` is its own.
+    fn top_level_documents_of(&self, file: &Path) -> Option<Vec<PathBuf>> {
+        self.include_graph
             .doc_roots(&self.documents)
-            .remove(&file)
-            .filter(|roots| !roots.is_empty())
-            .unwrap_or_else(|| vec![file.clone()]);
-        roots
-            .into_iter()
-            .map(|root| {
-                let mut walk = ReadingWalk {
-                    workspace: self,
-                    reference: (&file, line),
-                    current: HashMap::new(),
-                    at_reference: None,
-                    definitions: Vec::new(),
-                    stack: Vec::new(),
-                };
-                walk.visit(&root);
-                let (at_reference, before_reference) = walk.at_reference.unwrap_or_default();
-                AttributeScope {
-                    workspace: self,
-                    document: root,
-                    at_reference,
-                    before_reference,
-                    definitions: walk.definitions,
-                }
-            })
-            .collect()
+            .remove(file)
+            .filter(|roots| !roots.is_empty() && roots.iter().any(|root| root != file))
+    }
+
+    /// The scope on `line` of `file`, reading the document `root`.
+    fn scope(&self, root: PathBuf, file: &Path, line: usize, preview: bool) -> AttributeScope<'_> {
+        let mut walk = ReadingWalk {
+            workspace: self,
+            reference: (file, line),
+            preview,
+            current: HashMap::new(),
+            at_reference: None,
+            definitions: Vec::new(),
+            stack: Vec::new(),
+        };
+        walk.visit(&root);
+        let (at_reference, before_reference) = walk.at_reference.unwrap_or_default();
+        AttributeScope {
+            workspace: self,
+            document: root,
+            preview,
+            at_reference,
+            before_reference,
+            definitions: walk.definitions,
+        }
     }
 
     /// How `name`, referenced on `line` of `file`, resolves in each
@@ -569,6 +616,9 @@ pub struct AttributeDefinition {
 pub struct AttributeScope<'a> {
     workspace: &'a Workspace,
     document: PathBuf,
+    /// The editor's preview of a file other documents include
+    /// ([`Workspace::preview_scope_at`]).
+    preview: bool,
     /// The last definition of each name before the position (an unset too).
     at_reference: HashMap<String, AttributeDefinition>,
     /// How many entries of `definitions` come before the position.
@@ -578,10 +628,17 @@ pub struct AttributeScope<'a> {
 }
 
 impl AttributeScope<'_> {
-    /// The top-level document this scope belongs to.
+    /// The top-level document this scope belongs to; for a preview the
+    /// previewed file.
     #[must_use]
     pub fn document(&self) -> &Path {
         &self.document
+    }
+
+    /// Whether this is the preview of a file other documents include.
+    #[must_use]
+    pub fn is_preview(&self) -> bool {
+        self.preview
     }
 
     /// The definition of `name` Asciidoctor uses at the position: the last
@@ -602,14 +659,23 @@ impl AttributeScope<'_> {
             })
     }
 
+    /// The value of `name` Asciidoctor has at the position: from the last
+    /// definition before it, else the config or a builtin. `None` when unset
+    /// or unknown; unlike [`Self::definition`], a later definition does not
+    /// count.
+    #[must_use]
+    pub fn value(&self, name: &str) -> Option<String> {
+        match self.at_reference.get(name) {
+            Some(definition) => definition.value.clone(),
+            None => self.preset(name).and_then(|definition| definition.value),
+        }
+    }
+
     /// `input` with the values in effect at the position substituted; an
     /// unset or unknown reference stays as written.
     #[must_use]
     pub fn substitute(&self, input: &str) -> String {
-        substitute_attributes(input, |name| match self.at_reference.get(name) {
-            Some(definition) => definition.value.clone(),
-            None => self.preset(name).and_then(|definition| definition.value),
-        })
+        substitute_attributes(input, |name| self.value(name))
     }
 
     /// Every definition of `name` in the document, in reading order.
@@ -626,7 +692,7 @@ impl AttributeScope<'_> {
     /// `name` from the config chain or built in, before the document's
     /// first line.
     fn preset(&self, name: &str) -> Option<AttributeDefinition> {
-        let (layer, hit) = self.workspace.attributes.preset(&self.document, name)?;
+        let (layer, hit) = self.workspace.preset(&self.document, name, self.preview)?;
         Some(AttributeDefinition {
             source: hit.source,
             origin: if layer == AttributeLayer::Config {
@@ -691,6 +757,8 @@ const MAX_WALK_DEPTH: usize = 64;
 struct ReadingWalk<'a> {
     workspace: &'a Workspace,
     reference: (&'a Path, usize),
+    /// Reading a preview ([`Workspace::preview_scope_at`]).
+    preview: bool,
     /// The last definition of each name so far; its `value` is `None` once
     /// unset.
     current: HashMap<String, AttributeDefinition>,
@@ -782,8 +850,7 @@ impl<'a> ReadingWalk<'a> {
             }
             let root = self.stack.first()?;
             self.workspace
-                .attributes
-                .preset(root, name)
+                .preset(root, name, self.preview)
                 .map(|(_, hit)| hit.value)
         })
     }

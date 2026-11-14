@@ -5,12 +5,12 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
-use asciidoc_core::attributes::{AttributeHit, AttributeLayer, AttributeSource};
+use asciidoc_core::attributes::{AttributeHit, AttributeLayer, AttributeSource, DOCDIR};
 use asciidoc_core::extractors::find_child_text;
 use asciidoc_core::paths::normalize_lexically;
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
-use asciidoc_core::workspace::{AttributeDefinition, AttributeOrigin, Workspace};
+use asciidoc_core::workspace::{AttributeDefinition, AttributeOrigin, AttributeScope, Workspace};
 
 use crate::positions;
 
@@ -134,6 +134,21 @@ pub fn resolve_goto_definitions(
             .map(|source| (source.file, source.line))
             .collect();
     }
+    if let NodeKind::Image { ref path, .. } = node_info.kind {
+        // Each top-level document's file, each once.
+        let mut targets: Vec<(PathBuf, usize)> = Vec::new();
+        for (_, target) in resolve_image_targets(path, doc_path, workspace, node_info.line) {
+            let ImageTarget::Local { path: target, .. } = target else {
+                continue;
+            };
+            if let Ok(canonical) = target.canonicalize() {
+                if !targets.iter().any(|(known, _)| *known == canonical) {
+                    targets.push((canonical, 1));
+                }
+            }
+        }
+        return targets;
+    }
     goto_target(&node_info, doc_path, workspace)
         .into_iter()
         .collect()
@@ -156,18 +171,13 @@ fn goto_target(
             let resolved = resolve_xref_target(ws, doc_path, target, node_info.line).ok()?;
             Some((resolved.file, resolved.line))
         }
-        NodeKind::Image { ref path, .. } => {
-            let ImageTarget::Local { path: target, .. } =
-                resolve_image_target(path, doc_path, workspace)
-            else {
-                return None;
-            };
-            let target_canon = target.canonicalize().ok()?;
-            Some((target_canon, 1))
-        }
-        NodeKind::AttributeRef { .. } | NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => {
-            // A reference is handled by `resolve_goto_definitions`; on a
-            // definition or anchor goto-definition is a no-op.
+        NodeKind::AttributeRef { .. }
+        | NodeKind::Image { .. }
+        | NodeKind::AttributeDef { .. }
+        | NodeKind::Anchor { .. } => {
+            // A reference or an image is handled by
+            // `resolve_goto_definitions`; on a definition or anchor
+            // goto-definition is a no-op.
             None
         }
     }
@@ -324,7 +334,7 @@ pub fn resolve_hover(
             if effective.iter().all(|(_, definition)| definition.is_none()) {
                 return None;
             }
-            let texts: Vec<(PathBuf, String)> = effective
+            let texts: Vec<(String, String)> = effective
                 .into_iter()
                 .map(|(document, definition)| {
                     let text = definition.map_or_else(
@@ -339,7 +349,7 @@ pub fn resolve_hover(
                             text
                         },
                     );
-                    (document, text)
+                    (file_display_name(&document), text)
                 })
                 .collect();
             Some(per_document_hover(texts))
@@ -437,29 +447,43 @@ pub fn resolve_hover(
         }
         NodeKind::Image { path, inline } => {
             let macro_form = if *inline { "image:" } else { "image::" };
-            match resolve_image_target(path, doc_path, workspace) {
-                ImageTarget::Remote { url } => Some(format!("{macro_form}{url}[]")),
-                ImageTarget::Local {
-                    path: target,
-                    display,
-                } => {
-                    let mut text = format!("{macro_form}{display}[]");
-                    if target.exists() {
-                        text.push_str("\n\n\u{2713} File exists");
-                    } else {
-                        text.push_str("\n\n\u{2717} File not found");
-                    }
-                    Some(text)
-                }
+            let mut targets = resolve_image_targets(path, doc_path, workspace, node_info.line);
+            // Scopes that reach the same file agree, however they spell it.
+            if targets
+                .windows(2)
+                .all(|pair| pair[0].1.same_place(&pair[1].1))
+            {
+                targets.truncate(1);
             }
+            let texts: Vec<(String, String)> = targets
+                .into_iter()
+                .map(|(label, target)| {
+                    let text = match target {
+                        ImageTarget::Remote { url } => format!("{macro_form}{url}[]"),
+                        ImageTarget::Local {
+                            path: target,
+                            display,
+                        } => {
+                            let status = if target.exists() {
+                                "\u{2713} File exists"
+                            } else {
+                                "\u{2717} File not found"
+                            };
+                            format!("{macro_form}{display}[]\n\n{status}")
+                        }
+                    };
+                    (label, text)
+                })
+                .collect();
+            Some(per_document_hover(texts))
         }
         NodeKind::Anchor { .. } => None,
     }
 }
 
-/// Hover text from one text per top-level document: the text alone when all
-/// agree, else each one under the name of its document (ADR-008).
-fn per_document_hover(texts: Vec<(PathBuf, String)>) -> String {
+/// Hover text from one text per scope, each with its label: the text alone
+/// when all agree, else each one under its label (ADR-008).
+fn per_document_hover(texts: Vec<(String, String)>) -> String {
     if texts.windows(2).all(|pair| pair[0].1 == pair[1].1) {
         return texts
             .into_iter()
@@ -469,7 +493,7 @@ fn per_document_hover(texts: Vec<(PathBuf, String)>) -> String {
     }
     texts
         .iter()
-        .map(|(document, text)| format!("In {}:\n{text}", file_display_name(document)))
+        .map(|(label, text)| format!("In {label}:\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -533,10 +557,6 @@ pub(crate) fn resolve_image_base_dir(
     doc_path: &Path,
     workspace: Option<&Workspace>,
 ) -> (PathBuf, String) {
-    let doc_dir = workspace
-        .and_then(|ws| ws.attributes().doc_dir(doc_path))
-        .or_else(|| doc_path.parent())
-        .unwrap_or(doc_path);
     let imagesdir_raw = workspace
         .and_then(|ws| ws.attributes().resolve(doc_path, "imagesdir"))
         .unwrap_or("");
@@ -545,12 +565,27 @@ pub(crate) fn resolve_image_base_dir(
     } else {
         imagesdir_raw.to_string()
     };
-    let base = if imagesdir.is_empty() {
+    let base = image_base_dir(image_doc_dir(doc_path, workspace), &imagesdir);
+    (base, imagesdir)
+}
+
+/// The folder an image path starts from before `imagesdir`: the document
+/// directory from the workspace (a symlink's folder for a symlinked
+/// document).
+fn image_doc_dir<'a>(doc_path: &'a Path, workspace: Option<&'a Workspace>) -> &'a Path {
+    workspace
+        .and_then(|ws| ws.attributes().doc_dir(doc_path))
+        .or_else(|| doc_path.parent())
+        .unwrap_or(doc_path)
+}
+
+/// `doc_dir / imagesdir`, or `doc_dir` alone when `imagesdir` is empty.
+fn image_base_dir(doc_dir: &Path, imagesdir: &str) -> PathBuf {
+    if imagesdir.is_empty() {
         doc_dir.to_path_buf()
     } else {
-        normalize_lexically(&doc_dir.join(&imagesdir))
-    };
-    (base, imagesdir)
+        normalize_lexically(&doc_dir.join(imagesdir))
+    }
 }
 
 /// Where an image macro points after attribute substitution and `imagesdir`.
@@ -560,6 +595,17 @@ enum ImageTarget {
     Local { path: PathBuf, display: String },
     /// An `http(s)` URL, from the macro target or from `imagesdir`.
     Remote { url: String },
+}
+
+impl ImageTarget {
+    /// Whether both point to the same file or URL.
+    fn same_place(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local { path: a, .. }, Self::Local { path: b, .. }) => a == b,
+            (Self::Remote { url: a }, Self::Remote { url: b }) => a == b,
+            _ => false,
+        }
+    }
 }
 
 fn is_remote_url(target: &str) -> bool {
@@ -578,8 +624,53 @@ fn resolve_image_target(
         image_path.to_string()
     };
     let (base, imagesdir) = resolve_image_base_dir(doc_path, workspace);
-    let display = if imagesdir.is_empty() || is_remote_url(&resolved_path) {
-        resolved_path.clone()
+    image_target(&resolved_path, &base, &imagesdir)
+}
+
+/// Where an image macro on `line` points, per top-level document and, for
+/// a file others include, in the editor's preview of it (ADR-008): target,
+/// `imagesdir` and `docdir` take the values in effect there. Each target
+/// comes with its scope's label; without a workspace, one target with the
+/// label of `doc_path`.
+fn resolve_image_targets(
+    image_path: &str,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+    line: usize,
+) -> Vec<(String, ImageTarget)> {
+    let Some(ws) = workspace else {
+        let target = resolve_image_target(image_path, doc_path, None);
+        return vec![(file_display_name(doc_path), target)];
+    };
+    let file_dir = image_doc_dir(doc_path, workspace);
+    ws.scopes_at(doc_path, line)
+        .into_iter()
+        .chain(ws.preview_scope_at(doc_path, line))
+        .map(|scope| {
+            let imagesdir = scope.value("imagesdir").unwrap_or_default();
+            let docdir = scope.value(DOCDIR).map(PathBuf::from);
+            let base = image_base_dir(docdir.as_deref().unwrap_or(file_dir), &imagesdir);
+            let target = image_target(&scope.substitute(image_path), &base, &imagesdir);
+            (scope_label(&scope), target)
+        })
+        .collect()
+}
+
+/// How a hover names a scope: its document, marked when it is a preview.
+fn scope_label(scope: &AttributeScope<'_>) -> String {
+    let name = file_display_name(scope.document());
+    if scope.is_preview() {
+        format!("{name} (preview)")
+    } else {
+        name
+    }
+}
+
+/// An image target from its substituted path, the folder it resolves
+/// against and the `imagesdir` shown in front of it.
+fn image_target(resolved_path: &str, base: &Path, imagesdir: &str) -> ImageTarget {
+    let display = if imagesdir.is_empty() || is_remote_url(resolved_path) {
+        resolved_path.to_string()
     } else {
         format!("{imagesdir}/{resolved_path}")
     };
@@ -587,7 +678,7 @@ fn resolve_image_target(
         return ImageTarget::Remote { url: display };
     }
     ImageTarget::Local {
-        path: normalize_lexically(&base.join(&resolved_path)),
+        path: normalize_lexically(&base.join(resolved_path)),
         display,
     }
 }
@@ -2902,6 +2993,48 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             "In a-draft.adoc:\n:x: draft\n\nDefined in a-draft.adoc:2\n\n\
              In b-book.adoc:\n:x: book\n\nDefined in b-book.adoc:2"
         );
+    }
+
+    #[test]
+    fn test_hover_image_shows_preview_of_included_file_where_it_breaks() {
+        // The book finds the image; previewing the chapter on its own
+        // (no config next to it) does not.
+        let chapter = "== C\n\nimage::pic.png[]\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("book.adoc", "= B\n:imagesdir: img\ninclude::ch/ch.adoc[]\n"),
+            ("ch/ch.adoc", chapter),
+            ("img/pic.png", ""),
+        ]);
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+        let hover = resolve_hover(chapter, pos, &paths[1], Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            "In book.adoc:\nimage::img/pic.png[]\n\n\u{2713} File exists\n\n\
+             In ch.adoc (preview):\nimage::pic.png[]\n\n\u{2717} File not found"
+        );
+    }
+
+    #[test]
+    fn test_hover_image_shows_one_target_when_preview_config_matches() {
+        // The chapter's config points its preview at the book's images.
+        let chapter = "== C\n\nimage::pic.png[]\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("book.adoc", "= B\n:imagesdir: img\ninclude::ch/ch.adoc[]\n"),
+            ("ch/.asciidoctorconfig", ":imagesdir: ../img\n"),
+            ("ch/ch.adoc", chapter),
+            ("img/pic.png", ""),
+        ]);
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+        let hover = resolve_hover(chapter, pos, &paths[2], Some(&ws)).unwrap();
+        assert_eq!(hover, "image::img/pic.png[]\n\n\u{2713} File exists");
+        let targets = resolve_goto_definitions(chapter, pos, &paths[2], Some(&ws));
+        assert_eq!(targets, vec![(paths[3].clone(), 1)]);
     }
 
     #[test]
