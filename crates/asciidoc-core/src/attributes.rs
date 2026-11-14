@@ -10,6 +10,26 @@ pub struct AttributeSource {
     pub line: usize,
 }
 
+/// An attribute entry of a config file as written: where, and its value
+/// before substitution (continued lines joined); `None` for an unset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigAttribute {
+    pub source: AttributeSource,
+    pub raw: Option<String>,
+}
+
+impl ConfigAttribute {
+    fn new(file: &Path, line: usize, raw: Option<&str>) -> Self {
+        Self {
+            source: AttributeSource {
+                file: file.to_path_buf(),
+                line,
+            },
+            raw: raw.map(str::to_string),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttributeEntry {
     value: String,
@@ -99,59 +119,103 @@ impl AttributeRegistry {
         if self.config_chains.contains_key(dir) || !dir.exists() {
             return;
         }
-        let Ok(ws_root) = self.workspace_root.canonicalize() else {
+        let Some(chain_dirs) = self.config_dirs(dir) else {
             return;
         };
 
-        // Collect directories from dir up to workspace_root (inclusive), then reverse
+        let mut merged = HashMap::new();
+        merge_config_chain(
+            &chain_dirs,
+            ChainLimit::All,
+            &self.builtin,
+            &mut merged,
+            None,
+        );
+        self.config_chains.insert(dir.to_path_buf(), merged);
+
+        // A config file in `dir` gets the chain without itself (see `config_chain`).
+        for config_path in config_files(dir) {
+            let mut own = HashMap::new();
+            merge_config_chain(
+                &chain_dirs,
+                ChainLimit::Without(&config_path),
+                &self.builtin,
+                &mut own,
+                None,
+            );
+            self.config_file_chains.insert(config_path, own);
+        }
+    }
+
+    /// The directories from the workspace root down to `dir`, as the config
+    /// chain of `dir` reads them. Walks upward from `dir` as given, without
+    /// resolving symlinks, until it reaches the workspace root (compared
+    /// canonically); `None` when it never does.
+    fn config_dirs(&self, dir: &Path) -> Option<Vec<PathBuf>> {
+        let ws_root = self.workspace_root.canonicalize().ok()?;
         let mut chain_dirs = Vec::new();
         let mut current = Some(dir);
         loop {
-            let Some(here) = current else {
-                return; // never reached the workspace root
-            };
+            let here = current?;
             chain_dirs.push(here.to_path_buf());
             if here.canonicalize().is_ok_and(|c| c == ws_root) {
                 break;
             }
             current = here.parent();
         }
-        chain_dirs.reverse(); // now root → dir order
+        chain_dirs.reverse(); // root → dir order
+        Some(chain_dirs)
+    }
 
-        let mut merged = HashMap::new();
-        merge_config_chain(&chain_dirs, None, &self.builtin, &mut merged);
-        self.config_chains.insert(dir.to_path_buf(), merged);
-
-        // A config file in `dir` gets the chain without itself (see `config_chain`).
-        for config_path in config_files(dir) {
-            let mut own = HashMap::new();
-            merge_config_chain(&chain_dirs, Some(&config_path), &self.builtin, &mut own);
-            self.config_file_chains.insert(config_path, own);
-        }
+    /// The last entry that sets or unsets `name` before the config file
+    /// `file` in load order: the one the entry of `file` for `name`
+    /// overrides. Never `file` itself or a config loaded after it. `None`
+    /// when `file` is no config file or no entry before it names `name`.
+    #[must_use]
+    pub fn overridden_config_attribute(&self, file: &Path, name: &str) -> Option<ConfigAttribute> {
+        let (dir, config_path) = self.config_file_location(file)?;
+        let chain_dirs = self.config_dirs(dir)?;
+        let mut watch = Watch {
+            name: name.to_string(),
+            last: None,
+        };
+        merge_config_chain(
+            &chain_dirs,
+            ChainLimit::Before(&config_path),
+            &self.builtin,
+            &mut HashMap::new(),
+            Some(&mut watch),
+        );
+        watch.last
     }
 
     /// The config chain `file` sees: the one of its document directory, or
     /// for a config file in that directory the chain without the file
     /// itself, as in `IntelliJ` (`!currentFile.equals(configFile)`).
     fn config_chain(&self, file: &Path) -> Option<&HashMap<String, AttributeEntry>> {
-        let dir = self.doc_dir(file)?;
-        match file.file_name().and_then(|name| name.to_str()) {
-            Some(name) if CONFIG_FILE_NAMES.contains(&name) => {
-                self.config_file_chains.get(&dir.join(name))
-            }
-            _ => self.config_chains.get(dir),
+        match self.config_file_location(file) {
+            Some((_, config_path)) => self.config_file_chains.get(&config_path),
+            None => self.config_chains.get(self.doc_dir(file)?),
         }
+    }
+
+    /// For a config file `file` (by its name), its document directory and
+    /// its path there; `None` for any other file.
+    fn config_file_location<'a>(&'a self, file: &'a Path) -> Option<(&'a Path, PathBuf)> {
+        let name = file.file_name()?.to_str()?;
+        if !CONFIG_FILE_NAMES.contains(&name) {
+            return None;
+        }
+        let dir = self.doc_dir(file)?;
+        Some((dir, dir.join(name)))
     }
 
     /// Whether `file` is a config file whose chain is known: one in the
     /// workspace, after [`Self::ensure_config_for_dir`].
     #[must_use]
     pub fn is_config_file(&self, file: &Path) -> bool {
-        self.config_chain(file).is_some()
-            && file
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| CONFIG_FILE_NAMES.contains(&name))
+        self.config_file_location(file)
+            .is_some_and(|(_, config_path)| self.config_file_chains.contains_key(&config_path))
     }
 
     /// Drop all cached config chains.
@@ -459,16 +523,20 @@ impl From<&AttributeEntry> for AttributeHit {
 ///
 /// Walks `chain_dirs` (expected in root → leaf order), loading each config file
 /// and merging its attributes. Later directories override earlier ones.
-/// `exclude` contributes only its `{asciidoctorconfigdir}`, not its entries:
-/// the chain of that config file itself.
+/// `limit` leaves a config file out of the chain, or ends it there. `watch`
+/// notes the entries for one name on the way.
 fn merge_config_chain(
     chain_dirs: &[PathBuf],
-    exclude: Option<&Path>,
+    limit: ChainLimit<'_>,
     builtin: &HashMap<String, String>,
     merged: &mut HashMap<String, AttributeEntry>,
+    mut watch: Option<&mut Watch>,
 ) {
     for chain_dir in chain_dirs {
         for config_path in config_files(chain_dir) {
+            if limit == ChainLimit::Before(&config_path) {
+                return;
+            }
             let Ok(content) = std::fs::read_to_string(&config_path) else {
                 continue;
             };
@@ -483,7 +551,7 @@ fn merge_config_chain(
                     }),
                 },
             );
-            if exclude == Some(config_path.as_path()) {
+            if limit == ChainLimit::Without(&config_path) {
                 continue;
             }
 
@@ -492,10 +560,29 @@ fn merge_config_chain(
                 conditionals: config_path.extension().is_some_and(|ext| ext == "adoc"),
                 max_depth: MAX_CONFIG_INCLUDE_DEPTH,
                 stack: Vec::new(),
+                watch: watch.as_deref_mut(),
             };
             read.apply_text(&config_path, &content, merged);
         }
     }
+}
+
+/// Which config files a chain reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainLimit<'a> {
+    /// All of them.
+    All,
+    /// All but this file's entries: it contributes only its
+    /// `{asciidoctorconfigdir}`, the chain of that config file itself.
+    Without(&'a Path),
+    /// Those loaded before this file.
+    Before(&'a Path),
+}
+
+/// The last entry that sets or unsets `name` in a chain read.
+struct Watch {
+    name: String,
+    last: Option<ConfigAttribute>,
 }
 
 /// Asciidoctor's default `max-include-depth`; the include graph sets no
@@ -513,6 +600,8 @@ struct ConfigRead<'a> {
     max_depth: usize,
     /// Canonical paths of the files being read, outermost first.
     stack: Vec<PathBuf>,
+    /// The entries for one name, noted as they apply.
+    watch: Option<&'a mut Watch>,
 }
 
 impl ConfigRead<'_> {
@@ -568,6 +657,7 @@ impl ConfigRead<'_> {
         match entry {
             ConfigEntry::Set { name, .. } if name == DOCDIR => {}
             ConfigEntry::Set { name, value, line } => {
+                self.note(file, &name, line, Some(&value));
                 let substituted = substitute_with(merged, &value);
                 merged.insert(
                     name,
@@ -580,11 +670,19 @@ impl ConfigRead<'_> {
                     },
                 );
             }
-            ConfigEntry::Unset { name } => {
+            ConfigEntry::Unset { name, line } => {
+                self.note(file, &name, line, None);
                 merged.remove(&name);
             }
             ConfigEntry::Include { target } => self.include(file, &target, merged),
             ConfigEntry::Conditional { .. } | ConfigEntry::Ifeval | ConfigEntry::Endif => {}
+        }
+    }
+
+    /// Note the entry for `name` on `line` of `file` if it is the one watched.
+    fn note(&mut self, file: &Path, name: &str, line: usize, raw: Option<&str>) {
+        if let Some(watch) = self.watch.as_deref_mut().filter(|watch| watch.name == name) {
+            watch.last = Some(ConfigAttribute::new(file, line, raw));
         }
     }
 
@@ -704,8 +802,8 @@ enum ConfigEntry {
         value: String,
         line: usize,
     },
-    /// `:name!:` or `:!name:`.
-    Unset { name: String },
+    /// `:name!:` or `:!name:`, with its 1-indexed line.
+    Unset { name: String, line: usize },
     /// `include::target[...]`, target not yet substituted.
     Include { target: String },
     /// `ifdef::`/`ifndef::`: opens a block, or with `single_line` the
@@ -737,7 +835,7 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
             let single_line = text.map(|text| {
                 let mut entries = parse_asciidoctorconfig(text);
                 for entry in &mut entries {
-                    if let ConfigEntry::Set { line, .. } = entry {
+                    if let ConfigEntry::Set { line, .. } | ConfigEntry::Unset { line, .. } = entry {
                         *line = idx + 1;
                     }
                 }
@@ -764,6 +862,7 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
                     if let Some(name) = unset.filter(|name| !name.is_empty()) {
                         result.push(ConfigEntry::Unset {
                             name: name.to_string(),
+                            line: idx + 1,
                         });
                     } else if !key.is_empty() {
                         let mut value = value.to_string();
@@ -792,6 +891,48 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
         }
     }
     result
+}
+
+/// The entry for `name` on `line` (1-based) of the config file `file` with
+/// the text `content`, as written: a continued value joined, an unset
+/// without value. `None` when that line holds no entry for `name`.
+#[must_use]
+pub fn config_attribute_at(
+    file: &Path,
+    content: &str,
+    line: usize,
+    name: &str,
+) -> Option<ConfigAttribute> {
+    entry_at(file, &parse_asciidoctorconfig(content), line, name)
+}
+
+/// The entry for `name` on `line` among `entries`, looking into single-line
+/// conditionals too.
+fn entry_at(
+    file: &Path,
+    entries: &[ConfigEntry],
+    line: usize,
+    name: &str,
+) -> Option<ConfigAttribute> {
+    entries.iter().find_map(|entry| {
+        let raw = match entry {
+            ConfigEntry::Set {
+                name: set,
+                value,
+                line: at,
+            } if set == name && *at == line => Some(value.as_str()),
+            ConfigEntry::Unset {
+                name: unset,
+                line: at,
+            } if unset == name && *at == line => None,
+            ConfigEntry::Conditional {
+                single_line: Some(entries),
+                ..
+            } => return entry_at(file, entries, line, name),
+            _ => return None,
+        };
+        Some(ConfigAttribute::new(file, line, raw))
+    })
 }
 
 /// The target of an `include::target[...]` line; the attribute list is not read.
@@ -866,6 +1007,96 @@ mod tests {
         let dummy = child.join("any.adoc");
         assert_eq!(registry.resolve(&dummy, "imagesdir"), Some("img"));
         assert_eq!(registry.resolve(&dummy, "chapdir"), Some("chapters"));
+    }
+
+    fn attribute(file: &Path, line: usize, raw: Option<&str>) -> Option<ConfigAttribute> {
+        Some(ConfigAttribute::new(file, line, raw))
+    }
+
+    /// What a config file overrides is what loads before it: root to leaf,
+    /// per folder the `.adoc` file, then the plain one. Never itself, never
+    /// what loads after it.
+    #[test]
+    fn test_overridden_config_attribute_follows_load_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join(".asciidoctorconfig.adoc"), ":d: adoc\n").unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":d: plain\n:e: e\n").unwrap();
+        fs::write(sub.join(".asciidoctorconfig.adoc"), ":d: sub\n").unwrap();
+
+        let registry = AttributeRegistry::new(&root);
+        let root_adoc = root.join(".asciidoctorconfig.adoc");
+        let root_plain = root.join(".asciidoctorconfig");
+        let sub_adoc = sub.join(".asciidoctorconfig.adoc");
+        assert_eq!(registry.overridden_config_attribute(&root_adoc, "d"), None);
+        assert_eq!(
+            registry.overridden_config_attribute(&root_plain, "d"),
+            attribute(&root_adoc, 1, Some("adoc"))
+        );
+        assert_eq!(
+            registry.overridden_config_attribute(&sub_adoc, "d"),
+            attribute(&root_plain, 1, Some("plain"))
+        );
+        assert_eq!(
+            registry.overridden_config_attribute(&sub_adoc, "e"),
+            attribute(&root_plain, 2, Some("e"))
+        );
+        assert_eq!(
+            registry.overridden_config_attribute(&sub_adoc, "none"),
+            None
+        );
+        assert_eq!(
+            registry.overridden_config_attribute(&sub.join("a.adoc"), "d"),
+            None
+        );
+    }
+
+    /// An unset is an entry too, and an entry of an included file has the
+    /// included file as its place; the value is as written, not substituted.
+    #[test]
+    fn test_overridden_config_attribute_reports_unsets_and_included_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("inc.adoc"), ":from-inc: {base}/i\n").unwrap();
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            ":base: b\n:d: 1\n:d!:\ninclude::inc.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(sub.join(".asciidoctorconfig"), ":d: 2\n").unwrap();
+
+        let registry = AttributeRegistry::new(&root);
+        let sub_config = sub.join(".asciidoctorconfig");
+        assert_eq!(
+            registry.overridden_config_attribute(&sub_config, "d"),
+            attribute(&root.join(".asciidoctorconfig"), 3, None)
+        );
+        assert_eq!(
+            registry.overridden_config_attribute(&sub_config, "from-inc"),
+            attribute(&root.join("inc.adoc"), 1, Some("{base}/i"))
+        );
+    }
+
+    /// The entry on a line is read as the chain reads it: a continued value
+    /// joined, an unset without value.
+    #[test]
+    fn test_config_attribute_at_reads_continued_values_and_unsets() {
+        let file = Path::new("/ws/.asciidoctorconfig");
+        let content = ":long: one \\\n  two \\\nthree\n:gone!:\n";
+        assert_eq!(
+            config_attribute_at(file, content, 1, "long"),
+            attribute(file, 1, Some("one two three"))
+        );
+        assert_eq!(
+            config_attribute_at(file, content, 4, "gone"),
+            attribute(file, 4, None)
+        );
+        assert_eq!(config_attribute_at(file, content, 2, "long"), None);
+        assert_eq!(config_attribute_at(file, content, 1, "other"), None);
     }
 
     #[test]
@@ -1307,6 +1538,7 @@ mod tests {
             conditionals: false,
             max_depth: 1,
             stack: Vec::new(),
+            watch: None,
         };
         read.apply_text(&config, &content, &mut merged);
 

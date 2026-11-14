@@ -103,6 +103,23 @@ pub fn normalize_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
+/// `path` as seen from the folder `from_dir`, without asking the
+/// filesystem: `..` for each folder of `from_dir` not shared with `path`.
+#[must_use]
+pub fn relative_path(from_dir: &Path, path: &Path) -> PathBuf {
+    let from: Vec<Component> = from_dir.components().collect();
+    let to: Vec<Component> = path.components().collect();
+    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut relative = PathBuf::new();
+    for _ in shared..from.len() {
+        relative.push("..");
+    }
+    for component in &to[shared..] {
+        relative.push(component);
+    }
+    relative
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +185,30 @@ mod tests {
                 normalize_lexically(Path::new(input)),
                 PathBuf::from(expected),
                 "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_path_goes_up_and_down_from_a_folder() {
+        for (from, to, expected) in [
+            (
+                "/ws/a/b",
+                "/ws/.asciidoctorconfig",
+                "../../.asciidoctorconfig",
+            ),
+            (
+                "/ws/a",
+                "/ws/a/.asciidoctorconfig.adoc",
+                ".asciidoctorconfig.adoc",
+            ),
+            ("/ws/a", "/ws/a/shared/attrs.adoc", "shared/attrs.adoc"),
+            ("/ws/a", "/ws/b/x.adoc", "../b/x.adoc"),
+        ] {
+            assert_eq!(
+                relative_path(Path::new(from), Path::new(to)),
+                PathBuf::from(expected),
+                "{from} -> {to}"
             );
         }
     }

@@ -5,12 +5,14 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
-use asciidoc_core::attributes::AttributeSource;
+use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::extractors::find_child_text;
 use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
-use asciidoc_core::workspace::{AttributeDefinition, AttributeOrigin, AttributeScope, Workspace};
+use asciidoc_core::workspace::{
+    AttributeDefinition, AttributeOrigin, AttributeScope, ConfigOverride, Workspace,
+};
 
 use crate::positions;
 use crate::scopes::{
@@ -329,17 +331,17 @@ pub fn resolve_hover(
         NodeKind::AttributeDef { name } => {
             let ws = workspace?;
             let file = ws.indexed_path(doc_path);
-            let config_value = ws
+            let config_entry = ws
                 .attributes()
                 .is_config_file(&file)
-                .then(|| config_entry_value(content, node_info.line, name))
+                .then(|| config_attribute_at(&file, content, node_info.line, name))
                 .flatten();
             let texts: Vec<(String, String)> = ws
                 .scopes_at(doc_path, node_info.line)
                 .iter()
                 .filter_map(|scope| {
-                    let text = if let Some(raw) = &config_value {
-                        config_definition_hover(ws, doc_path, scope, name, raw, node_info.line)
+                    let text = if let Some(entry) = &config_entry {
+                        config_definition_hover(ws, doc_path, scope, name, entry.raw.as_deref())
                     } else {
                         let definition = scope.definitions(name).find(|definition| {
                             definition.source.as_ref().is_some_and(|source| {
@@ -456,6 +458,16 @@ fn per_document_hover(mut texts: Vec<(String, String)>) -> String {
         .join("\n\n")
 }
 
+/// An attribute entry as written: `:name: raw`, `:name:` for an empty value,
+/// or `:name!:` for an unset.
+fn entry_text(name: &str, raw: Option<&str>) -> String {
+    match raw {
+        None => format!(":{name}!:"),
+        Some("") => format!(":{name}:"),
+        Some(raw) => format!(":{name}: {raw}"),
+    }
+}
+
 /// Hover text for one definition: the entry as written (`:name!:` for an
 /// unset), then what it resolves to where it differs.
 fn definition_hover(
@@ -465,9 +477,9 @@ fn definition_hover(
     definition: &AttributeDefinition,
 ) -> String {
     let (Some(raw), Some(value)) = (&definition.raw, &definition.value) else {
-        return format!(":{name}!:");
+        return entry_text(name, None);
     };
-    let mut text = format!(":{name}: {raw}");
+    let mut text = entry_text(name, Some(raw));
     let resolved = if definition.origin == AttributeOrigin::Config {
         config_relative_path(ws, doc_path, value).map(|path| path.display().to_string())
     } else {
@@ -481,46 +493,38 @@ fn definition_hover(
     text
 }
 
-/// The value written on `line` (1-based) of a config file for `name`.
-fn config_entry_value(content: &str, line: usize, name: &str) -> Option<String> {
-    let text = content.lines().nth(line.checked_sub(1)?)?;
-    let value = text
-        .strip_prefix(':')?
-        .strip_prefix(name)?
-        .strip_prefix(':')?;
-    Some(value.trim().to_string())
-}
-
-/// Hover text for the entry `:name: raw` on `line` of the config file
-/// `doc_path`: the line as written, then what it overrides. A config file
-/// sees the chain without itself, so `scope` holds only what is above it.
+/// Hover text for the entry `:name: raw` (`None` for an unset) of the config
+/// file `doc_path`: the line as written, then what it overrides: the entry loaded
+/// before it in a config file, shown with its place relative to `doc_path`,
+/// else a builtin. A config file sees the chain without itself, so `scope`
+/// substitutes against what is above it.
 fn config_definition_hover(
     ws: &Workspace,
     doc_path: &Path,
     scope: &AttributeScope<'_>,
     name: &str,
-    raw: &str,
-    line: usize,
+    raw: Option<&str>,
 ) -> String {
     let definition = AttributeDefinition {
-        source: Some(AttributeSource {
-            file: ws.indexed_path(doc_path),
-            line,
-        }),
+        source: None,
         origin: AttributeOrigin::Config,
-        raw: Some(raw.to_string()),
-        value: Some(scope.substitute(raw)),
+        raw: raw.map(str::to_string),
+        value: raw.map(|raw| scope.substitute(raw)),
     };
     let mut text = definition_hover(ws, doc_path, name, &definition);
-    if let Some(above) = scope.definition(name) {
-        let entry = above
-            .raw
-            .map_or_else(|| format!(":{name}!:"), |raw| format!(":{name}: {raw}"));
-        let from = above
-            .source
-            .map(|source| format!(" ({})", file_display_name(&source.file)))
-            .unwrap_or_default();
-        text = format!("{text}\n\nOverrides {entry}{from}");
+    let overridden = ws
+        .config_override(doc_path, scope, name)
+        .map(|overridden| match overridden {
+            ConfigOverride::Entry { place, line, raw } => format!(
+                "{} ({}:{line})",
+                entry_text(name, raw.as_deref()),
+                place.display()
+            ),
+            ConfigOverride::Builtin { raw } => entry_text(name, raw.as_deref()),
+        });
+    if let Some(overridden) = overridden {
+        use std::fmt::Write;
+        let _ = write!(text, "\n\nOverrides {overridden}");
     }
     text
 }
@@ -1448,7 +1452,7 @@ fn find_attr_def_columns(line_text: &str, name: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scanned;
+    use crate::test_support::{opened, scanned};
     use rstest::rstest;
     use std::fs;
 
@@ -2842,12 +2846,13 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     }
 
     /// A definition hover shows the line under the cursor. In a config file
-    /// the chain above it (without the file itself) only adds what the line
-    /// overrides.
+    /// the config loaded before it only adds what the line overrides, with
+    /// the place of that entry relative to the hovered file. Files are open
+    /// as in the editor, so the config files are documents of the workspace.
     #[test]
     fn test_hover_attribute_def_in_config_file_shows_its_own_line_and_what_it_overrides() {
         let child = ":d: down\n";
-        let (_tmp, ws, paths) = scanned(&[
+        let (_tmp, ws, paths) = opened(&[
             (".asciidoctorconfig", ":d: ./up\n"),
             ("sub/.asciidoctorconfig", child),
             ("sub/b.adoc", "= B\n"),
@@ -2858,7 +2863,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
         assert_eq!(
             resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
-            ":d: down\n\nOverrides :d: ./up (.asciidoctorconfig)"
+            ":d: down\n\nOverrides :d: ./up (../.asciidoctorconfig:1)"
         );
     }
 
@@ -2867,8 +2872,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     #[test]
     fn test_hover_attribute_def_in_config_file_substitutes_against_the_config_above() {
         let child = ":d: {d}/more\n";
-        let (_tmp, ws, paths) = scanned(&[
-            (".asciidoctorconfig", ":d: ./up\n"),
+        let (_tmp, ws, paths) = opened(&[
+            (".asciidoctorconfig", ":other: o\n:d: ./up\n"),
             ("sub/.asciidoctorconfig", child),
             ("sub/b.adoc", "= B\n"),
         ]);
@@ -2880,7 +2885,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
             format!(
-                ":d: {{d}}/more\n\nResolves to {}/up/more\n\nOverrides :d: ./up (.asciidoctorconfig)",
+                ":d: {{d}}/more\n\nResolves to {}/up/more\n\nOverrides :d: ./up (../.asciidoctorconfig:2)",
                 sub.display()
             )
         );
@@ -2891,7 +2896,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     #[test]
     fn test_hover_attribute_def_in_config_file_overrides_its_sibling_config() {
         let plain = ":d: plain\n";
-        let (_tmp, ws, paths) = scanned(&[
+        let (_tmp, ws, paths) = opened(&[
             (".asciidoctorconfig.adoc", ":d: adoc\n"),
             (".asciidoctorconfig", plain),
             ("a.adoc", "= A\n"),
@@ -2902,7 +2907,27 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
         assert_eq!(
             resolve_hover(plain, pos, &paths[1], Some(&ws)).unwrap(),
-            ":d: plain\n\nOverrides :d: adoc (.asciidoctorconfig.adoc)"
+            ":d: plain\n\nOverrides :d: adoc (.asciidoctorconfig.adoc:1)"
+        );
+    }
+
+    /// The sibling loaded after a config file does not count as overridden
+    /// by it: the `.adoc` file loads first, so nothing is above its line.
+    #[test]
+    fn test_hover_attribute_def_in_adoc_config_file_does_not_override_its_plain_sibling() {
+        let adoc = ":d: adoc\n";
+        let (_tmp, ws, paths) = opened(&[
+            (".asciidoctorconfig.adoc", adoc),
+            (".asciidoctorconfig", ":d: plain\n"),
+            ("a.adoc", "= A\n"),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(adoc, pos, &paths[0], Some(&ws)).unwrap(),
+            ":d: adoc"
         );
     }
 
@@ -2911,7 +2936,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     #[test]
     fn test_hover_attribute_def_in_adoc_config_file_shows_its_own_line() {
         let child = ":d: down\n";
-        let (_tmp, ws, paths) = scanned(&[
+        let (_tmp, ws, paths) = opened(&[
             (".asciidoctorconfig", ":d: up\n"),
             ("sub/.asciidoctorconfig.adoc", child),
             ("sub/b.adoc", "= B\n"),
@@ -2922,7 +2947,118 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
         assert_eq!(
             resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
-            ":d: down\n\nOverrides :d: up (.asciidoctorconfig)"
+            ":d: down\n\nOverrides :d: up (../.asciidoctorconfig:1)"
+        );
+    }
+
+    /// No config above defines the name: the entry overrides nothing, not
+    /// itself.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_does_not_override_itself() {
+        let child = ":kept: k\n:local: z\n";
+        let (_tmp, ws, paths) = opened(&[
+            (".asciidoctorconfig", ":kept: k\n"),
+            ("sub/.asciidoctorconfig", child),
+            ("sub/b.adoc", "= B\n"),
+        ]);
+        let pos = Position {
+            line: 1,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
+            ":local: z"
+        );
+    }
+
+    /// The entry overridden is the last one before the file in load order,
+    /// from whichever folder above, and an unset counts.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_overrides_the_nearest_config_above() {
+        let leaf = ":a: leaf\n:b: leaf\n";
+        let (_tmp, ws, paths) = opened(&[
+            (".asciidoctorconfig", ":a: root\n:b: root\n"),
+            ("mid/.asciidoctorconfig", ":b!:\n"),
+            ("mid/leaf/.asciidoctorconfig", leaf),
+            ("mid/leaf/c.adoc", "= C\n"),
+        ]);
+        let hover = |line| {
+            let pos = Position { line, character: 1 };
+            resolve_hover(leaf, pos, &paths[2], Some(&ws)).unwrap()
+        };
+        assert_eq!(
+            hover(0),
+            ":a: leaf\n\nOverrides :a: root (../../.asciidoctorconfig:1)"
+        );
+        assert_eq!(
+            hover(1),
+            ":b: leaf\n\nOverrides :b!: (../.asciidoctorconfig:1)"
+        );
+    }
+
+    /// A value continued with `\` shows complete, the lines joined.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_shows_a_continued_value_complete() {
+        let config = ":long: one \\\n  two \\\nthree\n:after: next\n";
+        let (_tmp, ws, paths) = opened(&[(".asciidoctorconfig", config), ("a.adoc", "= A\n")]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(config, pos, &paths[0], Some(&ws)).unwrap(),
+            ":long: one two three"
+        );
+    }
+
+    /// A config file in the workspace root, open in the editor, shows its
+    /// line even though no document sits next to it.
+    #[test]
+    fn test_hover_attribute_def_in_opened_root_config_file_shows_its_own_line() {
+        let config = ":d: only\n";
+        let (_tmp, ws, paths) = opened(&[(".asciidoctorconfig", config)]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(config, pos, &paths[0], Some(&ws)).unwrap(),
+            ":d: only"
+        );
+    }
+
+    /// A builtin is no config file: the override has no place to show.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_overriding_a_builtin_names_no_place() {
+        let config = ":env-asciidoc-lsp: x\n";
+        let (_tmp, ws, paths) = opened(&[(".asciidoctorconfig", config), ("a.adoc", "= A\n")]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(config, pos, &paths[0], Some(&ws)).unwrap(),
+            ":env-asciidoc-lsp: x\n\nOverrides :env-asciidoc-lsp:"
+        );
+    }
+
+    /// Asciidoctor prepends the config as text, so an earlier line of the same
+    /// file counts for a later reference; only the file's later lines do not.
+    #[test]
+    fn test_hover_attribute_def_in_config_file_reads_its_earlier_lines() {
+        let child = ":a: z\n:c: {a}\n";
+        let (_tmp, ws, paths) = opened(&[
+            (".asciidoctorconfig", ":a: x\n"),
+            ("sub/.asciidoctorconfig", child),
+            ("sub/b.adoc", "= B\n"),
+        ]);
+        let pos = Position {
+            line: 1,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(child, pos, &paths[1], Some(&ws)).unwrap(),
+            ":c: {a}\n\nResolves to z"
         );
     }
 

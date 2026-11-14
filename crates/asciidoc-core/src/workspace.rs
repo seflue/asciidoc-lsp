@@ -9,6 +9,7 @@ use crate::diagnostics::collect_diagnostics;
 use crate::graph::{
     build_graph, build_graph_with_overrides, include_edges, parse_single_file, IncludeGraph,
 };
+use crate::paths::relative_path;
 use crate::pdf_theme::PdfResolution;
 use crate::references::ReferenceIndex;
 use crate::types::{AttributeDef, Diagnostic, DocumentModel, FileLocation};
@@ -226,6 +227,31 @@ impl Workspace {
         let file = self.indexed_path(file);
         self.top_level_documents_of(&file)?;
         Some(self.scope(file.clone(), &file, line, true))
+    }
+
+    /// What the entry for `name` in the config file `file` overrides: the
+    /// entry loaded before it, else a builtin `scope` has for `name`. `None`
+    /// when `file` is no config file or nothing is overridden.
+    #[must_use]
+    pub fn config_override(
+        &self,
+        file: &Path,
+        scope: &AttributeScope<'_>,
+        name: &str,
+    ) -> Option<ConfigOverride> {
+        let file = self.indexed_path(file);
+        if let Some(entry) = self.attributes.overridden_config_attribute(&file, name) {
+            let dir = self.attributes.doc_dir(&file)?;
+            return Some(ConfigOverride::Entry {
+                place: relative_path(dir, &entry.source.file),
+                line: entry.source.line,
+                raw: entry.raw,
+            });
+        }
+        scope
+            .definition(name)
+            .filter(|definition| definition.origin == AttributeOrigin::Builtin)
+            .map(|builtin| ConfigOverride::Builtin { raw: builtin.raw })
     }
 
     /// `name` before the first line of `document`: from its config chain,
@@ -620,6 +646,22 @@ pub enum AttributeOrigin {
     Config,
     /// Built in (`docdir`, `env-asciidoc-lsp`).
     Builtin,
+}
+
+/// What an entry of a config file overrides. From [`Workspace::config_override`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigOverride {
+    /// An entry loaded before it, in a config file or one it includes.
+    Entry {
+        /// The file of the entry, relative to the document directory of the
+        /// overriding config file.
+        place: PathBuf,
+        line: usize,
+        /// The value as written; `None` for an unset.
+        raw: Option<String>,
+    },
+    /// A builtin attribute.
+    Builtin { raw: Option<String> },
 }
 
 /// One definition of an attribute, as Asciidoctor reads it.
@@ -2637,5 +2679,45 @@ mod tests {
                 line: 1
             })
         );
+    }
+
+    /// A config entry overrides the entry loaded before it, shown relative
+    /// to its own folder; with none before it, a builtin; else nothing.
+    #[test]
+    fn test_config_override_entry_builtin_and_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":shared: root\n").unwrap();
+        let config = sub.join(".asciidoctorconfig");
+        fs::write(&config, ":shared: sub\n:env-asciidoc-lsp: x\n:fresh: 1\n").unwrap();
+        let doc = sub.join("doc.adoc");
+        fs::write(&doc, "= Doc\n").unwrap();
+
+        let mut ws = Workspace::new(&root);
+        ws.ensure_file(&config, &HashMap::new());
+        ws.ensure_file(&doc, &HashMap::new());
+        let config_override = |file: &Path, line: usize, name: &str| {
+            let scopes = ws.scopes_at(file, line);
+            ws.config_override(file, &scopes[0], name)
+        };
+
+        assert_eq!(
+            config_override(&config, 0, "shared"),
+            Some(ConfigOverride::Entry {
+                place: PathBuf::from("../.asciidoctorconfig"),
+                line: 1,
+                raw: Some("root".to_string()),
+            })
+        );
+        assert_eq!(
+            config_override(&config, 1, "env-asciidoc-lsp"),
+            Some(ConfigOverride::Builtin {
+                raw: Some(String::new())
+            })
+        );
+        assert_eq!(config_override(&config, 2, "fresh"), None);
+        assert_eq!(config_override(&doc, 0, "shared"), None);
     }
 }
