@@ -3245,7 +3245,7 @@ mod tests {
     }
 
     /// adoc-0143, Verify "one-sentence-per-line code action joins a wrapped
-    /// paragraph", over the protocol with the develop grammar.
+    /// paragraph", over the protocol with the grammar on main.
     #[tokio::test]
     async fn test_fixture_code_action_puts_one_sentence_per_line() {
         let fx = fixture_dir("ventilate");
