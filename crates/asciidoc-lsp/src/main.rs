@@ -6,6 +6,7 @@ mod scopes;
 mod symbols;
 #[cfg(test)]
 mod test_support;
+mod version;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1159,6 +1160,11 @@ fn open_contents(docs: &HashMap<Uri, DocumentState>) -> HashMap<PathBuf, Arc<Str
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if version::wants_version(std::env::args().skip(1)) {
+        println!("{}", version::version_line(&version::build_version()));
+        return Ok(());
+    }
+
     // Tracing: write to stderr (LSP uses stdout for protocol).
     // Control via ASCIIDOC_LSP_LOG env var, e.g. ASCIIDOC_LSP_LOG=debug
     tracing_subscriber::fmt()
