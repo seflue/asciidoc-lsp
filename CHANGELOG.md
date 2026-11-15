@@ -10,8 +10,6 @@ Before 1.0, a minor version may contain breaking changes.
 
 ## [Unreleased]
 
-This is the first public release.
-
 ### Added
 
 - Hover on an attribute shows its resolved value, including paths set in

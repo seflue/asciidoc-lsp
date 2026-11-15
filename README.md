@@ -4,16 +4,16 @@
 
 A language server for [AsciiDoc](https://asciidoc.org/), built with Rust and [tree-sitter](https://tree-sitter.github.io/).
 
-Provides navigation, diagnostics, completions, and refactoring for AsciiDoc projects — with full workspace awareness including `include::` resolution, cross-references, and `.asciidoctorconfig` support.
+Provides navigation, diagnostics, completions, and refactoring for AsciiDoc projects. It follows `include::` and cross-references across files and reads `.asciidoctorconfig`.
 
 ## Features
 
 ### Navigation
 
-- **Go to Definition** (`gd`) — jump to targets of `include::`, `xref:`, `<<anchor>>`, `image::`, and `{attribute}` references
-- **Find References** (`gr`) — find all usages of attributes, includes, and anchors across the workspace
-- **Document Symbols** — nested section outline for the current file
-- **Workspace Symbols** — search sections, attributes, and includes across all files
+- **Go to Definition** (`gd`): jump to targets of `include::`, `xref:`, `<<anchor>>`, `image::`, and `{attribute}` references
+- **Find References** (`gr`): find all usages of attributes, includes, and anchors across the workspace
+- **Document Symbols**: nested section outline for the current file
+- **Workspace Symbols**: search sections, attributes, and includes across all files
 
 ### Diagnostics
 
@@ -25,8 +25,8 @@ Provides navigation, diagnostics, completions, and refactoring for AsciiDoc proj
 
 ### Completions
 
-- **Semantic** — attribute references (`{attr}`), include paths with attribute substitution, xref targets, anchor IDs
-- **Syntax** — block macros (`include::`, `image::`, `video::`), admonitions (`NOTE`, `WARNING`, ...), document attributes (`:toc:`, `:sectnums:`, ...), inline formatting (`kbd:`, `btn:`, ...)
+- **Semantic**: attribute references (`{attr}`), include paths with attribute substitution, xref targets, anchor IDs
+- **Syntax**: block macros (`include::`, `image::`, `video::`), admonitions (`NOTE`, `WARNING`, ...), document attributes (`:toc:`, `:sectnums:`, ...), inline formatting (`kbd:`, `btn:`, ...)
 
 ### Hover
 
@@ -37,15 +37,13 @@ Provides navigation, diagnostics, completions, and refactoring for AsciiDoc proj
 
 ### Refactoring
 
-- **Rename** (`vim.lsp.buf.rename()`) — rename anchors and attributes across the entire workspace, with `prepareRename` validation
+- **Rename** (`vim.lsp.buf.rename()`): rename anchors and attributes across the entire workspace, with `prepareRename` validation
 
-### Workspace Intelligence
+### Workspace
 
-- Workspace root taken from the editor (LSP root); each file is parsed on its own, with a background scan of the workspace on startup
-- `.asciidoctorconfig` attribute loading and substitution
-- Synthetic `{asciidoctorconfigdir}` attribute
-- Recursive include-tree resolution with attribute expansion
-- Incremental workspace rebuild on file changes
+- Reads `.asciidoctorconfig` and resolves attributes in it, including `{asciidoctorconfigdir}`.
+- Follows `include::` chains across files.
+- Picks up changes to files on disk.
 
 ## Installation
 
@@ -128,8 +126,8 @@ vim.lsp.enable('asciidoc_lsp')
 
 Recommended companion plugins:
 
-- [trouble.nvim](https://github.com/folke/trouble.nvim) — workspace-wide diagnostics view
-- [live-rename.nvim](https://github.com/saecki/live-rename.nvim) — inline rename preview (works with `prepareRename`)
+- [trouble.nvim](https://github.com/folke/trouble.nvim): workspace-wide diagnostics view
+- [live-rename.nvim](https://github.com/saecki/live-rename.nvim): inline rename preview (works with `prepareRename`)
 
 ### IntelliJ IDEA and other JetBrains IDEs
 
@@ -169,14 +167,9 @@ asciidoc-cli --tree --all docs/index.adoc
 ```
 crates/
   asciidoc-core/    # Parser, extractors, workspace model, diagnostics
-  asciidoc-lsp/     # LSP server (tower-lsp)
+  asciidoc-lsp/     # LSP server (tower-lsp-server)
   asciidoc-cli/     # CLI for inspection and debugging
 ```
-
-**Dual-grammar parsing:** Two tree-sitter grammars cover different levels of AsciiDoc syntax:
-
-- **Block** (`tree-sitter-asciidoc`) — document structure: sections, includes, attributes
-- **Inline** (`tree-sitter-asciidoc-inline`) — inline content: xrefs, anchors
 
 ## Development
 
@@ -205,9 +198,7 @@ Below 1.0: functional, but API and configuration may change.
 
 ## Contributing
 
-Contributions welcome. The project uses a Git submodule for the tree-sitter grammar.
-After cloning, ensure submodules are initialized (`git submodule update --init`).
-Please run `just ci` before submitting changes.
+Contributions welcome. Run `just ci` before submitting changes; setup is described under Development.
 
 ## License
 
