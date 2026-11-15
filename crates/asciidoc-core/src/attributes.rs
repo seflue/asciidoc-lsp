@@ -270,8 +270,7 @@ impl AttributeRegistry {
             document: document.to_path_buf(),
             dir: self
                 .doc_dir(document)
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_default(),
+                .map_or_default(|dir| dir.display().to_string()),
         }
     }
 

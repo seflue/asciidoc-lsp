@@ -163,8 +163,7 @@ impl IncludeGraph {
 
         let (sections, xrefs, anchors) = documents
             .get(file)
-            .map(|doc| (doc.sections.clone(), doc.xrefs.clone(), doc.anchors.clone()))
-            .unwrap_or_default();
+            .map_or_default(|doc| (doc.sections.clone(), doc.xrefs.clone(), doc.anchors.clone()));
 
         let children: Vec<IncludeTree> = self
             .includes_of(file)

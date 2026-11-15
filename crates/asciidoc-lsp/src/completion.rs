@@ -776,8 +776,7 @@ fn anchor_completion_item(
     let filename = loc
         .file
         .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .map_or_default(|f| f.to_string_lossy().to_string());
     let kind_label = match loc.kind {
         asciidoc_core::types::AnchorKind::Explicit => "explicit",
         asciidoc_core::types::AnchorKind::ImplicitSection => "section",

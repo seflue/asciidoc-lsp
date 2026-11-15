@@ -124,8 +124,7 @@ fn main() -> anyhow::Result<()> {
                 let display = x
                     .display_text
                     .as_deref()
-                    .map(|d| format!(" \"{d}\""))
-                    .unwrap_or_default();
+                    .map_or_default(|d| format!(" \"{d}\""));
                 println!("  {} (line {}){}", x.target, x.line, display);
             }
             println!();
@@ -201,11 +200,7 @@ fn format_tree_node(tree: &IncludeTree, show_all: bool) -> String {
         String::new()
     };
 
-    let error_suffix = tree
-        .error
-        .as_ref()
-        .map(|e| format!(" ⚠ {e}"))
-        .unwrap_or_default();
+    let error_suffix = tree.error.as_ref().map_or_default(|e| format!(" ⚠ {e}"));
 
     format!("{file_display}{section_info}{inline_info}{error_suffix}")
 }

@@ -691,25 +691,23 @@ pub fn explain_position(
         explain_resolution(info, lookup_path, workspace)
     });
     let line = pos.line as usize + 1;
-    let known_attributes: Vec<Value> = workspace
-        .map(|ws| {
-            ws.scopes_at(lookup_path, line)
-                .iter()
-                .flat_map(|scope| {
-                    let label = scope_label(scope);
-                    scope.known().into_iter().map(move |(name, definition)| {
-                        json!({
-                            "scope": label,
-                            "name": name,
-                            "value": definition.value,
-                            "origin": origin_name(definition.origin),
-                            "source": source_json(definition.source.as_ref()),
-                        })
+    let known_attributes: Vec<Value> = workspace.map_or_default(|ws| {
+        ws.scopes_at(lookup_path, line)
+            .iter()
+            .flat_map(|scope| {
+                let label = scope_label(scope);
+                scope.known().into_iter().map(move |(name, definition)| {
+                    json!({
+                        "scope": label,
+                        "name": name,
+                        "value": definition.value,
+                        "origin": origin_name(definition.origin),
+                        "source": source_json(definition.source.as_ref()),
                     })
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+            })
+            .collect()
+    });
 
     json!({
         "request": explain_request(raw_path, lookup_path, workspace),
