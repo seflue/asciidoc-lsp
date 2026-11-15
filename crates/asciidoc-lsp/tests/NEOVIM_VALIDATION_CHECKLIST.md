@@ -1,4 +1,4 @@
-# Manual Neovim Validation Checklist (Task 8.2)
+# Manual Neovim Validation Checklist
 
 Manual validation steps for all 12 Acceptance Criteria.
 Run against the arc42 fixture (`docs/index.adoc`).

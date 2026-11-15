@@ -54,7 +54,7 @@ pub struct IncludeTree {
     pub error: Option<String>,
 }
 
-// --- Semantic Layer types (adoc-0010) ---
+// --- Semantic Layer types ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorKind {

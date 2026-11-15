@@ -1,28 +1,25 @@
 == Architecture Decisions
 
-This section documents the key architectural decisions made during the design and implementation of asciidoc-lsp.
-Each decision follows the ADR (Architecture Decision Record) format with context, decision, and consequences.
-
 [[adr-treesitter]]
-=== ADR-1: Use Treesitter for Parsing
+=== ADR-1: Use Tree-sitter for Parsing
 
 *Status:* Accepted
 
 *Context:*
-The LSP server needs a parser that can handle incomplete and syntactically invalid documents gracefully, provide incremental re-parsing for responsiveness, and produce a concrete syntax tree that preserves all source information (whitespace, comments, positions).
-Three parser options were evaluated: writing a custom PEG parser, using the `acdc-parser` crate (an existing PEG-based AsciiDoc parser), and using the cathaysia Treesitter grammar for AsciiDoc.
+The LSP server needs a parser that handles incomplete and syntactically invalid documents and produces a concrete syntax tree that preserves all source information (whitespace, comments, positions).
+Three parser options were evaluated: writing a custom PEG parser, using the `acdc-parser` crate (an existing PEG-based AsciiDoc parser), and using the cathaysia Tree-sitter grammar for AsciiDoc.
 
 *Decision:*
-We chose the cathaysia Treesitter grammar as the primary parser.
-It provides error-tolerant parsing out of the box, supports incremental updates via Treesitter's edit API, and is available as a Rust crate on crates.io.
-The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing model and is a proven pattern from `tree-sitter-markdown`.
+We chose Tree-sitter as the parser.
+The grammar is the project's fork (github.com/seflue/tree-sitter-asciidoc) of the archived cathaysia grammar, included as the git submodule `vendor/tree-sitter-asciidoc`; the root Cargo.toml patches both grammar crates to it via `[patch.crates-io]`.
+The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing model.
 
 *Consequences:*
 
-* Positive: Incremental parsing, error recovery, and syntax highlighting queries are provided by the Treesitter framework with minimal custom code.
-* Positive: The grammar is community-maintained, reducing the maintenance burden on the asciidoc-lsp project.
-* Negative: The cathaysia grammar may not cover all AsciiDoc constructs. Edge cases may require contributing fixes upstream.
-* Negative: The dual-grammar approach adds complexity to the parser integration layer; for details, see xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
+* Positive: Error recovery and syntax highlighting queries are provided by the Tree-sitter framework with minimal custom code.
+* Positive: Grammar fixes are made in the fork and take effect through the submodule pin.
+* Negative: The grammar may not cover all AsciiDoc constructs. Gaps are fixed in the fork.
+* Negative: The dual-grammar approach adds complexity to the parser integration; for details, see xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
 
 [[adr-rust]]
 === ADR-2: Implement in Rust
@@ -31,35 +28,35 @@ The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing
 
 *Context:*
 The LSP server is a long-running process that must handle concurrent document updates from the editor.
-Memory safety, performance, and ecosystem support for both Treesitter and LSP protocol handling are critical requirements.
+Memory safety, performance, and ecosystem support for both Tree-sitter and LSP protocol handling are critical requirements.
 TypeScript (via vscode-languageserver), Rust (via tower-lsp-server), and Go (via gopls patterns) were considered.
 
 *Decision:*
 We chose Rust as the implementation language.
-The `tower-lsp-server` crate provides a mature, async-first LSP framework used by production servers like Biome, Harper, and Oxc.
-Treesitter's Rust bindings are first-class, and Rust's ownership model prevents the memory leaks and data races that are common in long-running server processes.
+The `tower-lsp-server` crate provides an async-first LSP framework.
+Tree-sitter's Rust bindings are first-class, and Rust's ownership model prevents data races in a long-running server process.
 
 *Consequences:*
 
-* Positive: Memory safety without garbage collection overhead. The server can maintain large in-memory caches without worrying about GC pauses affecting responsiveness.
-* Positive: The Rust ecosystem provides excellent tooling (cargo, clippy, rustfmt) and a strong type system that catches bugs at compile time.
+* Positive: Memory safety without garbage collection pauses.
+* Positive: The Rust ecosystem provides tooling (cargo, clippy, rustfmt) and a strong type system that catches bugs at compile time.
 * Negative: Higher learning curve compared to TypeScript. Contributors need Rust experience or must be willing to learn.
-* Negative: Longer compile times compared to TypeScript or Go, though incremental compilation and `cargo check` mitigate this in practice.
+* Negative: Longer compile times compared to TypeScript or Go.
 
-For the building block structure enabled by this choice, see xref:05_building_block_view.adoc#building-blocks[see Building Block View].
+For the building block structure, see xref:05_building_block_view.adoc#building-blocks[Building Block View].
 
 [[adr-dual-parser]]
-=== ADR-3: Treesitter-Only-First, Dual-Parser Later
+=== ADR-3: Tree-sitter-Only-First, Dual-Parser Later
 
-*Status:* Accepted
+*Status:* Superseded by xref:09_architecture_decisions.adoc#adr-semantics[ADR-4]
 
 *Context:*
-The `acdc-parser` crate (v0.6.0, PEG-based) provides semantic-level parsing of AsciiDoc, including attribute substitution, conditional processing, and include resolution.
+The `acdc-parser` crate (PEG-based) provides semantic-level parsing of AsciiDoc, including attribute substitution, conditional processing, and include resolution.
 However, integrating two parsers from the start increases complexity and creates the risk of inconsistent behavior when both parsers disagree on the document structure.
 
 *Decision:*
-We adopt a *Treesitter-only-first* strategy: the initial LSP features (document symbols, go-to-definition, basic diagnostics) are built entirely on the Treesitter CST.
-The `acdc-parser` is introduced only if specific semantic features (full attribute substitution, conditional includes) cannot be adequately implemented with Treesitter tree queries alone.
+We adopt a *Tree-sitter-only-first* strategy: the initial LSP features (document symbols, go-to-definition, basic diagnostics) are built entirely on the Tree-sitter CST.
+The `acdc-parser` is introduced only if specific semantic features (full attribute substitution, conditional includes) cannot be adequately implemented with Tree-sitter tree queries alone.
 
 *Consequences:*
 
@@ -68,4 +65,36 @@ The `acdc-parser` is introduced only if specific semantic features (full attribu
 * Negative: Some advanced AsciiDoc features (conditional directives, complex attribute substitution) may have limited support in the initial release.
 * Negative: If `acdc-parser` is needed later, integrating it into an existing codebase is harder than designing for it from the start.
 
-The quality goals and stakeholder expectations that drove this trade-off are documented in xref:05_building_block_view.adoc#building-blocks[see Building Block View] and xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
+The quality goals and stakeholder expectations that drove this trade-off are documented in xref:01_introduction_and_goals.adoc[Introduction and Goals] and xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
+
+[[adr-semantics]]
+=== ADR-4: Resolve AsciiDoc Semantics in asciidoc-core
+
+*Status:* Accepted
+
+*Context:*
+Asciidoctor converts one top-level document per run.
+`include::` is replaced textually before parsing, and an attribute entry applies from its line on in that reading order.
+The value of `{x}` in a shared file is therefore not a property of the line but of the pair (top-level document, position).
+If `book.adoc` and `web.adoc` include the same file with different `imagesdir` values, both results are correct.
+
+Asciidoctor sets `docdir` to the folder of the converted document and locks it, so a `:docdir:` entry in the document is ignored.
+Included files belong to the same document and keep that value.
+Tree-sitter parses syntax only. It knows nothing about attribute values, include order, or `docdir`.
+
+*Decision:*
+
+* There is no second parser. Attributes, includes, `docdir`, and cross-reference targets are resolved in `asciidoc-core` on top of the Tree-sitter trees. `asciidoc-lsp` translates the results into LSP types.
+* Attribute values are resolved per (top-level document, position). A definition applies from its line on, and an unset hides an earlier value. A file included by several top-level documents can have one value per document.
+* `asciidoc-core` returns the attribute scopes of all top-level documents and does not pick one; each feature decides how to show them. Path existence checks count a `{docdir}` target as broken only if it is broken for every including document.
+* A top-level document is a document that no other document includes.
+* `{docdir}` is the folder of the top-level document, as in Asciidoctor. A document without an includer is its own top-level document. A `:docdir:` entry in a document or in `.asciidoctorconfig` is ignored.
+* Each top-level document is read as the editor previews it: its own `.asciidoctorconfig` chain first, then the document.
+* For paths, a file that other documents include is also resolved as its own preview: its config chain and its own folder as base, without the attributes of the including document. Attribute values (hover, go to definition on `{name}`) show only the top-level documents.
+* Each feature decides how to present the results. If all agree, it shows one result. If they differ, it shows each result with the document name.
+
+*Consequences:*
+
+* Positive: One resolution rule for hover, go to definition, image, include, and xref paths, and completion.
+* Positive: Setups with several top-level documents (print and web, draft and book) are shown correctly and do not depend on file names.
+* Negative: The top-level document is derived from the include graph, not from build configuration.

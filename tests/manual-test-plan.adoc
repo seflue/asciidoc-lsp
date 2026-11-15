@@ -718,7 +718,7 @@ a| See xref:chapters/introduction.adoc#_quality_goals[Quality Goals] in an a-cel
 
 // Expected: Both xrefs jump to `tests/chapters/introduction.adoc` at
 // `=== Quality Goals`. The image resolves like T1.1 (`gd` opens
-// `tests/images/test-placeholder.png`, hover shows `✓ File exists`). Regression for adoc-0125: table cells are raw
+// `tests/images/test-placeholder.png`, hover shows `✓ File exists`). Regression: table cells are raw
 // `table_cell_content` in the grammar and were never fed to the inline parser.
 
 ---
@@ -758,7 +758,7 @@ anchor) and mark the result.
 // Run T8.3 in the fixture. Expected: `gd` does nothing, BrokenXref
 // diagnostic appears on the line, LSP stays attached.
 
-== T9: External file changes (adoc-0119)
+== T9: External file changes
 
 Verifies `workspace/didChangeWatchedFiles`. Run each case from a
 terminal while a `.adoc` file is open in Neovim with the LSP attached.
@@ -826,7 +826,7 @@ terminal while a `.adoc` file is open in Neovim with the LSP attached.
 // Expected: Neovim buffer state is preserved; xrefs to `x` still
 // resolve. The watcher event is ignored for open buffers.
 
-== T10: Debug tooling (adoc-0137)
+== T10: Debug tooling
 
 Needs asciidoc.nvim with `:AsciidocDebug` and the language-server
 section in `:checkhealth asciidoc`.

@@ -1,35 +1,17 @@
 == Solution Strategy
-:parser-version: 0.6.0
 
-The solution strategy for asciidoc-lsp is guided by three core principles: leverage existing community work wherever possible, prioritize incremental delivery of user-visible features, and maintain a modular architecture that allows swapping components as the project matures.
+* Parsing is based on tree-sitter grammars (xref:09_architecture_decisions.adoc#adr-treesitter[ADR-1]).
+* The server is written in Rust (xref:09_architecture_decisions.adoc#adr-rust[ADR-2]).
+* AsciiDoc semantics are resolved in `asciidoc-core`, without a second parser (xref:09_architecture_decisions.adoc#adr-semantics[ADR-4]).
 
-=== Why Rust
+=== Grammar
 
-Rust was chosen as the implementation language for several compelling reasons.
-First, the LSP server runs as a long-lived process that must handle concurrent document updates without memory leaks or crashes — Rust's ownership model provides these guarantees at compile time.
-Second, the Treesitter ecosystem has first-class Rust bindings through the `tree-sitter` crate, enabling direct integration without FFI overhead.
-Third, the `tower-lsp-server` crate (a community fork of `tower-lsp`) provides a production-proven foundation for LSP server development in Rust, used by projects like Biome, Harper, and Oxc.
+The grammar is the project's fork of the archived cathaysia `tree-sitter-asciidoc` grammar and is maintained in-house.
+It is included as the git submodule `vendor/tree-sitter-asciidoc`.
+The root `Cargo.toml` points both grammar crates to the submodule via `[patch.crates-io]`, so a fresh clone needs `git submodule update --init` before it builds.
 
-The main trade-off is a steeper learning curve compared to TypeScript-based LSP implementations.
-However, the performance and reliability benefits justify this investment for a tool that will be used daily by technical writers and developers.
-
-=== Why Treesitter
-
-Treesitter provides incremental, error-tolerant parsing — exactly the properties needed for an LSP server that must update its understanding of a document on every keystroke.
-The cathaysia AsciiDoc grammar is available as a Rust crate on crates.io (`tree-sitter-asciidoc` and `tree-sitter-asciidoc-inline`), making integration straightforward.
-
-The grammar uses a dual-grammar approach (block-level and inline-level), which mirrors how AsciiDoc itself works: block structure is parsed first, then inline markup within each block is parsed separately.
-This is handled via Treesitter's `set_included_ranges` mechanism, analogous to how `tree-sitter-markdown` handles its own dual grammar.
-
-For quality goal references, see <<project-goals>>.
-
-=== Dual-Parser Strategy
-
-While Treesitter handles the syntactic parsing, semantic analysis requires understanding AsciiDoc-specific constructs like attribute substitution, conditional includes, and cross-reference resolution.
-The `acdc-parser` crate (v{parser-version}, PEG-based) was evaluated as a secondary parser for these tasks.
-
-The current strategy is *Treesitter-only-first*: build the initial LSP features entirely on Treesitter's CST, and only introduce `acdc-parser` if specific semantic features cannot be adequately implemented with Treesitter alone.
-This keeps the dependency graph simple and avoids the complexity of maintaining two parsing pipelines from the start.
+The grammar ships as two languages: `tree-sitter-asciidoc` for block structure and `tree-sitter-asciidoc-inline` for inline markup.
+See xref:08_concepts.adoc#parsing-concepts[Tree-sitter Integration].
 
 === Technology Stack Summary
 
@@ -38,7 +20,7 @@ This keeps the dependency graph simple and avoids the complexity of maintaining 
 | Component | Technology
 
 | Language
-| Rust (edition 2024)
+| Rust (edition 2021)
 
 | LSP Framework
 | tower-lsp-server
@@ -47,7 +29,7 @@ This keeps the dependency graph simple and avoids the complexity of maintaining 
 | tree-sitter-asciidoc / tree-sitter-asciidoc-inline
 
 | Transport
-| stdio (standard LSP transport)
+| stdio
 
 | Build System
 | Cargo

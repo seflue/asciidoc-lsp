@@ -1,70 +1,36 @@
 == Cross-Cutting Concepts
 
+=== Tree-sitter Integration
+
 [[parsing-concepts]]
-This section describes the technical concepts and patterns that apply across multiple building blocks of the asciidoc-lsp system.
-These cross-cutting concerns influence how the individual components are implemented and how they interact.
+The server uses the AsciiDoc grammar in two languages: `tree-sitter-asciidoc` for block-level structure and `tree-sitter-asciidoc-inline` for inline markup.
 
-The parser version is {parser-version}.
+The block grammar is parsed first and identifies sections, attributes, and block macros.
+Paragraph text is opaque in the block tree.
+The block tree yields the text ranges of paragraphs, and the inline grammar parses each range on its own via `set_included_ranges`.
+Parsing all ranges in one call lets markup in one paragraph pair with markup in another and produces false nodes.
 
-=== Treesitter Integration
+The parsers are created in the `parser` module of `asciidoc-core`, and the `extractors` module reads sections, anchors, xrefs, and includes from the trees.
 
-Treesitter is the foundation of the parsing pipeline.
-The asciidoc-lsp server uses the cathaysia AsciiDoc grammar, which is distributed as two separate Treesitter grammars: `tree-sitter-asciidoc` for block-level structure and `tree-sitter-asciidoc-inline` for inline markup.
+=== Parsing on Change
 
-The integration follows the same pattern established by `tree-sitter-markdown`: the block grammar is parsed first to identify the overall document structure (sections, paragraphs, lists, blocks), and then the inline grammar is applied to the text content within each block using Treesitter's `set_included_ranges` API.
-This two-pass approach accurately reflects AsciiDoc's own processing model, where block structure is determined before inline substitutions are applied.
-
-The Treesitter integration is encapsulated in a `Parser` module that exposes a high-level API for the rest of the system.
-Other components never interact with the raw Treesitter C API directly — they work with the parsed tree through query cursors and node accessors.
-
-=== Incremental Parsing
-
-One of Treesitter's key strengths is its support for incremental parsing.
-When a document changes, the parser is given both the new source text and an edit descriptor that specifies which byte range was modified.
-Treesitter then reuses as much of the previous parse tree as possible, only re-parsing the affected nodes and their syntactic ancestors.
-
-In the asciidoc-lsp context, this means that a single keystroke in a 10,000-line document typically results in re-parsing only a handful of nodes rather than the entire file.
-The Workspace Manager tracks the pending edits and batches them before triggering a re-parse, further reducing overhead for rapid typing sequences.
-
-The incremental parsing strategy extends to the dual-grammar setup: if a block-level edit does not change the boundaries of any inline content regions, the inline parse trees are reused without modification.
-Only when an edit crosses a block boundary (e.g., adding a blank line that splits a paragraph) are both grammars re-invoked.
+The server uses full-document sync.
+Every change re-parses the whole file, and the extracted data of that file is replaced in the workspace.
 
 === Fault Tolerance
 
-AsciiDoc documents in an editor are frequently in a syntactically invalid state — the user is in the middle of typing a section heading, an attribute definition, or a cross-reference macro.
-The LSP server must handle these incomplete states gracefully without crashing or producing cascading false-positive diagnostics.
-
-Treesitter provides built-in error recovery: when it encounters unexpected tokens, it inserts `ERROR` and `MISSING` nodes into the parse tree rather than aborting.
-The asciidoc-lsp server leverages this by treating `ERROR` nodes as "best-effort" parsed regions that still contribute to the document structure.
-For example, a partially typed xref macro (`xref:some-doc.adoc#`) is still recognized as a cross-reference, allowing the server to offer completion suggestions for available anchors.
-
-The Semantic Layer applies additional fault tolerance by using fallback heuristics when the parse tree is ambiguous.
-If a cross-reference target cannot be resolved through the normal CST-based path, the resolver falls back to a text-based search across the workspace, trading precision for availability.
-
-=== Caching
-
-The caching strategy operates at three levels:
-
-. *Parse tree cache* — Each document's Treesitter parse tree is cached in memory and updated incrementally. The cache is keyed by document URI and invalidated on `textDocument/didChange` notifications.
-
-. *Symbol index cache* — The extracted symbols (sections, anchors, attributes) for each document are cached separately from the parse tree. This allows the symbol index to be reused when the parse tree changes in ways that don't affect the symbol structure (e.g., editing prose within a paragraph).
-
-. *Include graph cache* — The workspace-wide include graph is cached and updated lazily. When a document's includes change, only the affected edges in the graph are updated rather than rebuilding the entire graph.
-
-All caches use a generation counter to detect staleness.
-Each document change increments the generation, and cached entries are validated against the current generation before use.
+Documents in an editor are often incomplete.
+Tree-sitter inserts `ERROR` and `MISSING` nodes into the parse tree instead of aborting, so the rest of the document is still analyzed.
 
 === Include Resolution
 
-Include resolution is one of the most complex aspects of AsciiDoc processing because include paths can contain attribute references, relative paths, and even conditional logic.
-
-The asciidoc-lsp resolver handles the following include patterns:
+Include paths can contain attribute references.
+The resolver handles these forms:
 
 * Simple relative paths: `include::chapter1.adoc[]`
 * Attribute-based paths: `include::{chaptersdir}/chapter1.adoc[]`
 * Paths with leveloffset: `include::chapter1.adoc[leveloffset=+1]`
-* Tag-filtered includes: `include::source.rs[tags=main]`
 * Non-AsciiDoc includes: `include::config.yaml[]`
 
-The resolver maintains a search path that includes the document's directory, the workspace root, and any directories specified via `:includedir:` attributes.
-When an include cannot be resolved, a diagnostic is emitted on the include directive with the list of searched paths, helping the user understand why the include failed.
+Attributes in the path are substituted first, then the path is resolved relative to the directory of the including file.
+An include that cannot be resolved is reported as a diagnostic on the directive.

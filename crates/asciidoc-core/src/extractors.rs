@@ -170,7 +170,7 @@ pub fn collect_inline_ranges(node: tree_sitter::Node) -> Vec<tree_sitter::Range>
 /// Parsing all ranges in a single `set_included_ranges` call can cause
 /// cross-range misparses: e.g. a `+` in one paragraph matches a `+` in
 /// another, creating a false passthrough node that swallows xref/anchor
-/// nodes (adoc-0023). Parsing per-range isolates each line's parse context.
+/// nodes. Parsing per-range isolates each line's parse context.
 #[must_use]
 pub fn extract_inline_content_safe(
     ranges: &[tree_sitter::Range],
@@ -591,7 +591,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0125: xrefs in table cells ---
+    // --- xrefs in table cells ---
 
     fn xrefs_in(source: &str) -> Vec<Xref> {
         let mut p = parser::init_block_parser().unwrap();
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(xrefs[0].target, "my-anchor");
     }
 
-    // --- adoc-0013: Include-Attribute extraction ---
+    // --- Include-Attribute extraction ---
 
     #[test]
     fn test_extract_include_single_attribute() {
@@ -682,7 +682,7 @@ mod tests {
         assert!(includes[0].attributes.is_empty());
     }
 
-    // --- adoc-0014: False-positive xref filtering ---
+    // --- False-positive xref filtering ---
 
     #[test]
     fn test_xref_keyword_not_false_positive() {
@@ -767,7 +767,7 @@ mod tests {
         );
     }
 
-    // --- extract_conditionals tests (adoc-0062) ---
+    // --- extract_conditionals tests ---
 
     #[test]
     fn test_extract_conditionals_ifdef() {

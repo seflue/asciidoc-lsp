@@ -680,7 +680,7 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         return items;
     }
 
-    // The file as each scope reads it (ADR-008); anchors of any of them.
+    // The file as each scope reads it (ADR-4); anchors of any of them.
     let base = document_dir(doc_path, Some(ws));
     let resolved: Vec<String> = path_scopes(ws, doc_path, line)
         .map(|scope| scope.substitute(file))
@@ -866,7 +866,7 @@ struct PathListing {
     resolved_prefix: String,
 }
 
-/// One [`PathListing`] per scope of `doc_path` on `line` (ADR-008), each
+/// One [`PathListing`] per scope of `doc_path` on `line` (ADR-4), each
 /// starting from `base_dir(scope)`; without a workspace one from
 /// `fallback_base` with `prefix` as typed.
 fn path_listings(
@@ -1187,7 +1187,7 @@ fn resolve_syntax_catalog(
 /// - `Attribute` → `resolve_attribute_completions`
 ///
 /// `line` (1-based) is where the completion happens: attribute values are
-/// those in effect there (ADR-008).
+/// those in effect there (ADR-4).
 pub(crate) fn resolve_completions(
     ctx: CompletionContext,
     doc_path: &Path,
@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(detect_completion_context(content, pos), None);
     }
 
-    // --- Phase 2: resolve_xref_completions ---
+    // --- resolve_xref_completions ---
 
     use asciidoc_core::attributes::AttributeRegistry;
     use asciidoc_core::graph::IncludeGraph;
@@ -1513,7 +1513,7 @@ mod tests {
         assert_eq!(new_text(&items[0]), "sec[${1:label}]");
     }
 
-    // --- Phase 2b: resolve_xref_cross_anchor_completions ---
+    // --- resolve_xref_cross_anchor_completions ---
 
     #[test]
     fn test_cross_anchor_filters_by_file() {
@@ -1602,7 +1602,7 @@ mod tests {
         assert_eq!(new_text(&items[0]), "here>>");
     }
 
-    // --- Phase 2c: resolve_xref_path_completions ---
+    // --- resolve_xref_path_completions ---
 
     #[test]
     fn test_xref_path_lists_adoc_siblings() {
@@ -1761,7 +1761,7 @@ mod tests {
         assert_eq!(new_text(pic), "sub/pic.png[${1:alt}]");
     }
 
-    // --- Phase 3: resolve_include_completions ---
+    // --- resolve_include_completions ---
 
     use tempfile::TempDir;
 
@@ -1824,7 +1824,7 @@ mod tests {
         assert_eq!(new_text(&items[0]), "chapters/intro.adoc[${1:opts}]");
     }
 
-    // --- Phase 3b: resolve_include_completions with attribute substitution ---
+    // --- resolve_include_completions with attribute substitution ---
 
     /// Helper: create a tempdir with .asciidoctorconfig, src/ subdir with .adoc files,
     /// and a doc file at root level. Returns (TempDir, Workspace, PathBuf of doc_file).
@@ -1918,7 +1918,7 @@ mod tests {
         );
     }
 
-    // --- Completion over several attribute scopes (ADR-008) ---
+    // --- Completion over several attribute scopes (ADR-4) ---
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
         items.iter().map(|i| i.label.as_str()).collect()
@@ -1983,7 +1983,7 @@ mod tests {
         assert_eq!(labels(&items).iter().filter(|l| **l == "x").count(), 1);
     }
 
-    // --- Phase 4: resolve_attribute_completions ---
+    // --- resolve_attribute_completions ---
 
     /// A scanned workspace with `.asciidoctorconfig` and a document
     /// `doc.adoc` that sets `:author: Alice`; returns the document's path.
@@ -2037,7 +2037,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
-    // --- Phase 5: resolve_completions (dispatcher) ---
+    // --- resolve_completions (dispatcher) ---
 
     #[test]
     fn test_resolve_completions_xref() {
@@ -2697,7 +2697,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // image:: path detection (Task 1.1)
+    // image:: path detection
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2749,7 +2749,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // image:: attribute delegation (Task 1.2)
+    // image:: attribute delegation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2797,7 +2797,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // inline image: detection (Task 3.1)
+    // inline image: detection
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2877,7 +2877,7 @@ mod tests {
         );
     }
 
-    // --- Image Path Resolution (Task 2.1) ---
+    // --- Image Path Resolution ---
 
     #[test]
     fn test_resolve_image_empty_dir() {
@@ -2979,7 +2979,7 @@ mod tests {
         assert_eq!(items[0].label, "foto.png");
     }
 
-    // --- Image Path Dispatch (Task 2.2) ---
+    // --- Image Path Dispatch ---
 
     #[test]
     fn test_resolve_image_no_imagesdir() {

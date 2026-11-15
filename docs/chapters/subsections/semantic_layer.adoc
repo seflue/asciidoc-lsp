@@ -19,12 +19,8 @@ The resolver handles three types of cross-references:
 
 ==== Parser Integration
 
-The Semantic Layer queries the Treesitter CST (Concrete Syntax Tree) using tree queries to extract semantic information.
-For example, a query for all section headings returns their titles, levels, and positions, which are then used to build the document symbol hierarchy reported via `textDocument/documentSymbol`.
-
-The dual-grammar architecture (block-level and inline-level) means that some semantic constructs span both grammars.
-For instance, a cross-reference macro appears as inline content within a paragraph block.
-The Semantic Layer coordinates between both parse trees to provide a unified view of the document's semantic structure.
+The Semantic Layer reads the Tree-sitter CST (Concrete Syntax Tree) to extract semantic information.
+For example, the section headings with their titles, levels, and positions are used to build the document symbol hierarchy reported via `textDocument/documentSymbol`.
 
 ==== Diagnostic Generation
 
@@ -35,4 +31,4 @@ The Semantic Layer produces diagnostics for common issues:
 * Circular includes (file A includes file B which includes file A)
 * Undefined attributes (attribute referenced but never defined)
 
-Each diagnostic includes a severity level, a human-readable message, and the exact source range in the document, enabling editors to display inline error annotations.
+Each diagnostic includes a severity level, a human-readable message, and the exact source range in the document.

@@ -695,7 +695,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0018: workspace/symbol — Include Symbols (Task 2.1) ---
+    // --- workspace/symbol — Include Symbols ---
 
     #[test]
     fn test_workspace_symbols_includes_as_file_kind() {
@@ -738,7 +738,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0018: workspace/symbol — Attribute Symbols (Task 2.2) ---
+    // --- workspace/symbol — Attribute Symbols ---
 
     #[test]
     fn test_workspace_symbols_attributes_as_variable_kind() {
@@ -882,7 +882,7 @@ mod tests {
             );
         }
 
-        // adoc-0018: Includes should appear as FILE symbols
+        // Includes should appear as FILE symbols
         let file_symbols: Vec<_> = all_symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::FILE)
@@ -892,7 +892,7 @@ mod tests {
             "arc42 workspace should have FILE symbols for includes"
         );
 
-        // adoc-0018: Attributes should appear as VARIABLE symbols
+        // Attributes should appear as VARIABLE symbols
         let var_symbols: Vec<_> = all_symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::VARIABLE)
@@ -939,7 +939,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0018: documentSymbol — Include Symbols (Task 1.1) ---
+    // --- documentSymbol — Include Symbols ---
 
     #[test]
     fn test_document_symbols_include_as_file_kind() {
@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(file_sym.range.start.line, 2);
     }
 
-    // --- adoc-0018: documentSymbol — Attribute Symbols (Task 1.2) ---
+    // --- documentSymbol — Attribute Symbols ---
 
     #[test]
     fn test_document_symbols_attribute_as_variable_kind() {

@@ -206,7 +206,7 @@ impl Workspace {
     /// The attributes in effect on `line` of `file`, one scope per top-level
     /// document that reaches `file`, in path order. Asciidoctor converts each
     /// top-level document on its own, so each scope is correct for its
-    /// document and none is preferred (ADR-008). A file no document includes
+    /// document and none is preferred (ADR-4). A file no document includes
     /// is its own top-level document.
     #[must_use]
     pub fn scopes_at(&self, file: &Path, line: usize) -> Vec<AttributeScope<'_>> {
@@ -221,7 +221,7 @@ impl Workspace {
     /// The attributes in effect on `line` of `file` when the editor previews
     /// `file` on its own: its own config chain, its own folder as `docdir`,
     /// nothing from the documents that include it. `None` for a top-level
-    /// document, whose preview is its [`Self::scopes_at`] scope (ADR-008).
+    /// document, whose preview is its [`Self::scopes_at`] scope (ADR-4).
     #[must_use]
     pub fn preview_scope_at(&self, file: &Path, line: usize) -> Option<AttributeScope<'_>> {
         let file = self.indexed_path(file);
@@ -994,7 +994,7 @@ mod tests {
         assert!(usages.is_empty(), "Expected no usages, got: {:?}", usages);
     }
 
-    // --- adoc-0026 Task 1.2: find_all_include_references ---
+    // --- find_all_include_references ---
 
     #[test]
     fn test_find_include_references_multi_file() {
@@ -1032,7 +1032,7 @@ mod tests {
         assert!(refs.is_empty(), "Expected no include refs, got: {:?}", refs);
     }
 
-    // --- adoc-0026 Task 1.3: find_all_file_xrefs ---
+    // --- find_all_file_xrefs ---
 
     #[test]
     fn test_find_file_xrefs_cross_doc() {
@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(refs.len(), 2, "Expected 2 file xrefs, got: {:?}", refs);
     }
 
-    // --- adoc-0026 Task 1.4: find_all_anchor_references ---
+    // --- find_all_anchor_references ---
 
     #[test]
     fn test_find_anchor_refs_xref_macro() {
@@ -1169,7 +1169,7 @@ mod tests {
         assert!(ws.reference_index.anchors.contains_key("my-anchor"));
     }
 
-    // --- adoc-0067 Phase 3: Sibling config integration tests ---
+    // --- Sibling config integration tests ---
 
     #[test]
     fn test_sibling_dirs_get_separate_configs() {
@@ -1248,7 +1248,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0069 Phase 2: ensure_file tests ---
+    // --- ensure_file tests ---
 
     #[test]
     fn test_ensure_file_standalone() {
@@ -1391,12 +1391,12 @@ mod tests {
         );
     }
 
-    // --- adoc-0069: Additional coverage ---
+    // --- Additional coverage ---
 
     #[test]
     fn test_ensure_file_asciidoctorconfigdir_resolves() {
         // Standalone file in tests/ gets {asciidoctorconfigdir} from tests/.asciidoctorconfig,
-        // NOT from docs/.asciidoctorconfig. This is the core bug scenario of adoc-0069.
+        // NOT from docs/.asciidoctorconfig. This is the core bug scenario.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let docs_dir = root.join("docs");
@@ -1621,9 +1621,9 @@ mod tests {
         );
     }
 
-    // --- adoc-0072 Phase 4: Per-File-Diagnostics tests ---
+    // --- Per-File-Diagnostics tests ---
 
-    // adoc-0125: xrefs in default table cells take part in xref diagnostics.
+    // xrefs in default table cells take part in xref diagnostics.
     #[test]
     fn test_scan_workspace_checks_xrefs_in_table_cells() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1709,7 +1709,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0072 Phase 3: Per-File-Rebuild tests ---
+    // --- Per-File-Rebuild tests ---
 
     #[test]
     fn test_did_open_parses_only_opened_file() {
@@ -2248,7 +2248,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0119: remove_file + reload_config ---
+    // --- remove_file + reload_config ---
 
     #[test]
     fn test_remove_file_clears_all_indexes() {

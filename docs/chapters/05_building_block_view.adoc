@@ -1,21 +1,17 @@
 == Building Block View
 
 [[building-blocks]]
-This section describes the major building blocks of the asciidoc-lsp system and their responsibilities.
-The architecture follows a layered approach where each layer has a clear responsibility and communicates with adjacent layers through well-defined interfaces.
-
-image::building-block-view.puml[Building Block View]
-
-The system consists of three primary layers: the Transport Layer handles LSP protocol communication, the Workspace Manager maintains the state of all open documents and their relationships, and the Semantic Layer provides the intelligence behind LSP features like go-to-definition and diagnostics.
+The system consists of three layers: the Transport Layer handles LSP protocol communication, the Workspace Manager holds the state of all documents and their relationships, and the Semantic Layer provides the logic behind LSP features such as go-to-definition and diagnostics.
 
 === Layer Overview
 
-The Transport Layer sits at the boundary of the system, receiving JSON-RPC messages from the editor and dispatching them to the appropriate handlers.
-The Workspace Manager maintains an in-memory representation of the entire documentation workspace, tracking open files, include relationships, and parsed syntax trees.
-The Semantic Layer consumes the parsed trees and workspace state to provide the actual LSP feature implementations.
+The Transport Layer receives JSON-RPC messages from the editor and dispatches them to the handlers.
+The Workspace Manager keeps the extracted data of every document in the workspace (sections, anchors, xrefs, includes, attributes) and the include relationships between them.
+It does not keep parse trees.
+The Semantic Layer uses this data to implement the LSP features.
 
-Each layer is designed to be independently testable.
-The Transport Layer can be tested with mock LSP clients, the Workspace Manager with file system fixtures, and the Semantic Layer with pre-constructed syntax trees.
+The Transport Layer is the `asciidoc-lsp` crate.
+The Workspace Manager and the AsciiDoc-specific parts of the Semantic Layer live in `asciidoc-core`, and `asciidoc-lsp` translates their results into LSP types.
 
 === Detailed Building Blocks
 

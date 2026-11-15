@@ -79,7 +79,7 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
     // Try inline grammar (xrefs, shorthand xrefs, inline images).
     // Only parse the range(s) containing the cursor position to avoid cross-range
     // misparses (e.g. a `+` in one paragraph matching a `+` in another, creating
-    // a giant false passthrough node that swallows xref nodes — adoc-0023).
+    // a giant false passthrough node that swallows xref nodes).
     let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(block_tree.root_node());
     let cursor_ranges: Vec<_> = inline_ranges
         .iter()
@@ -103,7 +103,7 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
 /// Resolve a go-to-definition request to target files and lines
 /// (1-indexed). An attribute reference yields every definition, the one
 /// Asciidoctor uses first; an include, xref or image yields each scope's
-/// existing target once (ADR-008).
+/// existing target once (ADR-4).
 ///
 /// Extracted from the `LanguageServer` handler for testability (V-8).
 pub fn resolve_goto_definitions(
@@ -445,7 +445,7 @@ fn xref_hover(ws: &Workspace, target: &str, resolved: &ResolvedXref) -> String {
 }
 
 /// Hover text from one text per scope, each with its label: the text alone
-/// when all agree, else each one under its label (ADR-008).
+/// when all agree, else each one under its label (ADR-4).
 fn per_document_hover(mut texts: Vec<(String, String)>) -> String {
     collapse_if_agree(&mut texts, |a, b| a.1 == b.1);
     if let [(_, text)] = texts.as_slice() {
@@ -566,7 +566,7 @@ fn is_remote_url(target: &str) -> bool {
 }
 
 /// Where an image macro on `line` points, per top-level document and, for
-/// a file others include, in the editor's preview of it (ADR-008): target,
+/// a file others include, in the editor's preview of it (ADR-4): target,
 /// `imagesdir` and `docdir` take the values in effect there. Each target
 /// comes with its scope's label; without a workspace, one target with the
 /// label of `doc_path`.
@@ -609,7 +609,7 @@ fn image_target(resolved_path: &str, base: &Path, imagesdir: &str) -> ImageTarge
 
 /// Where an include or xref file path on `line` points, per top-level
 /// document and, for a file others include, in the editor's preview of it
-/// (ADR-008), without checking that it exists. Each target comes with its
+/// (ADR-4), without checking that it exists. Each target comes with its
 /// scope's label and the path as substituted there; canonical when it
 /// exists. Without a workspace, one target with the label of `doc_path`.
 fn resolve_doc_targets(
@@ -642,7 +642,7 @@ fn existing_targets(targets: &[DocTarget]) -> Vec<PathBuf> {
 }
 
 /// How an xref on `line` resolves, per top-level document and, for a file
-/// others include, in the editor's preview of it (ADR-008), each with its
+/// others include, in the editor's preview of it (ADR-4), each with its
 /// scope's label. Shared by go-to-definition, hover and the explain report.
 fn resolve_xref_targets(
     ws: &Workspace,
@@ -843,7 +843,7 @@ fn explain_image(label: &str, target: ImageTarget) -> Value {
     }
 }
 
-/// `name` on `line` per top-level document (ADR-008: no preview scope for
+/// `name` on `line` per top-level document (ADR-4: no preview scope for
 /// attribute values).
 fn explain_attribute(ws: &Workspace, doc_path: &Path, name: &str, line: usize) -> Value {
     let scopes: Vec<Value> = ws
@@ -1122,7 +1122,7 @@ fn find_attribute_ref_at_position(
 }
 
 // ---------------------------------------------------------------------------
-// Rename support (adoc-0036)
+// Rename support
 // ---------------------------------------------------------------------------
 
 /// Map of file path → list of `(line, start_col, end_col)` edits per file.
@@ -1378,7 +1378,7 @@ fn read_file_cached<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// Column-finder helpers (adoc-0036, Task 2.1)
+// Column-finder helpers
 // ---------------------------------------------------------------------------
 
 /// Find the byte offsets of `id` inside `[[id]]` on a line.
@@ -1454,7 +1454,7 @@ mod tests {
     use rstest::rstest;
     use std::fs;
 
-    // --- Task 4.1: find_node_at_position tests ---
+    // --- find_node_at_position tests ---
 
     #[rstest]
     #[case(
@@ -1521,7 +1521,7 @@ mod tests {
         assert!(find_node_at_position(content, pos).is_none());
     }
 
-    // --- Task 4.2: resolve_goto_definitions for include ---
+    // --- resolve_goto_definitions for include ---
 
     #[test]
     fn test_goto_def_include() {
@@ -1559,7 +1559,7 @@ mod tests {
         assert!(resolve_goto_definitions(&content, pos, &a, None).is_empty());
     }
 
-    // --- Task 4.3: resolve_goto_definitions for xref ---
+    // --- resolve_goto_definitions for xref ---
 
     #[test]
     fn test_goto_def_xref_file_anchor() {
@@ -1588,7 +1588,7 @@ mod tests {
         );
     }
 
-    // adoc-0125: xrefs in default (`|`) and AsciiDoc (`a|`) table cells.
+    // xrefs in default (`|`) and AsciiDoc (`a|`) table cells.
     #[rstest]
     #[case::default_cell("| See xref:b.adoc#my-anchor[link].", 12)]
     #[case::asciidoc_cell("a| See xref:b.adoc#my-anchor[link].", 13)]
@@ -1702,7 +1702,7 @@ mod tests {
         );
     }
 
-    // --- Task 3.1: resolve_goto_definitions for attribute references ---
+    // --- resolve_goto_definitions for attribute references ---
 
     #[test]
     fn test_goto_def_attribute_doc_header() {
@@ -1836,7 +1836,7 @@ mod tests {
         assert!(resolve_goto_definitions(content, pos, &paths[0], Some(&ws)).is_empty());
     }
 
-    // --- Task 2.1: find_node_at_position for {attribute} references ---
+    // --- find_node_at_position for {attribute} references ---
 
     #[test]
     fn test_find_node_attribute_ref() {
@@ -1893,12 +1893,12 @@ mod tests {
         assert!(find_node_at_position(content, pos2).is_none());
     }
 
-    // --- adoc-0023: xref after list items ---
+    // --- xref after list items ---
 
     #[test]
     fn test_find_node_xref_after_list_items() {
-        // Reproduces adoc-0023: xref in paragraph after unordered list is not found.
-        // This matches the pattern in 09_architecture_decisions.adoc:49.
+        // Regression: xref in paragraph after unordered list is not found.
+        // This matches the pattern in 09_architecture_decisions.adoc:46.
         let content = "\
 = Title
 
@@ -1916,10 +1916,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         let info = find_node_at_position(content, pos);
-        assert!(
-            info.is_some(),
-            "xref after list items must be found (adoc-0023)"
-        );
+        assert!(info.is_some(), "xref after list items must be found");
         let info = info.unwrap();
         assert_eq!(
             info.kind,
@@ -1931,22 +1928,22 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
     #[test]
     fn test_find_node_xref_real_adr_content() {
-        // adoc-0023: xref in 09_architecture_decisions.adoc line 49 was not found
+        // xref in 09_architecture_decisions.adoc line 46 was not found
         // because `+` in "(block + inline)" created a false passthrough spanning
-        // rows 17-70, swallowing the xref nodes.
+        // spanning most of the document, swallowing the xref nodes.
         let content = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/chapters/09_architecture_decisions.adoc"
         ))
         .unwrap();
 
-        // Line 49 (1-indexed): "...see xref:05_building_block_view.adoc#building-blocks[...]."
+        // Line 46 (1-indexed): "...see xref:05_building_block_view.adoc#building-blocks[...]."
         let pos = Position {
-            line: 48,
-            character: 67,
+            line: 45,
+            character: 50,
         };
         let info = find_node_at_position(&content, pos);
-        assert!(info.is_some(), "xref on line 49 must be found (adoc-0023)");
+        assert!(info.is_some(), "xref on line 46 must be found");
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {
@@ -1956,31 +1953,31 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     }
 
     #[test]
-    fn test_find_node_xref_real_adr_line_71() {
-        // adoc-0023: second affected xref on line 71, also inside the false passthrough.
+    fn test_find_node_xref_real_adr_second_passthrough_xref() {
+        // second affected xref on line 68, also inside the false passthrough.
         let content = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/chapters/09_architecture_decisions.adoc"
         ))
         .unwrap();
 
-        // Line 71 (1-indexed): "...documented in xref:05_building_block_view.adoc#building-blocks[...]..."
+        // Line 68 (1-indexed): "...documented in xref:01_introduction_and_goals.adoc[...]..."
         // "xref:" starts at character 91, target at 96
         let pos = Position {
-            line: 70,
+            line: 67,
             character: 100,
         };
         let info = find_node_at_position(&content, pos);
-        assert!(info.is_some(), "xref on line 71 must be found (adoc-0023)");
+        assert!(info.is_some(), "xref on line 68 must be found");
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {
-                target: "05_building_block_view.adoc#building-blocks".into()
+                target: "01_introduction_and_goals.adoc".into()
             }
         );
     }
 
-    // --- Task 2.2: find_node_at_position for attribute definitions ---
+    // --- find_node_at_position for attribute definitions ---
 
     #[test]
     fn test_find_node_attribute_def() {
@@ -2000,7 +1997,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0025: resolve_references for attribute references ---
+    // --- resolve_references for attribute references ---
 
     #[test]
     fn test_references_from_attribute_ref() {
@@ -2134,7 +2131,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0025 Task 4.1: Integration test — gr on {attr} in .adoc ---
+    // --- Integration test — gr on {attr} in .adoc ---
 
     #[test]
     fn test_integration_references_attribute_usage() {
@@ -2202,7 +2199,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0025 Task 4.2: Integration test — gr on definition in .asciidoctorconfig ---
+    // --- Integration test — gr on definition in .asciidoctorconfig ---
 
     #[test]
     fn test_integration_references_from_config() {
@@ -2240,7 +2237,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0026 Task 1.1: find_node_at_position for anchors ---
+    // --- find_node_at_position for anchors ---
 
     #[test]
     fn test_find_node_anchor() {
@@ -2274,7 +2271,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(info.kind, NodeKind::Anchor { id: "intro".into() });
     }
 
-    // --- adoc-0026 Task 2.1: resolve_references for includes ---
+    // --- resolve_references for includes ---
 
     #[test]
     fn test_references_from_include() {
@@ -2331,7 +2328,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0026 Task 2.2: resolve_references for anchors ---
+    // --- resolve_references for anchors ---
 
     #[test]
     fn test_references_from_anchor() {
@@ -2397,7 +2394,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0026 Task 2.3: resolve_references for xrefs ---
+    // --- resolve_references for xrefs ---
 
     #[test]
     fn test_references_from_xref() {
@@ -2458,7 +2455,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(results.len(), 2, "Expected 2 co-refs, got: {:?}", results);
     }
 
-    // --- adoc-0026 Task 3.1: Integration test — gr auf Include (Multi-File) ---
+    // --- Integration test — gr on include (multi-file) ---
 
     #[test]
     fn test_integration_include_references_multi_file() {
@@ -2502,7 +2499,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0026 Task 3.2: Integration test — gr auf Anchor (Multi-File) ---
+    // --- Integration test — gr on anchor (multi-file) ---
 
     #[test]
     fn test_integration_anchor_references_multi_file() {
@@ -2563,7 +2560,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0033 Task 1.1: find_node_at_position for image block macro ---
+    // --- find_node_at_position for image block macro ---
 
     #[test]
     fn test_find_node_image() {
@@ -2603,7 +2600,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0033 Task 2.1: resolve_goto_definitions for image ---
+    // --- resolve_goto_definitions for image ---
 
     #[test]
     fn test_goto_def_image_simple() {
@@ -2683,7 +2680,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0030: resolve_hover tests ---
+    // --- resolve_hover tests ---
 
     #[test]
     fn test_hover_attribute_ref_with_source() {
@@ -2744,7 +2741,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(hover, ":myattr: hello world");
     }
 
-    // --- adoc-0168: hover substitutes references in attribute values ---
+    // --- hover substitutes references in attribute values ---
 
     #[test]
     fn test_hover_attribute_ref_substitutes_references() {
@@ -3256,7 +3253,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     }
 
     /// An include target takes the attribute values of each top-level
-    /// document and of the editor's preview, like an image (ADR-008).
+    /// document and of the editor's preview, like an image (ADR-4).
     #[test]
     fn test_hover_include_shows_preview_of_included_file_where_it_breaks() {
         let chapter = "== C\n\ninclude::{parts}/p.adoc[]\n";
@@ -3862,7 +3859,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0033: image tests (unchanged) ---
+    // --- image tests (unchanged) ---
 
     #[test]
     fn test_goto_def_image_missing_file() {
@@ -3879,7 +3876,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert!(resolve_goto_definitions(&content, pos, &a, None).is_empty());
     }
 
-    // --- adoc-0036: Column-finder helpers ---
+    // --- Column-finder helpers ---
 
     #[test]
     fn test_find_anchor_def_columns() {
@@ -3953,7 +3950,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(find_attr_def_columns("text :name: value", "name"), None); // not at start
     }
 
-    // --- adoc-0036: prepare_rename tests ---
+    // --- prepare_rename tests ---
 
     #[test]
     fn test_prepare_rename_anchor_explicit() {
@@ -4034,7 +4031,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert!(result.is_none(), "include should not be renameable");
     }
 
-    // --- adoc-0036: resolve_rename tests ---
+    // --- resolve_rename tests ---
 
     #[test]
     fn test_resolve_rename_anchor_single_file() {
@@ -4546,7 +4543,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    // --- adoc-0137: explain_position report ---
+    // --- explain_position report ---
 
     /// Canonical temp dir, so raw and canonical document paths coincide.
     fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {

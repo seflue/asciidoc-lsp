@@ -664,7 +664,7 @@ mod tests {
     }
 
     /// The caller decides where the file part of an xref points (one
-    /// attribute scope, ADR-008); the anchor lookup stays the same.
+    /// attribute scope, ADR-4); the anchor lookup stays the same.
     #[test]
     fn test_resolve_xref_with_caller_resolved_file() {
         let registry = AttributeRegistry::new(Path::new("/tmp"));

@@ -1,5 +1,5 @@
 //! The attribute scopes a path-like value resolves in, and how features
-//! present them (ADR-008). Shared by navigation and completion.
+//! present them (ADR-4). Shared by navigation and completion.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,7 @@ use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 /// The scopes a path on `line` of `doc_path` resolves in: one per
 /// top-level document and, for a file others include, the editor's preview
-/// of it (ADR-008).
+/// of it (ADR-4).
 pub(crate) fn path_scopes<'w>(
     ws: &'w Workspace,
     doc_path: &Path,
@@ -21,7 +21,7 @@ pub(crate) fn path_scopes<'w>(
 }
 
 /// Keeps only the first of `items` when every neighbouring pair is `same`:
-/// scopes that agree give one result, not one per scope (ADR-008).
+/// scopes that agree give one result, not one per scope (ADR-4).
 pub(crate) fn collapse_if_agree<T>(items: &mut Vec<T>, same: impl Fn(&T, &T) -> bool) {
     if items.windows(2).all(|pair| same(&pair[0], &pair[1])) {
         items.truncate(1);

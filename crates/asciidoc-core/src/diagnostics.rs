@@ -380,7 +380,7 @@ mod tests {
         assert!(diags.contains_key(&PathBuf::from("/b.adoc")));
     }
 
-    // --- Conditional attribute diagnostics suppressed (adoc-0080) ---
+    // --- Conditional attribute diagnostics suppressed ---
     // ifdef/ifndef attributes are not diagnosed because they are often
     // only defined at build time, producing false-positive noise.
 

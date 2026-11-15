@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(source.line, 0, "synthetic attribute should use line 0");
     }
 
-    // --- layer priority (adoc-0137) ---
+    // --- layer priority ---
 
     #[test]
     fn test_same_file_hit_wins_over_config_and_builtin() {
@@ -1858,7 +1858,7 @@ mod tests {
         assert!(registry.preset(file, "nonexistent").is_none());
     }
 
-    /// Documents current behaviour (adoc-0137): the per-file layer is keyed by
+    /// Documents current behaviour: the per-file layer is keyed by
     /// the exact path passed to `register_file_attributes`. A lookup through a
     /// symlinked path to the same directory does not find the registration.
     #[cfg(unix)]
@@ -1941,7 +1941,7 @@ mod tests {
         assert!(registry.resolve_source(&file, "docdir").is_none());
     }
 
-    // --- adoc-0072: Config-Chain with LSP root_uri ---
+    // --- Config-Chain with LSP root_uri ---
 
     #[test]
     fn test_config_chain_with_lsp_root() {

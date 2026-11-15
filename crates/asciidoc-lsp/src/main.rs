@@ -267,9 +267,11 @@ impl LanguageServer for AsciiDocLsp {
             *self.root.lock() = Some(root.clone());
 
             // Create workspace and scan for all .adoc files
+            // tag::workspace-setup[]
             let mut ws = Workspace::new(root);
             ws.scan_workspace();
             ws.recalculate_diagnostics();
+            // end::workspace-setup[]
             *self.workspace.lock() = Some(ws);
         }
 
@@ -326,7 +328,7 @@ impl LanguageServer for AsciiDocLsp {
     async fn initialized(&self, _: InitializedParams) {
         // Register file watchers if the client supports dynamic registration.
         // Without this, external edits to `.asciidoctorconfig*` and `.adoc` files
-        // outside open buffers leave caches stale (adoc-0119).
+        // outside open buffers leave caches stale.
         if *self.can_request_file_watcher.lock() {
             let watchers = vec![
                 FileSystemWatcher {
@@ -1084,7 +1086,7 @@ fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
     }
 }
 
-/// Command name of the position debug report (adoc-0137).
+/// Command name of the position debug report.
 const EXPLAIN_POSITION_COMMAND: &str = "asciidoc.explainPosition";
 
 /// Validate a `workspace/executeCommand` request for
@@ -1369,7 +1371,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 8.1: Integration Tests — arc42 Fixture (AC-12)
+    // Integration Tests — arc42 Fixture (AC-12)
     // -----------------------------------------------------------------------
 
     /// Path to the workspace root (asciidoc-lsp/) from the crate manifest dir.
@@ -1501,19 +1503,19 @@ mod tests {
         let ws_root = workspace_root();
         let ws = Workspace::build(&ws_root, &index);
 
-        // Line 15 in workspace_manager.adoc:
-        // include::{cli-source-dir}/main.rs[tags=workspace-setup]
-        // {cli-source-dir} is at columns 9..25 (0-indexed LSP line 14).
+        // Line 11 in workspace_manager.adoc:
+        // include::{lsp-source-dir}/main.rs[tags=workspace-setup]
+        // {lsp-source-dir} is at columns 9..25 (0-indexed LSP line 10).
         let pos = Position {
-            line: 14,
-            character: 14, // inside "cli-source-dir"
+            line: 10,
+            character: 14, // inside "lsp-source-dir"
         };
 
         let targets = navigation::resolve_goto_definitions(&content, pos, &file, Some(&ws));
         assert_eq!(
             targets.len(),
             1,
-            "goto-definition on {{cli-source-dir}} should resolve to .asciidoctorconfig, got: {targets:?}"
+            "goto-definition on {{lsp-source-dir}} should resolve to .asciidoctorconfig, got: {targets:?}"
         );
 
         let (target, line) = targets.into_iter().next().unwrap();
@@ -1527,14 +1529,14 @@ mod tests {
         let config_content = std::fs::read_to_string(&config_path).unwrap();
         let config_line = config_content.lines().nth(line - 1).unwrap_or("");
         assert!(
-            config_line.contains(":cli-source-dir:"),
-            "line {} of .asciidoctorconfig should contain :cli-source-dir:, got: {:?}",
+            config_line.contains(":lsp-source-dir:"),
+            "line {} of .asciidoctorconfig should contain :lsp-source-dir:, got: {:?}",
             line,
             config_line
         );
     }
 
-    // --- Workspace lifecycle tests (adoc-0016: Live Diagnostics) ---
+    // --- Workspace lifecycle tests (Live Diagnostics) ---
 
     #[test]
     fn test_new_workspace_returns_empty() {
@@ -1709,7 +1711,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0072 Phase 1: Workspace-Root from LSP root_uri ---
+    // --- Workspace-Root from LSP root_uri ---
 
     #[test]
     fn test_workspace_root_from_lsp_root_uri() {
@@ -1733,7 +1735,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0119: watched-file classification + buffer filter ---
+    // --- watched-file classification + buffer filter ---
 
     #[test]
     fn test_classify_watched_path_config() {
@@ -1770,7 +1772,7 @@ mod tests {
         );
     }
 
-    // --- adoc-0119: open-buffer filter + deleted-key resolution ---
+    // --- open-buffer filter + deleted-key resolution ---
 
     #[test]
     fn test_is_path_open_direct_match() {
@@ -1850,7 +1852,7 @@ mod tests {
         assert_eq!(key, path);
     }
 
-    // --- adoc-0119: classify_events end-to-end ---
+    // --- classify_events end-to-end ---
 
     fn make_event(uri: &str, typ: FileChangeType) -> FileEvent {
         FileEvent {
@@ -1927,7 +1929,7 @@ mod tests {
         assert!(classified.config_changed);
     }
 
-    // --- adoc-0137: asciidoc.explainPosition command arguments ---
+    // --- asciidoc.explainPosition command arguments ---
 
     #[test]
     fn test_explain_position_args_parses_text_document_position() {
@@ -1979,7 +1981,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
-    // --- adoc-0137: debug log target format ---
+    // --- debug log target format ---
 
     #[test]
     fn test_lsp_target_uses_lsp_range_convention() {
@@ -1991,7 +1993,7 @@ mod tests {
         assert_eq!(lsp_target(&uri, &range), "file:///ws/a.adoc:2:4-2:9");
     }
 
-    // --- adoc-0138: documents opened through a symlink ---
+    // --- documents opened through a symlink ---
 
     /// A project at `<tmp>/real` with a directory symlink `<tmp>/link` to it.
     #[cfg(unix)]
@@ -2660,7 +2662,7 @@ mod tests {
         seen
     }
 
-    /// adoc-0138, Verify "B, C, E behave like A and D", part 1.
+    /// Verify "B, C, E behave like A and D", part 1.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_symlinked_paths_behave_like_canonical_paths() {
@@ -2685,7 +2687,7 @@ mod tests {
         }
     }
 
-    /// adoc-0138, Verify "B, C, E behave like A and D", part 2.
+    /// Verify "B, C, E behave like A and D", part 2.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_config_imagesdir_through_symlinked_root() {
@@ -2720,7 +2722,7 @@ mod tests {
         }
     }
 
-    /// adoc-0138, Verify "explainPosition shows raw and canonical path".
+    /// Verify "explainPosition shows raw and canonical path".
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_explain_position_reports_raw_and_canonical_path() {
@@ -2782,7 +2784,7 @@ mod tests {
         }
     }
 
-    /// adoc-0138, verification run: a single symlinked file, inside the
+    /// verification run: a single symlinked file, inside the
     /// workspace root and from another root.
     #[cfg(unix)]
     #[tokio::test]
@@ -2948,7 +2950,7 @@ mod tests {
     // `include::../part-up.adoc[]` reaches `part-up.adoc` from the real folder
     // and `config/part-up.adoc` from the link; only the preview of the link
     // side gets `imagesdir` from `config/.asciidoctorconfig`, the build of
-    // `via-link.adoc`, which includes the file, does not (ADR-008).
+    // `via-link.adoc`, which includes the file, does not (ADR-4).
 
     fn first_include_target(server: &AsciiDocLsp, file: &Path) -> PathBuf {
         let ws = server.workspace.lock();
@@ -2962,7 +2964,7 @@ mod tests {
     /// keeps the canonical folder, though it reaches the file through the
     /// link), and from the link's folder once opened through the link. The
     /// link folder's config chain enters only through the preview scope of
-    /// the file (ADR-008); the scope of the including document `via-link.adoc`
+    /// the file (ADR-4); the scope of the including document `via-link.adoc`
     /// does not get it.
     #[cfg(unix)]
     #[tokio::test]
@@ -2998,7 +3000,7 @@ mod tests {
         // `via-link.adoc` includes the file, so its build has no `imagesdir`.
         // The preview of the file takes `imagesdir` from the chain of
         // `config/`; its literal `../assets` resolves from the link folder to
-        // `config/assets`, as in Asciidoctor (ADR-008).
+        // `config/assets`, as in Asciidoctor (ADR-4).
         assert_eq!(
             image.as_deref(),
             Some(
@@ -3111,7 +3113,7 @@ mod tests {
             .all(|scope| scope.value("imagesdir").is_none()));
     }
 
-    /// adoc-0139, Verify "inline image has hover and gd like the block macro".
+    /// Verify "inline image has hover and gd like the block macro".
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_inline_image_resolves_like_block_image() {
@@ -3151,7 +3153,7 @@ mod tests {
         }
     }
 
-    /// adoc-0139, Verify "remote image: hover shows the URL unchanged, no
+    /// Verify "remote image: hover shows the URL unchanged, no
     /// File not found".
     #[cfg(unix)]
     #[tokio::test]
@@ -3184,7 +3186,7 @@ mod tests {
         }
     }
 
-    /// adoc-0139, Verify "report for an image has `canonical_target` equal to
+    /// Verify "report for an image has `canonical_target` equal to
     /// the gd target", over all scenarios A to F.
     #[cfg(unix)]
     #[tokio::test]
@@ -3250,7 +3252,7 @@ mod tests {
         format!("{}{}{}", &text[..start], edit.new_text, &text[end..])
     }
 
-    /// adoc-0143, Verify "one-sentence-per-line code action joins a wrapped
+    /// Verify "one-sentence-per-line code action joins a wrapped
     /// paragraph", over the protocol with the grammar on main.
     #[tokio::test]
     async fn test_fixture_code_action_puts_one_sentence_per_line() {
@@ -3722,7 +3724,7 @@ mod tests {
         );
     }
 
-    /// adoc-0164: a `./` value in a `.asciidoctorconfig` stays literal, as
+    /// a `./` value in a `.asciidoctorconfig` stays literal, as
     /// prepended text does in Asciidoctor, and resolves against the folder
     /// of the document that uses it, not the config folder. Hover shows the
     /// literal value and the resolved path; `{asciidoctorconfigdir}` anchors
@@ -3766,7 +3768,7 @@ mod tests {
         );
     }
 
-    /// adoc-0164: "Resolves to" shows only for a reference whose value comes
+    /// "Resolves to" shows only for a reference whose value comes
     /// from a config. A `./` value from the document header, and hover on an
     /// attribute entry, show the value alone (committed fixture
     /// `tests/fixtures/config_relative_values`, `sub/header.adoc`).
@@ -3825,7 +3827,7 @@ mod tests {
         let chapters = fx.join("docs/shared/chapters.adoc");
         let (service, _socket, uri, text) = open_fixture(&fx, &chapters).await;
         let server = service.inner();
-        // Each top-level document has its own docdir (ADR-008).
+        // Each top-level document has its own docdir (ADR-4).
         assert_eq!(
             hover_text(server, &uri, position_of(&text, "{docdir}", 2)).await,
             Some(format!(

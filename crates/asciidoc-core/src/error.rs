@@ -1,9 +1,9 @@
 use thiserror::Error;
 
-/// Typisierte Fehler für asciidoc-core.
+/// Typed errors for asciidoc-core.
 #[derive(Debug, Error)]
 pub enum CoreError {
-    /// Tree-sitter Language konnte nicht geladen werden.
+    /// Failed to load the tree-sitter language.
     #[error("failed to initialize tree-sitter language: {0}")]
     LanguageInit(#[from] tree_sitter::LanguageError),
 

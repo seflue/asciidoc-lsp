@@ -1,27 +1,20 @@
 === Workspace Manager
 
 [[workspace]]
-The Workspace Manager is the central stateful component of asciidoc-lsp.
-It maintains an up-to-date representation of all documents in the workspace, their parsed syntax trees, and the relationships between them (primarily through include directives).
+The Workspace Manager holds the extracted data of all documents in the workspace and the relationships between them, primarily include directives.
 
-When the server starts, the Workspace Manager initializes by scanning the workspace root directory for AsciiDoc files.
-It builds an initial include graph by parsing the top-level documents and following their include directives recursively.
-This initial scan is performed asynchronously to avoid blocking the LSP initialization handshake.
-
-The following code snippet shows the workspace initialization logic:
+On `initialize`, the server scans the workspace root for AsciiDoc files and calculates the diagnostics.
+The scan runs synchronously, before the server answers the `initialize` request:
 
 [source,rust]
 ----
-include::{cli-source-dir}/main.rs[tags=workspace-setup]
+include::{lsp-source-dir}/main.rs[tags=workspace-setup]
 ----
 
-As the user edits documents, the Workspace Manager receives `textDocument/didChange` notifications and incrementally updates the affected syntax trees.
-Treesitter's incremental parsing is essential here: instead of re-parsing the entire document on every keystroke, only the changed region and its syntactic dependencies are re-parsed.
-This keeps update latency well below the 200ms responsiveness target even for large documents.
+`textDocument/didOpen`, `didChange`, and `didSave` re-parse only the affected file.
+File watchers pick up external changes to AsciiDoc and `.asciidoctorconfig` files.
+After a change, the diagnostics are recalculated.
 
-The Workspace Manager also tracks document dependencies.
-When a file that is included by other documents changes, the manager invalidates the cached analysis for all dependent documents.
-This ensures that diagnostics and navigation features always reflect the current state of the workspace, even when edits in one file affect the semantics of another.
-
-The include graph is represented as a directed acyclic graph (DAG), with cycle detection to handle the edge case of circular includes gracefully.
-When a cycle is detected, the manager emits a diagnostic on the offending include directive and breaks the cycle to prevent infinite recursion during analysis.
+Includes form a directed graph.
+A circular include is detected and reported as a diagnostic on the offending include directive.
+A top-level document is derived from the graph: it is a document that no other document includes.

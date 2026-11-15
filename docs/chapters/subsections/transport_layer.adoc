@@ -6,12 +6,10 @@ It implements the Language Server Protocol specification, handling the JSON-RPC 
 
 The implementation is built on `tower-lsp-server`, a community-maintained fork of the original `tower-lsp` crate.
 This framework provides a trait-based approach where each LSP method (initialize, textDocument/didOpen, textDocument/definition, etc.) maps to an async Rust method.
-The tower-lsp-server crate handles all the low-level protocol details — framing, content-length headers, JSON serialization — so the asciidoc-lsp code can focus on the actual language analysis logic.
+The tower-lsp-server crate handles protocol details such as framing and JSON serialization.
 
-Communication uses the standard stdio transport, where the server reads JSON-RPC messages from stdin and writes responses to stdout.
-This is the most widely supported transport mechanism across editors: Neovim, VS Code, Helix, and Emacs all support stdio-based LSP servers out of the box.
-No additional configuration or socket management is required, which simplifies deployment and reduces the surface area for connection-related bugs.
+Communication uses the stdio transport: the server reads JSON-RPC messages from stdin and writes responses to stdout.
 
 The Transport Layer also handles capability negotiation during the `initialize` handshake.
-The server advertises which LSP features it supports (document symbols, go-to-definition, diagnostics, hover) and the client adjusts its behavior accordingly.
-This allows the server to incrementally add features without breaking compatibility with existing client configurations.
+The server advertises which LSP features it supports (full-document sync, document and workspace symbols, go to definition, references, rename, completion, hover, code actions, execute command) and the client adjusts its behavior accordingly.
+Diagnostics are pushed with `textDocument/publishDiagnostics`.
