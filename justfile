@@ -70,6 +70,10 @@ reset-testplan:
 clean:
     cargo clean
 
+# Cut a release: bump is patch, minor or major (gate: fmt-check, lint, test on main)
+release bump:
+    RELEASE_LINT_CMD="just fmt-check lint" scripts/release.sh {{bump}}
+
 # Update tree-sitter-asciidoc submodule to latest upstream commit
 update-grammar:
     git submodule update --remote vendor/tree-sitter-asciidoc
