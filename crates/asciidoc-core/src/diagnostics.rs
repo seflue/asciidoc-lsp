@@ -238,6 +238,43 @@ pub fn collect_diagnostics(
         diags.entry(diag.file.clone()).or_default().push(diag);
     }
 
+    // 7. Section titles out of sequence, per top-level document: one
+    // diagnostic per place, naming the documents when several read the file.
+    let mut out_of_sequence: BTreeMap<(PathBuf, usize, Vec<usize>, usize), Vec<PathBuf>> =
+        BTreeMap::new();
+    for scope in &top_level {
+        for found in crate::section_levels::out_of_sequence(workspace, scope.document()) {
+            let readers = out_of_sequence
+                .entry((found.file, found.line, found.expected, found.got))
+                .or_default();
+            // A document that reads the file more than once is named once.
+            if !readers.iter().any(|d| d == scope.document()) {
+                readers.push(scope.document().to_path_buf());
+            }
+        }
+    }
+    for ((file, line, expected, got), mut documents) in out_of_sequence {
+        documents.sort();
+        let several = catalogs.scopes_at(&file).len() > 1;
+        diags.entry(file.clone()).or_default().push(Diagnostic {
+            file,
+            line,
+            span: None,
+            kind: DiagnosticKind::SectionOutOfSequence {
+                expected,
+                got,
+                documents: if several {
+                    documents
+                        .iter()
+                        .map(|document| display_path(root, document))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            },
+        });
+    }
+
     diags
 }
 
@@ -375,6 +412,7 @@ mod tests {
             DocumentModel::test("/a.adoc").with_includes(vec![IncludeMacro {
                 path: "nonexistent.adoc".into(),
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
                 line: 3,
                 target_col: 9,
             }]),
@@ -552,6 +590,7 @@ mod tests {
             DocumentModel::test("/a.adoc").with_includes(vec![IncludeMacro {
                 path: "b.adoc".into(),
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
                 line: 3,
                 target_col: 9,
             }]),
@@ -561,6 +600,7 @@ mod tests {
             DocumentModel::test("/b.adoc").with_includes(vec![IncludeMacro {
                 path: "a.adoc".into(),
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
                 line: 5,
                 target_col: 9,
             }]),
@@ -573,6 +613,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         graph.add_edge(
@@ -581,6 +622,7 @@ mod tests {
                 target: a.clone(),
                 line: 5,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -623,6 +665,7 @@ mod tests {
             DocumentModel::test(parent.to_str().unwrap()).with_includes(vec![IncludeMacro {
                 path: "{docdir}/appendix/glossary.adoc".into(),
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
                 line: 20,
                 target_col: 9,
             }]),
@@ -658,6 +701,8 @@ mod tests {
                     line: 1,
                     id: None,
                     is_header: false,
+                    style: None,
+                    placement: crate::types::Placement::Body,
                 }])
                 .with_anchors(vec![Anchor {
                     id: "entry-anchor".into(),
@@ -684,6 +729,7 @@ mod tests {
             DocumentModel::test("/b.adoc").with_includes(vec![IncludeMacro {
                 path: "missing.adoc".into(),
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
                 line: 4,
                 target_col: 9,
             }]),
@@ -791,6 +837,8 @@ mod tests {
                     line: 1,
                     id: None,
                     is_header: false,
+                    style: None,
+                    placement: crate::types::Placement::Body,
                 }])
                 .with_anchors(vec![Anchor {
                     id: "valid-anchor".into(),
@@ -820,6 +868,7 @@ mod tests {
                 target: PathBuf::from("/b.adoc"),
                 line: 7,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         let diags = diagnose(documents, graph, registry);
@@ -1552,6 +1601,7 @@ mod tests {
                     target: PathBuf::from("/b.adoc"),
                     line,
                     attributes: vec![],
+                    placement: crate::types::Placement::Body,
                 },
             );
         }
@@ -1633,5 +1683,315 @@ mod tests {
         let (_, ws) = fixture_workspace("adversarial_project");
 
         assert_eq!(undefined_in_workspace(&ws), vec![]);
+    }
+
+    // --- Section titles out of sequence (fixture `section_levels`) ---
+
+    /// The `SectionOutOfSequence`s of `file` as (line, expected levels, got
+    /// level, names of the documents).
+    fn out_of_sequence(
+        ws: &crate::workspace::Workspace,
+        file: &Path,
+    ) -> Vec<(usize, Vec<usize>, usize, Vec<String>)> {
+        ws.diagnostics_for(file)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::SectionOutOfSequence {
+                    expected,
+                    got,
+                    documents,
+                } => Some((
+                    d.line,
+                    expected.clone(),
+                    *got,
+                    documents
+                        .iter()
+                        .map(|doc| doc.display().to_string())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sequence_rows(
+        ws: &crate::workspace::Workspace,
+        file: &Path,
+    ) -> Vec<(usize, Vec<usize>, usize)> {
+        out_of_sequence(ws, file)
+            .into_iter()
+            .map(|(line, expected, got, _)| (line, expected, got))
+            .collect()
+    }
+
+    /// Asciidoctor (`index.adoc`): `WARNING: index.adoc: line 17: section
+    /// title out of sequence: expected level 3, got level 4`. The chapters
+    /// included with `leveloffset=+1` raise nothing but their own skip.
+    #[test]
+    fn test_section_skipping_a_level_is_reported_with_asciidoctors_levels() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("index.adoc")),
+            vec![(17, vec![3], 4, vec![])]
+        );
+        assert_eq!(
+            ws.diagnostics_for(&root.join("index.adoc"))
+                .iter()
+                .find_map(
+                    |d| matches!(d.kind, DiagnosticKind::SectionOutOfSequence { .. })
+                        .then(|| d.span)
+                ),
+            Some(None)
+        );
+    }
+
+    /// Asciidoctor: `WARNING: chapters/skips.adoc: line 5: ... expected level
+    /// 3, got level 4`: the levels are the shifted ones, the place is the
+    /// title's own file.
+    #[test]
+    fn test_skipped_level_in_chapter_with_leveloffset_reports_shifted_levels() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("chapters/skips.adoc")),
+            vec![(5, vec![3], 4, vec![])]
+        );
+    }
+
+    /// Asciidoctor: nothing for `chapters/clean.adoc` (a `[discrete]` title
+    /// and a title in a sidebar are no sections) and nothing for
+    /// `chapters/entry_offset.adoc` (`:leveloffset: +1` before the include).
+    #[test]
+    fn test_chapters_included_with_leveloffset_stay_quiet() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("chapters/clean.adoc")),
+            vec![]
+        );
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("chapters/entry_offset.adoc")),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor: no warning for the project, whose chapters come in with
+    /// `leveloffset=+1`.
+    #[test]
+    fn test_adversarial_project_reports_no_section_out_of_sequence() {
+        let (_, ws) = fixture_workspace("adversarial_project");
+
+        let found: Vec<_> = ws
+            .all_diagnostics()
+            .into_iter()
+            .filter(|d| matches!(d.kind, DiagnosticKind::SectionOutOfSequence { .. }))
+            .map(|d| (d.file, d.line))
+            .collect();
+        assert_eq!(found, vec![]);
+    }
+
+    /// Asciidoctor (`out_of_sequence/main.adoc`): `line 8: expected level 1,
+    /// got level 2`.
+    #[test]
+    fn test_first_section_below_document_title_too_deep_is_reported() {
+        let (root, ws) = fixture_workspace("out_of_sequence");
+
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("main.adoc")),
+            vec![(8, vec![1], 2, vec![])]
+        );
+    }
+
+    /// Asciidoctor (`book.adoc`): `line 4: expected levels 0 or 1, got level
+    /// 2`, `line 8: expected level 1, got level 2` (below the part),
+    /// `line 12: expected level 2, got level 3`.
+    #[test]
+    fn test_book_accepts_levels_0_or_1_at_the_top_and_level_1_below_a_part() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            sequence_rows(&ws, &root.join("book.adoc")),
+            vec![(4, vec![0, 1], 2), (8, vec![1], 2), (12, vec![2], 3)]
+        );
+    }
+
+    /// Asciidoctor (`special.adoc`): an `ERROR` for the nested section in the
+    /// glossary (not ours) and a `WARNING` for line 11 only, below the
+    /// appendix. The glossary's children are not checked.
+    #[test]
+    fn test_special_section_children_are_not_checked_appendix_children_are() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            sequence_rows(&ws, &root.join("special.adoc")),
+            vec![(11, vec![2], 3)]
+        );
+    }
+
+    /// Asciidoctor (`headerless.adoc`): `line 5: expected level 2, got level
+    /// 3`; the opening `===` is not checked.
+    #[test]
+    fn test_headerless_document_leaves_its_top_sections_unchecked() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            sequence_rows(&ws, &root.join("headerless.adoc")),
+            vec![(5, vec![2], 3)]
+        );
+    }
+
+    /// Asciidoctor (`headerless_preamble.adoc`): `line 3: expected level 1,
+    /// got level 2`, because the preamble paragraph comes first. The LSP knows
+    /// no block before the first title: a deliberate false negative, which
+    /// keeps orphaned partials (`=== X` at the top) quiet.
+    #[test]
+    fn test_headerless_section_after_preamble_not_reported_lsp_does_not_see_the_preamble() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            sequence_rows(&ws, &root.join("headerless_preamble.adoc")),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor: `WARNING: shared/part.adoc: line 1: expected level 2, got
+    /// level 3` when `print.adoc` includes it with `leveloffset=+1`, nothing
+    /// for `web.adoc`. The message names the document.
+    #[test]
+    fn test_shared_file_out_of_sequence_in_one_document_names_it() {
+        let (root, ws) = fixture_workspace("section_levels");
+        let part = root.join("shared/part.adoc");
+
+        assert_eq!(
+            out_of_sequence(&ws, &part),
+            vec![(1, vec![2], 3, vec!["print.adoc".to_string()])]
+        );
+        assert_eq!(
+            ws.diagnostics_for(&part)[0].kind.to_string(),
+            "Section title out of sequence: expected level 2, got level 3 (in print.adoc)"
+        );
+        assert_eq!(out_of_sequence(&ws, &root.join("web.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`region.adoc`): only `line 11` (after `== Back`).
+    /// What `tag=t` reads is unknown to the LSP, so line 7 (`====` after the
+    /// region) is not judged against `== Before`, and `regions/tagged.adoc`
+    /// reports nothing.
+    #[test]
+    fn test_region_include_hides_the_parent_until_a_shallower_section() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            sequence_rows(&ws, &root.join("region.adoc")),
+            vec![(11, vec![2], 3)]
+        );
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("regions/tagged.adoc")),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor: `shared/sets_offset.adoc` line 4 (`:leveloffset: +1` in
+    /// the file on top of the include's own `+1`), nothing in `restore.adoc`:
+    /// after the include the value of before it is back.
+    #[test]
+    fn test_leveloffset_of_an_include_is_restored_after_it() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("shared/sets_offset.adoc")),
+            vec![(4, vec![2], 3, vec![])]
+        );
+        assert_eq!(out_of_sequence(&ws, &root.join("restore.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`offsets.adoc`): `line 5: expected level 1, got level 2`
+    /// (absolute `:leveloffset: 1`), `line 11: expected level 2, got level 3`
+    /// (after `:leveloffset!:`), and `shared/absolute.adoc: line 5: expected
+    /// level 3, got level 4` (`leveloffset=1` on the include).
+    #[test]
+    fn test_absolute_and_unset_leveloffset_entries() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            sequence_rows(&ws, &root.join("offsets.adoc")),
+            vec![(5, vec![1], 2), (11, vec![2], 3)]
+        );
+        assert_eq!(
+            sequence_rows(&ws, &root.join("shared/absolute.adoc")),
+            vec![(5, vec![3], 4)]
+        );
+    }
+
+    /// Asciidoctor: no warning; an include inside a listing or an example
+    /// block is block content, not sections.
+    #[test]
+    fn test_includes_inside_blocks_contribute_no_sections() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(out_of_sequence(&ws, &root.join("listing.adoc")), vec![]);
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("shared/deep_sample.adoc")),
+            vec![]
+        );
+    }
+
+    /// A file read twice by one document reports its skip once.
+    #[test]
+    fn test_file_read_twice_in_one_document_reports_once() {
+        let top = |line| IncludeMacro {
+            path: "b.adoc".into(),
+            attributes: vec![],
+            line,
+            target_col: 0,
+            placement: crate::types::Placement::Body,
+        };
+        let section = |level, line| Section {
+            level,
+            title: "T".into(),
+            line,
+            id: Some("id".into()),
+            is_header: level == 0,
+            style: None,
+            placement: crate::types::Placement::Body,
+        };
+        let mut documents = HashMap::new();
+        documents.insert(
+            PathBuf::from("/a.adoc"),
+            DocumentModel::test("/a.adoc")
+                .with_sections(vec![section(0, 1), section(1, 3)])
+                .with_includes(vec![top(5), top(7)]),
+        );
+        documents.insert(
+            PathBuf::from("/b.adoc"),
+            DocumentModel::test("/b.adoc").with_sections(vec![section(3, 1)]),
+        );
+        let mut graph = IncludeGraph::new();
+        for line in [5, 7] {
+            graph.add_edge(
+                Path::new("/a.adoc"),
+                crate::types::IncludeEdge {
+                    target: PathBuf::from("/b.adoc"),
+                    line,
+                    attributes: vec![],
+                    placement: crate::types::Placement::Body,
+                },
+            );
+        }
+
+        let diags = diagnose(documents, graph, make_registry());
+
+        let found: Vec<_> = diags[&PathBuf::from("/b.adoc")]
+            .iter()
+            .map(|d| (d.line, d.kind.to_string()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![(
+                1,
+                "Section title out of sequence: expected level 2, got level 3".to_string()
+            )]
+        );
     }
 }

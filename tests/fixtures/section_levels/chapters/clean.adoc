@@ -1,0 +1,12 @@
+= Clean Chapter
+
+== Clean Section
+
+[discrete]
+===== Discrete Heading
+
+=== Clean Subsection
+
+****
+===== Not A Section
+****

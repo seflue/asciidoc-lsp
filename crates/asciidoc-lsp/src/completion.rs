@@ -2125,6 +2125,8 @@ mod tests {
                     line: loc.line,
                     id: None,
                     is_header: false,
+                    style: None,
+                    placement: asciidoc_core::types::Placement::Body,
                 });
             } else {
                 doc.anchors.push(Anchor {

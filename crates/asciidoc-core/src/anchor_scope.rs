@@ -388,7 +388,7 @@ impl Workspace {
 /// from probes of Asciidoctor 2.0.26; the first of the keys `lines`, `tag`,
 /// `tags` that is present decides alone, even with an empty value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IncludeSelection {
+pub(crate) enum IncludeSelection {
     /// Every line, or every tag (`**`): the file is part of the document and
     /// a second reading repeats every ID.
     Whole,
@@ -400,7 +400,7 @@ enum IncludeSelection {
     Part,
 }
 
-fn include_selection(edge: &IncludeEdge) -> IncludeSelection {
+pub(crate) fn include_selection(edge: &IncludeEdge) -> IncludeSelection {
     let value = |key: &str| {
         edge.attributes
             .iter()
@@ -979,6 +979,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
+            placement: crate::types::Placement::Body,
         }
     }
 

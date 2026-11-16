@@ -1,6 +1,19 @@
 use std::fmt;
 use std::path::PathBuf;
 
+/// Where a title or an include stands in the block tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Among sections: a title there is a section.
+    #[default]
+    Body,
+    /// Inside a delimited block, table cell or list item: Asciidoctor reads
+    /// no section there, and an include there reads block content.
+    Block,
+    /// Inside a part the grammar could not parse (`ERROR`): unknown.
+    Unparsed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub level: usize,
@@ -14,6 +27,10 @@ pub struct Section {
     /// attribute entries and an ID line precede it. Asciidoctor generates no
     /// ID for it. A level-0 title elsewhere is a book part and gets one.
     pub is_header: bool,
+    /// Block style of the attribute lines above the title (`appendix`,
+    /// `discrete`); the last line that sets one wins.
+    pub style: Option<String>,
+    pub placement: Placement,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +40,7 @@ pub struct IncludeMacro {
     pub line: usize,
     /// Byte column, on `line`, where `path` starts.
     pub target_col: usize,
+    pub placement: Placement,
 }
 
 /// A source range that starts on a diagnostic's or xref's `line` and may end on a later one.
@@ -117,6 +135,7 @@ pub struct IncludeEdge {
     pub target: PathBuf,
     pub line: usize,
     pub attributes: Vec<(String, String)>,
+    pub placement: Placement,
 }
 
 #[derive(Debug, PartialEq)]
@@ -181,6 +200,17 @@ pub enum DiagnosticKind {
         /// under the root or up to two `..` steps away, absolute otherwise;
         /// not an addressable location.
         cycle_through: PathBuf,
+    },
+    /// A section title deeper than Asciidoctor expects below the section or
+    /// document header above it; levels include `leveloffset`.
+    SectionOutOfSequence {
+        /// The levels accepted there, ascending: `[n]`, or `[0, 1]` at the
+        /// top of a book.
+        expected: Vec<usize>,
+        got: usize,
+        /// As in `BrokenXref`: the top-level documents where it is out of
+        /// sequence when several read the file; empty otherwise.
+        documents: Vec<PathBuf>,
     },
     /// `pdf-themesdir` / `pdf-fontsdir` directory or `pdf-theme` file
     /// that does not exist.
@@ -263,6 +293,24 @@ impl fmt::Display for DiagnosticKind {
                     path,
                     cycle_through.display()
                 )
+            }
+            DiagnosticKind::SectionOutOfSequence {
+                expected,
+                got,
+                documents,
+            } => {
+                let levels: Vec<_> = expected.iter().map(ToString::to_string).collect();
+                let plural = if expected.len() > 1 { "s" } else { "" };
+                write!(
+                    f,
+                    "Section title out of sequence: expected level{plural} {}, got level {got}",
+                    levels.join(" or ")
+                )?;
+                if documents.is_empty() {
+                    return Ok(());
+                }
+                let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
+                write!(f, " (in {})", documents.join(", "))
             }
             DiagnosticKind::PdfPathNotFound { attribute, path } => {
                 write!(f, "{attribute}: not found: {}", path.display())
@@ -469,6 +517,36 @@ mod tests {
             .to_string()
             .contains("Duplicate anchor 'my-id' in /book.adoc, /web.adoc"));
         assert!(d4.to_string().contains("/a/b.adoc:5"));
+
+        let d5 = DiagnosticKind::SectionOutOfSequence {
+            expected: vec![3],
+            got: 4,
+            documents: vec![],
+        };
+        assert_eq!(
+            d5.to_string(),
+            "Section title out of sequence: expected level 3, got level 4"
+        );
+
+        let d5b = DiagnosticKind::SectionOutOfSequence {
+            expected: vec![0, 1],
+            got: 2,
+            documents: vec![],
+        };
+        assert_eq!(
+            d5b.to_string(),
+            "Section title out of sequence: expected levels 0 or 1, got level 2"
+        );
+
+        let d5c = DiagnosticKind::SectionOutOfSequence {
+            expected: vec![2],
+            got: 3,
+            documents: vec![PathBuf::from("print.adoc"), PathBuf::from("book.adoc")],
+        };
+        assert_eq!(
+            d5c.to_string(),
+            "Section title out of sequence: expected level 2, got level 3 (in print.adoc, book.adoc)"
+        );
     }
 
     #[test]

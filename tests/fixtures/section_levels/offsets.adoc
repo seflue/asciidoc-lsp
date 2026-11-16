@@ -1,0 +1,13 @@
+= Offsets
+
+:leveloffset: 1
+
+== Absolute Entry
+
+:leveloffset!:
+
+== Unset Entry
+
+==== Skipped After Unset
+
+include::shared/absolute.adoc[leveloffset=1]

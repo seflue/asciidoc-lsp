@@ -356,6 +356,8 @@ mod tests {
                 line: 1,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 1,
@@ -363,6 +365,8 @@ mod tests {
                 line: 3,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 1,
@@ -370,6 +374,8 @@ mod tests {
                 line: 5,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
         ];
         let content = "= Title\n\n== Chapter A\n\n== Chapter B\n";
@@ -401,6 +407,8 @@ mod tests {
                 line: 1,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 1,
@@ -408,6 +416,8 @@ mod tests {
                 line: 3,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 2,
@@ -415,6 +425,8 @@ mod tests {
                 line: 5,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 2,
@@ -422,6 +434,8 @@ mod tests {
                 line: 7,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 1,
@@ -429,6 +443,8 @@ mod tests {
                 line: 9,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
         ];
         let content = "= Doc\n\n== Ch1\n\n=== Sub1\n\n=== Sub2\n\n== Ch2\n";
@@ -463,6 +479,8 @@ mod tests {
                 line: 1,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 1,
@@ -470,6 +488,8 @@ mod tests {
                 line: 3,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
         ];
         let content = "= Title\n\n== Chapter\n\nSome text.\n";
@@ -511,6 +531,8 @@ mod tests {
                 line: 1,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
             asciidoc_core::types::Section {
                 level: 1,
@@ -518,6 +540,8 @@ mod tests {
                 line: 3,
                 id: None,
                 is_header: false,
+                style: None,
+                placement: asciidoc_core::types::Placement::Body,
             },
         ];
         let content = "== Ch1\n\n== Ch2\n";

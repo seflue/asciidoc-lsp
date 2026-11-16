@@ -1,0 +1,11 @@
+= Special Sections
+
+[glossary]
+== Glossary
+
+==== Term
+
+[appendix]
+== Appendix
+
+==== Skipped In Appendix

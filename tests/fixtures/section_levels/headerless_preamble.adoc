@@ -1,0 +1,5 @@
+Preamble text.
+
+=== Too Deep After Preamble
+
+== Next Section
