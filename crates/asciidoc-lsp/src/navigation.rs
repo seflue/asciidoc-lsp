@@ -7,6 +7,7 @@ use tower_lsp_server::ls_types::Position;
 
 use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
+use asciidoc_core::diagnostics::display_path;
 use asciidoc_core::extractors::{element_attr_id, find_child_text};
 use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
@@ -20,8 +21,8 @@ use asciidoc_core::workspace::{
 
 use crate::positions;
 use crate::scopes::{
-    collapse_if_agree, document_dir, file_display_name, path_scopes, scope_image_base, scope_label,
-    unique_in_order, DocTarget,
+    collapse_if_agree, document_dir, file_display_name, path_scopes, scope_docdir,
+    scope_image_base, scope_label, unique_in_order, DocTarget,
 };
 
 /// Classification of a node found at a cursor position.
@@ -40,8 +41,13 @@ pub(crate) enum NodeKind {
     AttributeDef { name: String, unset: bool },
     /// `[[id]]` anchor / ID assignment
     Anchor { id: String },
-    /// `image::path[]` block macro or `image:path[]` inline macro
-    Image { path: String, inline: bool },
+    /// `image::path[]` block macro or `image:path[]` inline macro; `attrlist`
+    /// is the text between `[` and `]`, as written
+    Image {
+        path: String,
+        inline: bool,
+        attrlist: String,
+    },
 }
 
 /// Information about a recognized node at a cursor position.
@@ -370,7 +376,7 @@ fn pdf_paths_display(name: &str, paths: &[PdfPath]) -> String {
 ///   choice values
 /// - `pdf-theme`, `pdf-themesdir`, `pdf-fontsdir` (reference or definition):
 ///   resolved absolute path
-/// - `Xref`/`ShorthandXref`: section title + file
+/// - `Xref`/`ShorthandXref`: section title + file, or `✗ Target not found`
 /// - `Include`: resolved path + file info
 pub fn resolve_hover(
     content: &str,
@@ -469,7 +475,7 @@ pub fn resolve_hover(
             let ws = workspace?;
             let catalogs = CatalogCache::new(ws);
             let resolved = resolve_xref_targets(ws, &catalogs, doc_path, target, node_info.line);
-            if resolved.iter().all(|(_, resolved)| resolved.is_err()) {
+            if resolved.is_empty() {
                 return None;
             }
             let texts: Vec<(String, String)> = resolved
@@ -507,7 +513,11 @@ pub fn resolve_hover(
                 .collect();
             (!texts.is_empty()).then(|| per_document_hover(texts))
         }
-        NodeKind::Image { path, inline } => {
+        NodeKind::Image {
+            path,
+            inline,
+            attrlist,
+        } => {
             let macro_form = if *inline { "image:" } else { "image::" };
             let mut targets = resolve_image_targets(path, doc_path, workspace, node_info.line);
             // Scopes that reach the same file agree, however they spell it.
@@ -516,7 +526,7 @@ pub fn resolve_hover(
                 .into_iter()
                 .map(|(label, target)| {
                     let text = match target {
-                        ImageTarget::Remote { url } => format!("{macro_form}{url}[]"),
+                        ImageTarget::Remote { url } => format!("{macro_form}{url}[{attrlist}]"),
                         ImageTarget::Local {
                             path: target,
                             display,
@@ -526,7 +536,7 @@ pub fn resolve_hover(
                             } else {
                                 "\u{2717} File not found"
                             };
-                            format!("{macro_form}{display}[]\n\n{status}")
+                            format!("{macro_form}{display}[{attrlist}]\n\n{status}")
                         }
                     };
                     (label, text)
@@ -538,22 +548,34 @@ pub fn resolve_hover(
     }
 }
 
-/// Hover text for an xref that resolves: the section title, or the anchor
-/// for an anchor outside a section title, then file and line.
+/// Hover text for an xref that resolves: the title of the section that
+/// carries the ID (`Workspace::anchor_title`) or, for an xref that names only
+/// a file, of its document header; then file and line. An ID outside a
+/// section title shows the anchor instead, a file without a header only the
+/// place.
 fn xref_hover(ws: &Workspace, target: &str, resolved: &ResolvedXref) -> String {
-    let section_title = ws.documents().get(&resolved.file).and_then(|doc| {
-        doc.sections
-            .iter()
-            .find(|s| s.line == resolved.line)
-            .map(|s| s.title.clone())
-    });
-    let display_path = file_display_name(&resolved.file);
-    if let Some(title) = section_title {
-        format!("\u{2192} {title}\n\n{display_path}:{}", resolved.line)
-    } else {
-        // Anchor without section (explicit anchor)
-        let anchor_id = target.rsplit('#').next().unwrap_or(target);
-        format!("[[{anchor_id}]]\n\n{display_path}:{}", resolved.line)
+    let (_, id) = parse_xref_target(target);
+    let title = match (resolved.kind, id) {
+        (Some(kind), Some(id)) => ws.anchor_title(
+            id,
+            &AnchorLocation {
+                file: resolved.file.clone(),
+                line: resolved.line,
+                kind,
+            },
+        ),
+        _ => ws.documents().get(&resolved.file).and_then(|doc| {
+            doc.sections
+                .iter()
+                .find(|s| s.is_header)
+                .map(|s| s.title.as_str())
+        }),
+    };
+    let place = format!("{}:{}", file_display_name(&resolved.file), resolved.line);
+    match (title, id) {
+        (Some(title), _) => format!("\u{2192} {title}\n\n{place}"),
+        (None, Some(id)) => format!("[[{id}]]\n\n{place}"),
+        (None, None) => place,
     }
 }
 
@@ -701,26 +723,33 @@ fn resolve_image_targets(
 ) -> Vec<(String, ImageTarget)> {
     let file_dir = document_dir(doc_path, workspace);
     let Some(ws) = workspace else {
-        let target = image_target(image_path, file_dir, "");
+        let target = image_target(image_path, file_dir, file_dir, "");
         return vec![(file_display_name(doc_path), target)];
     };
     path_scopes(ws, doc_path, line)
         .map(|scope| {
             let (base, imagesdir) = scope_image_base(&scope, file_dir);
-            let target = image_target(&scope.substitute(image_path), &base, &imagesdir);
+            let doc_dir = scope_docdir(&scope, file_dir);
+            let target = image_target(&scope.substitute(image_path), &base, &doc_dir, &imagesdir);
             (scope_label(&scope), target)
         })
         .collect()
 }
 
 /// An image target from its substituted path, the folder it resolves
-/// against and the `imagesdir` shown in front of it.
-fn image_target(resolved_path: &str, base: &Path, imagesdir: &str) -> ImageTarget {
-    let display = if imagesdir.is_empty() || is_remote_url(resolved_path) {
+/// against and the `imagesdir` shown in front of it. An absolute path shown
+/// is shown relative to `doc_dir` as far as `display_path` allows.
+fn image_target(resolved_path: &str, base: &Path, doc_dir: &Path, imagesdir: &str) -> ImageTarget {
+    let mut display = if imagesdir.is_empty() || is_remote_url(resolved_path) {
         resolved_path.to_string()
     } else {
         format!("{imagesdir}/{resolved_path}")
     };
+    if Path::new(&display).is_absolute() {
+        display = display_path(doc_dir, Path::new(&display))
+            .display()
+            .to_string();
+    }
     if is_remote_url(&display) {
         return ImageTarget::Remote { url: display };
     }
@@ -1336,6 +1365,7 @@ fn classify_block_node(
                         kind: NodeKind::Image {
                             path,
                             inline: false,
+                            attrlist: macro_attrlist(n, source),
                         },
                         line: n.start_position().row + 1,
                     });
@@ -1371,6 +1401,24 @@ fn cursor_on_attr_id(node: tree_sitter::Node, source: &[u8], id: &str) -> bool {
     false
 }
 
+/// The text of the macro `node` between its `[` and its `]`, as written.
+/// Empty when either bracket is missing, as in a macro still being typed.
+fn macro_attrlist(node: tree_sitter::Node, source: &[u8]) -> String {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    let open = children.iter().find(|c| c.kind() == "[" && !c.is_missing());
+    let close = children
+        .iter()
+        .rfind(|c| c.kind() == "]" && !c.is_missing());
+    let (Some(open), Some(close)) = (open, close) else {
+        return String::new();
+    };
+    if close.start_byte() < open.end_byte() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&source[open.end_byte()..close.start_byte()]).into_owned()
+}
+
 /// Check if the node at the given point is inside an xref (`inline_macro` or
 /// `<<>>`) or an inline image.
 fn classify_inline_node(
@@ -1404,7 +1452,11 @@ fn classify_inline_node(
                 if macro_name == "image" {
                     let path = find_child_text(n, "target", source).unwrap_or_default();
                     return Some(NodeInfo {
-                        kind: NodeKind::Image { path, inline: true },
+                        kind: NodeKind::Image {
+                            path,
+                            inline: true,
+                            attrlist: macro_attrlist(n, source),
+                        },
                         line: n.start_position().row + 1,
                     });
                 }
@@ -3909,7 +3961,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             info.kind,
             NodeKind::Image {
                 path: "images/diagram.png".into(),
-                inline: false
+                inline: false,
+                attrlist: "Alt".into()
             }
         );
         assert_eq!(info.line, 3); // 1-indexed
@@ -3928,7 +3981,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             info.kind,
             NodeKind::Image {
                 path: "logo.png".into(),
-                inline: false
+                inline: false,
+                attrlist: String::new()
             }
         );
     }
@@ -4871,12 +4925,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
-        // Anchor is on line 1 which is [[my-anchor]], not a section line.
-        // The section "Chapter B" is on line 2 — but resolved.line points to the anchor line.
-        assert!(
-            hover.contains("b.adoc:1"),
-            "Should show file + line, got: {hover}"
-        );
+        assert_eq!(hover, "\u{2192} Chapter B\n\nb.adoc:1");
     }
 
     #[test]
@@ -4896,14 +4945,11 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
-        assert!(
-            hover.contains("b.adoc:1"),
-            "Should show file + line, got: {hover}"
-        );
+        assert_eq!(hover, "\u{2192} Chapter B\n\nb.adoc:1");
     }
 
     #[test]
-    fn test_hover_xref_broken() {
+    fn test_hover_broken_xref_says_target_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.adoc");
         fs::write(&a, "= Doc A\n\nSee <<nonexistent>>.\n").unwrap();
@@ -4915,7 +4961,268 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 8,
         };
 
-        assert!(resolve_hover(&content, pos, &a, Some(&ws)).is_none());
+        assert_eq!(
+            resolve_hover(&content, pos, &a, Some(&ws)).as_deref(),
+            Some("\u{2717} Target not found")
+        );
+    }
+
+    #[rstest]
+    #[case::missing_file("See xref:missing.adoc[].\n", 10)]
+    #[case::missing_anchor_in_file("See xref:b.adoc#nope[].\n", 10)]
+    #[case::mistyped_auto_id("See <<_b_typo>>.\n", 8)]
+    fn test_hover_broken_file_xref_says_target_not_found(
+        #[case] line: &str,
+        #[case] character: u32,
+    ) {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = format!("= Doc A\n\n{line}\ninclude::b.adoc[]\n");
+        fs::write(&a, &doc).unwrap();
+        fs::write(root.join("b.adoc"), "[[real]]\n== B\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position { line: 2, character };
+
+        assert_eq!(
+            resolve_hover(&doc, pos, &a, Some(&ws)).as_deref(),
+            Some("\u{2717} Target not found")
+        );
+    }
+
+    /// Asciidoctor: `[[first]]` followed by `[[second]]` registers only
+    /// `second` (`possible invalid reference` for `first`).
+    #[test]
+    fn test_hover_xref_overridden_id_of_a_run_is_not_found() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n\n[[first]]\n[[second]]\n== Run\n\nSee <<first>> and <<second>>.\n";
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let at = |character| Position { line: 6, character };
+
+        let first = resolve_hover(doc, at(8), &a, Some(&ws));
+        let second = resolve_hover(doc, at(24), &a, Some(&ws));
+
+        assert_eq!(first.as_deref(), Some("\u{2717} Target not found"));
+        assert_eq!(second.as_deref(), Some("\u{2192} Run\n\na.adoc:4"));
+    }
+
+    #[rstest]
+    #[case::block_anchor("[[intro]]\n== Introduction\n", "<<intro>>", "Introduction")]
+    #[case::short_id("[#aud]\n== Audience\n", "<<aud>>", "Audience")]
+    #[case::id_attribute("[id=by-attr]\n== B\n", "<<by-attr>>", "B")]
+    #[case::inline_anchor("== Inline Title [[inl]]\n", "<<inl>>", "Inline Title")]
+    #[case::auto_id("== Plain\n", "<<_plain>>", "Plain")]
+    #[case::file_xref("[[intro]]\n== Introduction\n", "xref:b.adoc#intro[]", "Introduction")]
+    fn test_hover_xref_shows_the_title_of_the_section_carrying_the_id(
+        #[case] b_content: &str,
+        #[case] xref: &str,
+        #[case] title: &str,
+    ) {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = format!("= Doc A\n\nSee {xref}.\n\ninclude::b.adoc[]\n");
+        fs::write(&a, &doc).unwrap();
+        fs::write(root.join("b.adoc"), b_content).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(&doc, pos, &a, Some(&ws)).unwrap();
+
+        assert!(
+            hover.starts_with(&format!("\u{2192} {title}\n\nb.adoc:")),
+            "got: {hover}"
+        );
+    }
+
+    /// Asciidoctor renders `[p1]` for an anchor on a paragraph: the next
+    /// section is not its title.
+    #[test]
+    fn test_hover_xref_to_a_paragraph_anchor_shows_the_anchor() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n\nSee <<p1>>.\n\n[[p1]]\nA paragraph.\n\n== Later\n";
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+
+        assert!(hover.starts_with("[[p1]]"), "got: {hover}");
+        assert!(!hover.contains("Later"), "got: {hover}");
+    }
+
+    #[test]
+    fn test_hover_file_xref_shows_the_document_title() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n\nSee xref:b.adoc[].\n\ninclude::b.adoc[]\n";
+        fs::write(&a, doc).unwrap();
+        fs::write(root.join("b.adoc"), "// c\n= Other Doc\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+
+        assert_eq!(hover, "\u{2192} Other Doc\n\nb.adoc:1");
+    }
+
+    #[test]
+    fn test_hover_file_xref_without_a_document_title_shows_only_the_place() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n\nSee xref:b.adoc[].\n\ninclude::b.adoc[]\n";
+        fs::write(&a, doc).unwrap();
+        fs::write(root.join("b.adoc"), "Text.\n").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+
+        assert_eq!(hover, "b.adoc:1");
+    }
+
+    /// Fixture review repro (G7): `[[intro]]` above `= Introduction`,
+    /// included with `leveloffset=+1`.
+    #[test]
+    fn test_hover_xref_to_id_above_included_chapter_title_shows_title() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let content = fs::read_to_string(&index).unwrap();
+        let ws = Workspace::build(&root, &index);
+        let (row, text) = content
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.starts_with("See <<intro>>"))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(row).unwrap(),
+            character: u32::try_from(text.find("intro").unwrap()).unwrap(),
+        };
+
+        assert_eq!(
+            resolve_hover(&content, pos, &index, Some(&ws)).as_deref(),
+            Some("\u{2192} Introduction\n\nintro.adoc:1")
+        );
+    }
+
+    /// Fixture `chapters/setup.adoc`: `:imagesdir:` is
+    /// `{asciidoctorconfigdir}/images`, absolute; the hover shows it relative
+    /// to the document folder.
+    #[test]
+    fn test_hover_image_with_absolute_imagesdir_shows_path_relative_to_docdir() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let setup = root.join("chapters/setup.adoc");
+        let content = fs::read_to_string(&setup).unwrap();
+        let ws = Workspace::build(&root, &index);
+        let (row, text) = content
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.starts_with("image::diagrams"))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(row).unwrap(),
+            character: u32::try_from(text.find("diagrams").unwrap()).unwrap(),
+        };
+
+        assert_eq!(
+            resolve_hover(&content, pos, &setup, Some(&ws)).as_deref(),
+            Some("image::images/diagrams/arch.svg[Architecture]\n\n\u{2713} File exists")
+        );
+    }
+
+    #[rstest]
+    #[case::block(
+        "= Doc A\n\nimage::logo.png[Logo,200]\n",
+        10,
+        "image::logo.png[Logo,200]"
+    )]
+    #[case::inline(
+        "= Doc A\n:product: Acme\n\nText image:logo.png[{product} logo,32] here.\n",
+        12,
+        "image:logo.png[{product} logo,32]"
+    )]
+    #[case::empty("= Doc A\n\nimage::logo.png[]\n", 10, "image::logo.png[]")]
+    fn test_hover_image_keeps_the_attribute_list_as_written(
+        #[case] doc: &str,
+        #[case] character: u32,
+        #[case] first_line: &str,
+    ) {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        fs::write(&a, doc).unwrap();
+        fs::write(root.join("logo.png"), "fake-png-data").unwrap();
+        let ws = Workspace::build(&root, &a);
+        let macro_line = doc.lines().position(|l| l.contains("image:")).unwrap();
+        let pos = Position {
+            line: u32::try_from(macro_line).unwrap(),
+            character,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+
+        assert_eq!(hover, format!("{first_line}\n\n\u{2713} File exists"));
+    }
+
+    #[test]
+    fn test_hover_image_outside_the_document_folder_stays_absolute() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n:imagesdir: /asciidoc-lsp-absent/images\n\nimage::logo.png[Logo]\n";
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 3,
+            character: 10,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
+
+        assert_eq!(
+            hover,
+            "image::/asciidoc-lsp-absent/images/logo.png[Logo]\n\n\u{2717} File not found"
+        );
+    }
+
+    #[test]
+    fn test_macro_attrlist_of_an_unfinished_macro_is_empty() {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let doc = "= Doc A\n\nimage::logo.png[Alt\n";
+        fs::write(&a, doc).unwrap();
+        let ws = Workspace::build(&root, &a);
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+
+        let hover = resolve_hover(doc, pos, &a, Some(&ws));
+
+        assert!(
+            hover
+                .as_deref()
+                .is_none_or(|h| h.starts_with("image::logo.png[]")),
+            "got: {hover:?}"
+        );
     }
 
     #[test]
@@ -5026,7 +5333,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
         assert!(
-            hover.contains("image::photo.png[]"),
+            hover.contains("image::photo.png[My Photo]"),
             "Should show image path, got: {hover}"
         );
         assert!(
@@ -5049,7 +5356,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let hover = resolve_hover(&content, pos, &a, None).unwrap();
         assert!(
-            hover.contains("image::missing.png[]"),
+            hover.contains("image::missing.png[Alt]"),
             "Should show path, got: {hover}"
         );
         assert!(
@@ -5082,7 +5389,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
         assert!(
-            hover.contains("image::assets/img/logo.png[]"),
+            hover.contains("image::assets/img/logo.png[Logo]"),
             "Should show resolved path with imagesdir, got: {hover}"
         );
         assert!(
@@ -5126,7 +5433,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(hover, "image:img/logo.png[]\n\n\u{2713} File exists");
+        assert_eq!(hover, "image:img/logo.png[Alt]\n\n\u{2713} File exists");
         assert_eq!(
             resolve_goto_definitions(doc, pos, &a, Some(&ws)),
             vec![(img.join("logo.png"), 1)]
@@ -6443,7 +6750,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             node_kind_name(&NodeKind::Image {
                 path: s(),
-                inline: false
+                inline: false,
+                attrlist: s()
             }),
             "image"
         );
