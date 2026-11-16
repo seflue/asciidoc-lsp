@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::anchor_scope::{AnchorScope, CatalogCache};
 use crate::paths::{is_uri, resolve_doc_target};
-use crate::types::{Diagnostic, DiagnosticKind, Span};
+use crate::types::{Diagnostic, DiagnosticKind, DocumentModel, Span};
 use crate::workspace::Workspace;
 
 /// A duplicate: the second definition (file, line), the ID, and the first.
@@ -15,6 +15,96 @@ struct DuplicateKey<'a> {
     id: &'a str,
     first_file: &'a Path,
     first_line: usize,
+}
+
+/// The tag names an include must find in its target, as Asciidoctor selects
+/// them: `lines` beats `tag` beats `tags`, the first present key decides even
+/// when empty. Keys are trimmed (the grammar keeps the blank after a comma).
+/// `tag` is one name, `tags` splits at `;` and `,`. Entries are
+/// not trimmed; empty ones, negations (`!x`) and wildcards (`*`, `**`) are
+/// never looked up. Duplicates are dropped, written order is kept.
+///
+/// A value that still holds an attribute reference after `substitute` yields
+/// no names: the attribute may be set at build time, which the LSP cannot
+/// know. Asciidoctor would report `tag '{name}' not found`; no diagnostic is
+/// better than a false one.
+fn required_tags(
+    attributes: &[(String, String)],
+    substitute: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let find = |key: &str| {
+        attributes
+            .iter()
+            .rev()
+            .find(|(name, _)| name.trim() == key)
+            .map(|(_, value)| value.as_str())
+    };
+    if find("lines").is_some() {
+        return Vec::new();
+    }
+    let Some((value, split)) = find("tag")
+        .map(|value| (value, false))
+        .or_else(|| find("tags").map(|value| (value, true)))
+    else {
+        return Vec::new();
+    };
+    let value = substitute(value);
+    let value = value.trim();
+    // The grammar splits a quoted value at its comma (`tags="a,b"` yields
+    // `"a`), so an open quote is a grammar artifact: no diagnostic beats a
+    // false one. It also folds a following attribute into an empty value
+    // (`tags=,lines=1`); an unquoted value ends at its first comma, as in
+    // Asciidoctor, which also substitutes before it parses the list.
+    let unquoted = ['"', '\'']
+        .iter()
+        .find_map(|quote| value.strip_prefix(*quote)?.strip_suffix(*quote));
+    if unquoted.is_none() && value.starts_with(['"', '\'']) {
+        return Vec::new();
+    }
+    let value = unquoted.unwrap_or_else(|| value.split(',').next().unwrap_or_default());
+    if value.contains('{') {
+        return Vec::new();
+    }
+    let entries: Vec<&str> = if split {
+        value.split([';', ',']).collect()
+    } else {
+        vec![value]
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let is_name = !entry.is_empty() && !entry.starts_with('!') && entry != "*" && entry != "**";
+        if is_name && !names.iter().any(|name| name == entry) {
+            names.push(entry.to_string());
+        }
+    }
+    names
+}
+
+/// The tag names the file at `target` opens, `None` when it cannot be read.
+///
+/// A `.adoc`/`.asciidoc` target in `documents` is answered from its model:
+/// open buffers are the truth there and the file watcher keeps it fresh. Any
+/// other target is read from disk, once per run (`cache`); the watcher does
+/// not see such files, so a parsed model of one could be stale.
+fn declared_tags<'a>(
+    target: &Path,
+    documents: &'a HashMap<PathBuf, DocumentModel>,
+    cache: &'a mut HashMap<PathBuf, Option<Vec<String>>>,
+) -> Option<&'a [String]> {
+    let is_adoc = target
+        .extension()
+        .is_some_and(|ext| ext == "adoc" || ext == "asciidoc");
+    if let Some(doc) = documents.get(target).filter(|_| is_adoc) {
+        return Some(&doc.tags);
+    }
+    cache
+        .entry(target.to_path_buf())
+        .or_insert_with(|| {
+            std::fs::read_to_string(target)
+                .ok()
+                .map(|text| crate::extractors::extract_tag_directives(&text))
+        })
+        .as_deref()
 }
 
 /// Collect all diagnostics across the workspace, grouped by file.
@@ -37,6 +127,9 @@ pub fn collect_diagnostics(
     // The references each top-level document lacks the attribute for, walked
     // once per recalculation.
     let mut undefined_refs: HashMap<PathBuf, HashSet<(PathBuf, usize, usize)>> = HashMap::new();
+
+    // Tag names of include targets read from disk, once per recalculation.
+    let mut target_tags: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
 
     for (path, doc) in documents {
         // 1. Broken xrefs, checked in each top-level document that reads the
@@ -123,7 +216,7 @@ pub fn collect_diagnostics(
             }
         }
 
-        // 2. Broken includes: check if include targets exist in graph
+        // 2. Broken includes and missing include tags
         for inc in &doc.includes {
             if is_uri(&registry.substitute(path, &inc.path)) {
                 continue;
@@ -137,6 +230,29 @@ pub fn collect_diagnostics(
                     line: inc.line,
                     span: None,
                     kind: DiagnosticKind::BrokenInclude {
+                        path: inc.path.clone(),
+                    },
+                });
+                continue;
+            }
+            let required = required_tags(&inc.attributes, |value| registry.substitute(path, value));
+            if required.is_empty() {
+                continue;
+            }
+            let Some(declared) = declared_tags(&target_path, documents, &mut target_tags) else {
+                continue;
+            };
+            let tags: Vec<String> = required
+                .into_iter()
+                .filter(|tag| !declared.contains(tag))
+                .collect();
+            if !tags.is_empty() {
+                diags.entry(path.clone()).or_default().push(Diagnostic {
+                    file: path.clone(),
+                    line: inc.line,
+                    span: None,
+                    kind: DiagnosticKind::IncludeTagNotFound {
+                        tags,
                         path: inc.path.clone(),
                     },
                 });
@@ -1992,6 +2108,257 @@ mod tests {
                 1,
                 "Section title out of sequence: expected level 2, got level 3".to_string()
             )]
+        );
+    }
+
+    fn attrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// Asciidoctor include selection, oracle-checked per case (see the
+    /// `include_tags` fixture): `lines` > `tag` > `tags`, the first present
+    /// key decides even when empty; `tag` is one name, `tags` splits at `;`
+    /// and `,`; negations and wildcards are never looked up.
+    #[rstest::rstest]
+    #[case::tag(&[("tag", "missing")], &["missing"])]
+    #[case::tag_is_not_split(&[("tag", "\"a;b\"")], &["a;b"])]
+    #[case::tags_semicolon(&[("tags", "\"m1;m2\"")], &["m1", "m2"])]
+    #[case::tags_unquoted_comma_ends_value(&[("tags", "m1,m2")], &["m1"])]
+    #[case::tags_deduplicated(&[("tags", "\"m;m\"")], &["m"])]
+    #[case::tags_entries_not_trimmed(&[("tags", "\"a; b\"")], &["a", " b"])]
+    #[case::tag_quoted_space(&[("tag", "\" a\"")], &[" a"])]
+    #[case::single_quotes(&[("tag", "'a'")], &["a"])]
+    #[case::edge_whitespace(&[("tag", " a ")], &["a"])]
+    #[case::negated_tags(&[("tags", "\"!m\"")], &[])]
+    #[case::negated_tag(&[("tag", "!m")], &[])]
+    #[case::wildcards_with_negation(&[("tags", "\"**;!m\"")], &[])]
+    #[case::star_tags(&[("tags", "\"*\"")], &[])]
+    #[case::double_star_tags(&[("tags", "\"**\"")], &[])]
+    #[case::star_tag(&[("tag", "*")], &[])]
+    #[case::double_star_tag(&[("tag", "**")], &[])]
+    #[case::only_separators(&[("tags", "\";;\"")], &[])]
+    #[case::only_bang_tags(&[("tags", "\"!\"")], &[])]
+    #[case::only_bang_tag(&[("tag", "!")], &[])]
+    #[case::empty_tag(&[("tag", "")], &[])]
+    #[case::no_key(&[("leveloffset", "1")], &[])]
+    #[case::star_then_name(&[("tags", "\"*;m\"")], &["m"])]
+    #[case::negated_wildcard_then_name(&[("tags", "\"!**;m\"")], &["m"])]
+    #[case::name_then_negation(&[("tags", "\"m;!n\"")], &["m"])]
+    #[case::lines_wins(&[("lines", "1..2"), ("tag", "m")], &[])]
+    #[case::lines_wins_in_any_order(&[("tag", "m"), ("lines", "1")], &[])]
+    #[case::empty_lines_wins(&[("lines", ""), ("tag", "m")], &[])]
+    #[case::tag_wins_over_tags(&[("tag", "m"), ("tags", "p")], &["m"])]
+    #[case::tag_wins_in_any_order(&[("tags", "m"), ("tag", "p")], &["p"])]
+    #[case::empty_tag_wins_over_tags(&[("tag", ""), ("tags", "m")], &[])]
+    #[case::duplicate_tag_last_wins(&[("tag", "missing"), ("tag", "present")], &["present"])]
+    #[case::duplicate_tag_last_wins_second(&[("tag", "present"), ("tag", "missing")], &["missing"])]
+    #[case::quoted_comma_value_split_by_grammar_no_diagnostic(&[("tags", "\"present")], &[])]
+    #[case::single_quote_split_by_grammar_no_diagnostic(&[("tags", "'a")], &[])]
+    #[case::unquoted_comma_in_tag_is_grammar_misparse(&[("tag", ",tags=m22")], &[])]
+    #[case::key_after_comma_space(&[("indent", "0"), (" tag", "m50")], &["m50"])]
+    #[case::tags_key_after_comma_space(&[("indent", "0"), (" tags", "m51")], &["m51"])]
+    #[case::lines_key_after_comma_space(&[("tag", "m36"), (" lines", "1")], &[])]
+    #[case::tag_wins_after_comma_space(&[("tags", "m53"), (" tag", "present")], &["present"])]
+    #[case::empty_tags_folds_next_attribute_no_diagnostic(&[("tags", ",lines=1")], &[])]
+    #[case::unquoted_tags_comma_ends_value(&[("tags", "present,m30")], &["present"])]
+    fn test_required_tags_follows_asciidoctor_selection(
+        #[case] attributes: &[(&str, &str)],
+        #[case] expected: &[&str],
+    ) {
+        assert_eq!(required_tags(&attrs(attributes), str::to_string), expected);
+    }
+
+    #[test]
+    fn test_required_tags_substitutes_attributes() {
+        let substitute = |value: &str| value.replace("{x}", "p");
+        assert_eq!(required_tags(&attrs(&[("tag", "{x}")]), substitute), ["p"]);
+    }
+
+    /// Asciidoctor reports `tag '{undefined}' not found`; the LSP cannot know
+    /// build-time attributes, so it stays quiet rather than risk a false one.
+    #[test]
+    fn test_required_tags_unresolved_attribute_no_diagnostic_lsp_lacks_build_attributes() {
+        assert_eq!(
+            required_tags(&attrs(&[("tag", "{x}")]), str::to_string),
+            Vec::<String>::new()
+        );
+    }
+
+    fn include_tag_diagnostics(
+        ws: &crate::workspace::Workspace,
+        file: &Path,
+    ) -> Vec<(usize, String)> {
+        let mut found: Vec<_> = ws
+            .diagnostics_for(file)
+            .iter()
+            .filter(|d| matches!(d.kind, DiagnosticKind::IncludeTagNotFound { .. }))
+            .map(|d| (d.line, d.kind.to_string()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn missing_tag(line: usize, names: &str, path: &str) -> (usize, String) {
+        let word = if names.contains(',') { "tags" } else { "tag" };
+        (
+            line,
+            format!("{word} '{names}' not found in include file: {path}"),
+        )
+    }
+
+    const CONFIG: &str = "snippets/config.yml";
+
+    /// Asciidoctor 2.0.26, `asciidoctor -v -o - tests/fixtures/include_tags/main.adoc`:
+    /// the `tag '...' not found` warnings by line. Left out: line 25,
+    /// `tag={undefined}`, where the LSP does not know build-time attributes,
+    /// and line 39, `tags="present,m14"`, where the grammar splits the quoted
+    /// value at the comma and the LSP stays quiet rather than guess.
+    #[test]
+    fn test_include_tags_match_asciidoctor() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        let expected = vec![
+            missing_tag(4, "missing", CONFIG),
+            missing_tag(6, "m1, m2", CONFIG),
+            missing_tag(7, "m3", CONFIG),
+            missing_tag(8, "m4", CONFIG),
+            missing_tag(9, "m18", CONFIG),
+            missing_tag(10, "m16", CONFIG),
+            missing_tag(15, "m8", CONFIG),
+            missing_tag(17, "present;m10", CONFIG),
+            missing_tag(18, " m15", CONFIG),
+            missing_tag(20, "mq", CONFIG),
+            missing_tag(22, "m11", CONFIG),
+            missing_tag(26, "glued", CONFIG),
+            missing_tag(27, "onlyend", CONFIG),
+            missing_tag(28, "case", CONFIG),
+            missing_tag(32, "absent", "part.adoc"),
+            missing_tag(36, "listing", CONFIG),
+            missing_tag(40, "m19", CONFIG),
+            missing_tag(52, "missing2", CONFIG),
+            missing_tag(53, "m50", CONFIG),
+        ];
+        assert_eq!(
+            include_tag_diagnostics(&ws, &root.join("main.adoc")),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_include_tag_missing_is_reported_on_the_include_line() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        assert!(include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .contains(&missing_tag(4, "missing", CONFIG)));
+    }
+
+    #[test]
+    fn test_include_tag_present_is_quiet() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        let lines: Vec<_> = include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        // tag=present, tag=*, tag='present', tags=m12,tag=present, tag={tagname},
+        // tag=incond, part.adoc[tag=section], tag=,tags=m22, tag=missing1,tag=present,
+        // tags=m53, tag=present, tag=m36, lines=1, tags=,lines=1
+        for quiet in [5, 14, 19, 23, 24, 29, 31, 50, 51, 54, 55, 56] {
+            assert!(!lines.contains(&quiet), "line {quiet} must be quiet");
+        }
+    }
+
+    #[test]
+    fn test_include_tags_missing_are_reported_together() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        assert!(include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .contains(&missing_tag(6, "m1, m2", CONFIG)));
+    }
+
+    #[test]
+    fn test_include_tag_inside_listing_block_is_checked() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        assert!(include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .contains(&missing_tag(36, "listing", CONFIG)));
+    }
+
+    #[test]
+    fn test_include_tag_missing_in_adoc_target_is_reported() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        assert!(
+            include_tag_diagnostics(&ws, &root.join("main.adoc")).contains(&missing_tag(
+                32,
+                "absent",
+                "part.adoc"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_include_tag_on_missing_file_reports_only_broken_include() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        let on_line: Vec<_> = ws
+            .diagnostics_for(&root.join("main.adoc"))
+            .iter()
+            .filter(|d| d.line == 30)
+            .map(|d| &d.kind)
+            .collect();
+        assert!(matches!(
+            on_line.as_slice(),
+            [DiagnosticKind::BrokenInclude { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_include_tag_quoted_comma_value_split_by_grammar_no_diagnostic() {
+        let (root, ws) = fixture_workspace("include_tags");
+
+        let on_line: Vec<_> = include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .into_iter()
+            .filter(|(line, _)| *line == 39)
+            .collect();
+        assert!(on_line.is_empty(), "{on_line:?}");
+    }
+
+    /// A non-adoc target is always read from disk, even when the workspace
+    /// holds a (possibly stale) model of it.
+    #[test]
+    fn test_include_tag_non_adoc_target_is_read_from_disk_not_from_model() {
+        let (root, mut ws) = fixture_workspace("include_tags");
+        let config = root.join("snippets/config.yml");
+        let buffer = "# tag::present[]\n# tag::missing[]\n";
+        let overrides = HashMap::from([(config.clone(), std::sync::Arc::new(buffer.to_string()))]);
+
+        ws.update_file(&config, &overrides);
+        ws.recalculate_diagnostics();
+
+        assert!(include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .contains(&missing_tag(4, "missing", CONFIG)));
+    }
+
+    #[test]
+    fn test_include_tag_added_in_open_buffer_is_found() {
+        let (root, mut ws) = fixture_workspace("include_tags");
+        let part = root.join("part.adoc");
+        let buffer = "= Part\n\n// tag::section[]\nText.\n// end::section[]\n// tag::absent[]\n// end::absent[]\n";
+        let overrides = HashMap::from([(part.clone(), std::sync::Arc::new(buffer.to_string()))]);
+
+        ws.update_file(&part, &overrides);
+        ws.recalculate_diagnostics();
+
+        assert!(
+            !include_tag_diagnostics(&ws, &root.join("main.adoc")).contains(&missing_tag(
+                32,
+                "absent",
+                "part.adoc"
+            ))
         );
     }
 }

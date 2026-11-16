@@ -2117,6 +2117,7 @@ mod tests {
                     conditionals: vec![],
                     substituted_refs: vec![],
                     possible_definitions: vec![],
+                    tags: vec![],
                 });
             if loc.kind == AnchorKind::ImplicitSection {
                 doc.sections.push(Section {

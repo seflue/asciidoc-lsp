@@ -152,6 +152,9 @@ pub struct DocumentModel {
     pub substituted_refs: Vec<AttributeRef>,
     /// Entries the LSP cannot be sure of, see [`PossibleDefinition`].
     pub possible_definitions: Vec<PossibleDefinition>,
+    /// Names of the `tag::name[]` directives in the raw lines, see
+    /// `extract_tag_directives`.
+    pub tags: Vec<String>,
 }
 
 /// An attribute that may be defined at `line` without the LSP being able to
@@ -174,6 +177,12 @@ pub enum DiagnosticKind {
         documents: Vec<PathBuf>,
     },
     BrokenInclude {
+        path: String,
+    },
+    /// Tags named by an include's `tag`/`tags` that its file does not open
+    /// (`tag::name[]`). `path` is the include path as written.
+    IncludeTagNotFound {
+        tags: Vec<String>,
         path: String,
     },
     /// `documents` names the top-level documents where the attribute is not
@@ -258,6 +267,14 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::BrokenInclude { path } => {
                 write!(f, "Broken include: {path}")
+            }
+            DiagnosticKind::IncludeTagNotFound { tags, path } => {
+                let noun = if tags.len() == 1 { "tag" } else { "tags" };
+                write!(
+                    f,
+                    "{noun} '{}' not found in include file: {path}",
+                    tags.join(", ")
+                )
             }
             DiagnosticKind::UndefinedAttribute { name, documents } => {
                 write!(f, "Undefined attribute: {{{name}}}")?;
@@ -416,6 +433,7 @@ impl DocumentModel {
             conditionals: vec![],
             substituted_refs: vec![],
             possible_definitions: vec![],
+            tags: vec![],
         }
     }
 
@@ -491,6 +509,21 @@ mod tests {
             path: "missing.adoc".into(),
         };
         assert_eq!(d2.to_string(), "Broken include: missing.adoc");
+
+        let tag = DiagnosticKind::IncludeTagNotFound {
+            tags: vec!["a".into()],
+            path: "x.yml".into(),
+        };
+        assert_eq!(tag.to_string(), "tag 'a' not found in include file: x.yml");
+
+        let tags = DiagnosticKind::IncludeTagNotFound {
+            tags: vec!["a".into(), "b".into()],
+            path: "x.yml".into(),
+        };
+        assert_eq!(
+            tags.to_string(),
+            "tags 'a, b' not found in include file: x.yml"
+        );
 
         let d3 = DiagnosticKind::UndefinedAttribute {
             name: "foo".into(),

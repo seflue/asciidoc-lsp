@@ -32,6 +32,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
         | DiagnosticKind::UnknownPdfTheme { .. } => ls_types::DiagnosticSeverity::ERROR,
         DiagnosticKind::BrokenXref { .. }
         | DiagnosticKind::DuplicateAnchor { .. }
+        | DiagnosticKind::IncludeTagNotFound { .. }
         | DiagnosticKind::UndefinedAttribute { .. }
         | DiagnosticKind::CircularInclude { .. }
         | DiagnosticKind::SectionOutOfSequence { .. }
@@ -97,6 +98,28 @@ mod tests {
         assert_eq!(
             result[0].severity,
             Some(ls_types::DiagnosticSeverity::ERROR)
+        );
+    }
+
+    #[test]
+    fn test_convert_include_tag_not_found_is_warning() {
+        let content = "= Title\n\ninclude::a.yml[tag=x]\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 3,
+            span: None,
+            kind: DiagnosticKind::IncludeTagNotFound {
+                tags: vec!["x".into()],
+                path: "a.yml".into(),
+            },
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
         );
     }
 

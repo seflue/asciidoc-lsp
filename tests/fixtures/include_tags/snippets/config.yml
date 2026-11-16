@@ -1,0 +1,13 @@
+# tag::present[]
+key: value
+# end::present[]
+# end::onlyend[]
+# mytag::glued[]
+# tag::Case[]
+case: 1
+# end::Case[]
+ifdef::nope[]
+# tag::incond[]
+x: 1
+# end::incond[]
+endif::[]
