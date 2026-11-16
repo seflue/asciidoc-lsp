@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::Position;
 
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::extractors::{element_attr_id, find_child_text};
-use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
+use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
 use asciidoc_core::workspace::{
@@ -481,7 +481,9 @@ pub fn resolve_hover(
                 .into_iter()
                 .map(|target| {
                     let mut text = format!("include::{}[]", target.substituted);
-                    if target.path.exists() {
+                    if is_uri(&target.substituted) {
+                        text.push_str("\n\n\u{2197} Remote include, not fetched");
+                    } else if target.path.exists() {
                         let section_count = workspace
                             .and_then(|ws| ws.documents().get(&target.path))
                             .map_or(0, |doc| doc.sections.len());
@@ -895,6 +897,16 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
             let scopes: Vec<Value> = resolve_doc_targets(path, doc_path, workspace, info.line)
                 .into_iter()
                 .map(|target| {
+                    if is_uri(&target.substituted) {
+                        return json!({
+                            "scope": target.label,
+                            "remote": true,
+                            "target": null,
+                            "canonical_target": null,
+                            "display": target.substituted,
+                            "exists": null,
+                        });
+                    }
                     // Same existence gate as go-to-definition: the path gd returns.
                     let exists = target.path.exists();
                     json!({

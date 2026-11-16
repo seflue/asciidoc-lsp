@@ -3669,6 +3669,40 @@ mod tests {
         }
     }
 
+    /// Hover and explain on a URI include (literal or via attribute) show
+    /// the substituted URI as a remote include that is not fetched, never as
+    /// a missing file (committed fixture `tests/fixtures/uri_include_default`).
+    #[tokio::test]
+    async fn test_fixture_uri_include_hover_and_explain_show_remote() {
+        let fx = fixture_dir("uri_include_default");
+        let main = fx.join("main.adoc");
+        let (service, _socket, uri, text) = open_fixture(&fx, &main).await;
+        let server = service.inner();
+
+        for (needle, uri_text) in [
+            (
+                "include::https://example.org/b",
+                "https://example.org/b.adoc",
+            ),
+            ("include::{url-repo}/a", "https://example.org/repo/a.adoc"),
+        ] {
+            let position = position_of(&text, needle, 4);
+            assert_eq!(
+                hover_text(server, &uri, position).await,
+                Some(format!(
+                    "include::{uri_text}[]\n\n\u{2197} Remote include, not fetched"
+                )),
+                "{needle}"
+            );
+            let report = explain(server, &uri, position).await;
+            let scope = &report["resolution"]["scopes"][0];
+            assert_eq!(scope["remote"], true, "{needle}");
+            assert_eq!(scope["display"], uri_text, "{needle}");
+            assert!(scope["target"].is_null(), "{needle}");
+            assert!(scope["exists"].is_null(), "{needle}");
+        }
+    }
+
     /// An include or image without its attribute list, as while typing, is
     /// text: no broken include, and navigation after it keeps working
     /// (committed fixture `tests/fixtures/unfinished_block_macro`).
