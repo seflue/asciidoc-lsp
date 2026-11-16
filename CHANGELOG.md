@@ -10,6 +10,14 @@ Before 1.0, a minor version may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- VS Code extension: each release attaches VSIX packages that start the
+  server, with the matching binary bundled for Linux, Alpine, macOS and
+  Windows plus a universal package without one.
+- The server reports its name and version in the `initialize` result, so
+  clients can show which build is running.
+
 ## [0.7.0] - 2026-11-15
 
 ### Added
