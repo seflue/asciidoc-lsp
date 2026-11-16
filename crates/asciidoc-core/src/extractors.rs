@@ -298,14 +298,17 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
             } else {
                 None
             };
+            let is_header = header.is_some();
+            // ID lines above the title beat the one trailing the title.
+            let id = section_block_id(node, source)
+                .or(header.and_then(|prefix| prefix.id))
+                .or_else(|| inline_anchor.map(str::to_string));
             results.push(Section {
                 level,
                 title: title.to_string(),
                 line: node.start_position().row + 1, // 1-based
-                explicit_id: inline_anchor
-                    || header.unwrap_or(false)
-                    || has_explicit_id(node, source),
-                is_header: header.is_some(),
+                id,
+                is_header,
             });
         }
     }
@@ -328,24 +331,24 @@ pub fn is_valid_anchor_id(id: &str) -> bool {
         && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
 }
 
-/// Split a title into its text and whether it ends in an inline `[[id]]` /
-/// `[[id,reftext]]` anchor, which gives the section that ID. As in
+/// Split a title into its text and the ID of an inline `[[id]]` /
+/// `[[id,reftext]]` anchor at its end, which gives the section that ID. As in
 /// Asciidoctor, that needs a space before `[[` and a valid ID. A valid anchor
 /// without the space is no section ID, but its text still drops out of the
 /// title the implicit ID is generated from.
-fn split_trailing_anchor(title: &str) -> (&str, bool) {
+fn split_trailing_anchor(title: &str) -> (&str, Option<&str>) {
     let Some(rest) = title.strip_suffix("]]") else {
-        return (title, false);
+        return (title, None);
     };
     let Some(open) = rest.rfind("[[") else {
-        return (title, false);
+        return (title, None);
     };
     let (head, inner) = (&rest[..open], &rest[open + 2..]);
     let (id, reftext) = inner.split_once(',').unwrap_or((inner, "x"));
     if is_valid_anchor_id(id) && !reftext.trim().is_empty() && !head.ends_with('\\') {
-        (head.trim_end(), head.ends_with(' '))
+        (head.trim_end(), head.ends_with(' ').then_some(id))
     } else {
-        (title, false)
+        (title, None)
     }
 }
 
@@ -398,31 +401,34 @@ fn block_line_id(node: tree_sitter::Node, source: &[u8]) -> Option<(String, Opti
     }
 }
 
-/// Whether `node` is a `[[id]]` anchor or an attribute list with an ID.
-fn carries_id(node: tree_sitter::Node, source: &[u8]) -> bool {
-    block_line_id(node, source).is_some()
-}
-
-/// Whether the `section` holding the title node carries an ID: a
-/// `[[id]]` anchor, or a `[#id]` / `[id=...]` attribute list above the title.
-fn has_explicit_id(title: tree_sitter::Node, source: &[u8]) -> bool {
-    let Some(section) = title.parent().filter(|p| p.kind() == "section") else {
-        return false;
-    };
+/// The ID the `section` holding the title node carries: the last `[[id]]`
+/// anchor or `[#id]` / `[id=...]` attribute list above the title wins.
+fn section_block_id(title: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let section = title.parent().filter(|p| p.kind() == "section")?;
     let mut cursor = section.walk();
     let found = section
         .children(&mut cursor)
-        .any(|child| carries_id(child, source));
+        .take_while(|child| child.id() != title.id())
+        .filter_map(|child| block_line_id(child, source))
+        .last()
+        .map(|(id, _)| id);
     found
+}
+
+/// What precedes a document header.
+struct HeaderPrefix {
+    /// The ID one of the ID / attribute lines carries, if any.
+    id: Option<String>,
 }
 
 /// For a level-0 title: `None` if something other than comments, attribute
 /// entries and ID / attribute lines precedes it (a book part, not the
-/// document header). Otherwise `Some(has_id)`, whether one of those lines
-/// carries an ID. The grammar leaves such lines above the title as `ERROR`
-/// siblings, not as part of a section.
-fn header_prefix(title: tree_sitter::Node, source: &[u8]) -> Option<bool> {
-    let mut has_id = false;
+/// document header). Otherwise the ID one of those lines carries, if any; the
+/// one nearest the title wins, the last within a run.
+/// The grammar leaves such lines above the title as `ERROR` siblings, not as
+/// part of a section.
+fn header_prefix(title: tree_sitter::Node, source: &[u8]) -> Option<HeaderPrefix> {
+    let mut id = None;
     let mut prev = title.parent().and_then(|block| block.prev_sibling());
     while let Some(node) = prev {
         let mut cursor = node.walk();
@@ -430,12 +436,16 @@ fn header_prefix(title: tree_sitter::Node, source: &[u8]) -> Option<bool> {
             "ERROR" => {
                 let mut children = node.children(&mut cursor).peekable();
                 children.peek()?;
+                let mut run_id = None;
                 for child in children {
                     if !matches!(child.kind(), "block_anchor" | "element_attr") {
                         return None;
                     }
-                    has_id |= carries_id(child, source);
+                    if let Some((found, _)) = block_line_id(child, source) {
+                        run_id = Some(found);
+                    }
                 }
+                id = id.or(run_id);
             }
             "block_element" => {
                 let inner = node.child(0)?;
@@ -450,7 +460,7 @@ fn header_prefix(title: tree_sitter::Node, source: &[u8]) -> Option<bool> {
         }
         prev = node.prev_sibling();
     }
-    Some(has_id)
+    Some(HeaderPrefix { id })
 }
 
 fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<IncludeMacro>) {
@@ -838,9 +848,9 @@ mod tests {
         let sections = extract_sections(tree.root_node(), source.as_bytes());
 
         assert_eq!(sections[1].title, "Inline Anchor");
-        assert!(sections[1].explicit_id);
+        assert_eq!(sections[1].id.as_deref(), Some("tid"));
         for section in &sections[2..] {
-            assert!(!section.explicit_id, "{}", section.title);
+            assert_eq!(section.id, None, "{}", section.title);
         }
         assert_eq!(sections[4].title, "NoSpace");
     }
@@ -853,8 +863,8 @@ mod tests {
         let sections = extract_sections(tree.root_node(), source.as_bytes());
 
         // Asciidoctor needs a non-empty reftext after the comma.
-        assert!(!sections[1].explicit_id);
-        assert!(sections[2].explicit_id);
+        assert_eq!(sections[1].id, None);
+        assert_eq!(sections[2].id.as_deref(), Some("bid"));
         assert_eq!(sections[2].title, "Bar");
     }
 
@@ -906,17 +916,40 @@ mod tests {
     #[test]
     fn test_extract_sections_block_id_above_document_title() {
         let mut p = parser::init_block_parser().unwrap();
-        for (source, explicit) in [
-            ("[[cid]]\n= T\n", true),
-            ("[#cid]\n= T\n", true),
-            (":a: b\n[id=cid]\n= T\n", true),
-            ("[.role]\n= T\n", false),
-            ("= T\n", false),
+        for (source, id) in [
+            ("[[cid]]\n= T\n", Some("cid")),
+            ("[#cid]\n= T\n", Some("cid")),
+            (":a: b\n[id=cid]\n= T\n", Some("cid")),
+            // Asciidoctor: the last ID line above the title wins.
+            ("[[x]]\n[#y]\n= T\n", Some("y")),
+            ("[.role]\n= T\n", None),
+            ("= T\n", None),
         ] {
             let tree = parser::parse(&mut p, source).unwrap();
             let sections = extract_sections(tree.root_node(), source.as_bytes());
-            assert_eq!(sections[0].explicit_id, explicit, "{source:?}");
+            assert_eq!(sections[0].id.as_deref(), id, "{source:?}");
         }
+    }
+
+    #[rstest::rstest]
+    #[case::block_anchor("[[intro]]\n== Introduction\n", Some("intro"))]
+    #[case::shorthand("[#aud]\n== A\n", Some("aud"))]
+    #[case::id_attribute("[id=by-attr]\n== B\n", Some("by-attr"))]
+    #[case::last_id_line_wins("[[x]]\n[#y]\n== S\n", Some("y"))]
+    #[case::block_id_beats_inline("[[a]]\n== Both Anchors [[b]]\n", Some("a"))]
+    #[case::inline("== Inline Anchor [[tid]]\n", Some("tid"))]
+    #[case::inline_without_space("== NoSpace[[nsp]]\n", None)]
+    #[case::inline_empty_reftext("== Foo [[tid,]]\n", None)]
+    #[case::inline_escaped("== Escaped \\[[esc]]\n", None)]
+    #[case::role_only("[.role]\n== R\n", None)]
+    #[case::plain("== Options\n", None)]
+    #[case::paragraph_anchor_after_title("== Outer\n\n[[para-id]]\nA paragraph.\n", None)]
+    fn test_extract_sections_id(#[case] body: &str, #[case] id: Option<&str>) {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = format!("= Doc\n\n{body}");
+        let tree = parser::parse(&mut p, &source).unwrap();
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+        assert_eq!(sections[1].id.as_deref(), id, "{source:?}");
     }
 
     #[test]

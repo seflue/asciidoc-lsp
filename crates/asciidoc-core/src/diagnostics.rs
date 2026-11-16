@@ -613,7 +613,7 @@ mod tests {
                     level: 1,
                     title: "Entry".into(),
                     line: 1,
-                    explicit_id: false,
+                    id: None,
                     is_header: false,
                 }])
                 .with_anchors(vec![Anchor {
@@ -746,7 +746,7 @@ mod tests {
                     level: 1,
                     title: "Valid".into(),
                     line: 1,
-                    explicit_id: false,
+                    id: None,
                     is_header: false,
                 }])
                 .with_anchors(vec![Anchor {
