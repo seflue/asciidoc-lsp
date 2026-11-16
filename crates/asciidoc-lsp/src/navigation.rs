@@ -200,7 +200,7 @@ pub fn resolve_references(
     let mut results = match &node_info.kind {
         NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
             let mut r = ws.find_all_attribute_usages(name);
-            if include_declaration && matches!(node_info.kind, NodeKind::AttributeRef { .. }) {
+            if include_declaration {
                 for source in ws.definition_sites(doc_path, node_info.line, name) {
                     r.push(FileLocation::new(source.file, source.line, 0, 0));
                 }
@@ -2320,6 +2320,47 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
                 (doc.as_path(), 3)
             ]
         );
+    }
+
+    /// References on an attribute entry `:min-ram:` list the entry itself with
+    /// `includeDeclaration` (committed fixture `tests/fixtures/adversarial_project`).
+    #[test]
+    fn test_references_on_attribute_entry_include_declaration() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let content = fs::read_to_string(&index).unwrap();
+        // cursor on `:min-ram:` (index.adoc:10)
+        let pos = Position {
+            line: 9,
+            character: 3,
+        };
+
+        let locations = |include_declaration| -> Vec<(PathBuf, usize)> {
+            resolve_references(
+                &content,
+                pos,
+                &index,
+                Some(&ws),
+                include_declaration,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .iter()
+            .map(|loc| (loc.path.clone(), loc.line))
+            .collect()
+        };
+        let without = locations(false);
+        let with = locations(true);
+
+        assert_eq!(without.len(), 2, "usages only, got: {without:?}");
+        assert!(!without.contains(&(index.clone(), 10)));
+        assert_eq!(with.len(), 3, "usages + entry, got: {with:?}");
+        assert!(with.contains(&(index, 10)), "{with:?}");
     }
 
     // --- Integration test — gr on {attr} in .adoc ---
