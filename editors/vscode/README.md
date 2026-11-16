@@ -14,3 +14,7 @@ Highlighting comes from the server's semantic tokens, with semantic highlighting
 ## Commands
 
 - `AsciiDoc LSP: Restart Language Server`
+
+## Building from source
+
+From the repository root, `just install-vscode-plugin` builds the release server, bundles it into a VSIX and installs it with `code --install-extension` (Linux and macOS; needs `npm`, `jq` and the `code` CLI).

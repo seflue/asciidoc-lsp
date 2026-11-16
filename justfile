@@ -77,3 +77,11 @@ release bump:
 # Update tree-sitter-asciidoc submodule to latest upstream commit
 update-grammar:
     git submodule update --remote vendor/tree-sitter-asciidoc
+
+# Build the VS Code extension with the release server bundled and install it
+install-vscode-plugin: build-release
+    mkdir -p editors/vscode/server
+    cp "$(cargo metadata --no-deps --format-version 1 | jq -r '.target_directory')/release/asciidoc-lsp" editors/vscode/server/
+    npm --prefix editors/vscode ci
+    npm --prefix editors/vscode run package -- --out "{{justfile_directory()}}/editors/vscode/asciidoc-lsp.vsix"
+    code --install-extension "{{justfile_directory()}}/editors/vscode/asciidoc-lsp.vsix" --force
