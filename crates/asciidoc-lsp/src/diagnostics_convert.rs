@@ -1,6 +1,6 @@
 use tower_lsp_server::ls_types;
 
-use asciidoc_core::types::{Diagnostic as CoreDiagnostic, DiagnosticKind};
+use asciidoc_core::types::{Diagnostic as CoreDiagnostic, DiagnosticKind, Span};
 
 use crate::positions;
 
@@ -17,9 +17,13 @@ fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
         .lines()
         .nth(diag.line.saturating_sub(1))
         .unwrap_or_default();
-    let (start_col, end_col) = diag.span.unwrap_or((0, line_text.len()));
-    let start = positions::to_lsp_position(diag.line, start_col, content);
-    let end = positions::to_lsp_position(diag.line, end_col, content);
+    let span = diag.span.unwrap_or(Span {
+        start_col: 0,
+        end_line: diag.line,
+        end_col: line_text.len(),
+    });
+    let start = positions::to_lsp_position(diag.line, span.start_col, content);
+    let end = positions::to_lsp_position(span.end_line, span.end_col, content);
 
     let severity = match &diag.kind {
         DiagnosticKind::BrokenInclude { .. }
@@ -317,5 +321,32 @@ mod tests {
                 "<<gone-c,C>>",
             ]
         );
+    }
+
+    /// A table cell holds a broken xref that wraps onto the next line, beside
+    /// a one-line broken xref (committed fixture `tests/fixtures/multiline_xref`).
+    /// Asciidoctor reports both; the wrapped one ends at its `>>` on the next
+    /// line and does not cover the other.
+    #[test]
+    fn test_fixture_multiline_xref_range_ends_at_closing_brackets() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multiline_xref")
+            .canonicalize()
+            .unwrap();
+        let main = root.join("main.adoc");
+        let content = std::fs::read_to_string(&main).unwrap();
+        let ws = asciidoc_core::workspace::Workspace::build(&root, &main);
+
+        let mut result = convert_diagnostics(ws.diagnostics_for(&main), &content);
+        result.sort_by_key(|d| (d.range.start.line, d.range.start.character));
+
+        let ranges: Vec<(u32, u32, u32, u32)> = result
+            .iter()
+            .map(|d| {
+                let r = d.range;
+                (r.start.line, r.start.character, r.end.line, r.end.character)
+            })
+            .collect();
+        assert_eq!(ranges, vec![(3, 2, 3, 15), (3, 18, 4, 6)]);
     }
 }

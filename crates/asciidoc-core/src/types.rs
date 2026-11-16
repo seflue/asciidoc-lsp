@@ -22,13 +22,24 @@ pub struct IncludeMacro {
     pub line: usize,
 }
 
+/// A source range that starts on a diagnostic's or xref's `line` and may end on a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    /// Byte column on the start line.
+    pub start_col: usize,
+    /// 1-based line the range ends on.
+    pub end_line: usize,
+    /// Byte column on `end_line`.
+    pub end_col: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Xref {
     pub target: String,
     pub display_text: Option<String>,
     pub line: usize,
-    /// Byte columns `(start, end)` of the xref on its line, if it fits on one line.
-    pub span: Option<(usize, usize)>,
+    /// Range of the xref, from `line` to where it ends (a table cell can wrap it).
+    pub span: Option<Span>,
     /// Byte column, on `line`, where `target` starts.
     pub target_col: usize,
 }
@@ -217,8 +228,8 @@ impl fmt::Display for DiagnosticKind {
 pub struct Diagnostic {
     pub file: PathBuf,
     pub line: usize,
-    /// Byte columns `(start, end)` on `line`; `None` covers the whole line.
-    pub span: Option<(usize, usize)>,
+    /// Range starting on `line`; `None` covers the whole line.
+    pub span: Option<Span>,
     pub kind: DiagnosticKind,
 }
 

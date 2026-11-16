@@ -1,0 +1,6 @@
+= Multiline Xref
+
+|===
+| <<gone-cell>> | <<gone-multi,multi
+line>>
+|===
