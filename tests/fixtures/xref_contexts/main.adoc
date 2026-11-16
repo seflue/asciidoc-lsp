@@ -1,0 +1,63 @@
+= Xref Contexts
+
+== Section
+
+TIP: see <<missing-tip>>.
+
+[quote]
+____
+see <<missing-quote>>.
+____
+
+____
+see <<missing-quote-unstyled>>.
+____
+
+> see <<missing-md-quote>>.
+
+Term one:: see <<missing-dlist-inline>>.
+
+Term two::
+see <<missing-dlist-next>>.
+
+See <<missing-dlist-term>>:: definition
+
+Term three:: text
++
+see <<missing-dlist-continuation>>.
+
+Footnote one.footnote:[See <<missing-fn>>.]
+
+Footnote two.footnote:fid[See <<missing-fn-id>>.]
+
+Footnote three.footnote:[See <<missing-fn-comma,a, b>>.]
+
+Control, plain paragraph <<missing-control>>.
+
+Term four::
+  indented <<missing-dlist-indented>>.
+
+Outer::
+  Inner::: see <<missing-nested-indent>>.
+
+Term five::
+
+  literal <<missing-dlist-indented-blank>>
+
+____
+----
+<<not-reported-listing>>
+----
+....
+<<not-reported-literal>>
+....
+++++
+<<not-reported-passthrough>>
+++++
+////
+<<not-reported-block-comment>>
+////
+// <<not-reported-line-comment>>
+____
+
+> // <<not-reported-md-comment>>

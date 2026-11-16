@@ -251,7 +251,7 @@ pub fn parse_single_file(
     // Inline parsing for xrefs and inline anchors; block anchors come from
     // the block tree. Parse each range individually to prevent cross-range
     // passthrough misparses.
-    let inline_ranges = crate::extractors::collect_inline_ranges(root_node);
+    let inline_ranges = crate::extractors::collect_inline_ranges(root_node, source.as_bytes());
     let (xrefs, inline_anchors) =
         crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
     let mut anchors = crate::extractors::extract_anchors(root_node, source.as_bytes());

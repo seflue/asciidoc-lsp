@@ -77,27 +77,48 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
     }
 
     // Try inline grammar (xrefs, shorthand xrefs, inline images).
-    // Only parse the range(s) containing the cursor position to avoid cross-range
-    // misparses (e.g. a `+` in one paragraph matching a `+` in another, creating
-    // a giant false passthrough node that swallows xref nodes).
-    let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(block_tree.root_node());
-    let cursor_ranges: Vec<_> = inline_ranges
+    // Parse each range containing the cursor on its own: one range's markup
+    // must not pair with another's (e.g. a `+` in one paragraph matching a `+`
+    // in another, creating a giant false passthrough node that swallows xref
+    // nodes).
+    let inline_ranges = asciidoc_core::extractors::collect_inline_ranges(
+        block_tree.root_node(),
+        content.as_bytes(),
+    );
+    let mut inline_parser = asciidoc_core::parser::init_inline_parser().ok()?;
+    for range in inline_ranges
         .iter()
         .filter(|r| r.start_point.row <= point.row && r.end_point.row >= point.row)
-        .copied()
-        .collect();
-    if !cursor_ranges.is_empty() {
-        let mut inline_parser = asciidoc_core::parser::init_inline_parser().ok()?;
-        inline_parser.set_included_ranges(&cursor_ranges).ok()?;
-        let inline_tree = asciidoc_core::parser::parse(&mut inline_parser, content).ok()?;
-
-        if let Some(info) = classify_inline_node(inline_tree.root_node(), point, content.as_bytes())
-        {
+    {
+        if let Some(info) = classify_in_range(&mut inline_parser, *range, content, point) {
             return Some(info);
         }
     }
 
     None
+}
+
+/// Parse `range` with the inline grammar and classify the node at `point`.
+///
+/// Footnote content is opaque in the inline grammar, so when the cursor sits
+/// inside a footnote its content range is parsed on its own and classified.
+fn classify_in_range(
+    parser: &mut tree_sitter::Parser,
+    range: tree_sitter::Range,
+    content: &str,
+    point: tree_sitter::Point,
+) -> Option<NodeInfo> {
+    parser.set_included_ranges(&[range]).ok()?;
+    let tree = asciidoc_core::parser::parse(parser, content).ok()?;
+    if let Some(info) = classify_inline_node(tree.root_node(), point, content.as_bytes()) {
+        return Some(info);
+    }
+    let footnote_range = asciidoc_core::extractors::footnote_content_ranges(tree.root_node())
+        .into_iter()
+        .find(|r| r.start_point <= point && point <= r.end_point)?;
+    parser.set_included_ranges(&[footnote_range]).ok()?;
+    let footnote_tree = asciidoc_core::parser::parse(parser, content).ok()?;
+    classify_inline_node(footnote_tree.root_node(), point, content.as_bytes())
 }
 
 /// Resolve a go-to-definition request to target files and lines
@@ -1618,6 +1639,93 @@ mod tests {
             resolve_goto_definitions(&content, pos, &a, Some(&ws)),
             vec![(b, 1)]
         );
+    }
+
+    // xrefs in admonitions, quotes, description lists and footnotes.
+    #[rstest]
+    #[case::admonition("TIP: See <<my-anchor>>.", 12)]
+    #[case::quote_block("____\nSee <<my-anchor>>.\n____", 10)]
+    #[case::markdown_quote("> See <<my-anchor>>.", 10)]
+    #[case::dlist_inline("Term:: See <<my-anchor>>.", 13)]
+    #[case::dlist_term("See <<my-anchor>>:: def", 7)]
+    #[case::dlist_xref_macro("Term:: See xref:b.adoc#my-anchor[link].", 20)]
+    #[case::footnote("Text.footnote:[See <<my-anchor>>.]", 22)]
+    #[case::footnote_with_id("Text.footnote:fid[See <<my-anchor>>.]", 25)]
+    #[case::footnote_xref_macro("Text.footnote:[See xref:b.adoc#my-anchor[link\\].]", 30)]
+    fn test_goto_def_xref_in_block_context(#[case] body: &str, #[case] character: u32) {
+        let (_tmp, root) = canonical_tmp();
+        let a = root.join("a.adoc");
+        let b = root.join("b.adoc");
+        let content = format!("= Doc A\n\n{body}\n\ninclude::b.adoc[]\n");
+        fs::write(&a, &content).unwrap();
+        fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
+
+        let ws = Workspace::build(&root, &a);
+        let xref_line = content
+            .lines()
+            .position(|l| l.contains("my-anchor"))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(xref_line).unwrap(),
+            character,
+        };
+
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &a, Some(&ws)),
+            vec![(b, 1)]
+        );
+    }
+
+    /// `Gadget:: ... xref:chapters/reference.adoc#ref-options[Options]` in the
+    /// committed fixture is a description list definition.
+    #[test]
+    fn test_goto_def_xref_in_fixture_description_list() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let content = fs::read_to_string(&index).unwrap();
+        let ws = Workspace::build(&root, &index);
+        let (row, text) = content
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.starts_with("Gadget::"))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(row).unwrap(),
+            character: u32::try_from(text.find("ref-options").unwrap()).unwrap(),
+        };
+
+        assert_eq!(
+            resolve_goto_definitions(&content, pos, &index, Some(&ws)),
+            vec![(root.join("chapters/reference.adoc"), 5)]
+        );
+    }
+
+    /// Hover on the same `Gadget::` xref shows the target section.
+    #[test]
+    fn test_hover_xref_in_fixture_description_list() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let content = fs::read_to_string(&index).unwrap();
+        let ws = Workspace::build(&root, &index);
+        let (row, text) = content
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.starts_with("Gadget::"))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(row).unwrap(),
+            character: u32::try_from(text.find("ref-options").unwrap()).unwrap(),
+        };
+
+        let hover = resolve_hover(&content, pos, &index, Some(&ws)).unwrap();
+
+        assert!(hover.contains("reference.adoc"), "got {hover}");
     }
 
     #[test]

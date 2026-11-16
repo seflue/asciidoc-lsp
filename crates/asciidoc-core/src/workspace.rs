@@ -2720,4 +2720,51 @@ mod tests {
         assert_eq!(config_override(&config, 2, "fresh"), None);
         assert_eq!(config_override(&doc, 0, "shared"), None);
     }
+
+    /// Every context in `tests/fixtures/xref_contexts/main.adoc` holds one
+    /// broken xref; Asciidoctor reports exactly these targets; the `not-reported-*` lines (raw blocks and
+    /// comments nested in quotes) stay quiet.
+    #[test]
+    fn test_fixture_xref_contexts_report_broken_xrefs() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/xref_contexts")
+            .canonicalize()
+            .unwrap();
+        let main = root.join("main.adoc");
+
+        let ws = Workspace::build(&root, &main);
+
+        let mut broken: Vec<(usize, String)> = ws
+            .diagnostics_for(&main)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                crate::types::DiagnosticKind::BrokenXref { target } => {
+                    Some((d.line, target.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        broken.sort();
+        let expected: Vec<(usize, String)> = [
+            (5, "missing-tip"),
+            (9, "missing-quote"),
+            (13, "missing-quote-unstyled"),
+            (16, "missing-md-quote"),
+            (18, "missing-dlist-inline"),
+            (21, "missing-dlist-next"),
+            (23, "missing-dlist-term"),
+            (27, "missing-dlist-continuation"),
+            (29, "missing-fn"),
+            (31, "missing-fn-id"),
+            (33, "missing-fn-comma"),
+            (35, "missing-control"),
+            (38, "missing-dlist-indented"),
+            (41, "missing-nested-indent"),
+            (45, "missing-dlist-indented-blank"),
+        ]
+        .into_iter()
+        .map(|(l, t)| (l, t.to_string()))
+        .collect();
+        assert_eq!(broken, expected);
+    }
 }

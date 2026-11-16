@@ -159,9 +159,12 @@ pub fn extract_conditionals(source: &str) -> Vec<ConditionalDirective> {
 /// Collect byte ranges of `line` nodes inside paragraphs, titles, etc.
 /// These ranges are passed to the inline parser via `set_included_ranges`.
 #[must_use]
-pub fn collect_inline_ranges(node: tree_sitter::Node) -> Vec<tree_sitter::Range> {
+pub fn collect_inline_ranges(node: tree_sitter::Node, source: &[u8]) -> Vec<tree_sitter::Range> {
     let mut ranges = Vec::new();
-    walk_for_inline_ranges(node, &mut ranges);
+    walk_for_inline_ranges(node, source, &mut ranges);
+    // A description list item's `line` is collected before its `term`; keep
+    // document order for callers and for `set_included_ranges`.
+    ranges.sort_by_key(|r| r.start_byte);
     ranges
 }
 
@@ -184,17 +187,88 @@ pub fn extract_inline_content_safe(
     };
 
     for range in ranges {
-        if parser.set_included_ranges(&[*range]).is_err() {
-            continue;
-        }
-        let Ok(tree) = crate::parser::parse(&mut parser, source) else {
-            continue;
-        };
-        all_xrefs.extend(extract_xrefs(tree.root_node(), source.as_bytes()));
-        all_anchors.extend(extract_anchors(tree.root_node(), source.as_bytes()));
+        extract_range(
+            &mut parser,
+            *range,
+            source,
+            &mut all_xrefs,
+            &mut all_anchors,
+        );
     }
 
     (all_xrefs, all_anchors)
+}
+
+/// Parse one range and collect its xrefs and anchors. Footnote content is an
+/// opaque attribute list in the inline grammar, so each footnote's text is
+/// parsed alone right after the range that contains it.
+fn extract_range(
+    parser: &mut tree_sitter::Parser,
+    range: tree_sitter::Range,
+    source: &str,
+    xrefs: &mut Vec<Xref>,
+    anchors: &mut Vec<Anchor>,
+) {
+    if parser.set_included_ranges(&[range]).is_err() {
+        return;
+    }
+    let Ok(tree) = crate::parser::parse(parser, source) else {
+        return;
+    };
+    xrefs.extend(extract_xrefs(tree.root_node(), source.as_bytes()));
+    anchors.extend(extract_anchors(tree.root_node(), source.as_bytes()));
+    for footnote in footnote_content_ranges(tree.root_node()) {
+        extract_range(parser, footnote, source, xrefs, anchors);
+    }
+}
+
+/// Byte ranges of the text between `[` and `]` of every `footnote` node.
+///
+/// The inline grammar models footnote content as an attribute list, so xrefs
+/// inside it are only found by parsing these ranges separately. Empty
+/// contents are skipped.
+#[must_use]
+pub fn footnote_content_ranges(root: tree_sitter::Node) -> Vec<tree_sitter::Range> {
+    let mut ranges = Vec::new();
+    walk_for_footnote_content(root, &mut ranges);
+    ranges
+}
+
+fn walk_for_footnote_content(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter::Range>) {
+    if node.kind() == "footnote" {
+        if let Some(range) = footnote_content_range(node) {
+            ranges.push(range);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_footnote_content(child, ranges);
+    }
+}
+
+/// Content range of one `footnote` node, between its `[` and `]` children.
+fn footnote_content_range(footnote: tree_sitter::Node) -> Option<tree_sitter::Range> {
+    let mut cursor = footnote.walk();
+    let mut open = None;
+    let mut close = None;
+    for child in footnote.children(&mut cursor) {
+        match child.kind() {
+            "[" if open.is_none() => open = Some(child),
+            "]" => close = Some(child),
+            _ => {}
+        }
+    }
+    let (open, close) = (open?, close?);
+    if close.start_byte() <= open.end_byte() {
+        return None;
+    }
+    Some(tree_sitter::Range {
+        start_byte: open.end_byte(),
+        end_byte: close.start_byte(),
+        start_point: open.end_position(),
+        end_point: close.start_position(),
+    })
 }
 
 // --- Private walk functions ---
@@ -360,7 +434,11 @@ fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref
     }
 }
 
-fn walk_for_inline_ranges(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter::Range>) {
+fn walk_for_inline_ranges(
+    node: tree_sitter::Node,
+    source: &[u8],
+    ranges: &mut Vec<tree_sitter::Range>,
+) {
     // Collect `line` nodes inside paragraphs, titles, admonitions, etc.
     // These contain inline content that needs the inline parser.
     let parent_kind = node.kind();
@@ -379,28 +457,119 @@ fn walk_for_inline_ranges(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter:
             | "callout_list_item"
             | "block_title"
             | "quoted_line"
+            | "admonition"
+            | "quoted_block"
+            | "quoted_md_block"
+            | "description_list_item"
     );
 
     if is_inline_container {
+        let is_quote = matches!(parent_kind, "quoted_block" | "quoted_md_block");
+        let mut raw_delimiter: Option<String> = None;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "line" {
-                ranges.push(child.range());
+            if child.kind() != "line" {
+                continue;
             }
+            if is_quote && is_raw_quote_line(child, source, &mut raw_delimiter) {
+                continue;
+            }
+            ranges.push(child.range());
         }
     }
 
-    // Table cells (`|` and `a|`) are raw `table_cell_content` without `line`
-    // children, so the whole cell content is one inline range.
-    if parent_kind == "table_cell_content" {
+    // Text indented right below a description list item (no blank line) is
+    // the item's text, but the grammar parses it as an `ident_block`.
+    collect_dlist_indented_ranges(node, ranges);
+
+    // Table cells (`|` and `a|`) and description list terms are raw leaf
+    // tokens without `line` children, so the whole node is one inline range.
+    if matches!(parent_kind, "table_cell_content" | "term") {
         ranges.push(node.range());
     }
 
     // Still recurse into children for nested structures
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_for_inline_ranges(child, ranges);
+        walk_for_inline_ranges(child, source, ranges);
     }
+}
+
+/// Quote content is stored as raw `line` children, so nested raw blocks
+/// (listing, literal, passthrough, block comment) and line comments show up
+/// as prose. Returns true for lines that Asciidoctor does not read as text:
+/// the delimiters themselves, everything between them, and `//` comments.
+/// `raw_delimiter` carries the open delimiter across calls.
+fn is_raw_quote_line(
+    line: tree_sitter::Node,
+    source: &[u8],
+    raw_delimiter: &mut Option<String>,
+) -> bool {
+    let text = line.utf8_text(source).unwrap_or_default().trim_end();
+    if let Some(open) = raw_delimiter {
+        if text == open {
+            *raw_delimiter = None;
+        }
+        return true;
+    }
+    let is_delimiter = text.len() >= 4
+        && ['-', '.', '+', '/']
+            .iter()
+            .any(|&c| text.chars().all(|t| t == c));
+    if is_delimiter {
+        *raw_delimiter = Some(text.to_string());
+        return true;
+    }
+    text.starts_with("//")
+}
+
+/// Ranges of the indented lines that follow a description list (a blank line
+/// in between is fine; Asciidoctor still reads them as item text). They are
+/// children of the sibling `ident_block`. Indented text after any other block
+/// is a literal block and is left alone.
+fn collect_dlist_indented_ranges(node: tree_sitter::Node, ranges: &mut Vec<tree_sitter::Range>) {
+    let mut cursor = node.walk();
+    let mut after_dlist = false;
+    for child in node.children(&mut cursor) {
+        if let Some(block) = find_kind(child, "ident_block").filter(|_| after_dlist) {
+            let mut next_row = None;
+            let mut lines = block.walk();
+            for line in block.children(&mut lines) {
+                let row = line.start_position().row;
+                if line.kind() != "ident_block_line" || next_row.is_some_and(|n| n != row) {
+                    break;
+                }
+                next_row = Some(row + 1);
+                if let Some(marker) = line.child(0).filter(|c| c.kind() == "ident_marker") {
+                    ranges.push(tree_sitter::Range {
+                        start_byte: marker.end_byte(),
+                        end_byte: line.end_byte(),
+                        start_point: marker.end_position(),
+                        end_point: line.end_position(),
+                    });
+                }
+            }
+        }
+        after_dlist = ends_with_kind(child, "description_list");
+    }
+}
+
+fn ends_with_kind(node: tree_sitter::Node, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+    node.child(node.child_count().saturating_sub(1))
+        .is_some_and(|last| ends_with_kind(last, kind))
+}
+
+fn find_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    if node.child_count() != 1 {
+        return None;
+    }
+    find_kind(node.child(0)?, kind)
 }
 
 // --- Helpers ---
@@ -575,7 +744,7 @@ mod tests {
         let mut p = parser::init_block_parser().unwrap();
         let source = "= Title\n\nA paragraph with content.\n\n== Section\n\nAnother paragraph.\n";
         let tree = parser::parse(&mut p, source).unwrap();
-        let ranges = collect_inline_ranges(tree.root_node());
+        let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
 
         assert!(
             !ranges.is_empty(),
@@ -589,7 +758,7 @@ mod tests {
         let mut p = parser::init_block_parser().unwrap();
         let source = "= Title\n\n* Item with <<anchor>>\n* Another item\n. Ordered item\n";
         let tree = parser::parse(&mut p, source).unwrap();
-        let ranges = collect_inline_ranges(tree.root_node());
+        let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
 
         // List items contain `line` nodes with inline content
         assert!(
@@ -604,7 +773,7 @@ mod tests {
     fn xrefs_in(source: &str) -> Vec<Xref> {
         let mut p = parser::init_block_parser().unwrap();
         let tree = parser::parse(&mut p, source).unwrap();
-        let ranges = collect_inline_ranges(tree.root_node());
+        let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
         let (xrefs, _) = extract_inline_content_safe(&ranges, source);
         xrefs
     }
@@ -622,6 +791,54 @@ mod tests {
         let xrefs = xrefs_in(source);
         assert_eq!(xrefs.len(), 1, "got {xrefs:?}");
         assert_eq!(xrefs[0].target, "target.adoc");
+    }
+
+    #[rstest::rstest]
+    #[case::admonition_paragraph("= T\n\nTIP: see <<x>>.\n")]
+    #[case::quote_block("= T\n\n[quote]\n____\nsee <<x>>.\n____\n")]
+    #[case::quote_block_unstyled("= T\n\n____\nsee <<x>>.\n____\n")]
+    #[case::nested_quote_block("= T\n\n____\nouter\n_____\nsee <<x>>.\n_____\n____\n")]
+    #[case::markdown_quote("= T\n\n> see <<x>>.\n")]
+    #[case::dlist_inline("= T\n\nTerm:: see <<x>>.\n")]
+    #[case::dlist_next_line("= T\n\nTerm::\nsee <<x>>.\n")]
+    #[case::dlist_term("= T\n\nSee <<x>>:: def\n")]
+    #[case::dlist_xref_macro("= T\n\nTerm:: see xref:x.adoc#x[X]\n")]
+    #[case::dlist_continuation("= T\n\nTerm:: text\n+\nsee <<x>>.\n")]
+    #[case::dlist_indented_body("= T\n\nTerm::\n  indented <<x>>.\n")]
+    #[case::dlist_indented_after_blank("= T\n\nTerm::\n\n  indented <<x>>.\n")]
+    #[case::dlist_nested_indented("= T\n\nOuter::\n  Inner::: see <<x>>.\n")]
+    #[case::footnote("= T\n\nText.footnote:[See <<x>>.]\n")]
+    #[case::footnote_with_id("= T\n\nText.footnote:fid[See <<x>>.]\n")]
+    #[case::footnote_reftext_with_comma("= T\n\nText.footnote:[See <<x,a, b>>.]\n")]
+    fn test_xref_in_block_context(#[case] source: &str) {
+        let xrefs = xrefs_in(source);
+        assert_eq!(xrefs.len(), 1, "got {xrefs:?}");
+        assert!(xrefs[0].target.ends_with('x'), "got {xrefs:?}");
+    }
+
+    /// Raw content nested in a quote is not prose: Asciidoctor reports no
+    /// xref there.
+    #[rstest::rstest]
+    #[case::listing("= T\n\n____\n----\nsee <<x>>\n----\n____\n")]
+    #[case::source_listing("= T\n\n____\n[source]\n----\nsee <<x>>\n----\n____\n")]
+    #[case::literal("= T\n\n____\n....\nsee <<x>>\n....\n____\n")]
+    #[case::passthrough("= T\n\n____\n++++\nsee <<x>>\n++++\n____\n")]
+    #[case::block_comment("= T\n\n____\n////\nsee <<x>>\n////\n____\n")]
+    #[case::line_comment("= T\n\n____\n// see <<x>>\n____\n")]
+    #[case::markdown_line_comment("= T\n\n> // see <<x>>\n")]
+    #[case::indented_paragraph_without_dlist("= T\n\nText\n\n  see <<x>>.\n")]
+    fn test_no_xref_in_raw_content(#[case] source: &str) {
+        let xrefs = xrefs_in(source);
+        assert!(xrefs.is_empty(), "got {xrefs:?}");
+    }
+
+    #[test]
+    fn test_xrefs_come_in_document_order() {
+        let xrefs = xrefs_in(
+            "= T\n\nSee <<a>>.\n\nTerm:: <<b>>\n\nText.footnote:[<<c>>] and <<d>>.\n\nLast <<e>>.\n",
+        );
+        let targets: Vec<&str> = xrefs.iter().map(|x| x.target.as_str()).collect();
+        assert_eq!(targets, ["a", "b", "d", "c", "e"]);
     }
 
     #[test]
@@ -970,7 +1187,7 @@ mod tests {
         let mut p = parser::init_block_parser().unwrap();
         let tree = parser::parse(&mut p, &source).unwrap();
 
-        let ranges = collect_inline_ranges(tree.root_node());
+        let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
         let (xrefs, _) = extract_inline_content_safe(&ranges, &source);
         let rows: Vec<_> = ranges.iter().map(|r| r.start_point.row).collect();
         let includes: Vec<_> = extract_includes(tree.root_node(), source.as_bytes())
