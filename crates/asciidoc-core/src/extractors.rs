@@ -290,15 +290,22 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
 
     if let Some(level) = level {
         // Title text is in the `line` child node
-        let title = find_child_text(node, "line", source)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let text = find_child_text(node, "line", source).unwrap_or_default();
+        let (title, inline_anchor) = split_trailing_anchor(text.trim());
         if !title.is_empty() {
+            let header = if kind == "document_title" {
+                header_prefix(node, source)
+            } else {
+                None
+            };
             results.push(Section {
                 level,
-                title,
+                title: title.to_string(),
                 line: node.start_position().row + 1, // 1-based
+                explicit_id: inline_anchor
+                    || header.unwrap_or(false)
+                    || has_explicit_id(node, source),
+                is_header: header.is_some(),
             });
         }
     }
@@ -307,6 +314,105 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
     for child in node.children(&mut cursor) {
         walk_for_sections(child, source, results);
     }
+}
+
+/// Split a title into its text and whether it ends in an inline `[[id]]` /
+/// `[[id,reftext]]` anchor, which gives the section that ID. As in
+/// Asciidoctor, that needs a space before `[[` and a valid ID. A valid anchor
+/// without the space is no section ID, but its text still drops out of the
+/// title the implicit ID is generated from.
+fn split_trailing_anchor(title: &str) -> (&str, bool) {
+    let Some(rest) = title.strip_suffix("]]") else {
+        return (title, false);
+    };
+    let Some(open) = rest.rfind("[[") else {
+        return (title, false);
+    };
+    let (head, inner) = (&rest[..open], &rest[open + 2..]);
+    let (id, reftext) = inner.split_once(',').unwrap_or((inner, "x"));
+    let mut chars = id.chars();
+    let valid_id = chars
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':')
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'));
+    if valid_id && !reftext.trim().is_empty() && !head.ends_with('\\') {
+        (head.trim_end(), head.ends_with(' '))
+    } else {
+        (title, false)
+    }
+}
+
+/// Whether `node` is a `[[id]]` anchor or an attribute list with an ID
+/// (`[#id]`, `[id=...]`).
+fn carries_id(node: tree_sitter::Node, source: &[u8]) -> bool {
+    let is_id_attr = |attr: tree_sitter::Node| match attr.kind() {
+        "positional_attr" => {
+            let mut c = attr.walk();
+            let has_id = attr.children(&mut c).any(|n| n.kind() == "id");
+            has_id
+        }
+        "named_attr" => find_child_text(attr, "attribute_name", source).as_deref() == Some("id"),
+        _ => false,
+    };
+    match node.kind() {
+        "block_anchor" => true,
+        "element_attr" => {
+            let mut c = node.walk();
+            let found = node.children(&mut c).any(is_id_attr);
+            found
+        }
+        _ => false,
+    }
+}
+
+/// Whether the `section` holding the title node carries an ID: a
+/// `[[id]]` anchor, or a `[#id]` / `[id=...]` attribute list above the title.
+fn has_explicit_id(title: tree_sitter::Node, source: &[u8]) -> bool {
+    let Some(section) = title.parent().filter(|p| p.kind() == "section") else {
+        return false;
+    };
+    let mut cursor = section.walk();
+    let found = section
+        .children(&mut cursor)
+        .any(|child| carries_id(child, source));
+    found
+}
+
+/// For a level-0 title: `None` if something other than comments, attribute
+/// entries and ID / attribute lines precedes it (a book part, not the
+/// document header). Otherwise `Some(has_id)`, whether one of those lines
+/// carries an ID. The grammar leaves such lines above the title as `ERROR`
+/// siblings, not as part of a section.
+fn header_prefix(title: tree_sitter::Node, source: &[u8]) -> Option<bool> {
+    let mut has_id = false;
+    let mut prev = title.parent().and_then(|block| block.prev_sibling());
+    while let Some(node) = prev {
+        let mut cursor = node.walk();
+        match node.kind() {
+            "ERROR" => {
+                let mut children = node.children(&mut cursor).peekable();
+                children.peek()?;
+                for child in children {
+                    if !matches!(child.kind(), "block_anchor" | "element_attr") {
+                        return None;
+                    }
+                    has_id |= carries_id(child, source);
+                }
+            }
+            "block_element" => {
+                let inner = node.child(0)?;
+                if !matches!(
+                    inner.kind(),
+                    "document_attr" | "line_comment" | "block_comment"
+                ) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        prev = node.prev_sibling();
+    }
+    Some(has_id)
 }
 
 fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<IncludeMacro>) {
@@ -641,6 +747,71 @@ mod tests {
         assert_eq!(sections[1].title, "Chapter One");
         assert_eq!(sections[2].level, 2);
         assert_eq!(sections[2].title, "Subsection");
+    }
+
+    #[test]
+    fn test_extract_sections_inline_anchor_in_title() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Doc\n\n== Inline Anchor [[tid]]\n\n== Escaped \\[[esc]]\n\n== Bad Anchor [[1bad]]\n\n== NoSpace[[nsp]]\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+
+        assert_eq!(sections[1].title, "Inline Anchor");
+        assert!(sections[1].explicit_id);
+        for section in &sections[2..] {
+            assert!(!section.explicit_id, "{}", section.title);
+        }
+        assert_eq!(sections[4].title, "NoSpace");
+    }
+
+    #[test]
+    fn test_extract_sections_inline_anchor_reftext() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Doc\n\n== Foo [[tid,]]\n\n== Bar [[bid, Bar Text]]\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+
+        // Asciidoctor needs a non-empty reftext after the comma.
+        assert!(!sections[1].explicit_id);
+        assert!(sections[2].explicit_id);
+        assert_eq!(sections[2].title, "Bar");
+    }
+
+    #[test]
+    fn test_extract_sections_header_title_flag() {
+        let mut p = parser::init_block_parser().unwrap();
+        let header_forms = [
+            "= T\n\n== A\n",
+            "// c\n:a: b\n= T\n",
+            "[[cid]]\n= T\n",
+            "[#cid]\n= T\n",
+            ":a: b\n[id=cid]\n= T\n",
+        ];
+        for source in header_forms {
+            let tree = parser::parse(&mut p, source).unwrap();
+            let sections = extract_sections(tree.root_node(), source.as_bytes());
+            assert!(sections[0].is_header, "{source:?}");
+        }
+        let source = ":doctype: book\n\nText.\n\n= Part\n\n== C\n\n= Part Two\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+        assert!(sections.iter().all(|s| !s.is_header));
+    }
+
+    #[test]
+    fn test_extract_sections_block_id_above_document_title() {
+        let mut p = parser::init_block_parser().unwrap();
+        for (source, explicit) in [
+            ("[[cid]]\n= T\n", true),
+            ("[#cid]\n= T\n", true),
+            (":a: b\n[id=cid]\n= T\n", true),
+            ("[.role]\n= T\n", false),
+            ("= T\n", false),
+        ] {
+            let tree = parser::parse(&mut p, source).unwrap();
+            let sections = extract_sections(tree.root_node(), source.as_bytes());
+            assert_eq!(sections[0].explicit_id, explicit, "{source:?}");
+        }
     }
 
     #[test]

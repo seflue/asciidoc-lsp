@@ -157,7 +157,7 @@ impl Workspace {
         let (graph, documents) = build_graph(entry, &mut ws.attributes);
         ws.include_graph = graph;
         ws.documents = documents;
-        ws.reference_index = ReferenceIndex::build(&ws.documents, &ws.attributes);
+        ws.reindex_all();
         ws.recalculate_diagnostics();
         ws
     }
@@ -440,8 +440,11 @@ impl Workspace {
             self.include_graph.add_edge(file, edge.clone());
         }
 
-        self.reference_index.add_file(file, &doc, &self.attributes);
         self.documents.insert(file.to_path_buf(), doc);
+        self.reindex_file(file);
+        for edge in &edges {
+            self.reindex_file(&edge.target);
+        }
     }
 
     /// Get diagnostics for a specific file.
@@ -505,6 +508,12 @@ impl Workspace {
     /// — the caller is responsible for collecting diagnostics after the update.
     pub fn update_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, Arc<String>>) {
         // Remove old edges and index entries for this file
+        let old_targets: Vec<PathBuf> = self
+            .include_graph
+            .includes_of(file)
+            .iter()
+            .map(|edge| edge.target.clone())
+            .collect();
         self.include_graph.remove_edges_from(file);
         self.reference_index.remove_file(file);
 
@@ -512,6 +521,9 @@ impl Workspace {
         let Some((doc, edges)) = parse_single_file(file, &mut self.attributes, overrides) else {
             // File can't be parsed — remove from documents
             self.documents.remove(file);
+            for target in &old_targets {
+                self.reindex_file(target);
+            }
             return;
         };
 
@@ -519,8 +531,36 @@ impl Workspace {
             self.include_graph.add_edge(file, edge.clone());
         }
 
-        self.reference_index.add_file(file, &doc, &self.attributes);
         self.documents.insert(file.to_path_buf(), doc);
+        self.reindex_file(file);
+        for target in old_targets
+            .iter()
+            .chain(edges.iter().map(|edge| &edge.target))
+        {
+            self.reindex_file(target);
+        }
+    }
+
+    /// Rebuild a file's reference index entries, including its header title
+    /// ID when another document includes the file: only the header of a
+    /// top-level document gets no ID.
+    fn reindex_file(&mut self, file: &Path) {
+        let Some(doc) = self.documents.get(file) else {
+            return;
+        };
+        self.reference_index.remove_file(file);
+        self.reference_index.add_file(file, doc, &self.attributes);
+        if !self.include_graph.included_by(file).is_empty() {
+            self.reference_index
+                .add_header_title_id(file, doc, &self.attributes);
+        }
+    }
+
+    fn reindex_all(&mut self) {
+        let files: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        for file in &files {
+            self.reindex_file(file);
+        }
     }
 
     /// Remove a file from the workspace entirely.
@@ -530,11 +570,20 @@ impl Workspace {
     /// per-file attribute entry. Called when a `.adoc` file is deleted on disk.
     /// Caller is responsible for `recalculate_diagnostics()` afterwards.
     pub fn remove_file(&mut self, file: &Path) {
+        let targets: Vec<PathBuf> = self
+            .include_graph
+            .includes_of(file)
+            .iter()
+            .map(|edge| edge.target.clone())
+            .collect();
         self.include_graph.remove_edges_from(file);
         self.reference_index.remove_file(file);
         self.documents.remove(file);
         self.diagnostics.remove(file);
         self.attributes.forget_file(file);
+        for target in &targets {
+            self.reindex_file(target);
+        }
     }
 
     /// Record the folder of the path `file` is addressed by (a symlink's
@@ -638,7 +687,7 @@ impl Workspace {
         let (graph, documents) = build_graph_with_overrides(entry, &mut ws.attributes, overrides);
         ws.include_graph = graph;
         ws.documents = documents;
-        ws.reference_index = ReferenceIndex::build(&ws.documents, &ws.attributes);
+        ws.reindex_all();
         ws.recalculate_diagnostics();
         ws
     }
@@ -2773,5 +2822,48 @@ mod tests {
         .map(|(l, t)| (l, t.to_string()))
         .collect();
         assert_eq!(broken, expected);
+    }
+
+    #[test]
+    fn test_update_file_reindexes_dropped_and_added_include_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let index = root.join("index.adoc");
+        let child = root.join("child.adoc");
+        fs::write(&index, "= Main\n\ninclude::child.adoc[]\n").unwrap();
+        fs::write(&child, "= Child Title\n\nText.\n").unwrap();
+
+        let mut ws = Workspace::build(&root, &index);
+        assert!(ws.reference_index().lookup("_child_title").is_some());
+
+        // Parent drops the include: the child is a top-level document again.
+        let none = HashMap::new();
+        let dropped = HashMap::from([(index.clone(), Arc::new("= Main\n".to_string()))]);
+        ws.update_file(&index, &dropped);
+        assert!(ws.reference_index().lookup("_child_title").is_none());
+
+        // Parent includes it again.
+        ws.update_file(&index, &none);
+        assert!(ws.reference_index().lookup("_child_title").is_some());
+    }
+
+    #[test]
+    fn test_ensure_and_remove_file_reindex_include_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let index = root.join("index.adoc");
+        let child = root.join("child.adoc");
+        fs::write(&index, "= Main\n\ninclude::child.adoc[]\n").unwrap();
+        fs::write(&child, "= Child Title\n\nText.\n").unwrap();
+
+        let none = HashMap::new();
+        let mut ws = Workspace::new(&root);
+        ws.ensure_file(&child, &none);
+        assert!(ws.reference_index().lookup("_child_title").is_none());
+        ws.ensure_file(&index, &none);
+        assert!(ws.reference_index().lookup("_child_title").is_some());
+
+        ws.remove_file(&index);
+        assert!(ws.reference_index().lookup("_child_title").is_none());
     }
 }

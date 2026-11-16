@@ -347,6 +347,8 @@ mod tests {
                     level: 1,
                     title: "Entry".into(),
                     line: 1,
+                    explicit_id: false,
+                    is_header: false,
                 }])
                 .with_anchors(vec![Anchor {
                     id: "entry-anchor".into(),
@@ -480,6 +482,8 @@ mod tests {
                     level: 1,
                     title: "Valid".into(),
                     line: 1,
+                    explicit_id: false,
+                    is_header: false,
                 }])
                 .with_anchors(vec![Anchor {
                     id: "valid-anchor".into(),

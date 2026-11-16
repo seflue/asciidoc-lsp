@@ -1,0 +1,6 @@
+= My Book
+:doctype: book
+
+include::chapter.adoc[]
+
+See <<_chapter_foo>>.

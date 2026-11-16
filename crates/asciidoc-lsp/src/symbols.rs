@@ -354,16 +354,22 @@ mod tests {
                 level: 0,
                 title: "Title".into(),
                 line: 1,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 1,
                 title: "Chapter A".into(),
                 line: 3,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 1,
                 title: "Chapter B".into(),
                 line: 5,
+                explicit_id: false,
+                is_header: false,
             },
         ];
         let content = "= Title\n\n== Chapter A\n\n== Chapter B\n";
@@ -393,26 +399,36 @@ mod tests {
                 level: 0,
                 title: "Doc".into(),
                 line: 1,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 1,
                 title: "Ch1".into(),
                 line: 3,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 2,
                 title: "Sub1".into(),
                 line: 5,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 2,
                 title: "Sub2".into(),
                 line: 7,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 1,
                 title: "Ch2".into(),
                 line: 9,
+                explicit_id: false,
+                is_header: false,
             },
         ];
         let content = "= Doc\n\n== Ch1\n\n=== Sub1\n\n=== Sub2\n\n== Ch2\n";
@@ -445,11 +461,15 @@ mod tests {
                 level: 0,
                 title: "Title".into(),
                 line: 1,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 1,
                 title: "Chapter".into(),
                 line: 3,
+                explicit_id: false,
+                is_header: false,
             },
         ];
         let content = "= Title\n\n== Chapter\n\nSome text.\n";
@@ -489,11 +509,15 @@ mod tests {
                 level: 1,
                 title: "Ch1".into(),
                 line: 1,
+                explicit_id: false,
+                is_header: false,
             },
             asciidoc_core::types::Section {
                 level: 1,
                 title: "Ch2".into(),
                 line: 3,
+                explicit_id: false,
+                is_header: false,
             },
         ];
         let content = "== Ch1\n\n== Ch2\n";

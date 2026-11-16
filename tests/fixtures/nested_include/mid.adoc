@@ -1,0 +1,3 @@
+= Mid Title
+
+include::inner.adoc[]
