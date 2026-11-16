@@ -1197,6 +1197,25 @@ fn resolve_doc_attribute_completions(prefix: &str) -> Vec<CompletionItem> {
     resolve_syntax_catalog(DOC_ATTRIBUTES, prefix, CompletionItemKind::PROPERTY)
 }
 
+/// The values of a snippet's choice list (`${1|a,b|}`). Placeholders
+/// (`${1:images}`) and snippets without a placeholder yield `None`.
+fn snippet_choices(snippet: &str) -> Option<impl Iterator<Item = &str>> {
+    let (_, rest) = snippet.split_once("${1|")?;
+    let (list, _) = rest.split_once("|}")?;
+    Some(list.split(','))
+}
+
+/// Description and choice values of the catalog document attribute `name`,
+/// matched ASCII case-insensitively; no values when its snippet offers no
+/// choice list.
+pub(crate) fn doc_attribute_doc(name: &str) -> Option<(&'static str, Vec<&'static str>)> {
+    let entry = DOC_ATTRIBUTES
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(name))?;
+    let values = snippet_choices(entry.snippet).map_or_else(Vec::new, Iterator::collect);
+    Some((entry.detail, values))
+}
+
 /// Resolve inline macro completions for a known macro name.
 fn resolve_inline_macro_completions(macro_name: &str) -> Vec<CompletionItem> {
     INLINE_MACROS
@@ -1365,6 +1384,56 @@ mod tests {
     use super::*;
     use crate::test_support::scanned;
     use rstest::rstest;
+
+    #[test]
+    fn test_snippet_choices_reads_choice_list() {
+        let choices: Vec<&str> = snippet_choices("toc: ${1|auto,left,right,preamble|}")
+            .unwrap()
+            .collect();
+        assert_eq!(choices, vec!["auto", "left", "right", "preamble"]);
+    }
+
+    #[rstest]
+    #[case("imagesdir: ${1:images}")]
+    #[case("numbered:")]
+    fn test_snippet_choices_ignore_placeholders(#[case] snippet: &str) {
+        assert!(snippet_choices(snippet).is_none());
+    }
+
+    #[test]
+    fn test_doc_attribute_doc_has_description_and_choices() {
+        assert_eq!(
+            doc_attribute_doc("toc"),
+            Some((
+                "Table of contents placement",
+                vec!["auto", "left", "right", "preamble"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_doc_without_choices() {
+        assert_eq!(
+            doc_attribute_doc("imagesdir"),
+            Some(("Images directory", vec![]))
+        );
+        assert_eq!(
+            doc_attribute_doc("sectnums"),
+            Some(("Number sections", vec![]))
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_doc_matches_name_case_insensitively() {
+        assert_eq!(doc_attribute_doc("TOC"), doc_attribute_doc("toc"));
+        assert!(doc_attribute_doc("TOC").is_some());
+    }
+
+    #[test]
+    fn test_doc_attribute_doc_unknown_name() {
+        assert_eq!(doc_attribute_doc("myattr"), None);
+        assert_eq!(doc_attribute_doc("pdf-theme"), None);
+    }
 
     /// Span for resolver tests that don't look at where the target starts.
     const AT_LINE_START: TargetSpan = TargetSpan {

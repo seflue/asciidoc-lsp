@@ -4332,7 +4332,7 @@ mod tests {
 
     /// "Resolves to" shows only for a reference whose value comes
     /// from a config. A `./` value from the document header, and hover on an
-    /// attribute entry, show the value alone (committed fixture
+    /// attribute entry, show the value without a resolved path (committed fixture
     /// `tests/fixtures/config_relative_values`, `sub/header.adoc`).
     #[tokio::test]
     async fn test_fixture_header_relative_value_shows_no_resolved_path() {
@@ -4350,7 +4350,7 @@ mod tests {
             hover_text(server, &uri, position_of(&text, ":imagesdir:", 2))
                 .await
                 .as_deref(),
-            Some(":imagesdir: ./images")
+            Some(":imagesdir: ./images\n\nImages directory")
         );
     }
 
