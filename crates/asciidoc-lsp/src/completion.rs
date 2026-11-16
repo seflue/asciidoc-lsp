@@ -323,20 +323,15 @@ const SOURCE_LANGUAGES: &[&str] = &[
 // Completion Context
 // ---------------------------------------------------------------------------
 
-/// An existing `[…]` block immediately after the cursor. When present,
-/// anchor resolvers extend their `TextEdit` over the existing brackets and
-/// re-emit them as a snippet `[${1:label}]`, so the `label` placeholder is
-/// selected after the user accepts the completion.
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) struct TrailingBrackets {
-    pub end_col: u32, // UTF-16 column AFTER closing `]`
-}
-
 /// The target typed so far (path or anchor) on the cursor line: from the
 /// column right after the macro marker (`xref:`, `<<`, `#`, `include::`,
 /// `image:`) up to the cursor, in UTF-16 columns. `end_col` is where the
 /// token ends: the cursor, or further right when the cursor sits inside it
-/// (`{pr|o}`, `<<|ref-o>>`).
+/// (`{pr|o}`, `<<|ref-o>>`, `image::diag|rams/a.svg`). For paths and
+/// `xref:` targets, `next` is the character right at `end_col` (`/`, `[`, a
+/// separator `#`, or a delimiter), or None when the token ran to the end of
+/// the line (a trailing `.` stays behind) or ended at a `#` that separates
+/// nothing.
 ///
 /// Every item of a target context carries a `TextEdit` over this span.
 /// Without one, clients guess where the typed word starts by their own
@@ -346,14 +341,14 @@ pub(crate) struct TrailingBrackets {
 pub(crate) struct TargetSpan {
     pub line: u32,
     pub start_col: u32,
-    pub cursor_col: u32,
     pub end_col: u32,
+    pub next: Option<char>,
 }
 
 impl TargetSpan {
-    /// The span from its start to the cursor.
+    /// The whole token, from its start to `end_col`.
     fn range(self) -> Range {
-        self.range_to(self.cursor_col)
+        self.range_to(self.end_col)
     }
 
     /// The span from its start to `end_col` on the same line.
@@ -372,13 +367,11 @@ impl TargetSpan {
 }
 
 /// How an anchor completion edits the line: what follows the anchor
-/// (`closing`), the typed target it replaces (`span`) and an existing `[…]`
-/// block it takes over (`trailing`).
+/// (`closing`) and the typed target it replaces (`span`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AnchorEdit<'a> {
     pub closing: &'a str,
     pub span: TargetSpan,
-    pub trailing: Option<TrailingBrackets>,
 }
 
 /// Classification of a completion trigger context.
@@ -390,7 +383,6 @@ pub(crate) enum CompletionContext {
         prefix: String,
         closing: &'static str,
         span: TargetSpan,
-        trailing: Option<TrailingBrackets>,
     },
     /// `xref:prefix` without `#` — could be either a workspace anchor or an
     /// `.adoc` file path. Resolver dispatches to *both* and merges results to
@@ -400,7 +392,6 @@ pub(crate) enum CompletionContext {
         prefix: String,
         closing: &'static str,
         span: TargetSpan,
-        trailing: Option<TrailingBrackets>,
     },
     /// `xref:file.adoc#anchor_prefix` or `<<file.adoc#anchor_prefix` —
     /// cross-file anchor. Empty `file` means same-document (e.g. `xref:#sec`).
@@ -410,7 +401,6 @@ pub(crate) enum CompletionContext {
         anchor_prefix: String,
         closing: &'static str,
         span: TargetSpan,
-        trailing: Option<TrailingBrackets>,
     },
     /// `include::prefix` — include path completion
     IncludePath { prefix: String, span: TargetSpan },
@@ -518,6 +508,15 @@ fn attribute_value_target(before_cursor: &str) -> Option<(&'static str, usize)> 
     Some((entry.name, before_cursor.len() - value.len()))
 }
 
+/// How far a target token extends past the cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    /// Only the stop characters end it.
+    Bracketed,
+    /// Anchor id: ends at the first character an id cannot hold.
+    AnchorId,
+}
+
 /// Detect the completion context at the given cursor position by scanning
 /// the current line backwards from the cursor.
 ///
@@ -531,15 +530,17 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     let before_cursor = &line_str[..col];
     let after_cursor = &line_str[col..];
 
-    // When the user is mid-edit (e.g. accepted a path-completion snippet that
-    // pre-inserted `[label]` and is now typing `#anchor` before it), the line
-    // after the cursor already contains the closing brackets. Re-emitting `[]`
-    // or `>>` would double them. Compute effective closings up-front.
-    let xref_long_close = if after_cursor.starts_with('[') {
-        ""
-    } else {
-        "[]"
-    };
+    // An inline macro's target extends past the cursor only if its own `[`
+    // follows directly: the rest of the word consists of path or id
+    // characters (a positive class, so no whitespace, `,`, `)`, `:` or
+    // markup delimiters) and ends at `[`. Otherwise the range ends at the
+    // cursor and nothing the user did not type is replaced.
+    let own_bracket_follows = after_cursor
+        .trim_start_matches(|c: char| {
+            c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '#' | '~' | '%' | '{' | '}')
+        })
+        .starts_with('[');
+
     // The rest of the attribute name after the cursor (`{pr|o}`) counts too.
     let after_name = after_cursor.trim_start_matches(is_attribute_name_char);
     let utf16_len = |text: &str| -> u32 {
@@ -551,33 +552,82 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     let attr_end_col =
         pos.character + utf16_len(&after_cursor[..after_cursor.len() - after_name.len()]);
     let attr_close = if after_name.starts_with('}') { "" } else { "}" };
-    // Detect an existing `[…]` block right after the cursor and compute UTF-16
-    // columns so resolvers can emit a TextEdit that overwrites the existing
-    // label and selects a fresh `${1:label}` placeholder. Only meaningful for
-    // long-form xref (`[]` closing was suppressed to "" above).
-    let xref_trailing: Option<TrailingBrackets> =
-        after_cursor.strip_prefix('[').and_then(|after_open| {
-            after_open.find(']').map(|rel_idx| {
-                let end_byte = rel_idx + 2; // `[` + content + `]`
-                #[allow(clippy::cast_possible_truncation)]
-                let utf16_len = after_cursor[..end_byte].encode_utf16().count() as u32;
-                TrailingBrackets {
-                    end_col: pos.character + utf16_len,
-                }
-            })
-        });
-
     // The target typed so far starts at byte `start` of the line.
     let span_from = |start: usize| TargetSpan {
         line: pos.line,
         start_col: utf16_len(&line_str[..start]),
-        cursor_col: pos.character,
         end_col: pos.character,
+        next: None,
     };
     // The same, for an attribute name: it extends to the end of the name.
     let attr_span_from = |start: usize| TargetSpan {
         end_col: attr_end_col,
         ..span_from(start)
+    };
+    // The same, for a target that runs on to the end of its `kind`
+    // (`image::diag|rams/a.svg[x]`): the part after the cursor is replaced
+    // too, so accepting an item does not leave its tail behind. Only when
+    // `extend` is set; otherwise the range ends at the cursor. A trailing `.`
+    // stays unless a `/`, `[` or a `#` separator follows it. A `#` is the
+    // file/anchor separator only when an id character follows it.
+    let token_span_from = |start: usize, kind: TargetKind, extend: bool| {
+        let is_id_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.');
+        let is_separator_hash =
+            |rest: &str| rest.starts_with('#') && rest[1..].starts_with(is_id_char);
+        let token_len = if extend {
+            after_cursor
+                .char_indices()
+                .find(|&(i, c)| {
+                    if c == '#' {
+                        return kind != TargetKind::Bracketed
+                            || is_separator_hash(&after_cursor[i..]);
+                    }
+                    match kind {
+                        TargetKind::Bracketed => matches!(c, '/' | '['),
+                        TargetKind::AnchorId => !is_id_char(c),
+                    }
+                })
+                .map_or(after_cursor.len(), |(i, _)| i)
+        } else {
+            0
+        };
+        let rest = &after_cursor[token_len..];
+        let separator_hash = kind != TargetKind::AnchorId && is_separator_hash(rest);
+        // The character that ended the token; none at the end of the line or
+        // at a `#` that is no separator.
+        let stop = match rest.chars().next() {
+            Some('#') if !separator_hash => None,
+            stop => stop,
+        };
+        let token_len = if matches!(stop, Some('/' | '[' | '#')) {
+            token_len
+        } else {
+            after_cursor[..token_len].trim_end_matches('.').len()
+        };
+        TargetSpan {
+            end_col: pos.character + utf16_len(&after_cursor[..token_len]),
+            next: after_cursor[token_len..]
+                .chars()
+                .next()
+                .filter(|_| stop.is_some()),
+            ..span_from(start)
+        }
+    };
+    // A path ends at its segment, an anchor at the macro's brackets. A block
+    // macro that starts its line (`include::`, `image::`) holds nothing but
+    // the macro, so its target is everything up to any later `[`; anywhere
+    // else, and for an inline macro, see `own_bracket_follows`.
+    let path_span_from =
+        |start: usize, extend: bool| token_span_from(start, TargetKind::Bracketed, extend);
+    let anchor_span_from =
+        |start: usize| token_span_from(start, TargetKind::AnchorId, own_bracket_follows);
+    let block_macro_extends = |macro_start: usize| macro_start == 0 && after_cursor.contains('[');
+    // The brackets an xref still needs: none when the token ends at its `[`
+    // or at a `#` that separates the file from its anchor (the brackets
+    // belong after the anchor).
+    let xref_close = |span: TargetSpan| match span.next {
+        Some('[' | '#') => "",
+        _ => "[]",
     };
 
     // Priority 1a: include:: (longest trigger)
@@ -599,7 +649,7 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         }
         return Some(CompletionContext::IncludePath {
             prefix: prefix.to_string(),
-            span: span_from(prefix_start),
+            span: path_span_from(prefix_start, block_macro_extends(idx)),
         });
     }
 
@@ -621,7 +671,7 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
             }
             return Some(CompletionContext::ImagePath {
                 prefix: prefix.to_string(),
-                span: span_from(prefix_start),
+                span: path_span_from(prefix_start, block_macro_extends(idx)),
             });
         }
     }
@@ -647,7 +697,7 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                 }
                 return Some(CompletionContext::ImagePath {
                     prefix: prefix.to_string(),
-                    span: span_from(prefix_start),
+                    span: path_span_from(prefix_start, own_bracket_follows),
                 });
             }
         }
@@ -674,19 +724,19 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
             }
             // Split at `#` for cross-file anchor form `xref:file.adoc#anchor`.
             if let Some(hash_pos) = prefix.find('#') {
+                let span = anchor_span_from(prefix_start + hash_pos + 1);
                 return Some(CompletionContext::XrefCrossAnchor {
                     file: prefix[..hash_pos].to_string(),
                     anchor_prefix: prefix[hash_pos + 1..].to_string(),
-                    closing: xref_long_close,
-                    span: span_from(prefix_start + hash_pos + 1),
-                    trailing: xref_trailing,
+                    closing: xref_close(span),
+                    span,
                 });
             }
+            let span = path_span_from(prefix_start, own_bracket_follows);
             return Some(CompletionContext::XrefAnchorOrPath {
                 prefix: prefix.to_string(),
-                closing: xref_long_close,
-                span: span_from(prefix_start),
-                trailing: xref_trailing,
+                closing: xref_close(span),
+                span,
             });
         }
     }
@@ -714,16 +764,12 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                     anchor_prefix: prefix[hash_pos + 1..].to_string(),
                     closing: xref_short_close,
                     span: short_span_from(prefix_start + hash_pos + 1),
-                    // Shorthand uses `>>` not `[]`, so trailing-bracket logic
-                    // doesn't apply; existing tests assume None.
-                    trailing: None,
                 });
             }
             return Some(CompletionContext::XrefAnchor {
                 prefix: prefix.to_string(),
                 closing: xref_short_close,
                 span: short_span_from(prefix_start),
-                trailing: None,
             });
         }
     }
@@ -975,26 +1021,19 @@ fn anchor_items<'a>(
 
 /// Resolve xref anchor completions by listing the IDs of the top-level
 /// documents that read `doc_path`, filtered by prefix. Each item's edit replaces `span`
-/// with the anchor, followed by `closing` (`">>"` or `"[]"`). When
-/// `trailing` is `Some`, an existing `[…]` is
-/// overwritten with a snippet so the `label` placeholder ends up selected.
+/// with the anchor, followed by `closing` (`">>"` or `"[]"`).
 pub(crate) fn resolve_xref_completions(
     prefix: &str,
     doc_path: &Path,
     ws: Option<&Workspace>,
     closing: &str,
     span: TargetSpan,
-    trailing: Option<TrailingBrackets>,
 ) -> Vec<CompletionItem> {
     let Some(ws) = ws else {
         return Vec::new();
     };
 
-    let edit = AnchorEdit {
-        closing,
-        span,
-        trailing,
-    };
+    let edit = AnchorEdit { closing, span };
     anchor_items(
         anchors_of_documents(ws, doc_path, &[])
             .iter()
@@ -1091,7 +1130,7 @@ pub(crate) fn resolve_xref_path_completions(
     });
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
-    // When brackets already follow the cursor (`closing == ""`): drop the bracket
+    // When a `[` follows later in the same target (`closing == ""`): drop the bracket
     // snippet entirely; cursor lands at the end of the inserted path.
     let file_snippet = if closing == "[]" {
         "${1}[${2:label}]"
@@ -1113,11 +1152,7 @@ fn anchor_completion_item(
     ws: &Workspace,
     edit: AnchorEdit<'_>,
 ) -> CompletionItem {
-    let AnchorEdit {
-        closing,
-        span,
-        trailing,
-    } = edit;
+    let AnchorEdit { closing, span } = edit;
     let filename = loc
         .file
         .file_name()
@@ -1132,26 +1167,19 @@ fn anchor_completion_item(
         None => format!("{filename} ({kind_label})"),
     };
 
-    // The edit always replaces the typed anchor prefix (`span`). Three modes:
-    // (1) `trailing` is Some → an existing `[…]` follows the cursor. The
-    //     range also swallows it and the edit emits `id[${1:label}]` so the
-    //     `label` placeholder is selected after acceptance.
-    // (2) `closing == "[]"` (no trailing) → fresh long-form xref: snippet inserts
-    //     `id[${1:label}]` so cursor lands on `label`.
-    // (3) Otherwise (e.g. `closing == ">>"` for shorthand or `""` when something
-    //     else follows) → plain insert.
-    let (range, new_text, format) = match trailing {
-        Some(t) => (
-            span.range_to(t.end_col),
+    // The edit replaces the whole anchor token (`span`) and leaves what
+    // follows it, such as an existing `[text]`, alone. A fresh long-form xref
+    // (`closing == "[]"`) gets a snippet so the cursor lands on `label`;
+    // otherwise (`">>"` for shorthand, `""` when something else follows) it
+    // is a plain insert.
+    let range = span.range();
+    let (new_text, format) = if closing == "[]" {
+        (
             format!("{id}[${{1:label}}]"),
             Some(InsertTextFormat::SNIPPET),
-        ),
-        None if closing == "[]" => (
-            span.range(),
-            format!("{id}[${{1:label}}]"),
-            Some(InsertTextFormat::SNIPPET),
-        ),
-        None => (span.range_to(span.end_col), format!("{id}{closing}"), None),
+        )
+    } else {
+        (format!("{id}{closing}"), None)
     };
 
     CompletionItem {
@@ -1301,6 +1329,8 @@ fn list_path_items(
     };
 
     let list_dir = asciidoc_core::paths::normalize_lexically(&listing.base_dir.join(resolved_dir));
+    // A `/` right after the token belongs to the directory item.
+    let dir_end_col = span.end_col + u32::from(span.next == Some('/'));
 
     let Ok(entries) = std::fs::read_dir(&list_dir) else {
         return Vec::new();
@@ -1322,7 +1352,7 @@ fn list_path_items(
                     label: dir_name.clone(),
                     kind: Some(CompletionItemKind::FOLDER),
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: span.range(),
+                        range: span.range_to(dir_end_col),
                         new_text: full_path.clone(),
                     })),
                     // filter_text must include the typed dir prefix so client-side
@@ -1333,6 +1363,10 @@ fn list_path_items(
                     ..Default::default()
                 })
             } else {
+                // A segment that continues with `/` must be a directory.
+                if span.next == Some('/') {
+                    return None;
+                }
                 // Cheap checks first; the text sniff reads the file.
                 let matches_filter = name.starts_with(filter)
                     && match ext_filter {
@@ -1354,6 +1388,12 @@ fn list_path_items(
                     return None;
                 }
                 let full_path = format!("{original_dir_prefix}{name}");
+                // Brackets already after the token stay as they are.
+                let file_snippet = if span.next == Some('[') {
+                    ""
+                } else {
+                    file_snippet
+                };
                 let snippet = format!("{full_path}{file_snippet}");
                 Some(CompletionItem {
                     label: name.clone(),
@@ -1476,7 +1516,7 @@ pub(crate) fn resolve_attribute_completions(
             };
             CompletionItem {
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: span.range_to(span.end_col),
+                    range: span.range(),
                     new_text: format!("{name}{closing}"),
                 })),
                 label: name,
@@ -1693,20 +1733,22 @@ pub(crate) fn resolve_completions(
             prefix,
             closing,
             span,
-            trailing,
-        } => resolve_xref_completions(&prefix, doc_path, ws, closing, span, trailing),
+        } => resolve_xref_completions(&prefix, doc_path, ws, closing, span),
         CompletionContext::XrefAnchorOrPath {
             prefix,
             closing,
             span,
-            trailing,
         } => {
             // Discovery-friendly: merge anchor + path completions for `xref:foo`.
             // `closing` is `""` when brackets already exist after the cursor —
-            // both arms must respect it to avoid doubling. When `trailing` is
-            // Some, anchor items use TextEdit so the existing label is selected.
-            let mut items =
-                resolve_xref_completions(&prefix, doc_path, ws, closing, span, trailing);
+            // both arms must respect it to avoid doubling.
+            // An anchor id holds neither `/` nor `#`, so none fits a segment
+            // that continues with one.
+            let mut items = if matches!(span.next, Some('/' | '#')) {
+                Vec::new()
+            } else {
+                resolve_xref_completions(&prefix, doc_path, ws, closing, span)
+            };
             items.extend(resolve_xref_path_completions(
                 &prefix, doc_path, line, ws, closing, span,
             ));
@@ -1724,18 +1766,13 @@ pub(crate) fn resolve_completions(
             anchor_prefix,
             closing,
             span,
-            trailing,
         } => resolve_xref_cross_anchor_completions(
             &file,
             &anchor_prefix,
             doc_path,
             line,
             ws,
-            AnchorEdit {
-                closing,
-                span,
-                trailing,
-            },
+            AnchorEdit { closing, span },
         ),
         CompletionContext::IncludePath { prefix, span } => {
             resolve_include_completions(&prefix, doc_path, line, ws, span)
@@ -1834,21 +1871,21 @@ mod tests {
     const AT_LINE_START: TargetSpan = TargetSpan {
         line: 0,
         start_col: 0,
-        cursor_col: 0,
         end_col: 0,
+        next: None,
     };
 
     fn span(start_col: u32, cursor_col: u32) -> TargetSpan {
-        span_to(start_col, cursor_col, cursor_col)
+        span_to(start_col, cursor_col)
     }
 
     /// A span whose token runs on past the cursor, to `end_col`.
-    fn span_to(start_col: u32, cursor_col: u32, end_col: u32) -> TargetSpan {
+    fn span_to(start_col: u32, end_col: u32) -> TargetSpan {
         TargetSpan {
             line: 0,
             start_col,
-            cursor_col,
             end_col,
+            next: None,
         }
     }
 
@@ -1871,19 +1908,19 @@ mod tests {
 
     #[rstest]
     #[case("xref shorthand", "See <<my-pre", 0, 12,
-        CompletionContext::XrefAnchor { prefix: "my-pre".into(), closing: ">>", span: span(6, 12), trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "my-pre".into(), closing: ">>", span: span(6, 12) })]
     #[case("include path", "include::chap", 0, 13,
         CompletionContext::IncludePath { prefix: "chap".into(), span: span(9, 13) })]
     #[case("attribute", "The {img", 0, 8,
         CompletionContext::Attribute { prefix: "img".into(), span: span(5, 8), closing: "}" })]
     #[case("xref empty prefix", "See <<", 0, 6,
-        CompletionContext::XrefAnchor { prefix: "".into(), closing: ">>", span: span(6, 6), trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "".into(), closing: ">>", span: span(6, 6) })]
     #[case("xref multiline", "= Title\n\nSee <<my-id", 2, 11,
-        CompletionContext::XrefAnchor { prefix: "my-id".into(), closing: ">>", span: TargetSpan { line: 2, start_col: 6, cursor_col: 11, end_col: 11 }, trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "my-id".into(), closing: ">>", span: TargetSpan { line: 2, start_col: 6, end_col: 11, next: None } })]
     #[case("xref with umlaut", "Über <<anch", 0, 11,
-        CompletionContext::XrefAnchor { prefix: "anch".into(), closing: ">>", span: span(7, 11), trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "anch".into(), closing: ">>", span: span(7, 11) })]
     #[case("xref shorthand cross-file", "See <<other.adoc#sec", 0, 20,
-        CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: ">>", span: span(17, 20), trailing: None })]
+        CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: ">>", span: span(17, 20) })]
     #[case("attribute with CJK", "中{attr", 0, 6,
         CompletionContext::Attribute { prefix: "attr".into(), span: span(2, 6), closing: "}" })]
     #[case("inline macro prefix after multibyte", ":imagesdir: Ükbd", 0, 16,
@@ -1897,21 +1934,21 @@ mod tests {
     #[case("include closed brace stays include", "include::{snippetsdir}/file", 0, 27,
         CompletionContext::IncludePath { prefix: "{snippetsdir}/file".into(), span: span(9, 27) })]
     #[case("xref long form", "See xref:sec", 0, 12,
-        CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "[]", span: span(9, 12), trailing: None })]
+        CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "[]", span: span(9, 12) })]
     #[case("xref long form open attribute", "See xref:{attr", 0, 14,
         CompletionContext::Attribute { prefix: "attr".into(), span: span(10, 14), closing: "}" })]
     #[case("xref long form closed attribute", "See xref:{resolved}/sec", 0, 23,
-        CompletionContext::XrefAnchorOrPath { prefix: "{resolved}/sec".into(), closing: "[]", span: span(9, 23), trailing: None })]
+        CompletionContext::XrefAnchorOrPath { prefix: "{resolved}/sec".into(), closing: "[]", span: span(9, 23) })]
     #[case("xref long form cross-file", "See xref:other.adoc#sec", 0, 23,
-        CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: "[]", span: span(20, 23), trailing: None })]
+        CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: "[]", span: span(20, 23) })]
     #[case("xref long form same-file via hash", "See xref:#sec", 0, 13,
-        CompletionContext::XrefCrossAnchor { file: "".into(), anchor_prefix: "sec".into(), closing: "[]", span: span(10, 13), trailing: None })]
+        CompletionContext::XrefCrossAnchor { file: "".into(), anchor_prefix: "sec".into(), closing: "[]", span: span(10, 13) })]
     #[case("xref long form path subdir", "xref:chapters/", 0, 14,
-        CompletionContext::XrefAnchorOrPath { prefix: "chapters/".into(), closing: "[]", span: span(5, 14), trailing: None })]
+        CompletionContext::XrefAnchorOrPath { prefix: "chapters/".into(), closing: "[]", span: span(5, 14) })]
     #[case("xref path after multibyte counts UTF-16", "Über xref:chapters/", 0, 19,
-        CompletionContext::XrefAnchorOrPath { prefix: "chapters/".into(), closing: "[]", span: span(10, 19), trailing: None })]
+        CompletionContext::XrefAnchorOrPath { prefix: "chapters/".into(), closing: "[]", span: span(10, 19) })]
     #[case("xref before existing brackets", "xref:sec[Text]", 0, 8,
-        CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "", span: span(5, 8), trailing: Some(TrailingBrackets { end_col: 14 }) })]
+        CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "", span: TargetSpan { next: Some('['), ..span(5, 8) } })]
     #[case("inline image path after multibyte", "Ü image:sub/", 0, 12,
         CompletionContext::ImagePath { prefix: "sub/".into(), span: span(8, 12) })]
     #[case("block image path", "image::sub/", 0, 11,
@@ -1921,19 +1958,25 @@ mod tests {
     #[case("attribute in include before existing closing brace", "include::{snip}/a.adoc[]", 0, 14,
         CompletionContext::Attribute { prefix: "snip".into(), span: span(10, 14), closing: "" })]
     #[case("attribute mid-name before existing closing brace", "Use {pro} now.", 0, 7,
-        CompletionContext::Attribute { prefix: "pr".into(), span: span_to(5, 7, 8), closing: "" })]
+        CompletionContext::Attribute { prefix: "pr".into(), span: span_to(5, 8), closing: "" })]
     #[case("attribute with later unrelated closing", "Use {pro and {x}", 0, 8,
         CompletionContext::Attribute { prefix: "pro".into(), span: span(5, 8), closing: "}" })]
     #[case("attribute with closing after a space", "Use {pro now}", 0, 8,
         CompletionContext::Attribute { prefix: "pro".into(), span: span(5, 8), closing: "}" })]
     #[case("xref shorthand right after opener before existing target", "<<ref-o>>", 0, 2,
-        CompletionContext::XrefAnchor { prefix: "".into(), closing: "", span: span_to(2, 2, 7), trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "".into(), closing: "", span: span_to(2, 7) })]
     #[case("xref shorthand before comma and later closing", "<<setup-install,the install>>", 0, 15,
-        CompletionContext::XrefAnchor { prefix: "setup-install".into(), closing: "", span: span(2, 15), trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "setup-install".into(), closing: "", span: span(2, 15) })]
     #[case("xref shorthand ignores closing of a later xref", "<<a and <<b>>", 0, 3,
-        CompletionContext::XrefAnchor { prefix: "a".into(), closing: ">>", span: span(2, 3), trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "a".into(), closing: ">>", span: span(2, 3) })]
+    #[case("include without its own bracket ends at the cursor", "include::./x", 0, 9,
+        CompletionContext::IncludePath { prefix: "".into(), span: TargetSpan { next: Some('.'), ..span_to(9, 9) } })]
+    #[case("include with its own bracket runs up to the next slash", "include::./x[]", 0, 9,
+        CompletionContext::IncludePath { prefix: "".into(), span: TargetSpan { next: Some('/'), ..span_to(9, 10) } })]
+    #[case("xref anchor ends at punctuation, brackets still needed", "xref:se),xref:b[c]", 0, 7,
+        CompletionContext::XrefAnchorOrPath { prefix: "se".into(), closing: "[]", span: TargetSpan { next: Some(')'), ..span(5, 7) } })]
     #[case("xref shorthand cross-file before comma and later closing", "<<f.adoc#sec,text>>", 0, 12,
-        CompletionContext::XrefCrossAnchor { file: "f.adoc".into(), anchor_prefix: "sec".into(), closing: "", span: span(9, 12), trailing: None })]
+        CompletionContext::XrefCrossAnchor { file: "f.adoc".into(), anchor_prefix: "sec".into(), closing: "", span: span(9, 12) })]
     #[case("ifdef empty name", "ifdef::", 0, 7,
         CompletionContext::Attribute { prefix: "".into(), span: span(7, 7), closing: "" })]
     #[case("ifdef name prefix", "ifdef::sectn", 0, 12,
@@ -1945,7 +1988,11 @@ mod tests {
     #[case("ifdef second name after plus", "ifdef::a+sec", 0, 12,
         CompletionContext::Attribute { prefix: "sec".into(), span: span(9, 12), closing: "" })]
     #[case("ifdef mid-name before brackets", "ifdef::sec[]", 0, 9,
-        CompletionContext::Attribute { prefix: "se".into(), span: span_to(7, 9, 10), closing: "" })]
+        CompletionContext::Attribute { prefix: "se".into(), span: span_to(7, 10), closing: "" })]
+    #[case("ifdef edit keeps the names after a comma", "ifdef::sec,other[]", 0, 9,
+        CompletionContext::Attribute { prefix: "se".into(), span: span_to(7, 10), closing: "" })]
+    #[case("ifdef edit keeps the names after a plus", "ifdef::sec+other[]", 0, 9,
+        CompletionContext::Attribute { prefix: "se".into(), span: span_to(7, 10), closing: "" })]
     #[case("ifdef name that starts like an inline macro", "ifdef::im", 0, 9,
         CompletionContext::Attribute { prefix: "im".into(), span: span(7, 9), closing: "" })]
     #[case("ifdef name after multibyte counts UTF-16", "ifdef::äb", 0, 9,
@@ -1963,11 +2010,11 @@ mod tests {
     #[case("attribute value with dot", ":source-highlighter: highlight.", 0, 31,
         CompletionContext::AttributeValue { name: "source-highlighter", prefix: "highlight.".into(), span: span(21, 31) })]
     #[case("attribute value mid-token", ":toc: left", 0, 8,
-        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8, 10) })]
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 10) })]
     #[case("attribute value edit stops at a blank after the cursor", ":toc: left x", 0, 8,
-        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8, 10) })]
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 10) })]
     #[case("attribute value edit stops at a non-value character", ":toc: le{x}", 0, 8,
-        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8, 8) })]
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8) })]
     #[case("attribute value name case-insensitive", ":TOC: ", 0, 6,
         CompletionContext::AttributeValue { name: "toc", prefix: "".into(), span: span(6, 6) })]
     #[case("attribute value wins over inline macro", ":icons: fo", 0, 10,
@@ -1983,7 +2030,7 @@ mod tests {
     #[case("block style edit stops before the closing bracket", "[NO]", 0, 3,
         CompletionContext::BlockStyle { prefix: "NO".into(), span: span(1, 3) })]
     #[case("block style edit covers the rest of the token only", "[NOTE,x]", 0, 3,
-        CompletionContext::BlockStyle { prefix: "NO".into(), span: span_to(1, 3, 5) })]
+        CompletionContext::BlockStyle { prefix: "NO".into(), span: span_to(1, 5) })]
     #[case("block style wins over inline macro prefix", "[li", 0, 3,
         CompletionContext::BlockStyle { prefix: "li".into(), span: span(1, 3) })]
     #[case("source language prefix", "[source,ru", 0, 10,
@@ -1997,9 +2044,9 @@ mod tests {
     #[case("source language after id and option shorthands", "[source#sid%linenums,ru", 0, 23,
         CompletionContext::SourceLanguage { prefix: "ru".into(), span: span(21, 23) })]
     #[case("source language edit stops before the closing bracket", "[source,ru]", 0, 10,
-        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 10, 10) })]
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 10) })]
     #[case("source language edit covers the rest of the token", "[source,rust]", 0, 10,
-        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 10, 12) })]
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 12) })]
     #[case("source language may contain a plus", "[source,c+", 0, 10,
         CompletionContext::SourceLanguage { prefix: "c+".into(), span: span(8, 10) })]
     #[case("source language wins over link macro", "[source,li", 0, 10,
@@ -2175,14 +2222,8 @@ mod tests {
             ),
         ]);
 
-        let items = resolve_xref_completions(
-            "_my",
-            Path::new("/a.adoc"),
-            Some(&ws),
-            ">>",
-            AT_LINE_START,
-            None,
-        );
+        let items =
+            resolve_xref_completions("_my", Path::new("/a.adoc"), Some(&ws), ">>", AT_LINE_START);
         assert_eq!(items.len(), 2);
         // Sorted alphabetically
         assert_eq!(items[0].label, "_my-anchor");
@@ -2219,14 +2260,8 @@ mod tests {
             ),
         ]);
 
-        let items = resolve_xref_completions(
-            "",
-            Path::new("/a.adoc"),
-            Some(&ws),
-            ">>",
-            AT_LINE_START,
-            None,
-        );
+        let items =
+            resolve_xref_completions("", Path::new("/a.adoc"), Some(&ws), ">>", AT_LINE_START);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "_alpha");
         assert_eq!(items[1].label, "_beta");
@@ -2234,8 +2269,7 @@ mod tests {
 
     #[test]
     fn test_xref_completions_no_workspace() {
-        let items =
-            resolve_xref_completions("my", Path::new("/a.adoc"), None, ">>", AT_LINE_START, None);
+        let items = resolve_xref_completions("my", Path::new("/a.adoc"), None, ">>", AT_LINE_START);
         assert!(items.is_empty());
     }
 
@@ -2251,8 +2285,7 @@ mod tests {
         )]);
         // `xref:se` with the cursor at the end of the line
         let typed = span(5, 7);
-        let items =
-            resolve_xref_completions("se", Path::new("/a.adoc"), Some(&ws), "[]", typed, None);
+        let items = resolve_xref_completions("se", Path::new("/a.adoc"), Some(&ws), "[]", typed);
         assert_eq!(items.len(), 1);
         assert_eq!(edit(&items[0]).range, cols(5, 7));
         assert_eq!(new_text(&items[0]), "sec[${1:label}]");
@@ -2261,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xref_anchor_edit_swallows_existing_brackets() {
+    fn test_xref_anchor_edit_leaves_existing_brackets_alone() {
         let ws = ws_with_anchors(vec![(
             "sec",
             AnchorLocation {
@@ -2271,18 +2304,13 @@ mod tests {
             },
         )]);
         // `xref:se[Text]` with the cursor before `[`
-        let typed = span(5, 7);
-        let trailing = TrailingBrackets { end_col: 13 };
-        let items = resolve_xref_completions(
-            "se",
-            Path::new("/a.adoc"),
-            Some(&ws),
-            "",
-            typed,
-            Some(trailing),
-        );
-        assert_eq!(edit(&items[0]).range, cols(5, 13));
-        assert_eq!(new_text(&items[0]), "sec[${1:label}]");
+        let typed = TargetSpan {
+            next: Some('['),
+            ..span(5, 7)
+        };
+        let items = resolve_xref_completions("se", Path::new("/a.adoc"), Some(&ws), "", typed);
+        assert_eq!(edit(&items[0]).range, cols(5, 7));
+        assert_eq!(new_text(&items[0]), "sec");
     }
 
     // --- resolve_xref_cross_anchor_completions ---
@@ -2323,7 +2351,6 @@ mod tests {
             AnchorEdit {
                 closing: "[]",
                 span: AT_LINE_START,
-                trailing: None,
             },
         );
         assert_eq!(items.len(), 1);
@@ -2366,7 +2393,6 @@ mod tests {
             AnchorEdit {
                 closing: ">>",
                 span: AT_LINE_START,
-                trailing: None,
             },
         );
         assert_eq!(items.len(), 1);
@@ -2509,14 +2535,8 @@ mod tests {
             ("beta", at(AnchorKind::Explicit, 2)),
             ("_zeta", at(AnchorKind::Explicit, 3)),
         ]);
-        let items = resolve_xref_completions(
-            "",
-            Path::new("/a.adoc"),
-            Some(&ws),
-            ">>",
-            AT_LINE_START,
-            None,
-        );
+        let items =
+            resolve_xref_completions("", Path::new("/a.adoc"), Some(&ws), ">>", AT_LINE_START);
         let got: Vec<_> = items
             .iter()
             .map(|item| (item.label.as_str(), item.sort_text.as_deref()))
@@ -2552,7 +2572,6 @@ mod tests {
         let edit = AnchorEdit {
             closing: ">>",
             span: AT_LINE_START,
-            trailing: None,
         };
         for anchors in [
             [implicit.clone(), explicit.clone()],
@@ -2584,7 +2603,6 @@ mod tests {
         let edit = AnchorEdit {
             closing: ">>",
             span: AT_LINE_START,
-            trailing: None,
         };
         for anchors in [
             [later.clone(), first.clone()],
@@ -2620,7 +2638,6 @@ mod tests {
             prefix: String::new(),
             closing: "[]",
             span: AT_LINE_START,
-            trailing: None,
         };
         let items = resolve_completions(ctx, &a, 1, Some(&ws));
 
@@ -2863,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xref_items_before_existing_brackets_differ_in_range() {
+    fn test_xref_items_before_existing_brackets_both_keep_them() {
         let dir = setup_include_dir();
         let doc = dir.path().join("a.adoc");
         let ws = ws_with_anchors_at(
@@ -2877,9 +2894,8 @@ mod tests {
                 },
             )],
         );
-        // `xref:b|[Text]`: the path item keeps the brackets and replaces
-        // only up to the cursor; the anchor item swallows them and
-        // re-emits the label slot.
+        // `xref:b|[Text]`: path and anchor items both replace only the
+        // token and leave the brackets alone.
         let content = "xref:b[Text]";
         let ctx = detect_completion_context(content, Position::new(0, 6)).unwrap();
         let items = resolve_completions(ctx, &doc, 1, Some(&ws));
@@ -2887,8 +2903,8 @@ mod tests {
         assert_eq!(edit(path).range, cols(5, 6));
         assert_eq!(new_text(path), "b.adoc");
         let anchor = items.iter().find(|i| i.label == "b_anchor").unwrap();
-        assert_eq!(edit(anchor).range, cols(5, 12));
-        assert_eq!(new_text(anchor), "b_anchor[${1:label}]");
+        assert_eq!(edit(anchor).range, cols(5, 6));
+        assert_eq!(new_text(anchor), "b_anchor");
     }
 
     #[test]
@@ -3546,7 +3562,6 @@ mod tests {
             prefix: "my".into(),
             closing: ">>",
             span: AT_LINE_START,
-            trailing: None,
         };
 
         let items = resolve_completions(ctx, doc_path, 1, Some(&ws));
@@ -3888,7 +3903,6 @@ mod tests {
                 prefix: "target".into(),
                 closing: "[]",
                 span: span(5, 11),
-                trailing: None
             })
         );
     }
@@ -4190,7 +4204,7 @@ mod tests {
 
     #[test]
     fn test_attribute_value_edit_covers_the_token_after_the_cursor() {
-        let items = resolve_attribute_value_completions("toc", "le", span_to(6, 8, 10));
+        let items = resolve_attribute_value_completions("toc", "le", span_to(6, 10));
         assert_eq!(edit(&items[0]).range, cols(6, 10));
     }
 
@@ -4223,7 +4237,7 @@ mod tests {
 
     #[test]
     fn test_block_style_edit_replaces_token_only() {
-        let items = resolve_block_style_completions("NO", span_to(1, 3, 5));
+        let items = resolve_block_style_completions("NO", span_to(1, 5));
         let note = items.iter().find(|i| i.label == "NOTE").unwrap();
         assert_eq!(edit(note).range, cols(1, 5));
         assert_eq!(edit(note).new_text, "NOTE");
@@ -4595,6 +4609,770 @@ mod tests {
         assert!(
             labels.contains(&"screenshot.png"),
             "missing screenshot.png in {labels:?}"
+        );
+    }
+
+    // --- accepting a completion with the cursor inside a token ---
+
+    /// The line after accepting the item `label` with the cursor at `col`
+    /// (the caret `\u{2038}`, else the last `|`, in `line` marks the cursor
+    /// and is removed). The edit text is applied verbatim, so snippet
+    /// placeholders stay in the result.
+    fn accept_at_cursor(doc: &Path, ws: Option<&Workspace>, line: &str, label: &str) -> String {
+        accept_after_lines(doc, ws, &[], line, label)
+    }
+
+    /// Like `accept_at_cursor`, with `previous` lines of the same document
+    /// above `line`; the result is still only the edited `line`.
+    fn accept_after_lines(
+        doc: &Path,
+        ws: Option<&Workspace>,
+        previous: &[&str],
+        line: &str,
+        label: &str,
+    ) -> String {
+        let (col, marker) = line
+            .find('\u{2038}')
+            .map_or_else(|| (line.rfind('|').unwrap(), "|"), |i| (i, "\u{2038}"));
+        let text = format!("{}{}", &line[..col], &line[col + marker.len()..]);
+        let document = previous
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+            + &text;
+        #[allow(clippy::cast_possible_truncation)]
+        let pos = Position::new(previous.len() as u32, col as u32);
+        let ctx = detect_completion_context(&document, pos).unwrap();
+        let items = resolve_completions(ctx, doc, 1, ws);
+        let item = items
+            .iter()
+            .find(|i| i.label == label)
+            .unwrap_or_else(|| panic!("no item {label} for {line} in {items:?}"));
+        let te = edit(item);
+        assert_eq!(te.range.start.line, te.range.end.line);
+        let (start, end) = (
+            te.range.start.character as usize,
+            te.range.end.character as usize,
+        );
+        format!("{}{}{}", &text[..start], te.new_text, &text[end..])
+    }
+
+    #[test]
+    fn test_image_dir_choice_mid_token_replaces_the_whole_segment() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("diagrams")).unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image::diag|rams/arch.svg[Arch]", "diagrams/"),
+            "image::diagrams/arch.svg[Arch]"
+        );
+    }
+
+    #[test]
+    fn test_include_dir_choice_mid_token_replaces_the_whole_segment() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::create_dir_all(dir.path().join("snippets")).unwrap();
+        let doc = dir.path().join("sub/doc.adoc");
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                None,
+                "include::../sni|ppets/config.yml[]",
+                "snippets/"
+            ),
+            "include::../snippets/config.yml[]"
+        );
+    }
+
+    #[test]
+    fn test_include_file_choice_mid_token_keeps_existing_brackets() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("chapter.adoc"), "= C\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "include::chap|ter.adoc[opts]", "chapter.adoc"),
+            "include::chapter.adoc[opts]"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "include::chap|[opts]", "chapter.adoc"),
+            "include::chapter.adoc[opts]"
+        );
+    }
+
+    #[test]
+    fn test_block_macro_target_with_parens_and_spaces_stays_intact() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("diagram(1).png"), "").unwrap();
+        std::fs::write(dir.path().join("my pic.png"), "").unwrap();
+        std::fs::write(dir.path().join("chapter (draft).adoc"), "= C\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image::diagram|(1).png[A]", "diagram(1).png"),
+            "image::diagram(1).png[A]"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image::my| pic.png[B]", "my pic.png"),
+            "image::my pic.png[B]"
+        );
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                None,
+                "include::chapter| (draft).adoc[]",
+                "chapter (draft).adoc"
+            ),
+            "include::chapter (draft).adoc[]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_target_with_comma_is_not_replaced() {
+        // A comma is no path character for the heuristic: the range ends at
+        // the cursor and nothing is deleted.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("diagrams")).unwrap();
+        std::fs::write(dir.path().join("diagrams/a,b.png"), "").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image:diagrams/a|,b.png[C]", "a,b.png"),
+            "image:diagrams/a,b.png[${1:alt}],b.png[C]"
+        );
+    }
+
+    #[test]
+    fn test_xref_anchor_keeps_brackets_when_punctuation_ends_the_token() {
+        let ws = ws_with_anchors(vec![(
+            "sec",
+            AnchorLocation {
+                file: PathBuf::from("/a.adoc"),
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )]);
+        assert_eq!(
+            accept_at_cursor(
+                Path::new("/a.adoc"),
+                Some(&ws),
+                "xref:se|),xref:b[c]",
+                "sec"
+            ),
+            "xref:sec[${1:label}]),xref:b[c]"
+        );
+    }
+
+    #[test]
+    fn test_xref_path_before_slash_offers_no_anchors() {
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = ws_with_anchors(vec![(
+            "chapter-intro",
+            AnchorLocation {
+                file: doc.clone(),
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )]);
+        for text in ["xref:chap|ters/a.adoc[x]", "xref:chap|ters#sec[x]"] {
+            let col = text.find('|').unwrap();
+            let text = text.replacen('|', "", 1);
+            #[allow(clippy::cast_possible_truncation)]
+            let ctx = detect_completion_context(&text, Position::new(0, col as u32)).unwrap();
+            let items = resolve_completions(ctx, &doc, 1, Some(&ws));
+            assert!(
+                items.iter().all(|i| i.label != "chapter-intro"),
+                "{text}: {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cross_anchor_choice_before_brackets_keeps_the_link_text() {
+        let dir = TempDir::new().unwrap();
+        let reference = dir.path().join("reference.adoc");
+        std::fs::write(&reference, "= R\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = ws_with_anchors(vec![(
+            "ref-options",
+            AnchorLocation {
+                file: reference,
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )]);
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                Some(&ws),
+                "xref:reference.adoc#ref-o|[x]",
+                "ref-options"
+            ),
+            "xref:reference.adoc#ref-options[x]"
+        );
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                Some(&ws),
+                "xref:reference.adoc#ref-o|ptions[x]",
+                "ref-options"
+            ),
+            "xref:reference.adoc#ref-options[x]"
+        );
+    }
+
+    #[test]
+    fn test_cross_anchor_token_ends_only_at_id_stops() {
+        // No own `[` follows in the word, so the range ends at the cursor
+        // and `#` (closing highlight markup, no id character follows) and
+        // `(x)` stay untouched.
+        let dir = TempDir::new().unwrap();
+        let reference = dir.path().join("a.adoc");
+        std::fs::write(&reference, "= R\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = ws_with_anchors(vec![(
+            "sec",
+            AnchorLocation {
+                file: reference,
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )]);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "#xref:a.adoc#se|#", "sec"),
+            "#xref:a.adoc#sec[${1:label}]#"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "xref:a.adoc#se|(x)", "sec"),
+            "xref:a.adoc#sec[${1:label}](x)"
+        );
+    }
+
+    #[test]
+    fn test_xref_anchor_choice_inside_highlight_markup_is_offered() {
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "#xref:se|#", "sec"),
+            "#xref:sec[${1:label}]#"
+        );
+    }
+
+    #[test]
+    fn test_xref_file_choice_right_before_an_anchor_adds_no_brackets() {
+        // `xref:file.adoc[label]#sec` would detach the anchor.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), "= F\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "See xref:file.adoc|#sec.", "file.adoc"),
+            "See xref:file.adoc#sec."
+        );
+    }
+
+    #[test]
+    fn test_xref_without_own_bracket_replaces_only_up_to_the_cursor() {
+        // Accepted price (adoc-0190): without the macro's own `[` in the same
+        // word the range ends at the cursor, so the rest of the word stays.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), "= F\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "xref:se|ction more text", "sec"),
+            "xref:sec[${1:label}]ction more text"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "See xref:fi|le.adoc#sec.", "file.adoc"),
+            "See xref:file.adoc${1}[${2:label}]le.adoc#sec."
+        );
+    }
+
+    #[test]
+    fn test_inline_image_in_a_compact_table_cell_stops_at_the_cell_separator() {
+        // Asciidoctor splits cells before inline parsing: the `[` of the
+        // next cell's image is not this image's bracket.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "|image:pi\u{2038}|image:b.png[B]", "pic.png"),
+            "|image:pic.png[${1:alt}]|image:b.png[B]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_choice_mid_token_replaces_the_whole_segment() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("diagrams")).unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image:diag|rams/a.svg[x] text", "diagrams/"),
+            "image:diagrams/a.svg[x] text"
+        );
+    }
+
+    #[test]
+    fn test_xref_path_dir_choice_mid_token_replaces_the_whole_segment() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("chapters")).unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:chap|ters/a.adoc[x]", "chapters/"),
+            "xref:chapters/a.adoc[x]"
+        );
+    }
+
+    #[test]
+    fn test_xref_file_choice_mid_token_keeps_the_anchor_part() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), "= F\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:fi|le.adoc#sec[x]", "file.adoc"),
+            "xref:file.adoc#sec[x]"
+        );
+    }
+
+    #[test]
+    fn test_path_completion_without_brackets_replaces_only_up_to_the_cursor() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), "= F\n").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:fi|le more text", "file.adoc"),
+            "xref:file.adoc${1}[${2:label}]le more text"
+        );
+    }
+
+    fn sec_workspace(doc: &Path) -> Workspace {
+        ws_with_anchors(vec![(
+            "sec",
+            AnchorLocation {
+                file: doc.to_path_buf(),
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )])
+    }
+
+    #[test]
+    fn test_xref_anchor_choice_keeps_closing_paren() {
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "(see xref:se|)", "sec"),
+            "(see xref:sec[${1:label}])"
+        );
+    }
+
+    #[test]
+    fn test_xref_anchor_choice_keeps_closing_markup_delimiters() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "footnote:[See xref:se|]", "sec"),
+            "footnote:[See xref:sec[${1:label}]]"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "*xref:se|*", "sec"),
+            "*xref:sec[${1:label}]*"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "|xref:se\u{2038}|next", "sec"),
+            "|xref:sec[${1:label}]|next"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "footnote:[image:pi|]", "pic.png"),
+            "footnote:[image:pic.png[${1:alt}]]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_target_with_space_is_not_replaced() {
+        // A space is no path character for the heuristic: the range ends at
+        // the cursor and nothing is deleted.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("my pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image:my| pic.png[B]", "my pic.png"),
+            "image:my pic.png[${1:alt}] pic.png[B]"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_keeps_closing_underscore_delimiters() {
+        // No own `[` in the word, so the range ends at the cursor and the
+        // closing `_` delimiters stay.
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "_see xref:se|_ end.", "sec"),
+            "_see xref:sec[${1:label}]_ end."
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "__xref:se|__", "sec"),
+            "__xref:sec[${1:label}]__"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_keeps_underscore_inside_anchor_ids() {
+        // `_sec_title`: an inner `_` has a word character after it and stays.
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let other = dir.path().join("a.adoc");
+        std::fs::write(&other, "= A\n").unwrap();
+        let anchor_ws = |file: &Path| {
+            ws_with_anchors(vec![(
+                "_sec_title",
+                AnchorLocation {
+                    file: file.to_path_buf(),
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            )])
+        };
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                Some(&anchor_ws(&doc)),
+                "xref:_sec|_title[x]",
+                "_sec_title"
+            ),
+            "xref:_sec_title[x]"
+        );
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                Some(&anchor_ws(&other)),
+                "xref:a.adoc#_sec|_title[x]",
+                "_sec_title"
+            ),
+            "xref:a.adoc#_sec_title[x]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_choice_does_not_cross_into_another_macro() {
+        // A later macro's `[` is not this image's bracket: the prose between
+        // stays (Asciidoctor itself reads some of these as one image, but a
+        // half-typed target is no reason to delete text).
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("icon.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                None,
+                "See image:ic| to open, then xref:sec[Label].",
+                "icon.png"
+            ),
+            "See image:icon.png[${1:alt}] to open, then xref:sec[Label]."
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "Press image:ic| then kbd:[Ctrl+S].", "icon.png"),
+            "Press image:icon.png[${1:alt}] then kbd:[Ctrl+S]."
+        );
+    }
+
+    #[test]
+    fn test_inline_image_choice_stops_at_closing_bracket_before_later_image() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(
+                &doc,
+                None,
+                "footnote:[image:pi|] more image:b.png[x]",
+                "pic.png"
+            ),
+            "footnote:[image:pic.png[${1:alt}]] more image:b.png[x]"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_keeps_underscore_inside_file_names() {
+        // `_` is a path character: with the own `[` it stays in the target,
+        // without it the range ends at the cursor.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("my_file.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:my|_file.adoc[x]", "my_file.adoc"),
+            "xref:my_file.adoc[x]"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:my|_file.adoc more", "my_file.adoc"),
+            "xref:my_file.adoc${1}[${2:label}]_file.adoc more"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_stops_at_opening_parenthesis() {
+        // `xref:sec[label](x)`: Asciidoctor renders `(x)` as prose.
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "xref:se|(x) end.", "sec"),
+            "xref:sec[${1:label}](x) end."
+        );
+    }
+
+    #[test]
+    fn test_xref_anchor_choice_keeps_sentence_period() {
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "See xref:|.", "sec"),
+            "See xref:sec[${1:label}]."
+        );
+    }
+
+    #[test]
+    fn test_image_choice_keeps_comma_after_the_cursor() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image:pi|, more", "pic.png"),
+            "image:pic.png[${1:alt}], more"
+        );
+    }
+
+    #[test]
+    fn test_image_file_is_not_offered_where_the_segment_continues_with_a_slash() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("diagram.png"), b"").unwrap();
+        std::fs::create_dir_all(dir.path().join("diagrams")).unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let text = "image::diag|rams/arch.svg[Arch]";
+        let col = text.find('|').unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let ctx =
+            detect_completion_context(&text.replacen('|', "", 1), Position::new(0, col as u32))
+                .unwrap();
+        let labels: Vec<String> = resolve_completions(ctx, &doc, 1, None)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert_eq!(labels, vec!["diagrams/".to_string()]);
+    }
+
+    fn workspace_with_anchor(file: &Path, id: &str) -> Workspace {
+        ws_with_anchors(vec![(
+            id,
+            AnchorLocation {
+                file: file.to_path_buf(),
+                line: 1,
+                kind: AnchorKind::Explicit,
+            },
+        )])
+    }
+
+    #[test]
+    fn test_xref_choice_keeps_trailing_underscore_of_target_before_own_bracket() {
+        // `_` is a path/id character: `xref:sec_[x]` links to `#sec_`.
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = workspace_with_anchor(&doc, "sec_");
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "Plain xref:se|c_[x] end.", "sec_"),
+            "Plain xref:sec_[x] end."
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_keeps_underscore_before_dot_and_dash_in_file_names() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes_.adoc"), b"").unwrap();
+        std::fs::write(dir.path().join("a_-b.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:no|tes_.adoc[x]", "notes_.adoc"),
+            "xref:notes_.adoc[x]"
+        );
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:a|_-b.adoc[x]", "a_-b.adoc"),
+            "xref:a_-b.adoc[x]"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_with_bracket_in_the_same_word_takes_the_whole_target() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:fi|le.adoc[x]", "file.adoc"),
+            "xref:file.adoc[x]"
+        );
+    }
+
+    #[test]
+    fn test_xref_target_outside_the_path_character_class_is_not_replaced() {
+        // Parentheses and spaces are no path characters for the heuristic:
+        // the range ends at the cursor and nothing is deleted.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "xref:file|(1).adoc[x]", "file.adoc"),
+            "xref:file.adoc${1}[${2:label}](1).adoc[x]"
+        );
+    }
+
+    #[test]
+    fn test_xref_bracket_must_not_follow_after_cell_separator() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "|xref:fi\u{2038}|b[x]", "file.adoc"),
+            "|xref:file.adoc${1}[${2:label}]|b[x]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_bracket_must_not_follow_after_cell_separator() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "|image:pi\u{2038}|b[x]", "pic.png"),
+            "|image:pic.png[${1:alt}]|b[x]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_bracket_must_not_follow_after_closing_bracket() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("pic.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "footnote:[image:pi|] see a[0]", "pic.png"),
+            "footnote:[image:pic.png[${1:alt}]] see a[0]"
+        );
+    }
+
+    #[test]
+    fn test_inline_image_bracket_must_not_follow_after_trailing_whitespace() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("icon.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image:ic| then [.role]#x#", "icon.png"),
+            "image:icon.png[${1:alt}] then [.role]#x#"
+        );
+    }
+
+    #[test]
+    fn test_block_image_target_reads_everything_up_to_the_bracket() {
+        // A block macro starts the line, so its target is everything up to
+        // `[`, including `_` and spaces.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("my_ (1).png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "image::my|_ (1).png[A]", "my_ (1).png"),
+            "image::my_ (1).png[A]"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_keeps_unconstrained_closing_underscores_before_a_word() {
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        assert_eq!(
+            accept_at_cursor(&doc, Some(&ws), "__xref:se|__text", "sec"),
+            "__xref:sec[${1:label}]__text"
+        );
+    }
+
+    #[test]
+    fn test_midline_include_choice_keeps_the_text_after_the_cursor() {
+        // A block macro is recognised only at the start of a line; mid-line
+        // `include::` is prose, so the range ends at the cursor.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("foo.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let result = accept_at_cursor(
+            &doc,
+            None,
+            "Use `include::fo|` and see xref:adr-4[ADR-4].",
+            "foo.adoc",
+        );
+        assert!(
+            result.ends_with("` and see xref:adr-4[ADR-4]."),
+            "text after the cursor was replaced: {result}"
+        );
+    }
+
+    #[test]
+    fn test_midline_block_image_choice_keeps_the_text_after_the_cursor() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("foo.png"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let result = accept_at_cursor(
+            &doc,
+            None,
+            "Use `image::fo|` and see xref:adr-4[ADR-4].",
+            "foo.png",
+        );
+        assert!(
+            result.ends_with("` and see xref:adr-4[ADR-4]."),
+            "text after the cursor was replaced: {result}"
+        );
+    }
+
+    #[test]
+    fn test_line_start_include_choice_still_replaces_up_to_the_bracket() {
+        // Pins the line-start premise of the block-macro rule: with the
+        // check removed the mid-line tests above go red, with the rule
+        // broken for real block macros this one does.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("foo.adoc"), b"").unwrap();
+        let doc = dir.path().join("doc.adoc");
+        assert_eq!(
+            accept_at_cursor(&doc, None, "include::fo|o bar.adoc[x]", "foo.adoc"),
+            "include::foo.adoc[x]"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_does_not_cross_into_a_colon_macro() {
+        // `:` is no path character: `kbd:[Ctrl]` is another macro, not the
+        // bracket of this xref.
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        let result = accept_at_cursor(&doc, Some(&ws), "xref:se|kbd:[Ctrl]", "sec");
+        assert!(
+            result.ends_with("kbd:[Ctrl]"),
+            "following macro was replaced: {result}"
+        );
+    }
+
+    #[test]
+    fn test_xref_choice_mid_word_leaves_the_rest_of_the_word_without_own_bracket() {
+        // Accepted price of the heuristic: no `[` in the word, so the range
+        // ends at the cursor and `ction` stays.
+        let dir = TempDir::new().unwrap();
+        let doc = dir.path().join("doc.adoc");
+        let ws = sec_workspace(&doc);
+        let result = accept_at_cursor(&doc, Some(&ws), "xref:se|ction more text", "sec");
+        assert!(
+            result.ends_with("ction more text"),
+            "rest of the word was replaced: {result}"
         );
     }
 }
