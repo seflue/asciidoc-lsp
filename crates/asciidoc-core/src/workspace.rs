@@ -11,6 +11,7 @@ use crate::graph::{
 };
 use crate::paths::relative_path;
 use crate::pdf_theme::PdfResolution;
+use crate::reading::{read_in_order, ReadingVisitor};
 use crate::references::ReferenceIndex;
 use crate::types::{AttributeDef, Diagnostic, DocumentModel, FileLocation};
 
@@ -314,9 +315,8 @@ impl Workspace {
             current: HashMap::new(),
             at_reference: None,
             definitions: Vec::new(),
-            stack: Vec::new(),
         };
-        walk.visit(&root);
+        read_in_order(self, &root, &mut walk);
         let (at_reference, before_reference) = walk.at_reference.unwrap_or_default();
         AttributeScope {
             workspace: self,
@@ -879,10 +879,6 @@ fn value_of(
     }
 }
 
-/// Include depth at which [`ReadingWalk`] stops, as a guard on top of the
-/// cycle check.
-const MAX_WALK_DEPTH: usize = 64;
-
 /// Reading-order walk of one top-level document for
 /// [`Workspace::scopes_at`]. A file included twice is read twice.
 struct ReadingWalk<'a> {
@@ -897,9 +893,6 @@ struct ReadingWalk<'a> {
     /// came before it.
     at_reference: Option<(HashMap<String, AttributeDefinition>, usize)>,
     definitions: Vec<(String, AttributeDefinition)>,
-    /// Files being read, outermost first; the first is the top-level
-    /// document.
-    stack: Vec<PathBuf>,
 }
 
 /// One line of a document in reading order. On the same line a reference
@@ -907,7 +900,6 @@ struct ReadingWalk<'a> {
 enum WalkStep<'a> {
     Reference,
     Definition(&'a AttributeDef),
-    Include(&'a Path),
 }
 
 /// The attribute name of an entry, and whether the entry unsets it.
@@ -918,47 +910,39 @@ pub fn entry_name(name: &str) -> (&str, bool) {
         .map_or((name, false), |name| (name, true))
 }
 
-impl<'a> ReadingWalk<'a> {
-    fn visit(&mut self, file: &Path) {
-        let workspace: &'a Workspace = self.workspace;
-        let Some(doc) = workspace.documents.get(file) else {
-            return;
-        };
-        if self.stack.len() >= MAX_WALK_DEPTH || self.stack.iter().any(|open| open == file) {
-            return;
-        }
-        self.stack.push(file.to_path_buf());
-        let mut steps: Vec<(usize, WalkStep<'a>)> = doc
+impl<'a> ReadingVisitor<'a> for ReadingWalk<'a> {
+    type Item = WalkStep<'a>;
+
+    fn items(&self, file: &Path, doc: &'a DocumentModel) -> Vec<(usize, WalkStep<'a>)> {
+        let mut items: Vec<(usize, WalkStep<'a>)> = doc
             .attributes
             .iter()
             .map(|attr| (attr.line, WalkStep::Definition(attr)))
-            .chain(
-                workspace
-                    .include_graph
-                    .includes_of(file)
-                    .iter()
-                    .map(|edge| (edge.line, WalkStep::Include(edge.target.as_path()))),
-            )
             .collect();
         if self.reference.0 == file && self.at_reference.is_none() {
-            steps.push((self.reference.1, WalkStep::Reference));
+            items.push((self.reference.1, WalkStep::Reference));
         }
-        steps.sort_by_key(|(line, step)| (*line, !matches!(step, WalkStep::Reference)));
-        for (_, step) in steps {
-            match step {
-                WalkStep::Reference => {
-                    if self.at_reference.is_none() {
-                        self.at_reference = Some((self.current.clone(), self.definitions.len()));
-                    }
-                }
-                WalkStep::Definition(attr) => self.define(file, attr),
-                WalkStep::Include(target) => self.visit(target),
-            }
-        }
-        self.stack.pop();
+        items
     }
 
-    fn define(&mut self, file: &Path, attr: &AttributeDef) {
+    fn first_on_line(item: &WalkStep<'a>) -> bool {
+        matches!(item, WalkStep::Reference)
+    }
+
+    fn item(&mut self, stack: &[PathBuf], file: &Path, item: WalkStep<'a>) {
+        match item {
+            WalkStep::Reference => {
+                if self.at_reference.is_none() {
+                    self.at_reference = Some((self.current.clone(), self.definitions.len()));
+                }
+            }
+            WalkStep::Definition(attr) => self.define(stack, file, attr),
+        }
+    }
+}
+
+impl ReadingWalk<'_> {
+    fn define(&mut self, stack: &[PathBuf], file: &Path, attr: &AttributeDef) {
         let (name, unset) = entry_name(&attr.name);
         let definition = AttributeDefinition {
             source: Some(AttributeSource {
@@ -967,7 +951,7 @@ impl<'a> ReadingWalk<'a> {
             }),
             origin: AttributeOrigin::Document,
             raw: (!unset).then(|| attr.value.clone()),
-            value: (!unset).then(|| self.substitute(&attr.value)),
+            value: (!unset).then(|| self.substitute(stack, &attr.value)),
         };
         self.current.insert(name.to_string(), definition.clone());
         self.definitions.push((name.to_string(), definition));
@@ -975,10 +959,10 @@ impl<'a> ReadingWalk<'a> {
 
     /// `input` with the values in effect substituted; an unset or unknown
     /// reference stays as written.
-    fn substitute(&self, input: &str) -> String {
+    fn substitute(&self, stack: &[PathBuf], input: &str) -> String {
         substitute_attributes(input, |name| {
             value_of(&self.current, name, || {
-                let root = self.stack.first()?;
+                let root = stack.first()?;
                 self.workspace.preset(root, name, self.preview)
             })
         })
