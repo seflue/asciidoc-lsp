@@ -11,7 +11,7 @@ use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normal
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
 use asciidoc_core::workspace::{
-    AttributeDefinition, AttributeOrigin, AttributeScope, ConfigOverride, Workspace,
+    entry_name, AttributeDefinition, AttributeOrigin, AttributeScope, ConfigOverride, Workspace,
 };
 
 use crate::positions;
@@ -32,7 +32,8 @@ pub(crate) enum NodeKind {
     /// `{name}` attribute reference
     AttributeRef { name: String },
     /// `:name: value` attribute definition
-    AttributeDef { name: String },
+    /// An attribute entry line; `unset` for `:name!:` / `:!name:`.
+    AttributeDef { name: String, unset: bool },
     /// `[[id]]` anchor / ID assignment
     Anchor { id: String },
     /// `image::path[]` block macro or `image:path[]` inline macro
@@ -198,7 +199,7 @@ pub fn resolve_references(
     let ws = workspace?;
 
     let mut results = match &node_info.kind {
-        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. } => {
             let mut r = ws.find_all_attribute_usages(name);
             if include_declaration {
                 for source in ws.definition_sites(doc_path, node_info.line, name) {
@@ -390,7 +391,8 @@ pub fn resolve_hover(
             }
             Some(text)
         }
-        NodeKind::AttributeDef { name } if is_pdf_path_attribute(name) => {
+        // An unset entry resolves to no paths; it falls through to the generic arm.
+        NodeKind::AttributeDef { name, unset: false } if is_pdf_path_attribute(name) => {
             let resolution =
                 workspace?.resolve_pdf_attribute(doc_path, name, Some(node_info.line))?;
             Some(format!(
@@ -428,7 +430,7 @@ pub fn resolve_hover(
                 .collect();
             Some(per_document_hover(texts))
         }
-        NodeKind::AttributeDef { name } => {
+        NodeKind::AttributeDef { name, .. } => {
             let ws = workspace?;
             let file = ws.indexed_path(doc_path);
             let config_entry = ws
@@ -570,8 +572,8 @@ fn entry_text(name: &str, raw: Option<&str>) -> String {
     }
 }
 
-/// Hover text for one definition: the entry as written (`:name!:` for an
-/// unset), then what it resolves to where it differs.
+/// Hover text for one definition: the entry (`:name!:` for either unset form,
+/// as `:!name:` is shown normalised), then what it resolves to where it differs.
 fn definition_hover(
     ws: &Workspace,
     doc_path: &Path,
@@ -851,7 +853,7 @@ fn explain_node(info: &NodeInfo) -> Value {
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             json!({ "target": target })
         }
-        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. } => {
             json!({ "name": name })
         }
         NodeKind::Anchor { id } => json!({ "id": id }),
@@ -875,7 +877,7 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Workspace>) -> Value {
     let no_workspace = || json!({ "error": "no workspace" });
     match &info.kind {
-        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => workspace
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. } => workspace
             .map_or_else(no_workspace, |ws| {
                 explain_attribute(ws, doc_path, name, info.line)
             }),
@@ -1181,42 +1183,35 @@ fn classify_inline_node(
     None
 }
 
-/// Detect `:name: value` attribute definitions on the current line.
-/// Returns `NodeInfo` if the line matches the `:name: value` pattern.
+/// Split an attribute entry line into its name and whether it unsets.
+///
+/// The line shape is checked here; the `!` rule is core's `entry_name`, so
+/// both crates agree on which entries unset.
+fn parse_attribute_entry(line_str: &str) -> Option<(&str, bool)> {
+    let rest = line_str.strip_prefix(':')?;
+    let (inner, after) = rest.split_once(':')?;
+    // After the closing `:` must be end-of-line or whitespace
+    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let (name, unset) = entry_name(inner);
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid.then_some((name, unset))
+}
+
+/// Detect `:name: value` attribute definitions on the current line, including
+/// unset entries (`:name!:`, `:!name:`; the name excludes the `!`).
+/// Returns `NodeInfo` if the line matches.
 fn find_attribute_def_at_position(content: &str, line_1: usize) -> Option<NodeInfo> {
-    let line_0 = line_1.saturating_sub(1);
-    let line_str = content.lines().nth(line_0)?;
-    let bytes = line_str.as_bytes();
-
-    // Pattern: ^:([a-zA-Z0-9_-]+):\s+ or ^:([a-zA-Z0-9_-]+):$
-    if bytes.first() != Some(&b':') {
-        return None;
-    }
-
-    let mut end = 1;
-    while end < bytes.len() && bytes[end] != b':' {
-        let b = bytes[end];
-        if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-            return None;
-        }
-        end += 1;
-    }
-
-    // Must have closing `:` and name must be non-empty
-    if end >= bytes.len() || end <= 1 {
-        return None;
-    }
-
-    // After closing `:` must be end-of-line or whitespace
-    let after_colon = end + 1;
-    if after_colon < bytes.len() && bytes[after_colon] != b' ' && bytes[after_colon] != b'\t' {
-        return None;
-    }
-
-    let name = &line_str[1..end];
+    let line_str = content.lines().nth(line_1.saturating_sub(1))?;
+    let (name, unset) = parse_attribute_entry(line_str)?;
     Some(NodeInfo {
         kind: NodeKind::AttributeDef {
             name: name.to_string(),
+            unset,
         },
         line: line_1,
     })
@@ -1369,7 +1364,7 @@ pub fn prepare_rename(
                 end_col: end,
             })
         }
-        NodeKind::AttributeDef { name } => {
+        NodeKind::AttributeDef { name, .. } => {
             let (start, end) = find_attr_def_columns(line_text, name)?;
             Some(PrepareRenameResult {
                 placeholder: name.clone(),
@@ -1397,7 +1392,7 @@ pub fn resolve_rename(
     let ws = workspace?;
 
     match &node_info.kind {
-        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name } => {
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. } => {
             let mut edits: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
 
             // Attribute references: {name} → start_col+1 to end_col-1 (inside braces)
@@ -1628,15 +1623,18 @@ fn find_anchor_ref_columns(line_text: &str, id: &str) -> Option<(usize, usize)> 
     None
 }
 
-/// Find the byte offsets of `name` inside `:name:` at the start of a line.
-/// Returns `(start, end)` byte offsets of the name (exclusive end).
+/// Find the byte offsets of `name` inside `:name:`, `:name!:` or `:!name:` at
+/// the start of a line. Returns `(start, end)` byte offsets of the name
+/// (exclusive end).
 fn find_attr_def_columns(line_text: &str, name: &str) -> Option<(usize, usize)> {
-    let pattern = format!(":{name}:");
-    if line_text.starts_with(&pattern) {
-        Some((1, 1 + name.len()))
-    } else {
-        None
-    }
+    [
+        (format!(":{name}:"), 1),
+        (format!(":{name}!:"), 1),
+        (format!(":!{name}:"), 2),
+    ]
+    .into_iter()
+    .find(|(pattern, _)| line_text.starts_with(pattern))
+    .map(|(_, start)| (start, start + name.len()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2276,7 +2274,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             info.kind,
             NodeKind::AttributeDef {
-                name: "imagesdir".into()
+                name: "imagesdir".into(),
+                unset: false
             }
         );
     }
@@ -2458,6 +2457,153 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert!(!without.contains(&(index.clone(), 10)));
         assert_eq!(with.len(), 3, "usages + entry, got: {with:?}");
         assert!(with.contains(&(index, 10)), "{with:?}");
+    }
+
+    #[rstest]
+    #[case::suffix_form(6, 3, vec![5], vec![2, 5, 7])]
+    #[case::prefix_form(7, 3, vec![10], vec![3, 8, 10])]
+    fn test_references_on_unset_attribute_entry(
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] usages: Vec<usize>,
+        #[case] with_entries: Vec<usize>,
+    ) {
+        let (index, content, ws) = unset_entry_fixture();
+        let pos = Position { line, character };
+
+        let lines = |include_declaration| -> Vec<usize> {
+            let mut lines: Vec<usize> = resolve_references(
+                &content,
+                pos,
+                &index,
+                Some(&ws),
+                include_declaration,
+                &HashMap::new(),
+            )
+            .unwrap_or_default()
+            .iter()
+            .map(|loc| loc.line)
+            .collect();
+            lines.sort_unstable();
+            lines
+        };
+
+        assert_eq!(lines(false), usages);
+        assert_eq!(lines(true), with_entries);
+    }
+
+    #[rstest]
+    #[case(":min-ram!:", "min-ram", Some((1, 8)))]
+    #[case(":!min-ram:", "min-ram", Some((2, 9)))]
+    #[case::suffix_with_value(":min-ram!: 4 GB", "min-ram", Some((1, 8)))]
+    #[case::prefix_with_value(":!min-ram: 4 GB", "min-ram", Some((2, 9)))]
+    #[case::both_bangs_rejected(":!min-ram!:", "min-ram", None)]
+    #[case::trailing_garbage_rejected(":min-ram!x:", "min-ram", None)]
+    #[case::other_name_rejected(":!other-ram: value", "min-ram", None)]
+    fn test_find_attr_def_columns_unset_forms(
+        #[case] line: &str,
+        #[case] name: &str,
+        #[case] expected: Option<(usize, usize)>,
+    ) {
+        assert_eq!(find_attr_def_columns(line, name), expected);
+    }
+
+    #[rstest]
+    #[case::plain(":a: value", Some(("a", false)))]
+    #[case::suffix_with_value(":a!: value", Some(("a", true)))]
+    #[case::prefix_with_value(":!a: value", Some(("a", true)))]
+    #[case::suffix_trailing_blanks(":d!:   ", Some(("d", true)))]
+    #[case::bare_bang(":!:", None)]
+    #[case::double_bang(":!!:", None)]
+    #[case::both_bangs_not_recognised(":!a!:", None)]
+    fn test_find_attribute_def_at_position_unset_forms(
+        #[case] line: &str,
+        #[case] expected: Option<(&str, bool)>,
+    ) {
+        let found = find_attribute_def_at_position(line, 1).map(|info| info.kind);
+        let expected = expected.map(|(name, unset)| NodeKind::AttributeDef {
+            name: name.to_string(),
+            unset,
+        });
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn test_hover_unset_entry_of_pdf_path_attribute_does_not_show_the_earlier_value() {
+        let content = "= M\n:pdf-theme: custom\n:pdf-theme!:\n";
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        let pos = Position {
+            line: 2,
+            character: 1,
+        };
+        let hover = resolve_hover(content, pos, &paths[0], Some(&ws));
+        assert_eq!(hover.as_deref(), Some(":pdf-theme!:"));
+    }
+
+    #[rstest]
+    #[case::suffix_form(6, ":min-ram!:")]
+    #[case::prefix_form_shown_as_suffix(7, ":other-ram!:")]
+    fn test_hover_on_unset_entry_shows_the_unset_form(#[case] line: u32, #[case] expected: &str) {
+        let (index, content, ws) = unset_entry_fixture();
+        let pos = Position { line, character: 3 };
+        let hover = resolve_hover(&content, pos, &index, Some(&ws));
+        assert_eq!(hover.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn test_hover_on_unset_entry_in_config_file_shows_the_unset_form() {
+        let config = ":cfg!:\n";
+        let (_tmp, ws, paths) = opened(&[(".asciidoctorconfig", config), ("a.adoc", "= A\n")]);
+        let pos = Position {
+            line: 0,
+            character: 2,
+        };
+        let hover = resolve_hover(config, pos, &paths[0], Some(&ws));
+        assert_eq!(hover.as_deref(), Some(":cfg!:"));
+    }
+
+    fn unset_entry_fixture() -> (PathBuf, String, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/unset_entry_references")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let content = fs::read_to_string(&index).unwrap();
+        (index, content, ws)
+    }
+
+    #[rstest]
+    #[case::from_usage_of_suffix_unset(4, 8, vec![(2, 1, 8), (5, 7, 14), (7, 1, 8)])]
+    #[case::from_usage_of_prefix_unset(9, 8, vec![(3, 1, 10), (8, 2, 11), (10, 7, 16)])]
+    fn test_rename_edits_unset_entries(
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] expected: Vec<(usize, usize, usize)>,
+    ) {
+        let (index, content, ws) = unset_entry_fixture();
+        let pos = Position { line, character };
+        let edits = resolve_rename(&content, pos, &index, Some(&ws), &HashMap::new()).unwrap();
+        let mut found: Vec<_> = edits.into_values().flatten().collect();
+        found.sort_unstable();
+        assert_eq!(found, expected);
+    }
+
+    #[rstest]
+    #[case::suffix_form(6, 3, 1, 8)]
+    #[case::prefix_form(7, 3, 2, 11)]
+    fn test_prepare_rename_on_unset_entry(
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] start_col: usize,
+        #[case] end_col: usize,
+    ) {
+        let (index, content, ws) = unset_entry_fixture();
+        let pos = Position { line, character };
+        let result = prepare_rename(&content, pos, &index, Some(&ws)).unwrap();
+        assert_eq!(result.line, line as usize + 1);
+        assert_eq!((result.start_col, result.end_col), (start_col, end_col));
     }
 
     // --- Integration test — gr on {attr} in .adoc ---
@@ -2906,7 +3052,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             info.kind,
             NodeKind::AttributeDef {
-                name: "source-dir".into()
+                name: "source-dir".into(),
+                unset: false
             }
         );
     }
@@ -5358,7 +5505,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             "attribute_ref"
         );
         assert_eq!(
-            node_kind_name(&NodeKind::AttributeDef { name: s() }),
+            node_kind_name(&NodeKind::AttributeDef {
+                name: s(),
+                unset: false
+            }),
             "attribute_def"
         );
         assert_eq!(node_kind_name(&NodeKind::Anchor { id: s() }), "anchor");

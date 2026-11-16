@@ -1,0 +1,10 @@
+= Unset entries
+:min-ram: 4 GB
+:other-ram: 2 GB
+
+Needs {min-ram} before the unset.
+
+:min-ram!:
+:!other-ram:
+
+Needs {other-ram} after the unset.
