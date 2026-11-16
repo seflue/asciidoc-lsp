@@ -26,7 +26,7 @@ use tower_lsp_server::ls_types::{
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InitializedParams, Location, MarkedString, MessageType, OneOf, Position, PrepareRenameResponse,
     Range, ReferenceParams, Registration, RenameOptions, RenameParams, SaveOptions,
-    ServerCapabilities, TextDocumentPositionParams, TextDocumentSyncCapability,
+    ServerCapabilities, ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
     WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
@@ -321,7 +321,10 @@ impl LanguageServer for AsciiDocLsp {
                 }),
                 ..Default::default()
             },
-            ..Default::default()
+            server_info: Some(ServerInfo {
+                name: "asciidoc-lsp".into(),
+                version: Some(version::build_version()),
+            }),
         })
     }
 
@@ -2056,6 +2059,24 @@ mod tests {
             .await
             .unwrap();
         (service, socket)
+    }
+
+    #[tokio::test]
+    async fn test_initialize_reports_server_info() {
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+
+        let result = service
+            .inner()
+            .initialize(InitializeParams::default())
+            .await
+            .unwrap();
+
+        let info = result.server_info.unwrap();
+        assert_eq!(info.name, "asciidoc-lsp");
+        assert_eq!(
+            info.version.as_deref(),
+            Some(version::build_version().as_str())
+        );
     }
 
     async fn open_document(server: &AsciiDocLsp, uri: &Uri, text: &str) {
