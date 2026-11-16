@@ -1,0 +1,25 @@
+[[setup]]
+= Setup
+
+[[setup-install]]
+== Installation
+
+. Download the package.
+. Run the installer.
+. Check the version, see <<intro-audience,the audience section>>.
+
+.Default configuration
+[source,yaml]
+----
+include::../snippets/config.yml[]
+----
+
+image::diagrams/arch.svg[Architecture]
+
+[[setup-config]]
+== Configuration
+
+Edit the file shown in <<setup-install>>.
+Options are listed in xref:reference.adoc#ref-options[the reference].
+
+WARNING: Back up your data first.
