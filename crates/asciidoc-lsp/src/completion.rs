@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::{
@@ -7,6 +8,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use asciidoc_core::anchor_scope::AnchorScope;
+use asciidoc_core::paths::canonicalize_if_exists;
 use asciidoc_core::references::find_target_file;
 use asciidoc_core::types::AnchorLocation;
 use asciidoc_core::workspace::{AttributeScope, Workspace};
@@ -904,11 +906,14 @@ fn anchor_completion_item(
     }
 }
 
-/// File extension filter for path completions.
+/// Which files a path completion offers.
 #[derive(Clone, Copy)]
-enum PathCompletionFilter {
+enum PathCompletionFilter<'a> {
     /// Only `.adoc` files
     Adoc,
+    /// Every text file except hidden ones and `current`, the canonical path
+    /// of the document itself
+    IncludeTarget { current: &'a Path },
     /// Only image files (png, jpg, svg, ...)
     Image,
 }
@@ -918,11 +923,44 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "tif", "ico",
 ];
 
+/// How many leading bytes decide whether a file is text (the value git uses).
+const TEXT_SNIFF_LEN: u64 = 8000;
+
+/// Whether `head`, the start of a file, looks like text Asciidoctor could
+/// include: no NUL byte and valid UTF-8. A multibyte character cut off at
+/// the end of `head` still counts as valid.
+fn looks_like_text(head: &[u8]) -> bool {
+    if head.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(head) {
+        Ok(_) => true,
+        Err(err) => err.error_len().is_none(),
+    }
+}
+
+/// Whether the file at `path` is a readable regular file that looks like
+/// text. Anything else cannot be included; FIFOs and devices are never
+/// opened, since opening a FIFO without a writer blocks.
+fn is_text_file(path: &Path) -> bool {
+    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if file.take(TEXT_SNIFF_LEN).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    looks_like_text(&head)
+}
+
 /// Generic path completion resolver for `include::`, `image::`, and `xref:` macros.
 ///
 /// Differences are parameterized:
 /// - `base_dir`: starting directory for filesystem listing
-/// - `ext_filter`: which file extensions to include
+/// - `ext_filter`: which files to offer (see [`PathCompletionFilter`])
 /// - `file_snippet`: text appended after the file name when accepted, in LSP
 ///   snippet syntax (e.g. `"[${1:opts}]"` for include, `"${1}[${2:label}]"` for
 ///   xref so the cursor lands before `[` and Tab jumps to the label slot).
@@ -931,7 +969,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 fn resolve_path_completions(
     prefix: &str,
     listings: &[PathListing],
-    ext_filter: PathCompletionFilter,
+    ext_filter: PathCompletionFilter<'_>,
     file_snippet: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
@@ -983,7 +1021,7 @@ fn path_listings(
 fn list_path_items(
     prefix: &str,
     listing: &PathListing,
-    ext_filter: PathCompletionFilter,
+    ext_filter: PathCompletionFilter<'_>,
     file_snippet: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
@@ -1036,17 +1074,24 @@ fn list_path_items(
                     ..Default::default()
                 })
             } else {
-                let matches_filter = match ext_filter {
-                    PathCompletionFilter::Adoc => Path::new(&name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc")),
-                    PathCompletionFilter::Image => {
-                        Path::new(&name).extension().is_some_and(|ext| {
-                            IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
-                        })
-                    }
-                };
-                if !matches_filter || !name.starts_with(filter) {
+                // Cheap checks first; the text sniff reads the file.
+                let matches_filter = name.starts_with(filter)
+                    && match ext_filter {
+                        PathCompletionFilter::Adoc => Path::new(&name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc")),
+                        PathCompletionFilter::IncludeTarget { current } => {
+                            !name.starts_with('.')
+                                && canonicalize_if_exists(path.clone()) != current
+                                && is_text_file(&path)
+                        }
+                        PathCompletionFilter::Image => {
+                            Path::new(&name).extension().is_some_and(|ext| {
+                                IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+                            })
+                        }
+                    };
+                if !matches_filter {
                     return None;
                 }
                 let full_path = format!("{original_dir_prefix}{name}");
@@ -1068,8 +1113,9 @@ fn list_path_items(
         .collect()
 }
 
-/// Resolve include-path completions by listing `.adoc` files and subdirectories
-/// relative to the document directory, filtered by prefix.
+/// Resolve include-path completions by listing every text file except hidden
+/// ones and the document itself, and subdirectories, relative to the document
+/// directory, filtered by prefix.
 pub(crate) fn resolve_include_completions(
     prefix: &str,
     doc_path: &Path,
@@ -1081,11 +1127,12 @@ pub(crate) fn resolve_include_completions(
     let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |_| {
         base.to_path_buf()
     });
+    let current = canonicalize_if_exists(doc_path.to_path_buf());
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(
         prefix,
         &listings,
-        PathCompletionFilter::Adoc,
+        PathCompletionFilter::IncludeTarget { current: &current },
         "[${1:opts}]",
         span,
     )
@@ -2289,6 +2336,152 @@ mod tests {
         assert_eq!(labels(&items), vec!["p.adoc", "w.adoc"]);
     }
 
+    // --- Include targets: any text file, not hidden, not the document itself ---
+
+    fn adversarial_labels(file: &str, typed: &str) -> Vec<String> {
+        labels_in(fixture("adversarial_project"), file, typed)
+    }
+
+    /// Asciidoctor includes any text file (`[source,yaml]` + `include::config.yml[]`).
+    #[test]
+    fn test_include_completions_offer_non_adoc_files() {
+        assert_eq!(
+            adversarial_labels("chapters/setup.adoc", "include::../snippets/"),
+            vec!["config.yml"]
+        );
+        let (root, ws) = fixture("adversarial_project");
+        let typed = "include::../snippets/";
+        let ctx = detect_completion_context(typed, Position::new(0, 21)).unwrap();
+        let items = resolve_completions(ctx, &root.join("chapters/setup.adoc"), 1, Some(&ws));
+        assert_eq!(new_text(&items[0]), "../snippets/config.yml[${1:opts}]");
+    }
+
+    #[test]
+    fn test_include_completions_skip_the_current_file() {
+        let labels = adversarial_labels("chapters/setup.adoc", "include::");
+        assert!(labels.contains(&"intro.adoc".to_string()), "{labels:?}");
+        assert!(labels.contains(&"reference.adoc".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"setup.adoc".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn test_include_completions_skip_the_current_file_reached_through_an_attribute() {
+        let labels = adversarial_labels(
+            "chapters/setup.adoc",
+            "include::{asciidoctorconfigdir}/chapters/",
+        );
+        assert!(labels.contains(&"intro.adoc".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"setup.adoc".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn test_include_completions_skip_hidden_files() {
+        let labels = adversarial_labels("index.adoc", "include::");
+        assert!(
+            !labels.contains(&".asciidoctorconfig.adoc".to_string()),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&"chapters/".to_string()), "{labels:?}");
+        assert!(labels.contains(&"snippets/".to_string()), "{labels:?}");
+        assert!(adversarial_labels("index.adoc", "include::.asc").is_empty());
+    }
+
+    /// `logo.png` has no NUL byte but is not UTF-8, which Asciidoctor
+    /// cannot include either.
+    #[test]
+    fn test_include_completions_skip_binary_files() {
+        assert_eq!(
+            adversarial_labels("chapters/setup.adoc", "include::../images/diagrams/"),
+            vec!["arch.svg"]
+        );
+        let labels = adversarial_labels("chapters/setup.adoc", "include::../images/");
+        assert!(labels.contains(&"diagrams/".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"logo.png".to_string()), "{labels:?}");
+    }
+
+    /// `asciidoctorconfigdir` is an editor convention the Asciidoctor CLI
+    /// does not know (it reports "include file not found"); completion
+    /// follows the config chain (ADR-008).
+    #[test]
+    fn test_include_completions_resolve_attribute_paths() {
+        assert_eq!(
+            adversarial_labels(
+                "chapters/setup.adoc",
+                "include::{asciidoctorconfigdir}/partials/"
+            ),
+            vec!["legal.adoc"]
+        );
+        assert_eq!(
+            adversarial_labels(
+                "chapters/setup.adoc",
+                "include::{asciidoctorconfigdir}/snippets/"
+            ),
+            vec!["config.yml"]
+        );
+    }
+
+    /// Self-exclusion compares canonical paths, not file names: a same-named
+    /// file in another folder stays a valid include target.
+    #[test]
+    fn test_include_completions_skip_only_the_same_file_not_the_same_name() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::create_dir(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("a/x.adoc"), "= A\n").unwrap();
+        std::fs::write(dir.path().join("b/x.adoc"), "= B\n").unwrap();
+        let doc = dir.path().join("a/x.adoc");
+        let own = resolve_include_completions("", &doc, 1, None, AT_LINE_START);
+        assert!(!labels(&own).contains(&"x.adoc"), "{:?}", labels(&own));
+        let other = resolve_include_completions("../b/", &doc, 1, None, AT_LINE_START);
+        assert_eq!(labels(&other), vec!["x.adoc"]);
+    }
+
+    /// Only regular files are sniffed: opening a FIFO without a writer
+    /// blocks forever, which would freeze the server.
+    #[cfg(unix)]
+    #[test]
+    fn test_include_completions_do_not_open_fifos() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.adoc"), "= A\n").unwrap();
+        let fifo = dir.path().join("pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let doc = dir.path().join("dummy.adoc");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let items = resolve_include_completions("", &doc, 1, None, AT_LINE_START);
+            let _ = tx.send(items.into_iter().map(|i| i.label).collect::<Vec<_>>());
+        });
+        let labels = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("completion blocked on a FIFO");
+        assert_eq!(labels, vec!["a.adoc"]);
+    }
+
+    /// The include filters must not leak into xref: it targets `.adoc`
+    /// files only, and a self-xref is valid.
+    #[test]
+    fn test_xref_path_completions_keep_adoc_only_and_the_current_file() {
+        assert!(adversarial_labels("index.adoc", "xref:snippets/").is_empty());
+        let labels = adversarial_labels("index.adoc", "xref:");
+        assert!(labels.contains(&"index.adoc".to_string()), "{labels:?}");
+    }
+
+    #[rstest]
+    #[case(b"", true)]
+    #[case(b"key: value\n", true)]
+    #[case("ä".as_bytes(), true)]
+    #[case(&"ä".as_bytes()[..1], true)]
+    #[case(b"\x89PNG\r\n\x1a\n", false)]
+    #[case(b"a\0b", false)]
+    #[case(b"a\xffb", false)]
+    fn test_looks_like_text(#[case] head: &[u8], #[case] expected: bool) {
+        assert_eq!(looks_like_text(head), expected);
+    }
+
     /// An image folder set by one top-level document and another by the
     /// chapter's own preview: both are listed.
     #[test]
@@ -2534,8 +2727,9 @@ mod tests {
     #[test]
     fn test_resolve_completions_include() {
         let dir = setup_include_dir();
-        // doc_path is a file inside the dir (as in real LSP usage)
-        let doc_file = dir.path().join("a.adoc");
+        // doc_path is a file inside the dir (as in real LSP usage); not one
+        // of the listed files, since a document is no include target for itself
+        let doc_file = dir.path().join("dummy.adoc");
         let ctx = CompletionContext::IncludePath {
             prefix: "".into(),
             span: AT_LINE_START,
