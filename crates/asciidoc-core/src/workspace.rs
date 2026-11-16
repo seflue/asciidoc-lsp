@@ -3070,6 +3070,23 @@ mod tests {
         assert_eq!(broken, ["b", "c", "e", "g", "i", "k", "x"]);
     }
 
+    /// An attribute entry between ID / attribute lines and the level-0 title
+    /// keeps the title the document header, so it gets no implicit ID that
+    /// clashes with the later `[[_t]]`. Asciidoctor reports nothing for the
+    /// committed fixture `tests/fixtures/header_metadata_split`.
+    #[test]
+    fn test_fixture_header_metadata_split_by_attribute_entry() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/header_metadata_split")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+
+        let ws = Workspace::build(&root, &index);
+
+        assert!(ws.diagnostics_for(&index).is_empty());
+    }
+
     /// `anchor:id[]` / `anchor:id[reftext]` register inline anchors. Expected
     /// set from the Asciidoctor oracle (`INFO: possible invalid reference`
     /// for nothere, esc, 1digit, `sp ace`; `WARNING: id assigned to anchor
