@@ -1,0 +1,83 @@
+{
+  "name": "asciidoc-lsp",
+  "displayName": "AsciiDoc LSP",
+  "description": "Language server for AsciiDoc: navigation, completion, hover, diagnostics and refactoring.",
+  "version": "0.0.0",
+  "publisher": "seflue",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/seflue/asciidoc-lsp.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:asciidoc"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "asciidoc",
+        "aliases": [
+          "AsciiDoc",
+          "asciidoc"
+        ],
+        "extensions": [
+          ".adoc",
+          ".asciidoc",
+          ".asc",
+          ".ad"
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "AsciiDoc LSP",
+      "properties": {
+        "asciidoc-lsp.server.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `asciidoc-lsp` binary. Empty: use the binary bundled with the extension, else `asciidoc-lsp` from `PATH`."
+        },
+        "asciidoc-lsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "asciidoc-lsp.restartServer",
+        "title": "Restart Language Server",
+        "category": "AsciiDoc LSP"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p . && esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "package": "vsce package --no-dependencies",
+    "test": "node --test \"out/test/**/*.test.js\"",
+    "vscode:prepublish": "tsc -p . && esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.91.0",
+    "@vscode/vsce": "^4.1.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.0"
+  }
+}
