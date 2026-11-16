@@ -654,6 +654,7 @@ fn resolve_xref_targets(
         target: target.to_string(),
         display_text: None,
         line,
+        span: None,
     };
     let dir = document_dir(doc_path, Some(ws));
     path_scopes(ws, doc_path, line)

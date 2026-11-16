@@ -20,6 +20,8 @@ pub struct Xref {
     pub target: String,
     pub display_text: Option<String>,
     pub line: usize,
+    /// Byte columns `(start, end)` of the xref on its line, if it fits on one line.
+    pub span: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +208,8 @@ impl fmt::Display for DiagnosticKind {
 pub struct Diagnostic {
     pub file: PathBuf,
     pub line: usize,
+    /// Byte columns `(start, end)` on `line`; `None` covers the whole line.
+    pub span: Option<(usize, usize)>,
     pub kind: DiagnosticKind,
 }
 
