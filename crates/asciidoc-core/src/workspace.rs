@@ -879,7 +879,8 @@ enum WalkStep<'a> {
 }
 
 /// The attribute name of an entry, and whether the entry unsets it.
-fn entry_name(name: &str) -> (&str, bool) {
+#[must_use]
+pub fn entry_name(name: &str) -> (&str, bool) {
     name.strip_suffix('!')
         .or_else(|| name.strip_prefix('!'))
         .map_or((name, false), |name| (name, true))
