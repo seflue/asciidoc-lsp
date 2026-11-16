@@ -141,6 +141,17 @@ Use [LSP4IJ](https://github.com/redhat-developer/lsp4ij) (Red Hat), which attach
 
 LSP4IJ can export a user-defined language server as a zip, so you can hand the finished configuration to colleagues. See the [LSP4IJ documentation](https://github.com/redhat-developer/lsp4ij/blob/main/docs/UserDefinedLanguageServer.md).
 
+### VS Code
+
+The extension is not on the Marketplace yet. Install it from a VSIX attached to a [GitHub release](https://github.com/seflue/asciidoc-lsp/releases):
+
+1. Download the VSIX for your platform: `asciidoc-lsp-<platform>.vsix` with `linux-x64`, `linux-arm64`, `alpine-x64`, `alpine-arm64`, `darwin-x64`, `darwin-arm64` or `win32-x64`. It bundles the server, so no separate install is needed. On other platforms (for example `win32-arm64`), take `asciidoc-lsp-universal.vsix` and install the server yourself as described above.
+2. Install it: `code --install-extension asciidoc-lsp-<platform>.vsix`, or *Extensions: Install from VSIX...* in the command palette.
+
+The extension starts the server for `.adoc`, `.asciidoc`, `.asc` and `.ad` files. It picks the server in this order: the `asciidoc-lsp.server.path` setting, the bundled binary, `asciidoc-lsp` on `PATH`. The language status item of an AsciiDoc file shows the running server version. `AsciiDoc LSP: Restart Language Server` restarts it, and `asciidoc-lsp.trace.server` traces the protocol traffic.
+
+The extension ships no syntax highlighting; install an AsciiDoc grammar extension such as [asciidoctor-vscode](https://marketplace.visualstudio.com/items?itemName=asciidoctor.asciidoctor-vscode) for that. Its own completion, hover and symbol providers run next to this server, so expect duplicate suggestions while both are installed.
+
 ### Other editors
 
 Any editor with LSP support can use asciidoc-lsp: configure the client to run the `asciidoc-lsp` binary over stdio for `.adoc` files with language ID `asciidoc`.
