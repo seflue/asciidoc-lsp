@@ -189,7 +189,11 @@ fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 fn collect_block_regions(node: Node, source: &str, regions: &mut Vec<Region>) {
     match node.kind() {
         "document_attr" => {
-            regions.extend(child_of_kind(node, "line").map(Region::of));
+            regions.extend(
+                child_of_kind(node, "line")
+                    .filter(|value| entry_value_is_substituted(text(*value, source)))
+                    .map(Region::of),
+            );
             return;
         }
         "element_attr" => {
@@ -217,7 +221,7 @@ fn collect_block_regions(node: Node, source: &str, regions: &mut Vec<Region>) {
             let has_attributes = attrs
                 .subs
                 .as_deref()
-                .is_some_and(|subs| subs_has_attributes(subs, false));
+                .is_some_and(|subs| subs_has_attributes(subs, false, false));
             if has_attributes {
                 let body = if node.kind() == "ident_block" {
                     Some(node)
@@ -290,12 +294,40 @@ fn block_attrs(node: Node, source: &str) -> BlockAttrs {
     attrs
 }
 
+/// Whether the value of an attribute entry gets attribute substitution.
+/// Asciidoctor matches the whole value against
+/// `AttributeEntryPassMacroRx` (`\Apass:([a-z]+(?:,[a-z-]+)*)?\[(.*)\]\Z`):
+/// on a match the content gets only the macro's substitutions, otherwise the
+/// header substitutions apply, which include attributes.
+fn entry_value_is_substituted(value: &str) -> bool {
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix("pass:") else {
+        return true;
+    };
+    let Some((spec, _)) = rest.split_once('[') else {
+        return true;
+    };
+    if !value.ends_with(']') {
+        return true;
+    }
+    let mut tokens = spec.split(',');
+    let first_ok = tokens.next().is_some_and(|t| {
+        (spec.is_empty() || !t.is_empty()) && t.bytes().all(|b| b.is_ascii_lowercase())
+    });
+    let rest_ok =
+        tokens.all(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'));
+    if !(first_ok && rest_ok) {
+        return true;
+    }
+    subs_has_attributes(spec, false, true)
+}
+
 /// Whether the substitutions `subs` include attributes, starting from the
 /// block's default. `+x` / `x+` add, `-x` removes; plain names are
 /// collected as a union that replaces the default (Asciidoctor's
-/// `resolve_subs`). Only the full names count: block `subs` have no short
-/// forms.
-fn subs_has_attributes(subs: &str, default: bool) -> bool {
+/// `resolve_subs`). Block `subs` have no short forms; `short_forms` adds
+/// `a` and `n` for the subs of a pass macro.
+fn subs_has_attributes(subs: &str, default: bool, short_forms: bool) -> bool {
     let mut state: Option<bool> = None;
     for token in subs.split(',').map(str::trim) {
         let (name, change) = if let Some(name) = token.strip_prefix('+') {
@@ -307,7 +339,8 @@ fn subs_has_attributes(subs: &str, default: bool) -> bool {
         } else {
             (token, None)
         };
-        let carries = matches!(name, "attributes" | "normal");
+        let carries =
+            matches!(name, "attributes" | "normal") || (short_forms && matches!(name, "a" | "n"));
         match change {
             Some(true) => state = Some(state.unwrap_or(default) || carries),
             Some(false) => state = Some(state.unwrap_or(default) && !carries),
@@ -351,7 +384,7 @@ fn inline_text_is_substituted(root: Node, range: Range, source: &str) -> bool {
                 let has = attrs
                     .subs
                     .as_deref()
-                    .map_or(default, |subs| subs_has_attributes(subs, default));
+                    .map_or(default, |subs| subs_has_attributes(subs, default, false));
                 if !has {
                     return false;
                 }
@@ -804,6 +837,19 @@ mod tests {
     #[case::paragraph("A {x} b\n")]
     #[case::asciidoc_cell_paragraph("|===\na| Para {x}\n|===\n")]
     #[case::asciidoc_cell_list_item("|===\na|\n* item {x}\n|===\n")]
+    #[case::entry_pass_attributes_short(":p: pass:a[{x}]\n")]
+    #[case::entry_pass_normal_short(":p: pass:n[{x}]\n")]
+    #[case::entry_pass_attributes_long(":p: pass:attributes[{x}]\n")]
+    #[case::entry_pass_inside_value(":p: pre pass:[{x}] post\n")]
+    #[case::entry_pass_trailing_text(":p: pass:[{x}] trail\n")]
+    #[case::entry_pass_uppercase_spec(":p: pass:A[{x}]\n")]
+    #[case::entry_pass_empty_token(":p: pass:a,[{x}]\n")]
+    #[case::entry_pass_empty_first_token(":p: pass:,q[{x}]\n")]
+    #[case::entry_pass_minus_first_token(":p: pass:-a[{x}]\n")]
+    #[case::entry_pass_plus_first_token(":p: pass:+q[{x}]\n")]
+    #[case::entry_pass_plus_later_token(":p: pass:c,+a[{x}]\n")]
+    #[case::entry_pass_continued_trailing(":p: pass:[a] \\\n{x}\n")]
+    #[case::entry_pass_unclosed(":p: pass:[{x}\n")]
     fn reports_in_contexts(#[case] source: &str) {
         assert_eq!(names(source), ["x"], "{source:?}");
     }
@@ -873,6 +919,13 @@ mod tests {
     #[case::cell_line_comment_after_text("|===\na| t\n// c {x}\n|===\n")]
     #[case::cell_block_comment("|===\na|\n////\n{x}\n////\n|===\n")]
     #[case::cell_indented_literal("|===\na| t\n\n  ind {x}\n|===\n")]
+    #[case::entry_pass_macro(":p: pass:[{x}]\n")]
+    #[case::entry_pass_quotes(":p: pass:q[{x}]\n")]
+    #[case::entry_pass_removed(":p: pass:c,-a[{x}]\n")]
+    #[case::entry_pass_verbatim(":p: pass:v[{x}]\n")]
+    #[case::entry_pass_greedy(":p: pass:[a] {x} pass:[b]\n")]
+    #[case::entry_pass_continued(":p: pass:[{x} \\\nmore]\n")]
+    #[case::entry_pass_in_body("= T\n\n== S\n\n:p: pass:[{x}]\n")]
     fn quiet_contexts(#[case] source: &str) {
         assert_eq!(names(source), Vec::<String>::new(), "{source:?}");
     }
@@ -967,6 +1020,22 @@ mod tests {
     #[case("+quotes", true, true)]
     #[case("a", false, false)]
     fn subs_resolution(#[case] subs: &str, #[case] default: bool, #[case] expected: bool) {
-        assert_eq!(subs_has_attributes(subs, default), expected, "{subs:?}");
+        assert_eq!(
+            subs_has_attributes(subs, default, false),
+            expected,
+            "{subs:?}"
+        );
+    }
+
+    #[rstest]
+    #[case("a", true)]
+    #[case("n", true)]
+    #[case("q,a", true)]
+    #[case("a,-a", false)]
+    #[case("c,-a", false)]
+    #[case("q", false)]
+    #[case("", false)]
+    fn pass_macro_subs_resolution(#[case] subs: &str, #[case] expected: bool) {
+        assert_eq!(subs_has_attributes(subs, false, true), expected, "{subs:?}");
     }
 }
