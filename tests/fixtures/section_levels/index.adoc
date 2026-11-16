@@ -1,0 +1,19 @@
+= Section Levels
+
+include::chapters/clean.adoc[leveloffset=+1]
+
+include::chapters/skips.adoc[leveloffset=+1]
+
+:leveloffset: +1
+
+include::chapters/entry_offset.adoc[]
+
+:leveloffset: -1
+
+== Direct
+
+=== Direct Child
+
+===== Skipped Level
+
+Text.

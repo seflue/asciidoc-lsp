@@ -11,6 +11,16 @@ fn parse_offset(value: &str) -> i32 {
     value.trim().parse().unwrap_or(0)
 }
 
+/// The `leveloffset` after `value` is set while `current` is in force:
+/// `+n`/`-n` add to it, a bare number replaces it.
+pub(crate) fn next_leveloffset(current: i32, value: &str) -> i32 {
+    if value.starts_with(['+', '-']) {
+        current + parse_offset(value)
+    } else {
+        parse_offset(value)
+    }
+}
+
 /// The `leveloffset` in force at `line` of `doc`, from its attribute entries.
 /// `+n`/`-n` entries add to the current value, a bare number replaces it and
 /// an unset entry resets it.
@@ -19,8 +29,7 @@ fn leveloffset_at(doc: &DocumentModel, line: usize) -> i32 {
         .iter()
         .filter(|def| def.line < line)
         .fold(0, |offset, def| match def.name.as_str() {
-            "leveloffset" if def.value.starts_with(['+', '-']) => offset + parse_offset(&def.value),
-            "leveloffset" => parse_offset(&def.value),
+            "leveloffset" => next_leveloffset(offset, &def.value),
             "leveloffset!" | "!leveloffset" => 0,
             _ => offset,
         })
@@ -368,6 +377,7 @@ pub(crate) fn include_edges(
                 target,
                 line: inc.line,
                 attributes: inc.attributes.clone(),
+                placement: inc.placement,
             }
         })
         .collect()
@@ -422,6 +432,38 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn test_include_edges_keep_the_placement_of_the_macro() {
+        let macros = vec![
+            IncludeMacro {
+                path: "a.adoc".into(),
+                attributes: vec![],
+                line: 1,
+                target_col: 0,
+                placement: crate::types::Placement::Block,
+            },
+            IncludeMacro {
+                path: "b.adoc".into(),
+                attributes: vec![],
+                line: 2,
+                target_col: 0,
+                placement: crate::types::Placement::Body,
+            },
+        ];
+        let registry = AttributeRegistry::new(Path::new("/tmp"));
+        let edges = include_edges(Path::new("/tmp/x.adoc"), &macros, &registry);
+        assert_eq!(edges[0].placement, crate::types::Placement::Block);
+        assert_eq!(edges[1].placement, crate::types::Placement::Body);
+    }
+
+    #[test]
+    fn test_next_leveloffset_adds_relative_values_and_replaces_with_a_bare_number() {
+        assert_eq!(next_leveloffset(1, "+1"), 2);
+        assert_eq!(next_leveloffset(1, "-2"), -1);
+        assert_eq!(next_leveloffset(1, "3"), 3);
+        assert_eq!(next_leveloffset(1, ""), 0);
+    }
+
     // --- IncludeGraph unit tests ---
 
     #[test]
@@ -437,6 +479,7 @@ mod tests {
                 target: b.clone(),
                 line: 5,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         graph.add_edge(
@@ -445,6 +488,7 @@ mod tests {
                 target: c.clone(),
                 line: 10,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -466,6 +510,7 @@ mod tests {
                 target: b.clone(),
                 line: 5,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -762,6 +807,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         graph.add_edge(
@@ -770,6 +816,7 @@ mod tests {
                 target: a.clone(),
                 line: 5,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -793,6 +840,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         graph.add_edge(
@@ -801,6 +849,7 @@ mod tests {
                 target: c.clone(),
                 line: 5,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         graph.add_edge(
@@ -809,6 +858,7 @@ mod tests {
                 target: a.clone(),
                 line: 7,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -824,6 +874,7 @@ mod tests {
             target: target.to_path_buf(),
             line,
             attributes: vec![],
+            placement: crate::types::Placement::Body,
         }
     }
 
@@ -930,6 +981,7 @@ mod tests {
                 target: inline.clone(),
                 line: 9,
                 attributes: vec![("leveloffset".to_string(), "+1".to_string())],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -952,6 +1004,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
         graph.add_edge(
@@ -960,6 +1013,7 @@ mod tests {
                 target: c.clone(),
                 line: 5,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 
@@ -978,6 +1032,7 @@ mod tests {
                 target: a.clone(),
                 line: 2,
                 attributes: vec![],
+                placement: crate::types::Placement::Body,
             },
         );
 

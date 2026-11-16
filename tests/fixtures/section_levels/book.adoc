@@ -1,0 +1,12 @@
+= Book
+:doctype: book
+
+=== Before Any Chapter
+
+= Part
+
+=== Below Part
+
+== Chapter
+
+==== Skipped In Chapter

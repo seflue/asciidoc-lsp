@@ -34,6 +34,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
         | DiagnosticKind::DuplicateAnchor { .. }
         | DiagnosticKind::UndefinedAttribute { .. }
         | DiagnosticKind::CircularInclude { .. }
+        | DiagnosticKind::SectionOutOfSequence { .. }
         | DiagnosticKind::UnanchoredPdfPath { .. } => ls_types::DiagnosticSeverity::WARNING,
         DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::HINT,
     };
@@ -97,6 +98,30 @@ mod tests {
             result[0].severity,
             Some(ls_types::DiagnosticSeverity::ERROR)
         );
+    }
+
+    #[test]
+    fn test_convert_section_out_of_sequence_is_warning() {
+        let content = "= Title\n\n== A\n\n==== B\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 5,
+            span: None,
+            kind: DiagnosticKind::SectionOutOfSequence {
+                expected: vec![3],
+                got: 4,
+                documents: vec![],
+            },
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
+        );
+        assert_eq!(result[0].range.start.line, 4);
     }
 
     #[test]

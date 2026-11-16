@@ -1,6 +1,6 @@
 use crate::types::{
     Anchor, AttributeDef, AttributeRef, ConditionalDirective, ConditionalKind, ConditionalOperator,
-    IncludeMacro, Section, Span, Xref,
+    IncludeMacro, Placement, Section, Span, Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -309,6 +309,8 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
                 line: node.start_position().row + 1, // 1-based
                 id,
                 is_header,
+                style: section_style(node, source),
+                placement: placement(node),
             });
         }
     }
@@ -317,6 +319,69 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
     for child in node.children(&mut cursor) {
         walk_for_sections(child, source, results);
     }
+}
+
+/// Where `node` stands in the block tree: the first ancestor that is not
+/// part of the section structure decides. An `ERROR` is a part the grammar
+/// could not parse; any other (delimited block, table cell, list item) holds
+/// block content, where Asciidoctor reads no section.
+fn placement(node: tree_sitter::Node) -> Placement {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "section" | "section_block" | "block_element" | "document" => {
+                ancestor = parent.parent();
+            }
+            "ERROR" => return Placement::Unparsed,
+            _ => return Placement::Block,
+        }
+    }
+    Placement::Body
+}
+
+/// The block style (`[appendix]`, `[discrete]`) of an `element_attr`, if its
+/// first positional attribute has one.
+fn element_attr_style(attr: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = attr.walk();
+    let positional = attr
+        .children(&mut cursor)
+        .find(|c| c.kind() == "positional_attr")?;
+    find_child_text(positional, "block_style", source)
+}
+
+/// The block style of the attribute lines above a title; the last line that
+/// sets one wins. Above `titleN` the lines are children of the `section`;
+/// above a level-0 title they are `ERROR` siblings of its block.
+fn section_style(title: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let parent = title.parent()?;
+    let mut lines = Vec::new();
+    if parent.kind() == "section" {
+        let mut cursor = parent.walk();
+        for child in parent.children(&mut cursor) {
+            if child.id() == title.id() {
+                break;
+            }
+            if child.kind() == "element_attr" {
+                lines.push(child);
+            }
+        }
+    } else {
+        let mut prev = parent.prev_sibling();
+        while let Some(node) = prev.filter(|n| n.kind() == "ERROR") {
+            let mut cursor = node.walk();
+            let mut found: Vec<_> = node
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "element_attr")
+                .collect();
+            found.extend(lines);
+            lines = found;
+            prev = node.prev_sibling();
+        }
+    }
+    lines
+        .into_iter()
+        .filter_map(|attr| element_attr_style(attr, source))
+        .next_back()
 }
 
 /// Whether `id` is an ID Asciidoctor accepts for an inline anchor
@@ -478,6 +543,7 @@ fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<I
                 attributes,
                 line: node.start_position().row + 1,
                 target_col: target.map_or(0, |target| target.start_position().column),
+                placement: placement(node),
             });
         }
     }
@@ -956,6 +1022,89 @@ mod tests {
         let tree = parser::parse(&mut p, &source).unwrap();
         let sections = extract_sections(tree.root_node(), source.as_bytes());
         assert_eq!(sections[1].id.as_deref(), id, "{source:?}");
+    }
+
+    fn styles_of(source: &str) -> Vec<Option<String>> {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        extract_sections(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|s| s.style)
+            .collect()
+    }
+
+    /// Asciidoctor 2.0.26: the last style line above a title wins
+    /// (`[glossary]` then `[appendix]` is an appendix).
+    #[test]
+    fn test_section_style_is_the_block_style_of_its_attribute_lines() {
+        let source =
+            "= Doc\n\n[glossary#gid.role]\n== A\n\n[#id]\n== B\n\n[glossary]\n[appendix]\n== C\n";
+        assert_eq!(
+            styles_of(source),
+            [
+                None,
+                Some("glossary".to_string()),
+                None,
+                Some("appendix".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_discrete_heading_keeps_its_style() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Doc\n\n== A\n\n[discrete]\n===== D\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+        assert_eq!(sections[2].style.as_deref(), Some("discrete"));
+        assert_eq!(sections[2].placement, Placement::Body);
+    }
+
+    #[test]
+    fn test_level_0_title_takes_the_style_above_it() {
+        assert_eq!(
+            styles_of("[glossary]\n= Glossary\n"),
+            [Some("glossary".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_titles_inside_blocks_are_placed_in_block() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Doc\n\n====\n==== Ex\n====\n\n****\n===== Sb\n****\n\n--\n==== Op\n--\n\n|===\na|\n==== Cell\n|===\n\n== Real\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let placements: Vec<_> = extract_sections(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|s| (s.title, s.placement))
+            .collect();
+        let expected = [
+            ("Doc", Placement::Body),
+            ("Ex", Placement::Block),
+            ("Sb", Placement::Block),
+            ("Op", Placement::Block),
+            ("Cell", Placement::Block),
+            ("Real", Placement::Body),
+        ];
+        let expected: Vec<_> = expected.iter().map(|(t, p)| (t.to_string(), *p)).collect();
+        assert_eq!(placements, expected);
+    }
+
+    #[test]
+    fn test_include_inside_listing_and_example_block_is_placed_in_block() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Doc\n\n----\ninclude::a.adoc[]\n----\n\n====\ninclude::b.adoc[]\n====\n\ninclude::c.adoc[]\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let placements: Vec<_> = extract_includes(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|i| (i.path, i.placement))
+            .collect();
+        let expected = [
+            ("a.adoc", Placement::Block),
+            ("b.adoc", Placement::Block),
+            ("c.adoc", Placement::Body),
+        ];
+        let expected: Vec<_> = expected.iter().map(|(t, p)| (t.to_string(), *p)).collect();
+        assert_eq!(placements, expected);
     }
 
     #[test]

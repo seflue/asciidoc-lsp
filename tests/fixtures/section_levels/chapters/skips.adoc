@@ -1,0 +1,7 @@
+= Skipping Chapter
+
+== Skipping Section
+
+==== Skipped In Chapter
+
+Text.
