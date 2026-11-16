@@ -1,0 +1,13 @@
+:attribute-missing: warn
+
+= Anchor Macro
+
+A point anchor:plain[] in text and anchor:withtext[Some Text] too.
+
+See <<plain>> and <<withtext>> and <<nothere>>.
+
+Rejected by Asciidoctor: \anchor:esc[] and anchor:1digit[] and anchor:sp ace[] here.
+
+Twice anchor:dup[] and again anchor:dup[] here.
+
+See <<esc>> and <<1digit>> and <<sp ace>> and <<dup>>.

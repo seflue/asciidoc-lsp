@@ -316,6 +316,18 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
     }
 }
 
+/// Whether `id` is an ID Asciidoctor accepts for an inline anchor
+/// (`InlineAnchorRx`): a letter, `_` or `:`, then word characters, `-`, `:`
+/// or `.`.
+#[must_use]
+pub fn is_valid_anchor_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':')
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+}
+
 /// Split a title into its text and whether it ends in an inline `[[id]]` /
 /// `[[id,reftext]]` anchor, which gives the section that ID. As in
 /// Asciidoctor, that needs a space before `[[` and a valid ID. A valid anchor
@@ -330,12 +342,7 @@ fn split_trailing_anchor(title: &str) -> (&str, bool) {
     };
     let (head, inner) = (&rest[..open], &rest[open + 2..]);
     let (id, reftext) = inner.split_once(',').unwrap_or((inner, "x"));
-    let mut chars = id.chars();
-    let valid_id = chars
-        .next()
-        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':')
-        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'));
-    if valid_id && !reftext.trim().is_empty() && !head.ends_with('\\') {
+    if is_valid_anchor_id(id) && !reftext.trim().is_empty() && !head.ends_with('\\') {
         (head.trim_end(), head.ends_with(' '))
     } else {
         (title, false)
@@ -505,6 +512,21 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
                 line: node.start_position().row + 1,
             });
         }
+    }
+
+    // `anchor:id[]` / `anchor:id[reftext]` (inline tree) is the macro form.
+    if node.kind() == "inline_macro"
+        && find_child_text(node, "macro_name", source).as_deref() == Some("anchor")
+    {
+        let id = find_child_text(node, "target", source).unwrap_or_default();
+        if is_valid_anchor_id(&id) {
+            results.push(Anchor {
+                id,
+                reftext: find_child_text(node, "attr", source).filter(|s| !s.is_empty()),
+                line: node.start_position().row + 1,
+            });
+        }
+        return;
     }
 
     // Consecutive `[[id]]` / `[#id]` lines above one block form a run;
@@ -825,6 +847,30 @@ mod tests {
         assert!(!sections[1].explicit_id);
         assert!(sections[2].explicit_id);
         assert_eq!(sections[2].title, "Bar");
+    }
+
+    fn anchors_in(source: &str) -> Vec<Anchor> {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
+        let (_, anchors) = extract_inline_content_safe(&ranges, source);
+        anchors
+    }
+
+    #[test]
+    fn test_extract_inline_anchor_macro() {
+        let source = "A anchor:a1[] b anchor:a2[Some Text] c anchor:[] d \\anchor:esc[] e anchor:1d[] f anchor:sp ace[]\n";
+        let got: Vec<_> = anchors_in(source)
+            .into_iter()
+            .map(|a| (a.id, a.reftext))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a1".to_string(), None),
+                ("a2".to_string(), Some("Some Text".to_string()))
+            ]
+        );
     }
 
     #[test]
