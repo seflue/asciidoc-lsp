@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
-use asciidoc_core::extractors::find_child_text;
+use asciidoc_core::extractors::{element_attr_id, find_child_text};
 use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
@@ -1039,6 +1039,17 @@ fn classify_block_node(
                 });
             }
         }
+        // [#id] / [id=...] attribute list, only with the cursor on the ID
+        if n.kind() == "element_attr" {
+            if let Some((id, _)) = element_attr_id(n, source) {
+                if cursor_on_attr_id(node, source, &id) {
+                    return Some(NodeInfo {
+                        kind: NodeKind::Anchor { id },
+                        line: n.start_position().row + 1,
+                    });
+                }
+            }
+        }
         if n.kind() == "block_macro" {
             if let Some(macro_name) = find_child_text(n, "block_macro_name", source) {
                 if macro_name == "include" {
@@ -1064,6 +1075,29 @@ fn classify_block_node(
     }
 
     None
+}
+
+/// Whether `node`, a leaf inside an attribute list, is the `#id` shorthand
+/// or the value of `id=` and reads `id`.
+fn cursor_on_attr_id(node: tree_sitter::Node, source: &[u8], id: &str) -> bool {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        let is_id = match n.kind() {
+            "id" => true,
+            "attribute_value" => n.parent().is_some_and(|attr| {
+                find_child_text(attr, "attribute_name", source).as_deref() == Some("id")
+            }),
+            "element_attr" => return false,
+            _ => false,
+        };
+        if is_id {
+            return n
+                .utf8_text(source)
+                .is_ok_and(|text| text.trim_matches(['"', '\'']) == id);
+        }
+        current = n.parent();
+    }
+    false
 }
 
 /// Check if the node at the given point is inside an xref (`inline_macro` or
@@ -1478,15 +1512,53 @@ fn read_file_cached<'a>(
 // Column-finder helpers
 // ---------------------------------------------------------------------------
 
-/// Find the byte offsets of `id` inside `[[id]]` or `[[id,reftext]]` on a line.
+/// Find the byte offsets of `id` where a line defines it: `[[id]]` /
+/// `[[id,reftext]]`, the `#id` shorthand or `id=id` in an attribute list.
 /// Returns `(start, end)` byte offsets of the id (exclusive end).
 fn find_anchor_def_columns(line_text: &str, id: &str) -> Option<(usize, usize)> {
     let pattern = format!("[[{id}");
-    line_text.match_indices(&pattern).find_map(|(pos, _)| {
+    let anchor = line_text.match_indices(&pattern).find_map(|(pos, _)| {
         let end = pos + pattern.len();
         matches!(line_text[end..].chars().next(), Some(']' | ',')).then_some((pos + 2, end))
         // skip `[[`
-    })
+    });
+    if anchor.is_some() {
+        return anchor;
+    }
+    if !line_text.starts_with('[') {
+        return None;
+    }
+    let ends_id = |end: usize| {
+        matches!(
+            line_text.as_bytes().get(end),
+            Some(b'.' | b'%' | b'#' | b',' | b']')
+        )
+    };
+    let shorthand = format!("#{id}");
+    let mut from = 0;
+    while let Some(rel) = line_text[from..].find(&shorthand) {
+        let start = from + rel + 1;
+        if ends_id(start + id.len()) && !line_text[..start].contains('"') {
+            return Some((start, start + id.len()));
+        }
+        from = start;
+    }
+    for value in [format!("id={id}"), format!("id=\"{id}\"")] {
+        let mut from = 0;
+        while let Some(rel) = line_text[from..].find(&value) {
+            let pos = from + rel;
+            let quoted = value.ends_with('"');
+            let start = pos + 3 + usize::from(quoted);
+            let preceded = line_text[..pos].ends_with(['[', ',', ' ']);
+            let end = start + id.len();
+            let terminated = quoted || matches!(line_text.as_bytes().get(end), Some(b',' | b']'));
+            if preceded && terminated {
+                return Some((start, end));
+            }
+            from = pos + 1;
+        }
+    }
+    None
 }
 
 /// Find the byte offsets of `id` in an xref reference on a line.
@@ -4131,6 +4203,45 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     }
 
     // --- Column-finder helpers ---
+
+    #[rstest]
+    #[case::double_bracket_with_reftext("[[a,Ref]]", "a", Some((2, 3)))]
+    #[case::shorthand("[#sid]", "sid", Some((2, 5)))]
+    #[case::shorthand_with_role("[#sid.role]", "sid", Some((2, 5)))]
+    #[case::shorthand_after_style("[source#cid,rust]", "cid", Some((8, 11)))]
+    #[case::last_shorthand("[#a.r1#b]", "b", Some((7, 8)))]
+    #[case::named_id("[id=sid]", "sid", Some((4, 7)))]
+    #[case::quoted_named_id("[id=\"sid\"]", "sid", Some((5, 8)))]
+    #[case::named_id_after_style("[source,rust,id=cid]", "cid", Some((16, 19)))]
+    #[case::prefix_of_longer_id("[#sidx]", "sid", None)]
+    #[case::inside_reftext("[#a,reftext=\"#b\"]", "b", None)]
+    fn test_find_anchor_def_columns_attribute_lists(
+        #[case] line: &str,
+        #[case] id: &str,
+        #[case] expected: Option<(usize, usize)>,
+    ) {
+        assert_eq!(find_anchor_def_columns(line, id), expected);
+    }
+
+    #[rstest]
+    #[case::on_shorthand_id("[#sid]\n== S\n", 0, 3, Some("sid"))]
+    #[case::on_named_id_value("[id=sid]\n== S\n", 0, 5, Some("sid"))]
+    #[case::on_id_after_style("[source#cid,rust]\n----\nx\n----\n", 0, 9, Some("cid"))]
+    #[case::on_style_is_no_anchor("[source#cid,rust]\n----\nx\n----\n", 0, 2, None)]
+    #[case::on_other_value_is_no_anchor("[source#cid,rust]\n----\nx\n----\n", 0, 14, None)]
+    fn test_find_node_at_position_on_attribute_list_id(
+        #[case] content: &str,
+        #[case] line: u32,
+        #[case] col: u32,
+        #[case] expected: Option<&str>,
+    ) {
+        let info = find_node_at_position(content, Position::new(line, col));
+        let got = info.and_then(|i| match i.kind {
+            NodeKind::Anchor { id } => Some(id),
+            _ => None,
+        });
+        assert_eq!(got.as_deref(), expected);
+    }
 
     #[test]
     fn test_find_anchor_def_columns() {

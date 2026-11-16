@@ -2866,4 +2866,57 @@ mod tests {
         ws.remove_file(&index);
         assert!(ws.reference_index().lookup("_child_title").is_none());
     }
+
+    /// `[#id]` / `[id=...]` lines register block IDs, and only the last ID
+    /// above a block counts. Expected set from the Asciidoctor oracle
+    /// (`INFO: possible invalid reference`), committed fixture
+    /// `tests/fixtures/block_id_attrs`.
+    #[test]
+    fn test_fixture_block_ids_from_attribute_lists() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/block_id_attrs")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+
+        let ws = Workspace::build(&root, &index);
+
+        let mut broken: Vec<String> = ws
+            .diagnostics_for(&index)
+            .into_iter()
+            .filter_map(|d| match &d.kind {
+                crate::types::DiagnosticKind::BrokenXref { target } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        broken.sort();
+        assert_eq!(broken, ["b", "c", "e", "g", "i", "k", "x"]);
+    }
+
+    /// The adversarial fixture's `[#intro-audience]` above a section
+    /// resolves from another chapter (committed fixture
+    /// `tests/fixtures/adversarial_project`).
+    #[test]
+    fn test_fixture_section_id_from_attribute_list_resolves() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let setup = root.join("chapters/setup.adoc");
+
+        let ws = Workspace::build(&root, &index);
+
+        let broken = ws
+            .diagnostics_for(&setup)
+            .into_iter()
+            .filter(|d| {
+                matches!(&d.kind, crate::types::DiagnosticKind::BrokenXref { target } if target == "intro-audience")
+            })
+            .count();
+        assert_eq!(broken, 0);
+        let loc = ws.reference_index().lookup("intro-audience").unwrap();
+        assert!(loc.file.ends_with("chapters/intro.adoc"));
+        assert_eq!(loc.line, 9);
+    }
 }

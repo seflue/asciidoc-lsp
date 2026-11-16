@@ -1,0 +1,52 @@
+= Doc
+:attribute-missing: warn
+
+[#sec1]
+== Section one
+
+[#sec2.role]
+== Section two
+
+[id=sec3]
+== Section three
+
+[source#code1,rust]
+----
+fn main() {}
+----
+
+[source,rust,id=code2]
+----
+fn main() {}
+----
+
+[#a,id=b]
+Shorthand wins.
+
+[id=c,id=d]
+Last id wins.
+
+[#e.r1#f]
+Last hash wins.
+
+[source,#x]
+----
+no id
+----
+
+[#g]
+[#h]
+Two lines, only h.
+
+[[i]]
+[#j]
+Anchor then attr.
+
+[#k]
+[[l]]
+Attr then anchor.
+
+[#m,reftext="Ref M"]
+Reftext para.
+
+See <<sec1>> <<sec2>> <<sec3>> <<code1>> <<code2>> <<a>> <<b>> <<c>> <<d>> <<e>> <<f>> <<x>> <<g>> <<h>> <<i>> <<j>> <<k>> <<l>> <<m>>
