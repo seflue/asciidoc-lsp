@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::attributes::AttributeRegistry;
 use crate::graph::IncludeGraph;
@@ -8,8 +8,12 @@ use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
 
 /// Collect all diagnostics across the workspace, grouped by file.
+///
+/// Paths named inside messages are display paths, see `display_path`:
+/// relative to `root` where that is short, absolute otherwise.
 #[must_use]
 pub fn collect_diagnostics(
+    root: &Path,
     documents: &HashMap<PathBuf, DocumentModel>,
     graph: &IncludeGraph,
     ref_index: &ReferenceIndex,
@@ -68,7 +72,7 @@ pub fn collect_diagnostics(
                     span: None,
                     kind: DiagnosticKind::DuplicateAnchor {
                         id: id.clone(),
-                        first_file: first_loc.file.clone(),
+                        first_file: display_path(root, &first_loc.file),
                         first_line: first_loc.line,
                     },
                 });
@@ -110,17 +114,78 @@ pub fn collect_diagnostics(
             span: None,
             kind: DiagnosticKind::CircularInclude {
                 path: path_display.clone(),
-                cycle_through: target.clone(),
+                cycle_through: display_path(root, &target),
             },
         });
     }
 
     // 6. PDF theme and font paths
-    for diag in crate::pdf_theme::collect_pdf_diagnostics(documents, graph, registry) {
+    for mut diag in crate::pdf_theme::collect_pdf_diagnostics(documents, graph, registry) {
+        match &mut diag.kind {
+            DiagnosticKind::PdfPathNotFound { path, .. } => *path = pdf_display_path(root, path),
+            DiagnosticKind::PdfThemeYamlExtension { value } => {
+                *value = pdf_display_path(root, Path::new(value.as_str()))
+                    .display()
+                    .to_string();
+            }
+            _ => {}
+        }
         diags.entry(diag.file.clone()).or_default().push(diag);
     }
 
     diags
+}
+
+/// Most `..` steps a displayed relative path may need: covers a sibling
+/// folder (`../shared/x.adoc`) but not an unrecognisable long chain.
+const MAX_PARENT_STEPS: usize = 2;
+
+/// A file the scan reached (`DuplicateAnchor`, `CircularInclude`) as shown in
+/// a message. A relative path stays as it is. An absolute path is
+/// normalized lexically and shown relative to the workspace root when it is
+/// under the root or shares a folder with it and needs at most
+/// `MAX_PARENT_STEPS` `..` steps. Otherwise (outside the root, like
+/// `/opt/themes`) it stays absolute, independent of how long the shared
+/// ancestor is.
+fn display_path(root: &Path, path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let path = crate::paths::normalize_lexically(path);
+    let rel = crate::paths::relative_path(root, &path);
+    let parent_steps = rel
+        .components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count();
+    let shares_a_folder = root
+        .components()
+        .zip(path.components())
+        .take_while(|(a, b)| a == b)
+        .any(|(a, _)| matches!(a, std::path::Component::Normal(_)));
+    if shares_a_folder && parent_steps <= MAX_PARENT_STEPS {
+        rel
+    } else {
+        path
+    }
+}
+
+/// A PDF value as shown in a message: root-relative only when it lies under
+/// `root`, absolute otherwise, so a value the user wrote outside the root is
+/// never rewritten into a `..` form. A relative value stays as written.
+///
+/// Known gap: `root` is the canonical root. A document inside a
+/// non-canonical root that is a symlink to a target outside it has its
+/// `{docdir}` in the non-canonical form, so a path derived from it is not
+/// recognised as under the root and stays absolute.
+fn pdf_display_path(root: &Path, path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let path = crate::paths::normalize_lexically(path);
+    match path.strip_prefix(root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => path,
+    }
 }
 
 #[cfg(test)]
@@ -156,7 +221,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
         let flat = flatten(&diags);
 
         assert_eq!(flat.len(), 1);
@@ -181,7 +246,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
 
         let flat = flatten(&diags);
         assert!(flat
@@ -211,12 +276,111 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
 
         let flat = flatten(&diags);
         assert!(flat
             .iter()
             .any(|d| matches!(&d.kind, DiagnosticKind::DuplicateAnchor { id, .. } if id == "dup")));
+    }
+
+    /// A file sharing only `/` with the root keeps its absolute path: a
+    /// `../../..` chain would be longer and unrecognisable.
+    #[test]
+    fn test_duplicate_anchor_far_outside_root_keeps_absolute_path() {
+        let registry = make_registry();
+        let far = "/other-tree/note.adoc";
+        let mut documents = HashMap::new();
+        documents.insert(
+            PathBuf::from(far),
+            DocumentModel::test(far).with_anchors(vec![
+                Anchor {
+                    id: "dup".into(),
+                    reftext: None,
+                    line: 1,
+                },
+                Anchor {
+                    id: "dup".into(),
+                    reftext: None,
+                    line: 10,
+                },
+            ]),
+        );
+        let graph = IncludeGraph::new();
+        let ref_index = ReferenceIndex::build(&documents, &registry);
+        let diags = collect_diagnostics(
+            Path::new("/work/deep/root"),
+            &documents,
+            &graph,
+            &ref_index,
+            &registry,
+        );
+        let messages: Vec<String> = flatten(&diags).iter().map(|d| d.kind.to_string()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("first defined in /other-tree/note.adoc:1")),
+            "got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_display_path_rules() {
+        let root = Path::new("/work/proj");
+        assert_eq!(
+            display_path(root, Path::new("/work/proj/a/b.adoc")),
+            PathBuf::from("a/b.adoc")
+        );
+        assert_eq!(
+            display_path(root, Path::new("/work/shared/x.adoc")),
+            PathBuf::from("../shared/x.adoc")
+        );
+        assert_eq!(
+            display_path(root, Path::new("/opt/themes")),
+            PathBuf::from("/opt/themes")
+        );
+        assert_eq!(
+            display_path(root, Path::new("rel/x")),
+            PathBuf::from("rel/x")
+        );
+        // Shares a real ancestor with a deep root: a long `../` chain is
+        // unrecognisable, so the absolute path stays, however long the
+        // shared prefix makes it.
+        assert_eq!(
+            display_path(Path::new("/a/b/c/d/e/proj"), Path::new("/a/other.adoc")),
+            PathBuf::from("/a/other.adoc")
+        );
+        assert_eq!(
+            display_path(
+                Path::new("/very/long/shared/ancestor/path/d1/d2/d3/d4"),
+                Path::new("/very/long/shared/ancestor/path/x.adoc")
+            ),
+            PathBuf::from("/very/long/shared/ancestor/path/x.adoc")
+        );
+        // Three steps up exceeds MAX_PARENT_STEPS.
+        assert_eq!(
+            display_path(
+                Path::new("/work/proj/sub/deeper"),
+                Path::new("/work/x/y.adoc")
+            ),
+            PathBuf::from("/work/x/y.adoc")
+        );
+        // Two steps up is still shown relative.
+        assert_eq!(
+            display_path(Path::new("/work/proj/sub"), Path::new("/work/x/y.adoc")),
+            PathBuf::from("../../x/y.adoc")
+        );
+    }
+
+    #[test]
+    fn test_display_path_normalizes_inner_parent_segments() {
+        assert_eq!(
+            display_path(
+                Path::new("/work/proj"),
+                Path::new("/work/proj/a/../theme/x.yaml")
+            ),
+            PathBuf::from("theme/x.yaml")
+        );
     }
 
     #[test]
@@ -242,7 +406,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
 
         let flat = flatten(&diags);
         assert!(!flat
@@ -293,7 +457,7 @@ mod tests {
         );
 
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
         let flat = flatten(&diags);
 
         let circular: Vec<_> = flat
@@ -338,7 +502,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
         let flat = flatten(&diags);
 
         let broken_includes: Vec<_> = flat
@@ -399,7 +563,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
 
         // Diagnostics must cover multiple files — HashMap keys are the files
         assert!(
@@ -433,7 +597,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
         let flat = flatten(&diags);
 
         let cond_diags: Vec<_> = flat
@@ -464,7 +628,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
         let flat = flatten(&diags);
 
         let cond_diags: Vec<_> = flat
@@ -523,7 +687,7 @@ mod tests {
 
         let graph = IncludeGraph::new();
         let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(&documents, &graph, &ref_index, &registry);
+        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
         let flat = flatten(&diags);
 
         assert!(flat.is_empty(), "Expected no diagnostics, got: {:?}", flat);

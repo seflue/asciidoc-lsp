@@ -48,6 +48,8 @@ fn find_adoc_files(root: &Path) -> Vec<(PathBuf, PathBuf)> {
 
 pub struct Workspace {
     pub(crate) root: PathBuf,
+    /// `root` canonicalized once; document paths are canonical.
+    canonical_root: PathBuf,
     pub(crate) attributes: AttributeRegistry,
     pub(crate) include_graph: IncludeGraph,
     pub(crate) reference_index: ReferenceIndex,
@@ -121,6 +123,7 @@ impl Workspace {
         diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     ) -> Self {
         Self {
+            canonical_root: crate::paths::canonicalize_if_exists(root.clone()),
             root,
             attributes,
             include_graph,
@@ -137,6 +140,7 @@ impl Workspace {
     #[must_use]
     pub fn new(root: &Path) -> Self {
         Self {
+            canonical_root: crate::paths::canonicalize_if_exists(root.to_path_buf()),
             root: root.into(),
             attributes: AttributeRegistry::new(root),
             include_graph: IncludeGraph::new(),
@@ -497,6 +501,7 @@ impl Workspace {
         self.index_include_targets();
         self.refresh_doc_roots();
         self.diagnostics = collect_diagnostics(
+            &self.canonical_root,
             &self.documents,
             &self.include_graph,
             &self.reference_index,
@@ -627,13 +632,9 @@ impl Workspace {
     pub fn scan_workspace(&mut self) {
         let overrides = HashMap::new();
         let files = find_adoc_files(&self.root);
-        let canonical_root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
         let mut doc_dirs: HashMap<&Path, &Path> = HashMap::new();
         for (path, canonical) in &files {
-            let dir = if canonical.starts_with(&canonical_root) {
+            let dir = if canonical.starts_with(&self.canonical_root) {
                 canonical.parent()
             } else {
                 path.parent()
@@ -3314,5 +3315,100 @@ mod tests {
         ws.recalculate_diagnostics();
         assert_eq!(has_broken(&ws, &index), (true, true));
         assert_eq!(count_extra(&ws), 0);
+    }
+
+    /// Duplicate-anchor and circular-include messages, sorted.
+    fn path_bearing_messages(root: &Path) -> Vec<String> {
+        let mut ws = Workspace::new(root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let mut messages: Vec<String> = ws
+            .all_diagnostics()
+            .into_iter()
+            .map(|d| d.kind.to_string())
+            .filter(|m| m.starts_with("Duplicate anchor") || m.starts_with("Circular include"))
+            .collect();
+        messages.sort();
+        messages
+    }
+
+    /// Shared assertions: two root-relative messages, none containing a
+    /// `forbidden` absolute prefix.
+    fn assert_root_relative(messages: &[String], forbidden: &[&str]) {
+        assert_eq!(messages.len(), 2, "got: {messages:?}");
+        for m in messages {
+            for f in forbidden {
+                assert!(!m.contains(f), "absolute path in: {m}");
+            }
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("first defined in chapters/")),
+            "got: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("cycle through partials/")),
+            "got: {messages:?}"
+        );
+    }
+
+    /// Duplicate-anchor and circular-include messages name the other file
+    /// relative to the workspace root, never absolute (committed fixture
+    /// `tests/fixtures/diagnostic_paths`).
+    #[test]
+    fn test_fixture_diagnostic_messages_use_workspace_relative_paths() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/diagnostic_paths")
+            .canonicalize()
+            .unwrap();
+        let messages = path_bearing_messages(&root);
+
+        assert_root_relative(&messages, &[&root.display().to_string()]);
+    }
+
+    /// A root reached through a symlink or a `..` segment is not canonical,
+    /// while document paths are; messages must still be root-relative.
+    #[cfg(unix)]
+    #[test]
+    fn test_non_canonical_root_still_yields_relative_paths() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/diagnostic_paths")
+            .canonicalize()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&fixture, &link).unwrap();
+        let dotdot = fixture.join("../diagnostic_paths");
+
+        for root in [link, dotdot] {
+            let messages = path_bearing_messages(&root);
+            assert_root_relative(
+                &messages,
+                &[&fixture.display().to_string(), &root.display().to_string()],
+            );
+        }
+    }
+
+    /// A file outside the workspace root (reached via
+    /// `include::../shared/x.adoc[]`) is shown root-relative (`../shared/x.adoc`),
+    /// not with its absolute path (fixture `tests/fixtures/diagnostic_paths_outside`).
+    #[test]
+    fn test_outside_root_path_is_root_relative() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/diagnostic_paths_outside")
+            .canonicalize()
+            .unwrap();
+        let messages = path_bearing_messages(&base.join("root"));
+        let base_str = base.display().to_string();
+        assert!(
+            messages.iter().any(|m| m.contains("../shared/x.adoc")),
+            "expected ../shared/x.adoc, got: {messages:?}"
+        );
+        for m in &messages {
+            assert!(!m.contains(&base_str), "absolute path in: {m}");
+        }
     }
 }

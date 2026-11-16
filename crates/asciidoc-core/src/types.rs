@@ -124,21 +124,31 @@ pub enum DiagnosticKind {
     },
     DuplicateAnchor {
         id: String,
+        /// Display path, see `display_path` in diagnostics.rs: root-relative
+        /// under the root or up to two `..` steps away, absolute otherwise;
+        /// not an addressable location.
         first_file: PathBuf,
         first_line: usize,
     },
     CircularInclude {
         path: String,
+        /// Display path, see `display_path` in diagnostics.rs: root-relative
+        /// under the root or up to two `..` steps away, absolute otherwise;
+        /// not an addressable location.
         cycle_through: PathBuf,
     },
     /// `pdf-themesdir` / `pdf-fontsdir` directory or `pdf-theme` file
     /// that does not exist.
     PdfPathNotFound {
         attribute: String,
+        /// Display path (`pdf_display_path` in diagnostics.rs): root-relative
+        /// under the root, absolute otherwise; not an addressable location.
         path: PathBuf,
     },
     /// `pdf-theme` ending in `.yaml`: Asciidoctor PDF only loads `.yml`.
     PdfThemeYamlExtension {
+        /// Display path (`pdf_display_path` in diagnostics.rs): root-relative
+        /// under the root, absolute otherwise; not an addressable location.
         value: String,
     },
     /// `pdf-theme` name without `pdf-themesdir` that no bundled theme has.
