@@ -501,6 +501,7 @@ mod tests {
             target: "file.adoc#anchor".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
         let result = index
             .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry)
@@ -529,6 +530,7 @@ mod tests {
             target: "_my_section".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
         let result = index
             .resolve_xref(
@@ -554,6 +556,7 @@ mod tests {
             target: "nonexistent-id".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
         let result =
             index.resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry);
@@ -580,6 +583,7 @@ mod tests {
             target: "target.adoc".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
         let result = index
             .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry)
@@ -618,6 +622,7 @@ mod tests {
             target: "../b/doc.adoc#my-anchor".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
         let resolved = index
             .resolve_xref(&xref, &source, &graph, &documents, &registry)
@@ -655,6 +660,7 @@ mod tests {
             target: "{docdir}/sub/doc.adoc#x".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
         let resolved = index
             .resolve_xref(&xref, &source, &graph, &documents, &registry)
@@ -682,6 +688,7 @@ mod tests {
             target: "{edition}/doc.adoc#x".into(),
             display_text: None,
             line: 1,
+            span: None,
         };
 
         let resolved = index

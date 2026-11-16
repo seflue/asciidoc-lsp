@@ -27,6 +27,7 @@ pub fn collect_diagnostics(
                 diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: xref.line,
+                    span: xref.span,
                     kind: DiagnosticKind::BrokenXref {
                         target: xref.target.clone(),
                     },
@@ -46,6 +47,7 @@ pub fn collect_diagnostics(
                 diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: inc.line,
+                    span: None,
                     kind: DiagnosticKind::BrokenInclude {
                         path: inc.path.clone(),
                     },
@@ -63,6 +65,7 @@ pub fn collect_diagnostics(
                 .push(Diagnostic {
                     file: dup_loc.file.clone(),
                     line: dup_loc.line,
+                    span: None,
                     kind: DiagnosticKind::DuplicateAnchor {
                         id: id.clone(),
                         first_file: first_loc.file.clone(),
@@ -86,6 +89,7 @@ pub fn collect_diagnostics(
         diags.entry(source.clone()).or_default().push(Diagnostic {
             file: source.clone(),
             line,
+            span: None,
             kind: DiagnosticKind::CircularInclude {
                 path: path_display.clone(),
                 cycle_through: target.clone(),
@@ -127,6 +131,7 @@ mod tests {
                 target: "nonexistent".into(),
                 display_text: None,
                 line: 5,
+                span: None,
             }]),
         );
 
@@ -356,6 +361,7 @@ mod tests {
                 target: "nonexistent-target".into(),
                 display_text: None,
                 line: 2,
+                span: None,
             }]),
         );
 
@@ -486,6 +492,7 @@ mod tests {
                 target: "valid-anchor".into(),
                 display_text: None,
                 line: 2,
+                span: None,
             }]),
         );
 

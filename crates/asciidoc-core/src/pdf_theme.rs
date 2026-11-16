@@ -319,6 +319,7 @@ pub fn collect_pdf_diagnostics(
                     diags.push(Diagnostic {
                         file: entry.file.to_path_buf(),
                         line: entry.line,
+                        span: None,
                         kind,
                     });
                 }

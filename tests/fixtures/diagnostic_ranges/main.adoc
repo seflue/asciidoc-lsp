@@ -1,0 +1,5 @@
+= Diagnostic Ranges
+
+Ünï <<gone-a>> and xref:gone-b.adoc[B] and <<gone-c,C>> end.
+
+include::gone-include.adoc[]

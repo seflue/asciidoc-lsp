@@ -13,13 +13,13 @@ pub fn convert_diagnostics(diags: &[CoreDiagnostic], content: &str) -> Vec<ls_ty
 }
 
 fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
-    let start = positions::to_lsp_position(diag.line, 0, content);
-
     let line_text = content
         .lines()
         .nth(diag.line.saturating_sub(1))
         .unwrap_or_default();
-    let end = positions::to_lsp_position(diag.line, line_text.len(), content);
+    let (start_col, end_col) = diag.span.unwrap_or((0, line_text.len()));
+    let start = positions::to_lsp_position(diag.line, start_col, content);
+    let end = positions::to_lsp_position(diag.line, end_col, content);
 
     let severity = match &diag.kind {
         DiagnosticKind::BrokenInclude { .. }
@@ -56,6 +56,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
+            span: None,
             kind: DiagnosticKind::BrokenXref {
                 target: "missing".into(),
             },
@@ -78,6 +79,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
+            span: None,
             kind: DiagnosticKind::BrokenInclude {
                 path: "missing.adoc".into(),
             },
@@ -98,6 +100,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 1,
+            span: None,
             kind: DiagnosticKind::DuplicateAnchor {
                 id: "dup".into(),
                 first_file: PathBuf::from("/other.adoc"),
@@ -120,6 +123,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
+            span: None,
             kind: DiagnosticKind::UndefinedAttribute {
                 name: "undefined".into(),
             },
@@ -140,6 +144,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
+            span: None,
             kind: DiagnosticKind::CircularInclude {
                 path: "b.adoc".into(),
                 cycle_through: PathBuf::from("/b.adoc"),
@@ -161,6 +166,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
+            span: None,
             kind: DiagnosticKind::UndefinedConditionalAttr {
                 name: "missing".into(),
                 directive: "ifdef".into(),
@@ -208,6 +214,7 @@ mod tests {
             let diags = vec![CoreDiagnostic {
                 file: PathBuf::from("/test.adoc"),
                 line: 1,
+                span: None,
                 kind: kind.clone(),
             }];
             let result = convert_diagnostics(&diags, content);
@@ -231,6 +238,7 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
+            span: None,
             kind: DiagnosticKind::BrokenXref {
                 target: "missing".into(),
             },
@@ -252,11 +260,13 @@ mod tests {
             CoreDiagnostic {
                 file: PathBuf::from("/test.adoc"),
                 line: 3,
+                span: None,
                 kind: DiagnosticKind::BrokenXref { target: "a".into() },
             },
             CoreDiagnostic {
                 file: PathBuf::from("/test.adoc"),
                 line: 5,
+                span: None,
                 kind: DiagnosticKind::BrokenXref { target: "b".into() },
             },
         ];
@@ -266,5 +276,46 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].range.start.line, 2);
         assert_eq!(result[1].range.start.line, 4);
+    }
+
+    /// Text covered by a single-line LSP range (UTF-16 columns).
+    fn range_text(content: &str, range: ls_types::Range) -> String {
+        assert_eq!(range.start.line, range.end.line);
+        let line = content.lines().nth(range.start.line as usize).unwrap();
+        let units: Vec<u16> = line.encode_utf16().collect();
+        String::from_utf16(&units[range.start.character as usize..range.end.character as usize])
+            .unwrap()
+    }
+
+    /// Three broken xrefs on one line (after a multibyte prefix) and a broken
+    /// include: every diagnostic underlines exactly its own macro, ranges are
+    /// disjoint (committed fixture `tests/fixtures/diagnostic_ranges`).
+    #[test]
+    fn test_fixture_broken_refs_underline_only_themselves() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/diagnostic_ranges")
+            .canonicalize()
+            .unwrap();
+        let main = root.join("main.adoc");
+        let content = std::fs::read_to_string(&main).unwrap();
+        let ws = asciidoc_core::workspace::Workspace::build(&root, &main);
+
+        let result = convert_diagnostics(ws.diagnostics_for(&main), &content);
+
+        let mut texts: Vec<(u32, String)> = result
+            .iter()
+            .map(|d| (d.range.start.character, range_text(&content, d.range)))
+            .collect();
+        texts.sort();
+        let texts: Vec<String> = texts.into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "include::gone-include.adoc[]",
+                "<<gone-a>>",
+                "xref:gone-b.adoc[B]",
+                "<<gone-c,C>>",
+            ]
+        );
     }
 }
