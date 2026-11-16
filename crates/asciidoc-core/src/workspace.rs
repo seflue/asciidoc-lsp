@@ -2893,6 +2893,46 @@ mod tests {
         assert_eq!(broken, ["b", "c", "e", "g", "i", "k", "x"]);
     }
 
+    /// `anchor:id[]` / `anchor:id[reftext]` register inline anchors. Expected
+    /// set from the Asciidoctor oracle (`INFO: possible invalid reference`
+    /// for nothere, esc, 1digit, `sp ace`; `WARNING: id assigned to anchor
+    /// already in use: dup`), committed fixture
+    /// `tests/fixtures/inline_anchor_macro`.
+    #[test]
+    fn test_fixture_anchor_macro_registers_inline_anchor() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/inline_anchor_macro")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+
+        let ws = Workspace::build(&root, &index);
+
+        let mut broken: Vec<String> = ws
+            .diagnostics_for(&index)
+            .into_iter()
+            .filter_map(|d| match &d.kind {
+                crate::types::DiagnosticKind::BrokenXref { target } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        broken.sort();
+        assert_eq!(broken, ["1digit", "esc", "nothere", "sp ace"]);
+        let duplicates = ws
+            .diagnostics_for(&index)
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    &d.kind,
+                    crate::types::DiagnosticKind::DuplicateAnchor { .. }
+                )
+            })
+            .count();
+        assert_eq!(duplicates, 1);
+        assert_eq!(ws.reference_index().lookup("plain").unwrap().line, 5);
+        assert_eq!(ws.reference_index().lookup("withtext").unwrap().line, 5);
+    }
+
     /// The adversarial fixture's `[#intro-audience]` above a section
     /// resolves from another chapter (committed fixture
     /// `tests/fixtures/adversarial_project`).

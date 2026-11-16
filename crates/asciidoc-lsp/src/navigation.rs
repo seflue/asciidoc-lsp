@@ -1121,6 +1121,15 @@ fn classify_inline_node(
                         line: n.start_position().row + 1,
                     });
                 }
+                if macro_name == "anchor" {
+                    let id = find_child_text(n, "target", source).unwrap_or_default();
+                    if asciidoc_core::extractors::is_valid_anchor_id(&id) {
+                        return Some(NodeInfo {
+                            kind: NodeKind::Anchor { id },
+                            line: n.start_position().row + 1,
+                        });
+                    }
+                }
                 if macro_name == "image" {
                     let path = find_child_text(n, "target", source).unwrap_or_default();
                     return Some(NodeInfo {
@@ -1513,7 +1522,7 @@ fn read_file_cached<'a>(
 // ---------------------------------------------------------------------------
 
 /// Find the byte offsets of `id` where a line defines it: `[[id]]` /
-/// `[[id,reftext]]`, the `#id` shorthand or `id=id` in an attribute list.
+/// `[[id,reftext]]`, `anchor:id[...]`, the `#id` shorthand or `id=id` in an attribute list.
 /// Returns `(start, end)` byte offsets of the id (exclusive end).
 fn find_anchor_def_columns(line_text: &str, id: &str) -> Option<(usize, usize)> {
     let pattern = format!("[[{id}");
@@ -1524,6 +1533,10 @@ fn find_anchor_def_columns(line_text: &str, id: &str) -> Option<(usize, usize)> 
     });
     if anchor.is_some() {
         return anchor;
+    }
+    if let Some(pos) = line_text.find(&format!("anchor:{id}[")) {
+        let start = pos + "anchor:".len();
+        return Some((start, start + id.len()));
     }
     if !line_text.starts_with('[') {
         return None;
@@ -4243,6 +4256,37 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(got.as_deref(), expected);
     }
 
+    #[rstest]
+    #[case::empty_reftext("A anchor:aid[] b", "aid", Some((9, 12)))]
+    #[case::with_reftext("A anchor:aid[Some Text] b", "aid", Some((9, 12)))]
+    #[case::prefix_of_longer_id("anchor:aidx[]", "aid", None)]
+    fn test_find_anchor_def_columns_anchor_macro(
+        #[case] line: &str,
+        #[case] id: &str,
+        #[case] expected: Option<(usize, usize)>,
+    ) {
+        assert_eq!(find_anchor_def_columns(line, id), expected);
+    }
+
+    #[rstest]
+    #[case::on_id("A anchor:aid[] b\n", 0, 10, Some("aid"))]
+    #[case::on_id_with_reftext("A anchor:aid[Text] b\n", 0, 10, Some("aid"))]
+    #[case::empty_target("A anchor:[] b\n", 0, 4, None)]
+    #[case::invalid_target("A anchor:1d[] b\n", 0, 4, None)]
+    fn test_find_node_at_position_on_anchor_macro(
+        #[case] content: &str,
+        #[case] line: u32,
+        #[case] col: u32,
+        #[case] expected: Option<&str>,
+    ) {
+        let info = find_node_at_position(content, Position::new(line, col));
+        let got = info.and_then(|i| match i.kind {
+            NodeKind::Anchor { id } => Some(id),
+            _ => None,
+        });
+        assert_eq!(got.as_deref(), expected);
+    }
+
     #[test]
     fn test_find_anchor_def_columns() {
         assert_eq!(
@@ -4729,6 +4773,65 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
                 "edit should cover exactly the anchor id, line {line}"
             );
         }
+    }
+
+    const ANCHOR_MACRO_FIXTURE: &str = "../../tests/fixtures/inline_anchor_macro";
+
+    #[test]
+    fn test_resolve_rename_from_xref_edits_anchor_macro_definition() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(ANCHOR_MACRO_FIXTURE)
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let ws = Workspace::build(&root, &index);
+        let content = fs::read_to_string(&index).unwrap();
+        let line = content
+            .lines()
+            .position(|l| l.starts_with("See <<plain>>"))
+            .unwrap() as u32;
+        let character = content
+            .lines()
+            .nth(line as usize)
+            .unwrap()
+            .find("withtext")
+            .unwrap() as u32
+            + 2;
+
+        let edits = resolve_rename(
+            &content,
+            Position { line, character },
+            &index,
+            Some(&ws),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let file_edits = edits.get(&index).unwrap();
+        assert_eq!(file_edits.len(), 2);
+        for (l, start, end) in file_edits {
+            let text = content.lines().nth(*l - 1).unwrap();
+            assert_eq!(&text[*start..*end], "withtext", "line {l}");
+        }
+        assert!(file_edits.iter().any(|(l, _, _)| *l == 5));
+    }
+
+    #[test]
+    fn test_goto_definition_from_xref_lands_on_anchor_macro() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(ANCHOR_MACRO_FIXTURE)
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let ws = Workspace::build(&root, &index);
+        let content = fs::read_to_string(&index).unwrap();
+        let line = content
+            .lines()
+            .position(|l| l.starts_with("See <<plain>>"))
+            .unwrap() as u32;
+
+        let defs =
+            resolve_goto_definitions(&content, Position { line, character: 8 }, &index, Some(&ws));
+        assert_eq!(defs, [(index, 5)]);
     }
 
     #[test]
