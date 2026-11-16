@@ -216,8 +216,7 @@ impl Workspace {
     #[must_use]
     pub fn scopes_at(&self, file: &Path, line: usize) -> Vec<AttributeScope<'_>> {
         let file = self.indexed_path(file);
-        self.top_level_documents_of(&file)
-            .unwrap_or_else(|| vec![file.clone()])
+        self.top_level_documents_or_self(&file)
             .into_iter()
             .map(|root| self.scope(root, &file, line, false))
             .collect()
@@ -295,6 +294,13 @@ impl Workspace {
         } else {
             file.canonicalize().unwrap_or_else(|_| file.to_path_buf())
         }
+    }
+
+    /// The top-level documents that reach the indexed `file`, in path order;
+    /// `file` itself when no document includes it.
+    pub(crate) fn top_level_documents_or_self(&self, file: &Path) -> Vec<PathBuf> {
+        self.top_level_documents_of(file)
+            .unwrap_or_else(|| vec![file.to_path_buf()])
     }
 
     /// The top-level documents that include `file`; `None` when there are

@@ -1,0 +1,5 @@
+= Doc
+
+include::tagged.adoc[tag=a]
+
+include::tagged.adoc[tag=b]

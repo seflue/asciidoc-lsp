@@ -1,3 +1,4 @@
+pub mod anchor_scope;
 pub mod attributes;
 pub mod diagnostics;
 pub mod error;

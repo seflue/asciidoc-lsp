@@ -1,0 +1,8 @@
+= Doc
+
+include::region_outside_snip.adoc[tag=t]
+
+[[x]]
+Main.
+
+== Intro

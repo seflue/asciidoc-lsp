@@ -1,0 +1,7 @@
+= Doc
+
+include::tagged.adoc[tag=a]
+
+include::dup_z.adoc[]
+
+include::dup_z.adoc[]

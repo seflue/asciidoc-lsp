@@ -1,0 +1,9 @@
+// tag::a[]
+[[in-a]]
+Text a.
+
+== In A
+// end::a[]
+// tag::b[]
+Text b.
+// end::b[]

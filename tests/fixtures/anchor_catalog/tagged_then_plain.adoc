@@ -1,0 +1,5 @@
+= Doc
+
+include::part.adoc[tag=a]
+
+include::part.adoc[]

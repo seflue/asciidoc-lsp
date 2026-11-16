@@ -1,0 +1,8 @@
+= Doc
+:idseparator: -
+
+== Foo Bar
+
+== Foo Bar
+
+<<_foo-bar-2>> <<_foo_bar_2>>
