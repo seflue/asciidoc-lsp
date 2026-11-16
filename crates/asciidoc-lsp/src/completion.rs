@@ -230,7 +230,9 @@ pub(crate) struct TrailingBrackets {
 
 /// The target typed so far (path or anchor) on the cursor line: from the
 /// column right after the macro marker (`xref:`, `<<`, `#`, `include::`,
-/// `image:`) up to the cursor, in UTF-16 columns.
+/// `image:`) up to the cursor, in UTF-16 columns. `end_col` is where the
+/// token ends: the cursor, or further right when the cursor sits inside it
+/// (`{pr|o}`, `<<|ref-o>>`).
 ///
 /// Every item of a target context carries a `TextEdit` over this span.
 /// Without one, clients guess where the typed word starts by their own
@@ -241,6 +243,7 @@ pub(crate) struct TargetSpan {
     pub line: u32,
     pub start_col: u32,
     pub cursor_col: u32,
+    pub end_col: u32,
 }
 
 impl TargetSpan {
@@ -309,8 +312,14 @@ pub(crate) enum CompletionContext {
     IncludePath { prefix: String, span: TargetSpan },
     /// `image::prefix` — image path completion
     ImagePath { prefix: String, span: TargetSpan },
-    /// `{prefix` — attribute reference (open brace, not yet closed)
-    Attribute { prefix: String },
+    /// `{prefix` — attribute reference; `}` may already follow the cursor.
+    /// `span` covers the whole name, including the part after the cursor.
+    Attribute {
+        prefix: String,
+        span: TargetSpan,
+        /// `}` to append, or `""` when one already follows the cursor.
+        closing: &'static str,
+    },
     /// `ima` at line start — block macro completion
     BlockMacro { prefix: String },
     /// `NO` at line start — admonition completion
@@ -326,6 +335,26 @@ pub(crate) enum CompletionContext {
     },
     /// `kbd:` — inline macro completion (after known macro name + `:`)
     InlineMacro { macro_name: String },
+}
+
+/// `">>"` to append to a shorthand xref, or `""` when a `>>` already follows
+/// the cursor. The text may continue on the next lines of the paragraph
+/// (`<<id,the` newline `text>>`); a later `<<` or a blank line ends the search.
+fn shorthand_closing(content: &str, line: u32, after_cursor: &str) -> &'static str {
+    let mut rest = after_cursor.to_string();
+    for next in content.lines().skip(line as usize + 1) {
+        if next.trim().is_empty() {
+            break;
+        }
+        rest.push('\n');
+        rest.push_str(next);
+    }
+    let own_xref = rest.find("<<").map_or(&rest[..], |i| &rest[..i]);
+    if own_xref.contains(">>") {
+        ""
+    } else {
+        ">>"
+    }
 }
 
 /// Detect the completion context at the given cursor position by scanning
@@ -350,12 +379,18 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     } else {
         "[]"
     };
-    let xref_short_close = if after_cursor.starts_with(">>") {
-        ""
-    } else {
-        ">>"
+    // The rest of the attribute name after the cursor (`{pr|o}`) counts too.
+    let after_name =
+        after_cursor.trim_start_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_');
+    let utf16_len = |text: &str| -> u32 {
+        // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = text.encode_utf16().count() as u32;
+        len
     };
-
+    let attr_end_col =
+        pos.character + utf16_len(&after_cursor[..after_cursor.len() - after_name.len()]);
+    let attr_close = if after_name.starts_with('}') { "" } else { "}" };
     // Detect an existing `[…]` block right after the cursor and compute UTF-16
     // columns so resolvers can emit a TextEdit that overwrites the existing
     // label and selects a fresh `${1:label}` placeholder. Only meaningful for
@@ -373,15 +408,16 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         });
 
     // The target typed so far starts at byte `start` of the line.
-    let span_from = |start: usize| {
-        // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX.
-        #[allow(clippy::cast_possible_truncation)]
-        let start_col = line_str[..start].encode_utf16().count() as u32;
-        TargetSpan {
-            line: pos.line,
-            start_col,
-            cursor_col: pos.character,
-        }
+    let span_from = |start: usize| TargetSpan {
+        line: pos.line,
+        start_col: utf16_len(&line_str[..start]),
+        cursor_col: pos.character,
+        end_col: pos.character,
+    };
+    // The same, for an attribute name: it extends to the end of the name.
+    let attr_span_from = |start: usize| TargetSpan {
+        end_col: attr_end_col,
+        ..span_from(start)
     };
 
     // Priority 1a: include:: (longest trigger)
@@ -396,6 +432,8 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
             if !after_brace.contains('}') {
                 return Some(CompletionContext::Attribute {
                     prefix: after_brace.to_string(),
+                    span: attr_span_from(prefix_start + brace_pos + 1),
+                    closing: attr_close,
                 });
             }
         }
@@ -416,6 +454,8 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                 if !after_brace.contains('}') {
                     return Some(CompletionContext::Attribute {
                         prefix: after_brace.to_string(),
+                        span: attr_span_from(prefix_start + brace_pos + 1),
+                        closing: attr_close,
                     });
                 }
             }
@@ -440,6 +480,8 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                     if !after_brace.contains('}') {
                         return Some(CompletionContext::Attribute {
                             prefix: after_brace.to_string(),
+                            span: attr_span_from(prefix_start + brace_pos + 1),
+                            closing: attr_close,
                         });
                     }
                 }
@@ -465,6 +507,8 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                 if !after_brace.contains('}') {
                     return Some(CompletionContext::Attribute {
                         prefix: after_brace.to_string(),
+                        span: attr_span_from(prefix_start + brace_pos + 1),
+                        closing: attr_close,
                     });
                 }
             }
@@ -493,13 +537,23 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         let prefix = &before_cursor[prefix_start..];
         // If >> appears after <<, the xref is closed — no completion
         if !prefix.contains(">>") {
+            let xref_short_close = shorthand_closing(content, pos.line, after_cursor);
+            // The anchor token continues after the cursor up to `>>`, `,` or
+            // whitespace (`<<|ref-o>>`); accepting a completion replaces it.
+            let token_len = after_cursor
+                .find(|c: char| c == '>' || c == '<' || c == ',' || c.is_whitespace())
+                .unwrap_or(after_cursor.len());
+            let short_span_from = |start: usize| TargetSpan {
+                end_col: pos.character + utf16_len(&after_cursor[..token_len]),
+                ..span_from(start)
+            };
             // Cross-file anchor form `<<file.adoc#anchor>>`
             if let Some(hash_pos) = prefix.find('#') {
                 return Some(CompletionContext::XrefCrossAnchor {
                     file: prefix[..hash_pos].to_string(),
                     anchor_prefix: prefix[hash_pos + 1..].to_string(),
                     closing: xref_short_close,
-                    span: span_from(prefix_start + hash_pos + 1),
+                    span: short_span_from(prefix_start + hash_pos + 1),
                     // Shorthand uses `>>` not `[]`, so trailing-bracket logic
                     // doesn't apply; existing tests assume None.
                     trailing: None,
@@ -508,7 +562,7 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
             return Some(CompletionContext::XrefAnchor {
                 prefix: prefix.to_string(),
                 closing: xref_short_close,
-                span: span_from(prefix_start),
+                span: short_span_from(prefix_start),
                 trailing: None,
             });
         }
@@ -522,6 +576,8 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         if !prefix.contains('}') && !prefix.contains(' ') {
             return Some(CompletionContext::Attribute {
                 prefix: prefix.to_string(),
+                span: attr_span_from(prefix_start),
+                closing: attr_close,
             });
         }
     }
@@ -803,7 +859,7 @@ fn anchor_completion_item(
             format!("{id}[${{1:label}}]"),
             Some(InsertTextFormat::SNIPPET),
         ),
-        None => (span.range(), format!("{id}{closing}"), None),
+        None => (span.range_to(span.end_col), format!("{id}{closing}"), None),
     };
 
     CompletionItem {
@@ -1038,12 +1094,16 @@ pub(crate) fn resolve_image_completions(
 /// - `label`: attribute name
 /// - `kind`: Variable
 /// - `detail`: resolved attribute value
-/// - `insert_text`: `attr_name}` (appends closing `}`)
+/// - `text_edit`: replaces the name typed so far (`span`, including the part
+///   after the cursor) with `attr_name` plus `closing` (`}` unless one already
+///   follows the cursor)
 pub(crate) fn resolve_attribute_completions(
     prefix: &str,
     doc_path: &Path,
     line: usize,
     ws: Option<&Workspace>,
+    closing: &str,
+    span: TargetSpan,
 ) -> Vec<CompletionItem> {
     let Some(ws) = ws else {
         return Vec::new();
@@ -1077,7 +1137,10 @@ pub(crate) fn resolve_attribute_completions(
                     .join(", ")
             };
             CompletionItem {
-                insert_text: Some(format!("{name}}}")),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: span.range_to(span.end_col),
+                    new_text: format!("{name}{closing}"),
+                })),
                 label: name,
                 kind: Some(CompletionItemKind::VARIABLE),
                 detail: Some(detail),
@@ -1242,9 +1305,11 @@ pub(crate) fn resolve_completions(
         CompletionContext::ImagePath { prefix, span } => {
             resolve_image_completions(&prefix, doc_path, line, ws, span)
         }
-        CompletionContext::Attribute { prefix } => {
-            resolve_attribute_completions(&prefix, doc_path, line, ws)
-        }
+        CompletionContext::Attribute {
+            prefix,
+            span,
+            closing,
+        } => resolve_attribute_completions(&prefix, doc_path, line, ws, closing, span),
         CompletionContext::BlockMacro { prefix } => resolve_block_macro_completions(&prefix),
         CompletionContext::Admonition { prefix } => resolve_admonition_completions(&prefix),
         CompletionContext::DocumentAttribute { prefix } => {
@@ -1273,13 +1338,20 @@ mod tests {
         line: 0,
         start_col: 0,
         cursor_col: 0,
+        end_col: 0,
     };
 
     fn span(start_col: u32, cursor_col: u32) -> TargetSpan {
+        span_to(start_col, cursor_col, cursor_col)
+    }
+
+    /// A span whose token runs on past the cursor, to `end_col`.
+    fn span_to(start_col: u32, cursor_col: u32, end_col: u32) -> TargetSpan {
         TargetSpan {
             line: 0,
             start_col,
             cursor_col,
+            end_col,
         }
     }
 
@@ -1306,17 +1378,17 @@ mod tests {
     #[case("include path", "include::chap", 0, 13,
         CompletionContext::IncludePath { prefix: "chap".into(), span: span(9, 13) })]
     #[case("attribute", "The {img", 0, 8,
-        CompletionContext::Attribute { prefix: "img".into() })]
+        CompletionContext::Attribute { prefix: "img".into(), span: span(5, 8), closing: "}" })]
     #[case("xref empty prefix", "See <<", 0, 6,
         CompletionContext::XrefAnchor { prefix: "".into(), closing: ">>", span: span(6, 6), trailing: None })]
     #[case("xref multiline", "= Title\n\nSee <<my-id", 2, 11,
-        CompletionContext::XrefAnchor { prefix: "my-id".into(), closing: ">>", span: TargetSpan { line: 2, start_col: 6, cursor_col: 11 }, trailing: None })]
+        CompletionContext::XrefAnchor { prefix: "my-id".into(), closing: ">>", span: TargetSpan { line: 2, start_col: 6, cursor_col: 11, end_col: 11 }, trailing: None })]
     #[case("xref with umlaut", "Über <<anch", 0, 11,
         CompletionContext::XrefAnchor { prefix: "anch".into(), closing: ">>", span: span(7, 11), trailing: None })]
     #[case("xref shorthand cross-file", "See <<other.adoc#sec", 0, 20,
         CompletionContext::XrefCrossAnchor { file: "other.adoc".into(), anchor_prefix: "sec".into(), closing: ">>", span: span(17, 20), trailing: None })]
     #[case("attribute with CJK", "中{attr", 0, 6,
-        CompletionContext::Attribute { prefix: "attr".into() })]
+        CompletionContext::Attribute { prefix: "attr".into(), span: span(2, 6), closing: "}" })]
     #[case("inline macro prefix after multibyte", ":imagesdir: Ükbd", 0, 16,
         CompletionContext::InlineMacroPrefix { prefix: "kbd".into(), line: 0, word_start_col: 13, cursor_col: 16 })]
     #[case("inline macro after multibyte", "Ü kbd:", 0, 6,
@@ -1324,13 +1396,13 @@ mod tests {
     #[case("include priority over attribute", "include::{docdir}/chap", 0, 22,
         CompletionContext::IncludePath { prefix: "{docdir}/chap".into(), span: span(9, 22) })]
     #[case("include open brace triggers attribute", "include::{snip", 0, 14,
-        CompletionContext::Attribute { prefix: "snip".into() })]
+        CompletionContext::Attribute { prefix: "snip".into(), span: span(10, 14), closing: "}" })]
     #[case("include closed brace stays include", "include::{snippetsdir}/file", 0, 27,
         CompletionContext::IncludePath { prefix: "{snippetsdir}/file".into(), span: span(9, 27) })]
     #[case("xref long form", "See xref:sec", 0, 12,
         CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "[]", span: span(9, 12), trailing: None })]
     #[case("xref long form open attribute", "See xref:{attr", 0, 14,
-        CompletionContext::Attribute { prefix: "attr".into() })]
+        CompletionContext::Attribute { prefix: "attr".into(), span: span(10, 14), closing: "}" })]
     #[case("xref long form closed attribute", "See xref:{resolved}/sec", 0, 23,
         CompletionContext::XrefAnchorOrPath { prefix: "{resolved}/sec".into(), closing: "[]", span: span(9, 23), trailing: None })]
     #[case("xref long form cross-file", "See xref:other.adoc#sec", 0, 23,
@@ -1347,6 +1419,24 @@ mod tests {
         CompletionContext::ImagePath { prefix: "sub/".into(), span: span(8, 12) })]
     #[case("block image path", "image::sub/", 0, 11,
         CompletionContext::ImagePath { prefix: "sub/".into(), span: span(7, 11) })]
+    #[case("attribute before existing closing brace", "Use {pro} now.", 0, 8,
+        CompletionContext::Attribute { prefix: "pro".into(), span: span(5, 8), closing: "" })]
+    #[case("attribute in include before existing closing brace", "include::{snip}/a.adoc[]", 0, 14,
+        CompletionContext::Attribute { prefix: "snip".into(), span: span(10, 14), closing: "" })]
+    #[case("attribute mid-name before existing closing brace", "Use {pro} now.", 0, 7,
+        CompletionContext::Attribute { prefix: "pr".into(), span: span_to(5, 7, 8), closing: "" })]
+    #[case("attribute with later unrelated closing", "Use {pro and {x}", 0, 8,
+        CompletionContext::Attribute { prefix: "pro".into(), span: span(5, 8), closing: "}" })]
+    #[case("attribute with closing after a space", "Use {pro now}", 0, 8,
+        CompletionContext::Attribute { prefix: "pro".into(), span: span(5, 8), closing: "}" })]
+    #[case("xref shorthand right after opener before existing target", "<<ref-o>>", 0, 2,
+        CompletionContext::XrefAnchor { prefix: "".into(), closing: "", span: span_to(2, 2, 7), trailing: None })]
+    #[case("xref shorthand before comma and later closing", "<<setup-install,the install>>", 0, 15,
+        CompletionContext::XrefAnchor { prefix: "setup-install".into(), closing: "", span: span(2, 15), trailing: None })]
+    #[case("xref shorthand ignores closing of a later xref", "<<a and <<b>>", 0, 3,
+        CompletionContext::XrefAnchor { prefix: "a".into(), closing: ">>", span: span(2, 3), trailing: None })]
+    #[case("xref shorthand cross-file before comma and later closing", "<<f.adoc#sec,text>>", 0, 12,
+        CompletionContext::XrefCrossAnchor { file: "f.adoc".into(), anchor_prefix: "sec".into(), closing: "", span: span(9, 12), trailing: None })]
     fn test_detect_completion_some(
         #[case] _name: &str,
         #[case] content: &str,
@@ -1968,7 +2058,7 @@ mod tests {
             ("b-book.adoc", "= B\n:x: book\ninclude::ch.adoc[]\n"),
             ("ch.adoc", "== C\n\n{\n"),
         ]);
-        let items = resolve_attribute_completions("", &paths[2], 3, Some(&ws));
+        let items = resolve_attribute_completions("", &paths[2], 3, Some(&ws), "}", AT_LINE_START);
         let detail = |name: &str| {
             items
                 .iter()
@@ -1995,11 +2085,123 @@ mod tests {
         (dir, ws, paths.remove(1))
     }
 
+    /// Accept the item `label` at the `|` in `marked` and return the
+    /// document text afterwards.
+    fn accept(marked: &str, label: &str) -> String {
+        let bar = marked.find('|').expect("cursor marker");
+        let content = marked.replace('|', "");
+        let before = &marked[..bar];
+        let line = u32::try_from(before.matches('\n').count()).unwrap();
+        let character = u32::try_from(before.rsplit('\n').next().unwrap().len()).unwrap();
+        let (_dir, ws, files) = scanned(&[(
+            "doc.adoc",
+            "= Doc\n:product: Widget\n[[ref-options]]\n[[setup-install]]\n",
+        )]);
+        let ctx = detect_completion_context(&content, Position::new(line, character))
+            .expect("completion context");
+        let items = resolve_completions(ctx, &files[0], 3, Some(&ws));
+        let item = items
+            .iter()
+            .find(|i| i.label == label)
+            .unwrap_or_else(|| panic!("no item {label}"));
+        let edit = edit(item);
+        let offset = |p: Position| -> usize {
+            content
+                .split_inclusive('\n')
+                .take(p.line as usize)
+                .map(str::len)
+                .sum::<usize>()
+                + p.character as usize
+        };
+        format!(
+            "{}{}{}",
+            &content[..offset(edit.range.start)],
+            edit.new_text,
+            &content[offset(edit.range.end)..]
+        )
+    }
+
+    #[rstest]
+    #[case(
+        "attribute at name end before closing",
+        "Use {pro|} now.",
+        "product",
+        "Use {product} now."
+    )]
+    #[case(
+        "attribute mid-name before closing",
+        "Use {pr|o} now.",
+        "product",
+        "Use {product} now."
+    )]
+    #[case(
+        "attribute without closing",
+        "Use {pro| now.",
+        "product",
+        "Use {product} now."
+    )]
+    #[case(
+        "attribute with later unrelated closing",
+        "Use {pro| and {x}",
+        "product",
+        "Use {product} and {x}"
+    )]
+    #[case(
+        "attribute with later closing after space",
+        "Use {pro| now}",
+        "product",
+        "Use {product} now}"
+    )]
+    #[case(
+        "xref shorthand mid-token",
+        "<<|ref-o>>",
+        "ref-options",
+        "<<ref-options>>"
+    )]
+    #[case(
+        "xref shorthand before comma",
+        "<<setup-install|,the install>>",
+        "setup-install",
+        "<<setup-install,the install>>"
+    )]
+    #[case(
+        "xref shorthand fresh",
+        "See <<ref-|",
+        "ref-options",
+        "See <<ref-options>>"
+    )]
+    #[case(
+        "xref shorthand text on next line",
+        "<<setup-install|,the\ninstall>> here",
+        "setup-install",
+        "<<setup-install,the\ninstall>> here"
+    )]
+    #[case(
+        "xref shorthand ignores later xref across lines",
+        "<<ref-|\n<<b>>",
+        "ref-options",
+        "<<ref-options>>\n<<b>>"
+    )]
+    #[case(
+        "xref shorthand stops at blank line",
+        "<<ref-|\n\nx>>",
+        "ref-options",
+        "<<ref-options>>\n\nx>>"
+    )]
+    fn test_accepting_completion_yields_wellformed_text(
+        #[case] _name: &str,
+        #[case] marked: &str,
+        #[case] label: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(accept(marked, label), expected);
+    }
+
     #[test]
     fn test_attribute_completions_basic() {
         let (_dir, ws, file) = config_and_author_doc();
 
-        let items = resolve_attribute_completions("", &file, 1, Some(&ws));
+        let items = resolve_attribute_completions("", &file, 1, Some(&ws), "}", AT_LINE_START);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         // Builtin
         assert!(labels.contains(&"docdir"), "missing docdir in {:?}", labels);
@@ -2017,15 +2219,23 @@ mod tests {
         assert_eq!(author.kind, Some(CompletionItemKind::VARIABLE));
         // Check detail = resolved value
         assert_eq!(author.detail.as_ref().unwrap(), "Alice");
-        // Check insert_text appends closing }
-        assert_eq!(author.insert_text.as_ref().unwrap(), "author}");
+        // Check the edit appends closing }
+        assert_eq!(new_text(author), "author}");
+    }
+
+    #[test]
+    fn test_attribute_completions_omit_closing_when_one_follows() {
+        let (_dir, ws, file) = config_and_author_doc();
+
+        let items = resolve_attribute_completions("auth", &file, 1, Some(&ws), "", AT_LINE_START);
+        assert_eq!(new_text(&items[0]), "author");
     }
 
     #[test]
     fn test_attribute_completions_prefix_filter() {
         let (_dir, ws, file) = config_and_author_doc();
 
-        let items = resolve_attribute_completions("im", &file, 1, Some(&ws));
+        let items = resolve_attribute_completions("im", &file, 1, Some(&ws), "}", AT_LINE_START);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "imagesdir");
     }
@@ -2033,7 +2243,7 @@ mod tests {
     #[test]
     fn test_attribute_completions_no_workspace() {
         let file = Path::new("/tmp/doc.adoc");
-        let items = resolve_attribute_completions("", file, 1, None);
+        let items = resolve_attribute_completions("", file, 1, None, "}", AT_LINE_START);
         assert!(items.is_empty());
     }
 
@@ -2084,6 +2294,8 @@ mod tests {
         let (_dir, ws, file) = config_and_author_doc();
         let ctx = CompletionContext::Attribute {
             prefix: "im".into(),
+            span: AT_LINE_START,
+            closing: "}",
         };
 
         let items = resolve_completions(ctx, &file, 1, Some(&ws));
@@ -2763,7 +2975,9 @@ mod tests {
         assert_eq!(
             detect_completion_context(content, pos),
             Some(CompletionContext::Attribute {
-                prefix: "doc".into()
+                prefix: "doc".into(),
+                span: span(8, 11),
+                closing: "}"
             })
         );
     }
@@ -2855,7 +3069,9 @@ mod tests {
         assert_eq!(
             detect_completion_context(content, pos),
             Some(CompletionContext::Attribute {
-                prefix: "doc".into()
+                prefix: "doc".into(),
+                span: span(7, 10),
+                closing: "}"
             })
         );
     }
