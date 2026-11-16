@@ -630,6 +630,20 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         _ => "[]",
     };
 
+    // An `endif::` directive in column 0 (no `\`) has an attribute name as
+    // target, never a macro; offering `image:` etc. turns it into a broken
+    // directive. Must precede every macro trigger (`endif::image:` would
+    // match Priority 1c). Also suppresses attribute references (`{`) and
+    // xref openers (`<<`): Asciidoctor does not substitute the endif target,
+    // so `endif::{name}[]` never matches its `ifdef`. Name completion for
+    // `endif` is not offered.
+    if before_cursor
+        .strip_prefix("endif::")
+        .is_some_and(|target| !target.contains('['))
+    {
+        return None;
+    }
+
     // Priority 1a: include:: (longest trigger)
     if let Some(idx) = before_cursor.rfind("include::") {
         let prefix_start = idx + "include::".len();
@@ -1943,6 +1957,14 @@ mod tests {
         CompletionContext::Attribute { prefix: "snip".into(), span: span(10, 14), closing: "}" })]
     #[case("include closed brace stays include", "include::{snippetsdir}/file", 0, 27,
         CompletionContext::IncludePath { prefix: "{snippetsdir}/file".into(), span: span(9, 27) })]
+    #[case("endif prefix before the directive stays a block macro", "end", 0, 3,
+        CompletionContext::BlockMacro { prefix: "end".into() })]
+    #[case("escaped endif is text", "\\endif::im", 0, 10,
+        CompletionContext::InlineMacroPrefix { prefix: "im".into(), line: 0, word_start_col: 8, cursor_col: 10 })]
+    #[case("indented endif is text", " endif::im", 0, 10,
+        CompletionContext::InlineMacroPrefix { prefix: "im".into(), line: 0, word_start_col: 8, cursor_col: 10 })]
+    #[case("endif after text is text", "text endif::im", 0, 14,
+        CompletionContext::InlineMacroPrefix { prefix: "im".into(), line: 0, word_start_col: 12, cursor_col: 14 })]
     #[case("xref long form", "See xref:sec", 0, 12,
         CompletionContext::XrefAnchorOrPath { prefix: "sec".into(), closing: "[]", span: span(9, 12) })]
     #[case("xref long form open attribute", "See xref:{attr", 0, 14,
@@ -2130,6 +2152,14 @@ mod tests {
     #[case("second slot without style depends on the block", "[,ru", 0, 4)]
     #[case("style names are case-sensitive (Asciidoctor)", "[Source,ru", 0, 10)]
     #[case("third slot has no language", "[source,rust,ru", 0, 15)]
+    #[case("endif empty name", "endif::", 0, 7)]
+    #[case("endif name that starts like an inline macro", "endif::im", 0, 9)]
+    #[case("endif name like link", "endif::li", 0, 9)]
+    #[case("endif single letter like kbd", "endif::k", 0, 8)]
+    #[case("endif second name like an inline macro", "endif::a,im", 0, 11)]
+    #[case("endif after a full inline macro name", "endif::image:", 0, 13)]
+    #[case("endif attribute reference is no target", "endif::{na", 0, 10)]
+    #[case("endif xref opener is no target", "endif::<<", 0, 9)]
     fn test_detect_completion_none(
         #[case] _name: &str,
         #[case] content: &str,
