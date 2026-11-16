@@ -6,6 +6,26 @@ use std::sync::Arc;
 use crate::attributes::AttributeRegistry;
 use crate::types::{DocumentModel, IncludeEdge, IncludeMacro, IncludeTree};
 
+/// Value of a `leveloffset` setting as a number; unparsable values count as 0.
+fn parse_offset(value: &str) -> i32 {
+    value.trim().parse().unwrap_or(0)
+}
+
+/// The `leveloffset` in force at `line` of `doc`, from its attribute entries.
+/// `+n`/`-n` entries add to the current value, a bare number replaces it and
+/// an unset entry resets it.
+fn leveloffset_at(doc: &DocumentModel, line: usize) -> i32 {
+    doc.attributes
+        .iter()
+        .filter(|def| def.line < line)
+        .fold(0, |offset, def| match def.name.as_str() {
+            "leveloffset" if def.value.starts_with(['+', '-']) => offset + parse_offset(&def.value),
+            "leveloffset" => parse_offset(&def.value),
+            "leveloffset!" | "!leveloffset" => 0,
+            _ => offset,
+        })
+}
+
 pub struct IncludeGraph {
     pub(crate) forward: HashMap<PathBuf, Vec<IncludeEdge>>,
     pub(crate) reverse: HashMap<PathBuf, Vec<PathBuf>>,
@@ -94,20 +114,58 @@ impl IncludeGraph {
         roots
     }
 
+    /// Whether some includer shifts `file`'s headings with `leveloffset`,
+    /// as an include attribute or as an attribute entry in force at the
+    /// include line. A shifted file is a chapter, not the converted document.
+    #[must_use]
+    pub fn is_level_shifted(
+        &self,
+        file: &Path,
+        documents: &HashMap<PathBuf, DocumentModel>,
+    ) -> bool {
+        self.included_by(file).iter().any(|parent| {
+            self.includes_of(parent)
+                .iter()
+                .filter(|edge| edge.target == file)
+                .any(|edge| {
+                    edge.attributes
+                        .iter()
+                        .any(|(k, v)| k == "leveloffset" && parse_offset(v) != 0)
+                        || documents
+                            .get(parent)
+                            .is_some_and(|doc| leveloffset_at(doc, edge.line) != 0)
+                })
+        })
+    }
+
     /// Detect cycles in the include graph using DFS with 3-color marking.
+    /// The closing include is the one that re-enters a file already open on
+    /// the include stack, so the result depends on where the DFS starts.
+    ///
+    /// The DFS starts at each top-level document (nothing includes it) in
+    /// path order, as Asciidoctor starts at the document it converts. The
+    /// marks are shared, so every cycle is reported once, at the closing
+    /// include of the first top-level document that reaches it; a second
+    /// top-level document entering the same cycle elsewhere adds nothing.
+    /// Files no top-level document reaches (cycles with no outside entry)
+    /// follow in order of `rank` (lower first), then path order. `rank` is a
+    /// heuristic for the converted document, for example a level-0 header
+    /// that no include shifts; an untitled master inside a cycle gets the
+    /// wrong closing line.
     /// Returns back-edges as `(source_file, include_line, target_file)`.
     #[must_use]
-    pub fn detect_cycles(&self) -> Vec<(PathBuf, usize, PathBuf)> {
+    pub fn detect_cycles(&self, rank: impl Fn(&Path) -> u8) -> Vec<(PathBuf, usize, PathBuf)> {
+        let mut starts: Vec<&PathBuf> = self.forward.keys().collect();
+        starts.sort_by_key(|path| (!self.included_by(path).is_empty(), rank(path), *path));
+
+        let mut back_edges = Vec::new();
         let mut visiting = HashSet::new();
         let mut visited = HashSet::new();
-        let mut back_edges = Vec::new();
-
-        for start in self.forward.keys() {
+        for start in starts {
             if !visited.contains(start) {
                 self.dfs_cycle(start, &mut visiting, &mut visited, &mut back_edges);
             }
         }
-
         back_edges
     }
 
@@ -709,14 +767,11 @@ mod tests {
             },
         );
 
-        let cycles = graph.detect_cycles();
+        let cycles = graph.detect_cycles(|_| 0);
         assert_eq!(cycles.len(), 1, "Expected 1 cycle edge, got: {cycles:?}");
-        // Back-edge is either A→B or B→A depending on DFS start order
-        let (src, _, tgt) = &cycles[0];
-        assert!(
-            (src == &a && tgt == &b) || (src == &b && tgt == &a),
-            "Expected cycle between a and b, got: {cycles:?}"
-        );
+        // No top-level document: the DFS starts at `a` (path order) and
+        // `b -> a` closes the cycle.
+        assert_eq!(cycles, vec![(b, 5, a)]);
     }
 
     #[test]
@@ -751,15 +806,131 @@ mod tests {
             },
         );
 
-        let cycles = graph.detect_cycles();
+        let cycles = graph.detect_cycles(|_| 0);
         assert_eq!(cycles.len(), 1, "Expected 1 cycle edge, got: {cycles:?}");
-        // Back-edge closes the cycle — exact edge depends on DFS start order
-        let (src, _, tgt) = &cycles[0];
-        let nodes = [&a, &b, &c];
-        assert!(
-            nodes.contains(&src) && nodes.contains(&tgt),
-            "Expected cycle among a/b/c, got: {cycles:?}"
+        // No top-level document: the DFS starts at `a` (path order) and
+        // `c -> a` closes the cycle.
+        assert_eq!(cycles, vec![(c, 7, a)]);
+    }
+
+    fn edge(target: &Path, line: usize) -> IncludeEdge {
+        IncludeEdge {
+            target: target.to_path_buf(),
+            line,
+            attributes: vec![],
+        }
+    }
+
+    /// The untitled top-level `z` sorts after the cycle members and enters at
+    /// `b`, so the closing edge is `a -> b`, not `b -> a`.
+    #[test]
+    fn test_detect_cycles_starts_at_top_level_document() {
+        let mut graph = IncludeGraph::new();
+        let (a, b, z) = (
+            PathBuf::from("/a.adoc"),
+            PathBuf::from("/b.adoc"),
+            PathBuf::from("/z.adoc"),
         );
+        graph.add_edge(&z, edge(&b, 1));
+        graph.add_edge(&a, edge(&b, 3));
+        graph.add_edge(&b, edge(&a, 5));
+
+        assert_eq!(graph.detect_cycles(|_| 0), vec![(a, 3, b)]);
+    }
+
+    /// Two top-level documents enter the same cycle at different files; the
+    /// cycle is reported once, at the closing include of the first one in
+    /// path order (`m1 -> a -> b -> a`).
+    #[test]
+    fn test_detect_cycles_reports_one_closing_edge_per_cycle() {
+        let mut graph = IncludeGraph::new();
+        let (a, b, m1, m2) = (
+            PathBuf::from("/a.adoc"),
+            PathBuf::from("/b.adoc"),
+            PathBuf::from("/m1.adoc"),
+            PathBuf::from("/m2.adoc"),
+        );
+        graph.add_edge(&m1, edge(&a, 1));
+        graph.add_edge(&m2, edge(&b, 1));
+        graph.add_edge(&a, edge(&b, 3));
+        graph.add_edge(&b, edge(&a, 3));
+
+        assert_eq!(graph.detect_cycles(|_| 0), vec![(b, 3, a)]);
+    }
+
+    /// One top-level document enters the cycle at both members; still one edge.
+    #[test]
+    fn test_detect_cycles_single_top_entering_twice_reports_once() {
+        let mut graph = IncludeGraph::new();
+        let (a, b, top) = (
+            PathBuf::from("/a.adoc"),
+            PathBuf::from("/b.adoc"),
+            PathBuf::from("/top.adoc"),
+        );
+        graph.add_edge(&top, edge(&a, 1));
+        graph.add_edge(&top, edge(&b, 2));
+        graph.add_edge(&a, edge(&b, 3));
+        graph.add_edge(&b, edge(&a, 3));
+
+        assert_eq!(graph.detect_cycles(|_| 0), vec![(b, 3, a)]);
+    }
+
+    /// Without an outside entry, the lower rank starts the DFS even when the
+    /// path sorts later.
+    #[test]
+    fn test_detect_cycles_rank_picks_start_without_top_level_document() {
+        let mut graph = IncludeGraph::new();
+        let (a, z) = (PathBuf::from("/a.adoc"), PathBuf::from("/z.adoc"));
+        graph.add_edge(&a, edge(&z, 3));
+        graph.add_edge(&z, edge(&a, 5));
+
+        let z_first = |p: &Path| u8::from(p != Path::new("/z.adoc"));
+        assert_eq!(graph.detect_cycles(z_first), vec![(a, 3, z)]);
+    }
+
+    fn doc_with_entries(path: &str, entries: &[(&str, &str, usize)]) -> (PathBuf, DocumentModel) {
+        let attrs = entries
+            .iter()
+            .map(|(name, value, line)| crate::types::AttributeDef {
+                name: (*name).to_string(),
+                value: (*value).to_string(),
+                line: *line,
+            })
+            .collect();
+        (
+            PathBuf::from(path),
+            DocumentModel::test(path).with_attributes(attrs),
+        )
+    }
+
+    #[test]
+    fn test_is_level_shifted_by_attribute_entry_or_include_attribute() {
+        let (parent, doc) = doc_with_entries(
+            "/index.adoc",
+            &[("leveloffset", "+1", 3), ("leveloffset", "-1", 6)],
+        );
+        let documents = HashMap::from([(parent.clone(), doc)]);
+        let mut graph = IncludeGraph::new();
+        let (shifted, plain, inline) = (
+            PathBuf::from("/shifted.adoc"),
+            PathBuf::from("/plain.adoc"),
+            PathBuf::from("/inline.adoc"),
+        );
+        graph.add_edge(&parent, edge(&shifted, 4));
+        graph.add_edge(&parent, edge(&plain, 8));
+        graph.add_edge(
+            &parent,
+            IncludeEdge {
+                target: inline.clone(),
+                line: 9,
+                attributes: vec![("leveloffset".to_string(), "+1".to_string())],
+            },
+        );
+
+        assert!(graph.is_level_shifted(&shifted, &documents));
+        assert!(!graph.is_level_shifted(&plain, &documents), "reset by -1");
+        assert!(graph.is_level_shifted(&inline, &documents));
+        assert!(!graph.is_level_shifted(&parent, &documents));
     }
 
     #[test]
@@ -786,7 +957,7 @@ mod tests {
             },
         );
 
-        let cycles = graph.detect_cycles();
+        let cycles = graph.detect_cycles(|_| 0);
         assert!(cycles.is_empty(), "Expected no cycles, got: {cycles:?}");
     }
 
@@ -804,7 +975,7 @@ mod tests {
             },
         );
 
-        let cycles = graph.detect_cycles();
+        let cycles = graph.detect_cycles(|_| 0);
         assert_eq!(cycles.len(), 1, "Expected 1 cycle edge, got: {cycles:?}");
         assert_eq!(cycles[0].0, a.clone());
         assert_eq!(cycles[0].1, 2);

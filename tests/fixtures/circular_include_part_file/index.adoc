@@ -1,0 +1,4 @@
+= Book
+:doctype: book
+
+include::a-part.adoc[]

@@ -81,7 +81,25 @@ pub fn collect_diagnostics(
     // retained in DiagnosticKind for a future typo-detector.
 
     // 5. Circular includes
-    for (source, line, target) in graph.detect_cycles() {
+    // Rank the converted document for cycles without an outside entry: a
+    // level-0 title that no include shifts, best if it also sets `:doctype:`
+    // (a part file of a book has a title but not the doctype).
+    let rank = |path: &std::path::Path| {
+        let Some(doc) = documents.get(path) else {
+            return 2;
+        };
+        let is_header =
+            doc.sections.iter().any(|s| s.level == 0) && !graph.is_level_shifted(path, documents);
+        match (
+            is_header,
+            doc.attributes.iter().any(|a| a.name == "doctype"),
+        ) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, _) => 2,
+        }
+    };
+    for (source, line, target) in graph.detect_cycles(rank) {
         let path_display = target.file_name().map_or_else(
             || target.display().to_string(),
             |n| n.to_string_lossy().into_owned(),

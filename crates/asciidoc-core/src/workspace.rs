@@ -2508,6 +2508,72 @@ mod tests {
             .unwrap()
     }
 
+    /// The include that closes a cycle is reported in the file that holds it.
+    /// The traversal starts at the document Asciidoctor converts, so the edge
+    /// that re-enters it is the closing one, whatever the path order.
+    fn assert_circular_include_at(fixture: &str, file: &str, line: usize) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(fixture)
+            .canonicalize()
+            .unwrap();
+        for _ in 0..20 {
+            let mut ws = Workspace::new(&root);
+            ws.scan_workspace();
+            ws.recalculate_diagnostics();
+            let mut circular: Vec<(PathBuf, usize)> = ws
+                .all_diagnostics()
+                .iter()
+                .filter(|d| matches!(d.kind, crate::types::DiagnosticKind::CircularInclude { .. }))
+                .map(|d| (d.file.clone(), d.line))
+                .collect();
+            circular.sort();
+            assert_eq!(circular, vec![(root.join(file), line)], "{fixture}");
+        }
+    }
+
+    #[test]
+    fn test_fixture_circular_include_reported_at_closing_line() {
+        assert_circular_include_at("circular_include_closing", "partials/legal.adoc", 6);
+    }
+
+    /// The master (`book.adoc`) sorts after the partial it includes.
+    #[test]
+    fn test_fixture_circular_include_master_sorts_last() {
+        assert_circular_include_at("circular_include_master_last", "appendix/legal.adoc", 3);
+    }
+
+    /// The chapter has its own `= Title` but is shifted by `leveloffset`, so it
+    /// is not the converted document, although its path sorts before `index.adoc`.
+    #[test]
+    fn test_fixture_circular_include_leveloffset_chapter_is_not_master() {
+        assert_circular_include_at("circular_include_chapter_master", "chapters/intro.adoc", 3);
+    }
+
+    /// Same chapter, shifted with the attribute entry form
+    /// (`:leveloffset: +1` before the include) instead of an include attribute.
+    #[test]
+    fn test_fixture_circular_include_leveloffset_attribute_entry_is_not_master() {
+        assert_circular_include_at(
+            "circular_include_chapter_master_attr",
+            "chapters/intro.adoc",
+            3,
+        );
+    }
+
+    /// A book part file has a level-0 title as well, but only the master sets
+    /// `:doctype:`; the part sorts first and must not win.
+    #[test]
+    fn test_fixture_circular_include_part_file_is_not_master() {
+        assert_circular_include_at("circular_include_part_file", "a-part.adoc", 3);
+    }
+
+    /// The partial is included by the master and by a chapter.
+    #[test]
+    fn test_fixture_circular_include_partial_included_twice() {
+        assert_circular_include_at("circular_include_shared_partial", "partials/legal.adoc", 3);
+    }
+
     fn broken_includes(ws: &Workspace, file: &Path) -> usize {
         ws.diagnostics_for(file)
             .iter()

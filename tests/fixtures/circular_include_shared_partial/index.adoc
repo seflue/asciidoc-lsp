@@ -1,0 +1,5 @@
+= Handbook
+
+include::partials/legal.adoc[]
+
+include::chapters/setup.adoc[]

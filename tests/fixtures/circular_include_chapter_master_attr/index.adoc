@@ -1,0 +1,6 @@
+= Handbook
+
+:leveloffset: +1
+include::chapters/intro.adoc[]
+
+:leveloffset: -1
