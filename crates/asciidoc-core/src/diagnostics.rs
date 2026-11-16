@@ -400,12 +400,13 @@ const MAX_PARENT_STEPS: usize = 2;
 
 /// A file the scan reached (`DuplicateAnchor`, `CircularInclude`) as shown in
 /// a message. A relative path stays as it is. An absolute path is
-/// normalized lexically and shown relative to the workspace root when it is
-/// under the root or shares a folder with it and needs at most
-/// `MAX_PARENT_STEPS` `..` steps. Otherwise (outside the root, like
+/// normalized lexically and shown relative to the folder `root` when it is
+/// under `root` or shares a folder with it and needs at most
+/// `MAX_PARENT_STEPS` `..` steps. Otherwise (outside `root`, like
 /// `/opt/themes`) it stays absolute, independent of how long the shared
 /// ancestor is.
-fn display_path(root: &Path, path: &Path) -> PathBuf {
+#[must_use]
+pub fn display_path(root: &Path, path: &Path) -> PathBuf {
     if !path.is_absolute() {
         return path.to_path_buf();
     }
