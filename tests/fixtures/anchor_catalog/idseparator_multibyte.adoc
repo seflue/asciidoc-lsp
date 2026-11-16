@@ -1,0 +1,5 @@
+:idseparator: éa
+
+== Foo Bar
+
+== Foo Bar

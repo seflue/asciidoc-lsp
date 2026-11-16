@@ -12,7 +12,9 @@ use std::sync::atomic::Ordering;
 
 use crate::paths::{canonicalize_if_exists, join_doc_path, resolve_doc_target};
 use crate::reading::{read_in_order, ReadingVisitor};
-use crate::references::{find_target_file, generate_section_id, parse_xref_target};
+use crate::references::{
+    effective_id_separator, find_target_file, generate_section_id, parse_xref_target,
+};
 use crate::types::{
     Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, FileLocation, IncludeEdge,
     ResolvedXref, Section, Xref,
@@ -609,7 +611,8 @@ impl AnchorWalk<'_> {
     fn define_section(&mut self, file: &Path, section: &Section, plain_reread: bool) {
         let registry = &self.workspace.attributes;
         let prefix = registry.resolve(file, "idprefix").unwrap_or("_");
-        let separator = registry.resolve(file, "idseparator").unwrap_or("_");
+        let separator =
+            effective_id_separator(registry.resolve(file, "idseparator").unwrap_or("_"));
         let base = generate_section_id(&section.title, prefix, separator);
         let location = AnchorLocation {
             file: file.to_path_buf(),
@@ -747,6 +750,51 @@ mod tests {
         assert!(scope.lookup("_foo-bar").is_some());
         assert!(scope.lookup("_foo-bar-2").is_some());
         assert!(scope.lookup("_foo_bar_2").is_none());
+    }
+
+    /// Asciidoctor: an empty `:idseparator:` drops the spaces, the duplicate
+    /// suffix follows without separator (`_foobar2`). Must terminate.
+    #[test]
+    fn test_catalog_empty_idseparator_terminates_and_joins_suffix() {
+        let scope = catalog("idseparator_empty.adoc");
+
+        assert!(scope.lookup("_foobar").is_some());
+        assert!(scope.lookup("_foobar2").is_some());
+    }
+
+    /// Asciidoctor uses only the first character of a multi-char separator,
+    /// in the ID and in the duplicate suffix.
+    #[test]
+    fn test_catalog_multi_char_idseparator_uses_first_char_only() {
+        let scope = catalog("idseparator_multi.adoc");
+
+        assert!(scope.lookup("_foo-bar").is_some());
+        assert!(scope.lookup("_foo-bar-2").is_some());
+        assert!(scope.lookup("_foo--bar").is_none());
+    }
+
+    /// Multi-char separator `éa`: only `é` is used, sliced at a multi-byte
+    /// boundary, in the ID and in the suffix.
+    #[test]
+    fn test_catalog_multibyte_idseparator_in_id_and_suffix() {
+        let scope = catalog("idseparator_multibyte.adoc");
+
+        assert!(scope.lookup("_fooébar").is_some());
+        assert!(scope.lookup("_fooébaré2").is_some());
+        assert!(scope.lookup("_fooéabar").is_none());
+        assert!(scope.lookup("_fooébaréa2").is_none());
+    }
+
+    /// Asciidoctor: an empty `:idseparator:` removes only spaces; `-`, `.`
+    /// and `_` of the title stay in the ID.
+    #[test]
+    fn test_catalog_empty_idseparator_keeps_dash_dot_underscore() {
+        let scope = catalog("idseparator_empty_punct.adoc");
+
+        assert!(scope.lookup("_foo-barbaz").is_some());
+        assert!(scope.lookup("_foo_barqux").is_some());
+        assert!(scope.lookup("_foo.barzap").is_some());
+        assert!(scope.lookup("_foobarbaz").is_none());
     }
 
     /// A file included twice with `tag`/`lines` is the usual way to read two

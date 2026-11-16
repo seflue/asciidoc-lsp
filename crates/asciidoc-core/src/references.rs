@@ -54,10 +54,27 @@ pub fn parse_xref_target(target: &str) -> (Option<&str>, Option<&str>) {
     }
 }
 
+/// The part of an `:idseparator:` value Asciidoctor uses: its first character,
+/// or nothing for an empty value (spaces are then simply removed).
+#[must_use]
+pub(crate) fn effective_id_separator(separator: &str) -> &str {
+    separator
+        .char_indices()
+        .nth(1)
+        .map_or(separator, |(end, _)| &separator[..end])
+}
+
 /// Generate an implicit section ID from a title.
-/// Rules: lowercase, non-alnum → separator, prepend prefix.
+/// Rules: lowercase, non-alnum → separator, prepend prefix. Only the first
+/// character of `separator` is used, like Asciidoctor. With an empty
+/// separator only spaces are removed; `-`, `.` and `_` are kept.
+/// Out of scope: Asciidoctor also keeps `_`/`.`/`-` from the title for a
+/// non-default separator and applies typographic replacements.
 #[must_use]
 pub fn generate_section_id(title: &str, prefix: &str, separator: &str) -> String {
+    // Public API takes the raw attribute value; the catalog normalizes it
+    // too because it needs the same separator for the duplicate suffix.
+    let separator = effective_id_separator(separator);
     let mut result = String::with_capacity(prefix.len() + title.len());
     result.push_str(prefix);
 
@@ -68,6 +85,11 @@ pub fn generate_section_id(title: &str, prefix: &str, separator: &str) -> String
                 result.push(lower);
             }
             prev_was_sep = false;
+        } else if separator.is_empty() {
+            // Asciidoctor deletes only spaces; `-`, `.` and `_` survive.
+            if matches!(ch, '-' | '.' | '_') {
+                result.push(ch);
+            }
         } else if !prev_was_sep {
             result.push_str(separator);
             prev_was_sep = true;
@@ -75,7 +97,7 @@ pub fn generate_section_id(title: &str, prefix: &str, separator: &str) -> String
     }
 
     // Remove trailing separator
-    while result.ends_with(separator) && result.len() > prefix.len() {
+    while !separator.is_empty() && result.ends_with(separator) && result.len() > prefix.len() {
         result.truncate(result.len() - separator.len());
     }
 
@@ -95,6 +117,18 @@ mod tests {
     #[case("What is \"Clean Code\"?", "_", "_", "_what_is_clean_code")]
     #[case("Building Block View", "sec-", "-", "sec-building-block-view")]
     #[case("Building Block View", "", "_", "building_block_view")]
+    #[case("Foo Bar", "_", "", "_foobar")]
+    #[case("Foo Bar", "_", "--", "_foo-bar")]
+    #[case("Foo Bar", "", "-", "foo-bar")]
+    #[case("Foo Bar", "_", "é", "_fooébar")]
+    #[case("Foo Bar ", "_", "éa", "_fooébar")]
+    // An empty separator removes only spaces; `-`, `.` and `_` stay, other
+    // punctuation is dropped (InvalidSectionIdCharsRx).
+    #[case("Foo-Bar Baz", "_", "", "_foo-barbaz")]
+    #[case("Foo_Bar Baz", "_", "", "_foo_barbaz")]
+    #[case("Foo.Bar Baz", "_", "", "_foo.barbaz")]
+    #[case("-Foo Bar", "", "", "-foobar")]
+    #[case("Foo, Bar?", "_", "", "_foobar")]
     fn test_generate_section_id(
         #[case] title: &str,
         #[case] prefix: &str,
