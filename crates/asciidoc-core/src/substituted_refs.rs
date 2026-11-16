@@ -536,6 +536,7 @@ const PREDEFINED: &[&str] = &[
     "outfile",
     "user-home",
     "max-include-depth",
+    "attribute-missing",
     "attribute-undefined",
     "iconsdir",
     "stylesdir",

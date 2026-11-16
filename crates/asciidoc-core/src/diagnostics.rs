@@ -1546,6 +1546,8 @@ mod tests {
             "safe-mode-name",
             "doctitle",
             "empty",
+            "attribute-missing",
+            "attribute-undefined",
         ];
         let refs = names
             .iter()
