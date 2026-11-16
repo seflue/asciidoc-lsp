@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::attributes::AttributeRegistry;
 use crate::graph::IncludeGraph;
-use crate::paths::resolve_doc_target;
+use crate::paths::{is_uri, resolve_doc_target};
 use crate::references::ReferenceIndex;
 use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
 
@@ -36,6 +36,9 @@ pub fn collect_diagnostics(
 
         // 2. Broken includes: check if include targets exist in graph
         for inc in &doc.includes {
+            if is_uri(&registry.substitute(path, &inc.path)) {
+                continue;
+            }
             let Some(target_path) = resolve_doc_target(path, &inc.path, registry) else {
                 continue;
             };

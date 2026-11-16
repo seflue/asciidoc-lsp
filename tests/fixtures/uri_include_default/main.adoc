@@ -1,0 +1,16 @@
+= URI includes
+:url-repo: https://example.org/repo
+
+include::https://example.org/b.adoc[]
+
+include::{url-repo}/a.adoc[]
+
+include::HTTP://example.org/c.adoc[]
+
+include::http:/example.org/one-slash.adoc[]
+
+include::foo:bar.adoc[]
+
+include::mailto:me@example.org[]
+
+include::missing.adoc[]

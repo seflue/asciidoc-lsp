@@ -3624,6 +3624,42 @@ mod tests {
         );
     }
 
+    /// A URI include (literal or via attribute) is never reported as broken,
+    /// with or without `allow-uri-read`: the LSP loads nothing over the
+    /// network (committed fixtures `tests/fixtures/uri_include_*`).
+    #[tokio::test]
+    async fn test_fixture_uri_include_is_never_broken() {
+        for name in ["uri_include_allowed", "uri_include_default"] {
+            let fx = fixture_dir(name);
+            let main = fx.join("main.adoc");
+            let (service, _socket, _uri, _text) = open_fixture(&fx, &main).await;
+            let server = service.inner();
+
+            let ws = server.workspace.lock();
+            let broken: Vec<_> = ws
+                .as_ref()
+                .unwrap()
+                .diagnostics_for(&main)
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.kind,
+                        asciidoc_core::types::DiagnosticKind::BrokenInclude { .. }
+                    )
+                })
+                .map(|d| d.kind.to_string())
+                .collect();
+            assert_eq!(
+                broken,
+                [asciidoc_core::types::DiagnosticKind::BrokenInclude {
+                    path: "missing.adoc".into()
+                }
+                .to_string()],
+                "{name}"
+            );
+        }
+    }
+
     /// An include or image without its attribute list, as while typing, is
     /// text: no broken include, and navigation after it keeps working
     /// (committed fixture `tests/fixtures/unfinished_block_macro`).
