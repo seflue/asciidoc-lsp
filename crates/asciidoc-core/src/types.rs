@@ -6,9 +6,10 @@ pub struct Section {
     pub level: usize,
     pub title: String,
     pub line: usize,
-    /// The section carries an ID of its own (`[[id]]`, `[#id]`, `[id=...]`),
-    /// so Asciidoctor generates no `_title` ID for it.
-    pub explicit_id: bool,
+    /// The ID the section carries itself: `[[id]]`, `[#id]` or `[id=...]`
+    /// above the title, else `== Title [[id]]`. With it Asciidoctor generates
+    /// no `_title` ID.
+    pub id: Option<String>,
     /// The level-0 title is the document header: only blank lines, comments,
     /// attribute entries and an ID line precede it. Asciidoctor generates no
     /// ID for it. A level-0 title elsewhere is a book part and gets one.

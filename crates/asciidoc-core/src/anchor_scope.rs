@@ -304,6 +304,23 @@ impl Workspace {
         self.read_anchor_scope(&self.indexed_path(document))
     }
 
+    /// The title of the section that `id` names, defined at `location`.
+    /// `None` for an anchor outside a section title (paragraph, inline,
+    /// block) and for an ID Asciidoctor drops from a run of ID lines, which
+    /// names no section. The title is raw, attribute references unresolved.
+    #[must_use]
+    pub fn anchor_title(&self, id: &str, location: &AnchorLocation) -> Option<&str> {
+        let document = self.documents.get(&location.file)?;
+        let mut sections = document.sections.iter();
+        let section = match location.kind {
+            AnchorKind::ImplicitSection => sections.find(|s| s.line == location.line),
+            AnchorKind::Explicit | AnchorKind::BlockId => {
+                sections.find(|s| s.line >= location.line && s.id.as_deref() == Some(id))
+            }
+        }?;
+        Some(section.title.as_str())
+    }
+
     /// Every definition of an ID in the workspace, once: the first definition
     /// of each ID in each top-level document and the explicit ones after it.
     /// Unlike [`AnchorScope::lookup`] it keeps an ID that several documents
@@ -505,7 +522,7 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
                 // document title (a top-level file without a header of its
                 // own) still gets one here: a false negative, accepted.
                 let is_document_header = section.is_header && stack.len() == 1;
-                if !section.explicit_id && !is_document_header {
+                if section.id.is_none() && !is_document_header {
                     let plain_reread = self.note_plain_reading(file, section.line, None);
                     self.define_section(file, section, plain_reread);
                 }
@@ -1311,5 +1328,51 @@ mod tests {
 
         assert_eq!(resolved.file, PathBuf::from("/web/doc.adoc"));
         assert_eq!(resolved.line, 5);
+    }
+
+    fn titles_workspace() -> (Workspace, PathBuf) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/xref_completion_titles")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        (Workspace::build(&root, &index), index)
+    }
+
+    #[test]
+    fn test_anchor_title_names_the_section_that_carries_the_id() {
+        let (ws, index) = titles_workspace();
+        let scope = ws.anchor_scope_of(&index);
+        for (id, title) in [
+            ("top", "Product Manual"),
+            ("intro", "Introduction"),
+            ("_audience", "Audience"),
+            ("y", "Stacked Run"),
+            ("a", "Both Anchors"),
+            ("tid", "Inline Anchor"),
+            ("_later", "Later"),
+        ] {
+            let location = scope.lookup(id).unwrap();
+            assert_eq!(ws.anchor_title(id, location), Some(title), "{id}");
+        }
+    }
+
+    #[test]
+    fn test_anchor_title_is_none_outside_a_section_title() {
+        let (ws, index) = titles_workspace();
+        let scope = ws.anchor_scope_of(&index);
+        // A paragraph anchor must not take the title of the section after it.
+        let para = scope.lookup("para").unwrap();
+        assert_eq!(ws.anchor_title("para", para), None);
+        // Asciidoctor drops these IDs of a run (`b` loses to `[[a]]`, `x` to
+        // `[#y]`): they name no section.
+        for (id, line) in [("b", 14), ("x", 9)] {
+            let location = AnchorLocation {
+                file: index.clone(),
+                line,
+                kind: AnchorKind::Explicit,
+            };
+            assert_eq!(ws.anchor_title(id, &location), None, "{id}");
+        }
     }
 }

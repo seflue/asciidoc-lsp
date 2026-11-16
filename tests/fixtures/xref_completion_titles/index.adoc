@@ -1,0 +1,23 @@
+[[top]]
+= Product Manual
+
+[[intro]]
+== Introduction
+
+== Audience
+
+[[x]]
+[#y]
+== Stacked Run
+
+[[a]]
+== Both Anchors [[b]]
+
+== Inline Anchor [[tid]]
+
+[[para]]
+A paragraph before the next section.
+
+== Later
+
+See <<top>>, <<intro>>, <<_audience>>, <<y>>, <<a>>, <<tid>>, <<para>>, <<_later>>.

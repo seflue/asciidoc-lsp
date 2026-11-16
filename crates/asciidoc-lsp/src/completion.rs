@@ -10,7 +10,7 @@ use tower_lsp_server::ls_types::{
 use asciidoc_core::anchor_scope::AnchorScope;
 use asciidoc_core::paths::canonicalize_if_exists;
 use asciidoc_core::references::find_target_file;
-use asciidoc_core::types::AnchorLocation;
+use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 use crate::positions;
@@ -712,18 +712,36 @@ fn anchors_of_documents(
     anchors
 }
 
-/// Completion items for `anchors`, sorted by ID, one per ID.
+/// Where an ID of this kind of definition is listed: explicit IDs first, the
+/// IDs generated from a title after them.
+fn anchor_rank(kind: AnchorKind) -> u8 {
+    match kind {
+        AnchorKind::Explicit | AnchorKind::BlockId => 0,
+        AnchorKind::ImplicitSection => 1,
+    }
+}
+
+/// Completion items for `anchors`: explicit IDs first, then by ID, one per
+/// ID. Of an ID defined twice the explicit definition is listed, else the
+/// first by file and line.
 fn anchor_items<'a>(
     anchors: impl IntoIterator<Item = &'a (String, AnchorLocation)>,
+    ws: &Workspace,
     edit: AnchorEdit<'_>,
 ) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = anchors
+    let mut anchors: Vec<_> = anchors.into_iter().collect();
+    anchors.sort_by(|(a_id, a), (b_id, b)| {
+        a_id.cmp(b_id)
+            .then_with(|| anchor_rank(a.kind).cmp(&anchor_rank(b.kind)))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    anchors.dedup_by(|(a_id, _), (b_id, _)| a_id == b_id);
+    anchors.sort_by_key(|(_, location)| anchor_rank(location.kind));
+    anchors
         .into_iter()
-        .map(|(id, location)| anchor_completion_item(id, location, edit))
-        .collect();
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items.dedup_by(|a, b| a.label == b.label);
-    items
+        .map(|(id, location)| anchor_completion_item(id, location, ws, edit))
+        .collect()
 }
 
 /// Resolve xref anchor completions by listing the IDs of the top-level
@@ -752,6 +770,7 @@ pub(crate) fn resolve_xref_completions(
         anchors_of_documents(ws, doc_path, &[])
             .iter()
             .filter(|(id, _)| id.starts_with(prefix)),
+        ws,
         edit,
     )
 }
@@ -789,6 +808,7 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
                         std::fs::canonicalize(&loc.file).unwrap_or_else(|_| loc.file.clone());
                     loc_canonical == doc_canonical
                 }),
+            ws,
             edit,
         );
     }
@@ -819,6 +839,7 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         anchors_of_documents(ws, doc_path, &canonical_targets)
             .iter()
             .filter(|(id, _)| id.starts_with(anchor_prefix)),
+        ws,
         edit,
     )
 }
@@ -860,6 +881,7 @@ pub(crate) fn resolve_xref_path_completions(
 fn anchor_completion_item(
     id: &str,
     loc: &asciidoc_core::types::AnchorLocation,
+    ws: &Workspace,
     edit: AnchorEdit<'_>,
 ) -> CompletionItem {
     let AnchorEdit {
@@ -876,7 +898,10 @@ fn anchor_completion_item(
         asciidoc_core::types::AnchorKind::ImplicitSection => "section",
         asciidoc_core::types::AnchorKind::BlockId => "block",
     };
-    let detail = format!("{filename} ({kind_label})");
+    let detail = match ws.anchor_title(id, loc) {
+        Some(title) => format!("{title} \u{2014} {filename} ({kind_label})"),
+        None => format!("{filename} ({kind_label})"),
+    };
 
     // The edit always replaces the typed anchor prefix (`span`). Three modes:
     // (1) `trailing` is Some → an existing `[…]` follows the cursor. The
@@ -904,6 +929,7 @@ fn anchor_completion_item(
         label: id.to_string(),
         kind: Some(CompletionItemKind::REFERENCE),
         detail: Some(detail),
+        sort_text: Some(format!("{}{id}", anchor_rank(loc.kind))),
         text_edit: Some(CompletionTextEdit::Edit(TextEdit { range, new_text })),
         insert_text_format: format,
         ..Default::default()
@@ -1381,7 +1407,13 @@ pub(crate) fn resolve_completions(
             items.extend(resolve_xref_path_completions(
                 &prefix, doc_path, line, ws, closing, span,
             ));
-            items.sort_by(|a, b| a.label.cmp(&b.label));
+            // Sorted as a client sorts: by `sortText`, else by label.
+            items.sort_by(|a, b| {
+                a.sort_text
+                    .as_deref()
+                    .unwrap_or(&a.label)
+                    .cmp(b.sort_text.as_deref().unwrap_or(&b.label))
+            });
             items
         }
         CompletionContext::XrefCrossAnchor {
@@ -1653,7 +1685,7 @@ mod tests {
                     level: 1,
                     title: id.trim_start_matches('_').replace('_', " "),
                     line: loc.line,
-                    explicit_id: false,
+                    id: None,
                     is_header: false,
                 });
             } else {
@@ -1940,17 +1972,226 @@ mod tests {
     /// none of `book.adoc` (a document header gets no ID).
     #[test]
     fn test_xref_completions_offer_only_the_ids_of_the_top_level_document() {
+        // Explicit IDs come before generated ones (deliberate, adoc-0210).
         assert_eq!(
             fixture_labels("solo/main.adoc", "<<"),
-            vec!["_first", "_second", "note"]
+            vec!["note", "_first", "_second"]
         );
         assert_eq!(
             fixture_labels("solo2/main.adoc", "<<"),
-            vec!["_first", "_second", "note"]
+            vec!["note", "_first", "_second"]
         );
         let book = fixture_labels("book.adoc", "<<");
         assert!(book.contains(&"setup-only".to_string()), "got: {book:?}");
         assert!(!book.contains(&"note".to_string()), "got: {book:?}");
+    }
+
+    /// The items `<<` offers in `file` of the fixture.
+    fn items_in((root, ws): (PathBuf, Workspace), file: &str, typed: &str) -> Vec<CompletionItem> {
+        let doc = root.join(file);
+        let column = u32::try_from(typed.len()).unwrap();
+        let ctx = detect_completion_context(typed, Position::new(0, column)).unwrap();
+        resolve_completions(ctx, &doc, 1, Some(&ws))
+    }
+
+    /// Asciidoctor links `<<intro>>` as "Introduction": the detail names the
+    /// section the ID belongs to. An anchor that is no section title
+    /// (`para`) gets no title, not that of the next section.
+    #[test]
+    fn test_xref_completion_detail_names_the_section_title() {
+        let items = items_in(fixture("xref_completion_titles"), "index.adoc", "<<");
+        let detail = |label: &str| {
+            items
+                .iter()
+                .find(|item| item.label == label)
+                .and_then(|item| item.detail.clone())
+        };
+        assert_eq!(
+            detail("intro").as_deref(),
+            Some("Introduction \u{2014} index.adoc (explicit)")
+        );
+        assert_eq!(
+            detail("_audience").as_deref(),
+            Some("Audience \u{2014} index.adoc (section)")
+        );
+        assert_eq!(
+            detail("top").as_deref(),
+            Some("Product Manual \u{2014} index.adoc (explicit)")
+        );
+        assert_eq!(detail("para").as_deref(), Some("index.adoc (explicit)"));
+    }
+
+    /// `intro.adoc` is included with `leveloffset=+1`; its level-0 title is
+    /// the section `[[intro]]` names.
+    #[test]
+    fn test_xref_completion_detail_titles_an_included_chapter() {
+        let items = items_in(fixture("adversarial_project"), "chapters/setup.adoc", "<<");
+        let intro = items.iter().find(|item| item.label == "intro").unwrap();
+        assert_eq!(
+            intro.detail.as_deref(),
+            Some("Introduction \u{2014} intro.adoc (explicit)")
+        );
+    }
+
+    /// Explicit IDs are listed before the IDs Asciidoctor generated from a
+    /// title (`_audience`).
+    #[test]
+    fn test_xref_completions_list_explicit_ids_before_generated_ones() {
+        let items = items_in(fixture("xref_completion_titles"), "index.adoc", "<<");
+        let position = |wanted: &str| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.detail.as_deref().is_some_and(|d| d.ends_with(wanted)))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        let explicit = position("(explicit)");
+        let generated = position("(section)");
+        assert!(!explicit.is_empty() && !generated.is_empty());
+        assert!(explicit.iter().max() < generated.iter().min(), "{items:?}");
+        let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(&labels[labels.len() - 2..], ["_audience", "_later"]);
+    }
+
+    /// Rank comes from the kind of definition, not from a leading `_`: an
+    /// explicit `[[_zeta]]` is listed before the generated `_alpha`.
+    #[test]
+    fn test_xref_completion_rank_ignores_leading_underscore() {
+        let at = |kind, line| AnchorLocation {
+            file: PathBuf::from("/a.adoc"),
+            line,
+            kind,
+        };
+        let ws = ws_with_anchors(vec![
+            ("_alpha", at(AnchorKind::ImplicitSection, 1)),
+            ("beta", at(AnchorKind::Explicit, 2)),
+            ("_zeta", at(AnchorKind::Explicit, 3)),
+        ]);
+        let items = resolve_xref_completions(
+            "",
+            Path::new("/a.adoc"),
+            Some(&ws),
+            ">>",
+            AT_LINE_START,
+            None,
+        );
+        let got: Vec<_> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.sort_text.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("_zeta", Some("0_zeta")),
+                ("beta", Some("0beta")),
+                ("_alpha", Some("1_alpha"))
+            ]
+        );
+    }
+
+    /// Of an ID defined twice, the explicit definition is listed whatever
+    /// the order of the input: its detail (title) is the one shown.
+    #[test]
+    fn test_anchor_items_keep_the_explicit_definition_of_a_repeated_id() {
+        let at = |file: &str, line, kind| {
+            (
+                "_x".to_string(),
+                AnchorLocation {
+                    file: PathBuf::from(file),
+                    line,
+                    kind,
+                },
+            )
+        };
+        // Rank and file order disagree: the implicit one comes first by file.
+        let implicit = at("/a.adoc", 1, AnchorKind::ImplicitSection);
+        let explicit = at("/b.adoc", 3, AnchorKind::Explicit);
+        let ws = ws_with_anchors(vec![]);
+        let edit = AnchorEdit {
+            closing: ">>",
+            span: AT_LINE_START,
+            trailing: None,
+        };
+        for anchors in [
+            [implicit.clone(), explicit.clone()],
+            [explicit.clone(), implicit.clone()],
+        ] {
+            let items = anchor_items(&anchors, &ws, edit);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].detail.as_deref(), Some("b.adoc (explicit)"));
+        }
+    }
+
+    /// Of an ID with two explicit definitions, the first by file and line
+    /// is listed whatever the order of the input.
+    #[test]
+    fn test_anchor_items_keep_the_first_of_two_explicit_definitions() {
+        let at = |file: &str, line| {
+            (
+                "x".to_string(),
+                AnchorLocation {
+                    file: PathBuf::from(file),
+                    line,
+                    kind: AnchorKind::Explicit,
+                },
+            )
+        };
+        let later = at("/b.adoc", 1);
+        let first = at("/a.adoc", 5);
+        let ws = ws_with_anchors(vec![]);
+        let edit = AnchorEdit {
+            closing: ">>",
+            span: AT_LINE_START,
+            trailing: None,
+        };
+        for anchors in [
+            [later.clone(), first.clone()],
+            [first.clone(), later.clone()],
+        ] {
+            let items = anchor_items(&anchors, &ws, edit);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].detail.as_deref(), Some("a.adoc (explicit)"));
+        }
+    }
+
+    /// The merged list for `xref:` is in the order a client sorts it: by
+    /// `sortText`, else by label. Path items carry no `sortText`.
+    #[test]
+    fn test_xref_or_path_completions_follow_sort_text() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.adoc");
+        std::fs::write(&a, "= A\n").unwrap();
+        std::fs::write(dir.path().join("b.adoc"), "= B\n").unwrap();
+        let at = |kind, line| AnchorLocation {
+            file: a.clone(),
+            line,
+            kind,
+        };
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![
+                ("_alpha", at(AnchorKind::ImplicitSection, 1)),
+                ("zed", at(AnchorKind::Explicit, 2)),
+            ],
+        );
+        let ctx = CompletionContext::XrefAnchorOrPath {
+            prefix: String::new(),
+            closing: "[]",
+            span: AT_LINE_START,
+            trailing: None,
+        };
+        let items = resolve_completions(ctx, &a, 1, Some(&ws));
+
+        let key = |item: &CompletionItem| item.sort_text.clone().unwrap_or(item.label.clone());
+        let keys: Vec<_> = items.iter().map(key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+        let index = |wanted: &str| labels.iter().position(|l| *l == wanted).unwrap();
+        assert!(index("zed") < index("_alpha"), "{labels:?}");
+        assert!(labels.contains(&"b.adoc"), "{labels:?}");
     }
 
     /// `book.adoc` includes `reference.adoc`, so after `reference.adoc#`
