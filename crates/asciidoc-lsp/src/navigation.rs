@@ -365,7 +365,9 @@ fn pdf_paths_display(name: &str, paths: &[PdfPath]) -> String {
 /// - `AttributeRef`: value + definition location; references in the value
 ///   replaced, a relative path from an `.asciidoctorconfig` also resolved
 ///   against the document's folder
-/// - `AttributeDef`: value, with references replaced as for `AttributeRef`
+/// - `AttributeDef`: value, with references replaced as for `AttributeRef`;
+///   for an attribute of the completion catalog also its description and
+///   choice values
 /// - `pdf-theme`, `pdf-themesdir`, `pdf-fontsdir` (reference or definition):
 ///   resolved absolute path
 /// - `Xref`/`ShorthandXref`: section title + file
@@ -454,7 +456,14 @@ pub fn resolve_hover(
                     Some((scope_label(scope), text))
                 })
                 .collect();
-            (!texts.is_empty()).then(|| per_document_hover(texts))
+            if texts.is_empty() {
+                return None;
+            }
+            let hover = per_document_hover(texts);
+            Some(match catalog_attribute_doc(name) {
+                Some(doc) => format!("{hover}\n\n{doc}"),
+                None => hover,
+            })
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             let ws = workspace?;
@@ -560,6 +569,16 @@ fn per_document_hover(mut texts: Vec<(String, String)>) -> String {
         .map(|(label, text)| format!("In {label}:\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Description and choice values of a completion-catalog document attribute.
+fn catalog_attribute_doc(name: &str) -> Option<String> {
+    let (detail, values) = crate::completion::doc_attribute_doc(name)?;
+    if values.is_empty() {
+        Some(detail.to_string())
+    } else {
+        Some(format!("{detail}\n\nValues: {}", values.join(", ")))
+    }
 }
 
 /// An attribute entry as written: `:name: raw`, `:name:` for an empty value,
@@ -4701,7 +4720,100 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
         assert_eq!(
             hover,
-            ":imagesdir: {assets}/img\n\nResolves to doc/assets/img"
+            ":imagesdir: {assets}/img\n\nResolves to doc/assets/img\n\nImages directory"
+        );
+    }
+
+    const TOC_DOC: &str = "Table of contents placement\n\nValues: auto, left, right, preamble";
+
+    fn hover_at(content: &str, line: u32, character: u32) -> Option<String> {
+        let (_tmp, ws, paths) = scanned(&[("m.adoc", content)]);
+        resolve_hover(content, Position { line, character }, &paths[0], Some(&ws))
+    }
+
+    /// Verify of the item: hover on `:toc:` shows description and values.
+    #[test]
+    fn test_hover_attribute_def_of_catalog_attribute_shows_description_and_values() {
+        assert_eq!(
+            hover_at("= M\n:toc: left\n", 1, 1).unwrap(),
+            format!(":toc: left\n\n{TOC_DOC}")
+        );
+    }
+
+    #[rstest]
+    #[case(":sectnums:", ":sectnums:\n\nNumber sections")]
+    #[case(":imagesdir: img", ":imagesdir: img\n\nImages directory")]
+    fn test_hover_attribute_def_of_catalog_attribute_without_choices(
+        #[case] entry: &str,
+        #[case] expected: &str,
+    ) {
+        let content = format!("= M\n{entry}\n");
+        assert_eq!(hover_at(&content, 1, 1).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_hover_attribute_def_catalog_name_is_case_insensitive() {
+        assert_eq!(
+            hover_at("= M\n:TOC: left\n", 1, 1).unwrap(),
+            format!(":TOC: left\n\n{TOC_DOC}")
+        );
+    }
+
+    #[test]
+    fn test_hover_unset_entry_of_catalog_attribute_shows_its_description() {
+        assert_eq!(
+            hover_at("= M\n:toc: left\n:toc!:\n", 2, 1).unwrap(),
+            format!(":toc!:\n\n{TOC_DOC}")
+        );
+    }
+
+    /// The description depends on the name only, so a file shared by two
+    /// masters shows it once, after the last scope block.
+    #[test]
+    fn test_hover_attribute_def_in_shared_file_shows_catalog_doc_once() {
+        let shared = ":imagesdir: {base}/img\n";
+        let (_tmp, ws, paths) = scanned(&[
+            ("m1.adoc", "= M1\n:base: A\ninclude::shared.adoc[]\n"),
+            ("m2.adoc", "= M2\n:base: B\ninclude::shared.adoc[]\n"),
+            ("shared.adoc", shared),
+        ]);
+        let pos = Position {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            resolve_hover(shared, pos, &paths[2], Some(&ws)).unwrap(),
+            "In m1.adoc:\n:imagesdir: {base}/img\n\nResolves to A/img\n\n\
+             In m2.adoc:\n:imagesdir: {base}/img\n\nResolves to B/img\n\n\
+             Images directory"
+        );
+    }
+
+    /// Asciidoctor renders an entry-shaped line in a listing block as text
+    /// (`<pre>`), so the description alone never creates a hover.
+    #[test]
+    fn test_hover_entry_line_in_listing_block_has_no_catalog_doc() {
+        assert!(hover_at("= M\n\n----\n:toc: right\n----\n", 3, 1).is_none());
+    }
+
+    #[test]
+    fn test_hover_catalog_entry_in_adversarial_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let content = fs::read_to_string(&index).unwrap();
+        // cursor on `:icons: font` (index.adoc:7)
+        let pos = Position {
+            line: 6,
+            character: 3,
+        };
+        assert_eq!(
+            resolve_hover(&content, pos, &index, Some(&ws)).unwrap(),
+            ":icons: font\n\nIcon mode\n\nValues: font, image"
         );
     }
 
@@ -4715,7 +4827,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
-        assert_eq!(hover, ":imagesdir: {nowhere}/img");
+        assert_eq!(hover, ":imagesdir: {nowhere}/img\n\nImages directory");
     }
 
     #[test]
