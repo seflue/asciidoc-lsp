@@ -78,6 +78,23 @@ pub fn resolve_doc_path(
     Some(candidates.find(|path| path.exists()).unwrap_or(first))
 }
 
+/// Whether `target` is a URI rather than a file path, by Asciidoctor's
+/// `Helpers.uriish?` (`UriSniffRx = \A[A-Za-z][A-Za-z0-9.+-]+:/{0,2}`): a
+/// scheme of at least two characters, then `:`. Slashes after the colon are
+/// optional (`mailto:a@b`, `http:/x`), and a one-letter scheme is a drive
+/// letter, not a URI. Asciidoctor treats a URI include as a link or a
+/// network fetch, never as a file, so it has no path to check.
+#[must_use]
+pub fn is_uri(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme.len() >= 2
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+}
+
 /// Drop `.` segments and let each `..` pop the segment before it, without
 /// asking the filesystem. Asciidoctor's `PathResolver#system_path` resolves
 /// paths this way, so `..` in a symlinked folder goes to the link's parent,
@@ -125,6 +142,23 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn is_uri_follows_asciidoctor_uriish() {
+        for yes in [
+            "https://x",
+            "HTTP://x",
+            "git+ssh://x",
+            "http:/x",
+            "mailto:a@b",
+            "foo:bar.adoc",
+        ] {
+            assert!(is_uri(yes), "{yes}");
+        }
+        for no in ["a://x", "C:/x", "1x://x", "./https://x", "doc.adoc", ""] {
+            assert!(!is_uri(no), "{no}");
+        }
+    }
 
     #[test]
     fn resolves_sibling_directory() {
