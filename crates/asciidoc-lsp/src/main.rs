@@ -645,8 +645,14 @@ impl LanguageServer for AsciiDocLsp {
             &content,
             ws.is_some(),
         );
-        let result =
-            navigation::resolve_goto_definitions(&content, position, &doc_path, ws.as_ref());
+        let overrides = build_content_overrides(&self.documents, uri);
+        let result = navigation::resolve_definition_locations(
+            &content,
+            position,
+            &doc_path,
+            ws.as_ref(),
+            &overrides,
+        );
         // Drop the lock before building response
         drop(ws);
         tracing::debug!(?result, "goto_definition: result");
@@ -654,22 +660,10 @@ impl LanguageServer for AsciiDocLsp {
         let client_uris = self.client_uris(uri);
         let mut locations: Vec<Location> = result
             .into_iter()
-            .filter_map(|(target_path, target_line)| {
-                let target_uri = result_uri(&target_path, &client_uris)?;
-                // Convert 1-indexed line to 0-indexed LSP position
-                // LSP uses u32 for line numbers; real-world files won't exceed u32::MAX lines.
-                #[allow(clippy::cast_possible_truncation)]
-                let lsp_line = (target_line as u32).saturating_sub(1);
-                let target_pos = Position {
-                    line: lsp_line,
-                    character: 0,
-                };
+            .filter_map(|loc| {
                 Some(Location {
-                    uri: target_uri,
-                    range: Range {
-                        start: target_pos,
-                        end: target_pos,
-                    },
+                    uri: result_uri(&loc.path, &client_uris)?,
+                    range: location_range(&loc, &overrides),
                 })
             })
             .collect();
@@ -696,6 +690,7 @@ impl LanguageServer for AsciiDocLsp {
 
         let include_declaration = params.context.include_declaration;
 
+        let overrides = build_content_overrides(&self.documents, uri);
         let ws = self.workspace.lock();
         log_navigation_request("references", &doc_path, position, &content, ws.is_some());
         let results = navigation::resolve_references(
@@ -704,6 +699,7 @@ impl LanguageServer for AsciiDocLsp {
             &doc_path,
             ws.as_ref(),
             include_declaration,
+            &overrides,
         );
         drop(ws);
         tracing::debug!(
@@ -720,12 +716,9 @@ impl LanguageServer for AsciiDocLsp {
             .into_iter()
             .filter_map(|loc| {
                 let target_uri = result_uri(&loc.path, &client_uris)?;
-                let file_content = std::fs::read_to_string(&loc.path).unwrap_or_default();
-                let start = positions::to_lsp_position(loc.line, loc.col, &file_content);
-                let end = positions::to_lsp_position(loc.line, loc.end_col, &file_content);
                 Some(Location {
                     uri: target_uri,
-                    range: Range { start, end },
+                    range: location_range(&loc, &overrides),
                 })
             })
             .collect();
@@ -1132,6 +1125,22 @@ fn result_uri(path: &Path, client_uris: &HashMap<PathBuf, Uri>) -> Option<Uri> {
         .get(path)
         .cloned()
         .or_else(|| Uri::from_file_path(path))
+}
+
+/// The LSP range of a byte-column span, converted to UTF-16 against the
+/// file's content: an open buffer's if there is one, else the disk's.
+fn location_range(
+    loc: &asciidoc_core::types::FileLocation,
+    overrides: &HashMap<PathBuf, Arc<String>>,
+) -> Range {
+    let content = overrides.get(&loc.path).map_or_else(
+        || std::fs::read_to_string(&loc.path).unwrap_or_default(),
+        |content| (**content).clone(),
+    );
+    Range {
+        start: positions::to_lsp_position(loc.line, loc.col, &content),
+        end: positions::to_lsp_position(loc.line, loc.end_col, &content),
+    }
 }
 
 /// Build a `HashMap` of file path -> content for all open documents.
@@ -3692,6 +3701,179 @@ mod tests {
         assert_eq!(
             definition_at(server, &uri, position_of(&text, "Uses {product}", 6), &fx).await,
             "main.adoc:1"
+        );
+    }
+
+    /// Find-references on an xref or an anchor answers the span of the id on
+    /// each line, the same spans rename edits (committed fixture
+    /// `tests/fixtures/reference_spans`).
+    #[tokio::test]
+    async fn test_fixture_references_carry_the_spans_rename_edits() {
+        let fx = fixture_dir("reference_spans");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+
+        let at_xref = references_of(server, &uri, position_of(&text, "<<target>>", 3)).await;
+        let at_anchor = references_of(server, &uri, position_of(&text, "[[target]]", 3)).await;
+        let mut spans: Vec<String> = at_xref
+            .iter()
+            .map(|l| lsp_target(&l.uri, &l.range).replace(fx.to_str().unwrap(), ""))
+            .collect();
+        spans.sort();
+
+        // Line 11 holds `<<target-old>> ... <<target>>`, line 13 two xrefs to
+        // one id.
+        let mut expected = vec![
+            "file:///main.adoc:4:2-4:8",
+            "file:///main.adoc:7:6-7:12",
+            "file:///main.adoc:9:16-9:22",
+            "file:///main.adoc:11:26-11:32",
+            "file:///main.adoc:13:8-13:14",
+            "file:///main.adoc:13:23-13:29",
+            "file:///other.adoc:3:10-3:16",
+        ];
+        expected.sort_unstable();
+        assert_eq!(spans, expected);
+        assert_eq!(at_anchor, at_xref);
+
+        let renamed = rename_edits(server, &uri, position_of(&text, "<<target>>", 3)).await;
+        let mut edit_spans: Vec<(Uri, Range)> = renamed
+            .into_iter()
+            .flat_map(|(uri, edits)| edits.into_iter().map(move |e| (uri.clone(), e.range)))
+            .collect();
+        let mut ref_spans: Vec<(Uri, Range)> =
+            at_xref.into_iter().map(|l| (l.uri, l.range)).collect();
+        edit_spans.sort_by_key(|(u, r)| (u.as_str().to_string(), r.start));
+        ref_spans.sort_by_key(|(u, r)| (u.as_str().to_string(), r.start));
+        assert_eq!(ref_spans, edit_spans);
+    }
+
+    /// An anchor with reftext (`[[id,Text]]`) answers the span of its id, and
+    /// an implicit section id, which no line spells, stays at the line start.
+    #[tokio::test]
+    async fn test_fixture_references_reftext_and_implicit_anchors() {
+        let fx = fixture_dir("reference_spans");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+        let targets = |locations: Vec<Location>| -> Vec<String> {
+            let mut t: Vec<String> = locations
+                .iter()
+                .map(|l| lsp_target(&l.uri, &l.range).replace(fx.to_str().unwrap(), ""))
+                .collect();
+            t.sort();
+            t
+        };
+
+        let reftext = references_of(server, &uri, position_of(&text, "<<reftext-id>>", 3)).await;
+        assert_eq!(
+            targets(reftext),
+            vec![
+                "file:///main.adoc:15:2-15:12",
+                "file:///main.adoc:18:6-18:16"
+            ]
+        );
+
+        let implicit =
+            references_of(server, &uri, position_of(&text, "<<_implicit_section>>", 3)).await;
+        assert_eq!(
+            targets(implicit),
+            vec![
+                "file:///main.adoc:20:0-20:0",
+                "file:///main.adoc:22:5-22:22"
+            ]
+        );
+    }
+
+    /// Unsaved buffers: the spans come from the edited content, in UTF-16,
+    /// for the current buffer and for another open one, and still equal
+    /// the rename spans.
+    #[tokio::test]
+    async fn test_fixture_references_follow_unsaved_buffers() {
+        let fx = fixture_dir("reference_spans");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+        let other_path = fx.join("other.adoc");
+        let other_text = fs::read_to_string(&other_path).unwrap();
+        let other_uri = file_uri(&other_path);
+        open_document(server, &other_uri, &other_text).await;
+
+        let edited = text.replace("See <<target>>", "See \u{e4}\u{f6} <<target>>");
+        change_document(server, &uri, 2, &edited).await;
+        let other_edited = other_text.replace("Back to <<target", "Back to \u{e4}\u{f6} <<target");
+        change_document(server, &other_uri, 2, &other_edited).await;
+
+        let refs = references_of(server, &uri, position_of(&edited, "<<target>>", 3)).await;
+        let mut spans: Vec<(String, u32, u32, u32)> = refs
+            .iter()
+            .map(|l| {
+                (
+                    l.uri.as_str().to_string(),
+                    l.range.start.line,
+                    l.range.start.character,
+                    l.range.end.character,
+                )
+            })
+            .collect();
+        spans.sort();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.0.ends_with("main.adoc") && s.1 == 7 && s.2 == 9 && s.3 == 15),
+            "{spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.0.ends_with("other.adoc") && s.1 == 3 && s.2 == 13 && s.3 == 19),
+            "{spans:?}"
+        );
+
+        let renamed = rename_edits(server, &uri, position_of(&edited, "<<target>>", 3)).await;
+        let mut edit_spans: Vec<(Uri, Range)> = renamed
+            .into_iter()
+            .flat_map(|(uri, edits)| edits.into_iter().map(move |e| (uri.clone(), e.range)))
+            .collect();
+        let mut ref_spans: Vec<(Uri, Range)> = refs.into_iter().map(|l| (l.uri, l.range)).collect();
+        edit_spans.sort_by_key(|(u, r)| (u.as_str().to_string(), r.start));
+        ref_spans.sort_by_key(|(u, r)| (u.as_str().to_string(), r.start));
+        assert_eq!(ref_spans, edit_spans);
+    }
+
+    /// Go-to-definition from an xref lands on the id inside `[[id]]`, or on
+    /// the line start when no line spells the id.
+    #[tokio::test]
+    async fn test_fixture_definition_lands_on_the_anchor_id() {
+        let fx = fixture_dir("reference_spans");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let server = service.inner();
+        let definition = |position: Position| {
+            let params = GotoDefinitionParams {
+                text_document_position_params: doc_position(&uri, position),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            async move { server.goto_definition(params).await.unwrap().unwrap() }
+        };
+        let range_of = |response: GotoDefinitionResponse| match response {
+            GotoDefinitionResponse::Scalar(l) => l.range,
+            other => panic!("expected one location, got {other:?}"),
+        };
+
+        let at_target = range_of(definition(position_of(&text, "<<target>>", 3)).await);
+        assert_eq!(
+            (at_target.start, at_target.end),
+            (Position::new(4, 2), Position::new(4, 8))
+        );
+        let at_reftext = range_of(definition(position_of(&text, "<<reftext-id>>", 3)).await);
+        assert_eq!(
+            (at_reftext.start, at_reftext.end),
+            (Position::new(15, 2), Position::new(15, 12))
+        );
+        let at_implicit =
+            range_of(definition(position_of(&text, "<<_implicit_section>>", 3)).await);
+        assert_eq!(
+            (at_implicit.start, at_implicit.end),
+            (Position::new(20, 0), Position::new(20, 0))
         );
     }
 

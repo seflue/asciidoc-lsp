@@ -132,6 +132,7 @@ mod tests {
                 display_text: None,
                 line: 5,
                 span: None,
+                target_col: 0,
             }]),
         );
 
@@ -362,6 +363,7 @@ mod tests {
                 display_text: None,
                 line: 2,
                 span: None,
+                target_col: 0,
             }]),
         );
 
@@ -493,6 +495,7 @@ mod tests {
                 display_text: None,
                 line: 2,
                 span: None,
+                target_col: 0,
             }]),
         );
 
