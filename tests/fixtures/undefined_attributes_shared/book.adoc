@@ -1,0 +1,5 @@
+= Book
+:edition: print
+:product: P
+
+include::shared.adoc[]

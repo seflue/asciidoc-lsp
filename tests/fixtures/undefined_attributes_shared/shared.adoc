@@ -1,0 +1,7 @@
+== Shared
+
+Edition {edition} of {product}.
+
+// tag::t[]
+Tagged {edition}.
+// end::t[]

@@ -129,9 +129,14 @@ mod tests {
         let diags = vec![CoreDiagnostic {
             file: PathBuf::from("/test.adoc"),
             line: 3,
-            span: None,
+            span: Some(Span {
+                start_col: 0,
+                end_line: 3,
+                end_col: 11,
+            }),
             kind: DiagnosticKind::UndefinedAttribute {
                 name: "undefined".into(),
+                documents: vec![],
             },
         }];
 
@@ -142,6 +147,9 @@ mod tests {
             result[0].severity,
             Some(ls_types::DiagnosticSeverity::WARNING)
         );
+        assert_eq!(result[0].range.start.character, 0);
+        assert_eq!(result[0].range.end.character, 11);
+        assert_eq!(result[0].message, "Undefined attribute: {undefined}");
     }
 
     #[test]

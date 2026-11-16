@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::anchor_scope::{AnchorScope, CatalogCache};
 use crate::paths::{is_uri, resolve_doc_target};
-use crate::types::{Diagnostic, DiagnosticKind};
+use crate::types::{Diagnostic, DiagnosticKind, Span};
 use crate::workspace::Workspace;
 
 /// A duplicate: the second definition (file, line), the ID, and the first.
@@ -34,16 +34,20 @@ pub fn collect_diagnostics(
     let catalogs = CatalogCache::new(workspace);
     let top_level: Vec<Rc<AnchorScope>> = catalogs.all();
     let mut diags: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
+    // The references each top-level document lacks the attribute for, walked
+    // once per recalculation.
+    let mut undefined_refs: HashMap<PathBuf, HashSet<(PathBuf, usize, usize)>> = HashMap::new();
 
     for (path, doc) in documents {
         // 1. Broken xrefs, checked in each top-level document that reads the
         // file (the same ones go-to-definition uses): one diagnostic, naming
         // the documents where the target is missing when several read it.
-        let reading: Vec<Rc<AnchorScope>> = if doc.xrefs.is_empty() {
-            Vec::new()
-        } else {
-            catalogs.scopes_at(path)
-        };
+        let reading: Vec<Rc<AnchorScope>> =
+            if doc.xrefs.is_empty() && doc.substituted_refs.is_empty() {
+                Vec::new()
+            } else {
+                catalogs.scopes_at(path)
+            };
         for xref in &doc.xrefs {
             // The file part of the target is resolved in each reading
             // document's own attribute scope, as go-to-definition does; the
@@ -72,6 +76,43 @@ pub fn collect_diagnostics(
                     span: xref.span,
                     kind: DiagnosticKind::BrokenXref {
                         target: xref.target.clone(),
+                        documents: if reading.len() > 1 {
+                            missing
+                        } else {
+                            Vec::new()
+                        },
+                    },
+                });
+            }
+        }
+
+        // 1b. Undefined attributes, per top-level document like the xrefs:
+        // one diagnostic per reference, naming the documents that lack the
+        // attribute when several read the file.
+        for reference in &doc.substituted_refs {
+            let position = (path.clone(), reference.line, reference.start_col);
+            let missing: Vec<PathBuf> = reading
+                .iter()
+                .filter(|scope| scope.reads_whole(path))
+                .filter(|scope| {
+                    undefined_refs
+                        .entry(scope.document().to_path_buf())
+                        .or_insert_with(|| workspace.undefined_attribute_refs(scope.document()))
+                        .contains(&position)
+                })
+                .map(|scope| display_path(root, scope.document()))
+                .collect();
+            if !missing.is_empty() {
+                diags.entry(path.clone()).or_default().push(Diagnostic {
+                    file: path.clone(),
+                    line: reference.line,
+                    span: Some(Span {
+                        start_col: reference.start_col,
+                        end_line: reference.line,
+                        end_col: reference.end_col,
+                    }),
+                    kind: DiagnosticKind::UndefinedAttribute {
+                        name: reference.name.clone(),
                         documents: if reading.len() > 1 {
                             missing
                         } else {
@@ -257,7 +298,9 @@ mod tests {
     use super::*;
     use crate::attributes::AttributeRegistry;
     use crate::graph::IncludeGraph;
-    use crate::types::{Anchor, DocumentModel, IncludeMacro, Section, Xref};
+    use crate::types::{
+        Anchor, AttributeDef, AttributeRef, DocumentModel, IncludeMacro, Section, Xref,
+    };
     use pretty_assertions::assert_eq;
     use std::path::Path;
 
@@ -1199,5 +1242,396 @@ mod tests {
             broken_xrefs(&ws, &root.join("c.adoc")),
             vec![("only-in-a", vec![])]
         );
+    }
+
+    // --- Undefined attributes ---
+
+    /// The undefined-attribute diagnostics as (file name, line, name), sorted.
+    fn undefined(diags: &HashMap<PathBuf, Vec<Diagnostic>>) -> Vec<(String, usize, String)> {
+        let mut found: Vec<_> = flatten(diags)
+            .into_iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::UndefinedAttribute { name, .. } => Some((
+                    d.file.file_name().unwrap().to_string_lossy().into_owned(),
+                    d.line,
+                    name.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn undefined_in_workspace(ws: &Workspace) -> Vec<(String, usize, String)> {
+        undefined(&ws.diagnostics)
+    }
+
+    fn reference(name: &str, line: usize, start_col: usize) -> AttributeRef {
+        AttributeRef {
+            name: name.into(),
+            line,
+            start_col,
+            end_col: start_col + name.len() + 2,
+        }
+    }
+
+    fn entry(name: &str, value: &str, line: usize) -> AttributeDef {
+        AttributeDef {
+            name: name.into(),
+            value: value.into(),
+            line,
+        }
+    }
+
+    /// The diagnostics of one top-level document `/a.adoc`.
+    fn diagnose_one(doc: DocumentModel) -> HashMap<PathBuf, Vec<Diagnostic>> {
+        let mut documents = HashMap::new();
+        documents.insert(PathBuf::from("/a.adoc"), doc);
+        diagnose(documents, IncludeGraph::new(), make_registry())
+    }
+
+    fn a_doc() -> DocumentModel {
+        DocumentModel::test("/a.adoc")
+    }
+
+    fn lines_and_names(found: Vec<(String, usize, String)>) -> Vec<(usize, String)> {
+        found
+            .into_iter()
+            .map(|(_, line, name)| (line, name))
+            .collect()
+    }
+
+    #[test]
+    fn undefined_attribute_is_warning_with_span() {
+        let diags = diagnose_one(a_doc().with_substituted_refs(vec![reference("prodcut", 3, 6)]));
+        let flat = flatten(&diags);
+
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].line, 3);
+        assert_eq!(
+            flat[0].span,
+            Some(crate::types::Span {
+                start_col: 6,
+                end_line: 3,
+                end_col: 15,
+            })
+        );
+        assert_eq!(
+            flat[0].kind,
+            DiagnosticKind::UndefinedAttribute {
+                name: "prodcut".into(),
+                documents: vec![],
+            }
+        );
+    }
+
+    /// Asciidoctor (`g-before-def`): a reference before the entry warns.
+    #[test]
+    fn defined_before_is_quiet_defined_after_is_reported() {
+        let doc = a_doc()
+            .with_attributes(vec![entry("product", "Foo", 2), entry("late", "x", 5)])
+            .with_substituted_refs(vec![
+                reference("product", 3, 0),
+                reference("late", 3, 10),
+                reference("late", 6, 0),
+            ]);
+
+        assert_eq!(
+            lines_and_names(undefined(&diagnose_one(doc))),
+            vec![(3, "late".to_string())]
+        );
+    }
+
+    #[test]
+    fn unset_entry_makes_reference_undefined() {
+        let doc = a_doc()
+            .with_attributes(vec![entry("product", "Foo", 2), entry("product!", "", 4)])
+            .with_substituted_refs(vec![reference("product", 3, 0), reference("product", 5, 0)]);
+
+        assert_eq!(
+            lines_and_names(undefined(&diagnose_one(doc))),
+            vec![(5, "product".to_string())]
+        );
+    }
+
+    /// Asciidoctor: names are lower-cased on both sides.
+    #[test]
+    fn names_compare_case_insensitively() {
+        let doc = a_doc()
+            .with_attributes(vec![entry("MixedCase", "one", 1)])
+            .with_substituted_refs(vec![
+                reference("mixedcase", 2, 0),
+                reference("MIXEDCASE", 3, 0),
+            ]);
+
+        assert_eq!(undefined(&diagnose_one(doc)), vec![]);
+    }
+
+    #[test]
+    fn predefined_attributes_are_quiet() {
+        let names = [
+            "nbsp",
+            "docname",
+            "toc-title",
+            "backend-pdf",
+            "env-github",
+            "docdir",
+            "safe-mode-name",
+            "doctitle",
+            "empty",
+        ];
+        let refs = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| reference(name, index + 1, 0))
+            .collect();
+
+        assert_eq!(
+            undefined(&diagnose_one(a_doc().with_substituted_refs(refs))),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor warns for `{author}` without a header line, but the LSP
+    /// models neither the author nor the revision line: no diagnostic is
+    /// better than a false one.
+    #[test]
+    fn author_attributes_not_reported_lsp_has_no_header_model() {
+        let names = [
+            "author",
+            "email",
+            "firstname",
+            "lastname",
+            "authorinitials",
+            "authors",
+            "author_2",
+            "email_3",
+            "revnumber",
+            "revdate",
+            "revremark",
+        ];
+        let refs = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| reference(name, index + 1, 0))
+            .collect();
+
+        assert_eq!(
+            undefined(&diagnose_one(a_doc().with_substituted_refs(refs))),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor: only `skip` and `drop` silence the warning; `drop-line`
+    /// logs an INFO of its own and the LSP warns as well.
+    #[rstest::rstest]
+    #[case::missing(None, 1)]
+    #[case::warn(Some("warn"), 1)]
+    #[case::drop_line(Some("drop-line"), 1)]
+    #[case::skip(Some("skip"), 0)]
+    #[case::drop(Some("drop"), 0)]
+    #[case::unknown(Some("bogus"), 1)]
+    fn attribute_missing_modes(#[case] mode: Option<&str>, #[case] expected: usize) {
+        let mut doc = a_doc().with_substituted_refs(vec![reference("x", 3, 0)]);
+        if let Some(mode) = mode {
+            doc = doc.with_attributes(vec![entry("attribute-missing", mode, 1)]);
+        }
+
+        assert_eq!(undefined(&diagnose_one(doc)).len(), expected);
+    }
+
+    #[test]
+    fn attribute_missing_applies_from_its_position() {
+        let doc = a_doc()
+            .with_attributes(vec![entry("attribute-missing", "skip", 2)])
+            .with_substituted_refs(vec![reference("x", 1, 0), reference("x", 3, 0)]);
+
+        assert_eq!(
+            lines_and_names(undefined(&diagnose_one(doc))),
+            vec![(1, "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn unsetting_attribute_missing_warns_again() {
+        let doc = a_doc()
+            .with_attributes(vec![
+                entry("attribute-missing", "skip", 1),
+                entry("attribute-missing!", "", 3),
+            ])
+            .with_substituted_refs(vec![reference("x", 2, 0), reference("x", 4, 0)]);
+
+        assert_eq!(
+            lines_and_names(undefined(&diagnose_one(doc))),
+            vec![(4, "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn attribute_missing_from_config_chain() {
+        let (_, ws) = fixture_workspace("undefined_attributes_skip");
+
+        assert_eq!(undefined_in_workspace(&ws), vec![]);
+    }
+
+    #[test]
+    fn possible_definition_quiets_later_reference_only() {
+        let doc = a_doc()
+            .with_possible_definitions(vec![crate::types::PossibleDefinition {
+                name: "x".into(),
+                line: 2,
+            }])
+            .with_attributes(vec![entry("x!", "", 4)])
+            .with_substituted_refs(vec![
+                reference("x", 1, 0),
+                reference("x", 3, 0),
+                reference("x", 5, 0),
+            ]);
+
+        assert_eq!(
+            lines_and_names(undefined(&diagnose_one(doc))),
+            vec![(1, "x".to_string()), (5, "x".to_string())]
+        );
+    }
+
+    /// Asciidoctor (`:a: {a}` with `a` unset before): the reference on an
+    /// entry line means the value before the entry.
+    #[test]
+    fn reference_on_its_own_entry_line_is_reported() {
+        let doc = a_doc()
+            .with_attributes(vec![entry("a", "{a}", 1)])
+            .with_substituted_refs(vec![reference("a", 1, 4)]);
+
+        assert_eq!(
+            lines_and_names(undefined(&diagnose_one(doc))),
+            vec![(1, "a".to_string())]
+        );
+    }
+
+    #[test]
+    fn possible_attribute_missing_silences_later_references() {
+        let doc = a_doc()
+            .with_possible_definitions(vec![crate::types::PossibleDefinition {
+                name: "attribute-missing".into(),
+                line: 1,
+            }])
+            .with_substituted_refs(vec![reference("x", 2, 0)]);
+
+        assert_eq!(undefined(&diagnose_one(doc)), vec![]);
+    }
+
+    /// An entry on a line a block conditional covers may not run, so an
+    /// unset there does not make the attribute undefined.
+    #[test]
+    fn unset_inside_block_conditional_is_not_reported() {
+        let doc = a_doc()
+            .with_attributes(vec![entry("product", "Foo", 1), entry("product!", "", 3)])
+            .with_possible_definitions(vec![crate::types::PossibleDefinition {
+                name: "product".into(),
+                line: 3,
+            }])
+            .with_substituted_refs(vec![reference("product", 5, 0)]);
+
+        assert_eq!(undefined(&diagnose_one(doc)), vec![]);
+    }
+
+    #[test]
+    fn file_included_twice_reports_once() {
+        let mut documents = HashMap::new();
+        documents.insert(PathBuf::from("/a.adoc"), a_doc());
+        documents.insert(
+            PathBuf::from("/b.adoc"),
+            DocumentModel::test("/b.adoc").with_substituted_refs(vec![reference("y", 1, 0)]),
+        );
+        let mut graph = IncludeGraph::new();
+        for line in [2, 4] {
+            graph.add_edge(
+                Path::new("/a.adoc"),
+                crate::types::IncludeEdge {
+                    target: PathBuf::from("/b.adoc"),
+                    line,
+                    attributes: vec![],
+                },
+            );
+        }
+
+        let diags = diagnose(documents, graph, make_registry());
+
+        assert_eq!(
+            undefined(&diags),
+            vec![("b.adoc".to_string(), 1, "y".to_string())]
+        );
+    }
+
+    /// Asciidoctor on each top-level document: `book.adoc` defines the
+    /// edition and is quiet, `web.adoc` warns (once per position, although
+    /// it reads the file twice). `excerpt.adoc` reads only a tag of the
+    /// file and is no judge: it is not named.
+    #[test]
+    fn shared_file_is_checked_per_top_level_document() {
+        let (root, ws) = fixture_workspace("undefined_attributes_shared");
+
+        let reported: Vec<_> = ws
+            .diagnostics_for(&root.join("shared.adoc"))
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::UndefinedAttribute { name, documents } => Some((
+                    d.line,
+                    name.clone(),
+                    documents
+                        .iter()
+                        .map(|doc| doc.file_name().unwrap().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            reported.len(),
+            2,
+            "one diagnostic per position, got {reported:?}"
+        );
+        for (_, name, documents) in &reported {
+            assert_eq!(name, "edition");
+            assert_eq!(documents, &vec!["web.adoc".to_string()]);
+        }
+        assert_eq!(
+            reported.iter().map(|(line, ..)| *line).collect::<Vec<_>>(),
+            vec![3, 6]
+        );
+    }
+
+    /// Asciidoctor (`index.adoc` with `-a attribute-missing=warn`): the same
+    /// five warnings; everything else in the fixture stays quiet. The
+    /// chapter sees `imagesdir` from the master.
+    #[test]
+    fn test_undefined_attributes_fixture() {
+        let (_, ws) = fixture_workspace("undefined_attributes");
+
+        assert_eq!(
+            undefined_in_workspace(&ws),
+            vec![
+                (
+                    "chapter.adoc".to_string(),
+                    3,
+                    "missing-in-chapter".to_string()
+                ),
+                ("index.adoc".to_string(), 5, "prodcut".to_string()),
+                ("index.adoc".to_string(), 9, "product".to_string()),
+                ("index.adoc".to_string(), 11, "host".to_string()),
+                ("index.adoc".to_string(), 15, "inlisting".to_string()),
+            ]
+        );
+    }
+
+    /// The config defines `product` and `company` (ADR-008); the
+    /// Asciidoctor CLI does not read `.asciidoctorconfig.adoc` and warns.
+    #[test]
+    fn test_adversarial_project_has_no_undefined_attributes() {
+        let (_, ws) = fixture_workspace("adversarial_project");
+
+        assert_eq!(undefined_in_workspace(&ws), vec![]);
     }
 }

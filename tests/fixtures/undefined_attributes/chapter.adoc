@@ -1,0 +1,3 @@
+== Chapter
+
+Uses {imagesdir} and {missing-in-chapter}.

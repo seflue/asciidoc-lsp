@@ -13,7 +13,9 @@ use crate::graph::{
 use crate::paths::relative_path;
 use crate::pdf_theme::PdfResolution;
 use crate::reading::{read_in_order, ReadingVisitor};
-use crate::types::{AttributeDef, Diagnostic, DocumentModel, FileLocation};
+use crate::types::{
+    AttributeDef, AttributeRef, Diagnostic, DocumentModel, FileLocation, PossibleDefinition,
+};
 
 /// Recursively find all `.adoc` files under a directory, as `(path as
 /// reached, canonical path)` pairs in a stable order.
@@ -330,6 +332,23 @@ impl Workspace {
             before_reference,
             definitions: walk.definitions,
         }
+    }
+
+    /// The substituted references (file, line, start column) that the
+    /// top-level document `document` does not have set where they stand,
+    /// reading it and its includes in order (one walk for all of them). A
+    /// file read twice counts for each position once.
+    pub(crate) fn undefined_attribute_refs(
+        &self,
+        document: &Path,
+    ) -> HashSet<(PathBuf, usize, usize)> {
+        let mut walk = UndefinedWalk {
+            workspace: self,
+            known: HashMap::new(),
+            found: HashSet::new(),
+        };
+        read_in_order(self, document, &mut walk);
+        walk.found
     }
 
     /// Where `name`, referenced on `line` of `file`, is defined for
@@ -876,6 +895,132 @@ impl ReadingWalk<'_> {
                 self.workspace.preset(root, name, self.preview)
             })
         })
+    }
+}
+
+/// What the walk of [`Workspace::undefined_attribute_refs`] knows about an
+/// attribute.
+enum Known<'a> {
+    Set(&'a str),
+    Unset,
+    /// Possibly defined, see [`PossibleDefinition`]: never reported.
+    Possible,
+}
+
+/// One line of a document for the walk of
+/// [`Workspace::undefined_attribute_refs`].
+enum UndefinedStep<'a> {
+    Definition(&'a AttributeDef),
+    Possible(&'a PossibleDefinition),
+    Reference(&'a AttributeRef),
+}
+
+/// Reading-order walk of one top-level document that finds the references
+/// to attributes not set at that point.
+struct UndefinedWalk<'a> {
+    workspace: &'a Workspace,
+    /// What the entries so far say, by lower-case name.
+    known: HashMap<String, Known<'a>>,
+    found: HashSet<(PathBuf, usize, usize)>,
+}
+
+/// Value of `attribute-missing` that silences the warning. Asciidoctor
+/// drops the reference too under `drop-line` but logs it, so only these two
+/// count as an opt-out.
+const MISSING_SILENT: [&str; 2] = ["skip", "drop"];
+
+impl<'a> ReadingVisitor<'a> for UndefinedWalk<'a> {
+    type Item = UndefinedStep<'a>;
+
+    fn items(&self, _file: &Path, doc: &'a DocumentModel) -> Vec<(usize, UndefinedStep<'a>)> {
+        // An entry that is also a possible definition (a line inside a block
+        // conditional) may not run: the possible definition wins.
+        let definitions = doc
+            .attributes
+            .iter()
+            .filter(|attr| {
+                let name = entry_name(&attr.name).0;
+                !doc.possible_definitions.iter().any(|possible| {
+                    possible.line == attr.line && possible.name.eq_ignore_ascii_case(name)
+                })
+            })
+            .map(|attr| (attr.line, UndefinedStep::Definition(attr)));
+        let possible = doc
+            .possible_definitions
+            .iter()
+            .map(|possible| (possible.line, UndefinedStep::Possible(possible)));
+        let references = doc
+            .substituted_refs
+            .iter()
+            .map(|reference| (reference.line, UndefinedStep::Reference(reference)));
+        definitions.chain(possible).chain(references).collect()
+    }
+
+    /// On the same line a reference comes first, as in `ReadingWalk`: in
+    /// `:a: {a}`, `{a}` means the earlier value. A `{counter:x}` defines `x`
+    /// for the references behind it.
+    fn first_on_line(item: &UndefinedStep<'a>) -> bool {
+        !matches!(item, UndefinedStep::Definition(_))
+    }
+
+    fn item(&mut self, stack: &[PathBuf], file: &Path, item: UndefinedStep<'a>) {
+        match item {
+            UndefinedStep::Definition(attr) => {
+                let (name, unset) = entry_name(&attr.name);
+                let known = if unset {
+                    Known::Unset
+                } else {
+                    Known::Set(&attr.value)
+                };
+                self.known.insert(name.to_lowercase(), known);
+            }
+            UndefinedStep::Possible(possible) => {
+                self.known
+                    .insert(possible.name.to_lowercase(), Known::Possible);
+            }
+            UndefinedStep::Reference(reference) => {
+                let Some(top) = stack.first() else {
+                    return;
+                };
+                if self.is_undefined(top, &reference.name) {
+                    self.found
+                        .insert((file.to_path_buf(), reference.line, reference.start_col));
+                }
+            }
+        }
+    }
+}
+
+impl UndefinedWalk<'_> {
+    fn is_undefined(&self, top: &Path, name: &str) -> bool {
+        let silent = match self.known.get("attribute-missing") {
+            Some(Known::Set(mode)) => MISSING_SILENT.contains(&mode.trim()),
+            Some(Known::Possible) => true,
+            Some(Known::Unset) => false,
+            None => self
+                .preset(top, "attribute-missing")
+                .is_some_and(|mode| MISSING_SILENT.contains(&mode.trim())),
+        };
+        if silent {
+            return false;
+        }
+        let lower = name.to_lowercase();
+        match self.known.get(&lower) {
+            Some(Known::Set(_) | Known::Possible) => false,
+            Some(Known::Unset) => true,
+            None => {
+                self.preset(top, name).is_none()
+                    && self.preset(top, &lower).is_none()
+                    && !crate::substituted_refs::is_predefined(&lower)
+            }
+        }
+    }
+
+    /// The value `name` has before the first line of `top`.
+    fn preset(&self, top: &Path, name: &str) -> Option<String> {
+        self.workspace
+            .preset(top, name, false)
+            .and_then(|definition| definition.value)
     }
 }
 

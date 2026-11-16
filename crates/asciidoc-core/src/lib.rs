@@ -10,6 +10,7 @@ pub mod pdf_theme;
 pub mod quick_fix;
 mod reading;
 pub mod references;
+pub mod substituted_refs;
 pub mod types;
 pub mod ventilate;
 pub mod workspace;

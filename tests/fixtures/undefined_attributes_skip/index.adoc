@@ -1,0 +1,3 @@
+= Index
+
+Nothing is reported for {nothing} because the config says skip.

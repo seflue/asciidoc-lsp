@@ -1,0 +1,6 @@
+= Web
+:product: P
+
+include::shared.adoc[]
+
+include::shared.adoc[]
