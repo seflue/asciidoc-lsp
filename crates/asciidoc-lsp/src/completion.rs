@@ -222,6 +222,103 @@ const INLINE_MACROS: &[SyntaxEntry] = &[
     },
 ];
 
+/// Built-in styles of a block attribute line (`[NOTE]`): `(name, detail)`.
+/// Source: Asciidoctor 2.0.26 (paragraph, listing, example, quote, open,
+/// table, literal, pass and sidebar warn on unknown styles; sections and
+/// lists never do) and the Asciidoctor documentation for section and list
+/// styles. One entry per name; `detail` names every use. Extension and
+/// converter-specific styles are left out.
+const BLOCK_STYLES: &[(&str, &str)] = &[
+    ("NOTE", "Admonition (paragraph or example block)"),
+    ("TIP", "Admonition (paragraph or example block)"),
+    ("IMPORTANT", "Admonition (paragraph or example block)"),
+    ("WARNING", "Admonition (paragraph or example block)"),
+    ("CAUTION", "Admonition (paragraph or example block)"),
+    (
+        "source",
+        "Source code listing (paragraph, listing or open block)",
+    ),
+    ("listing", "Listing block"),
+    ("literal", "Literal block"),
+    ("quote", "Quote (paragraph, quote or open block)"),
+    ("verse", "Verse (paragraph, quote or open block)"),
+    ("example", "Example block"),
+    ("sidebar", "Sidebar block"),
+    ("open", "Open block"),
+    ("pass", "Passthrough block"),
+    ("stem", "STEM passthrough block (++++)"),
+    ("latexmath", "STEM passthrough block (++++)"),
+    ("asciimath", "STEM passthrough block (++++)"),
+    ("comment", "Comment block (not rendered)"),
+    ("normal", "Normal paragraph"),
+    ("abstract", "Abstract (block or section)"),
+    (
+        "partintro",
+        "Part introduction (block or section, book only)",
+    ),
+    ("appendix", "Appendix section"),
+    ("glossary", "Glossary (section or description list)"),
+    ("bibliography", "Bibliography (section or unordered list)"),
+    ("index", "Index section"),
+    ("preface", "Preface section"),
+    ("colophon", "Colophon section"),
+    ("dedication", "Dedication section"),
+    ("acknowledgments", "Acknowledgments section"),
+    ("discrete", "Discrete heading (not a section)"),
+    ("float", "Discrete heading (not a section)"),
+    ("arabic", "Ordered list numbering"),
+    ("decimal", "Ordered list numbering"),
+    ("loweralpha", "Ordered list numbering"),
+    ("upperalpha", "Ordered list numbering"),
+    ("lowerroman", "Ordered list numbering"),
+    ("upperroman", "Ordered list numbering"),
+    ("lowergreek", "Ordered list numbering"),
+    ("horizontal", "Horizontal description list"),
+    ("qanda", "Question and answer list"),
+];
+
+/// Languages offered after `[source,`. Suggestions only: Asciidoctor accepts
+/// any language name without a warning, and the list is not checked against
+/// a highlighter.
+const SOURCE_LANGUAGES: &[&str] = &[
+    "asciidoc",
+    "bash",
+    "c",
+    "console",
+    "cpp",
+    "csharp",
+    "css",
+    "diff",
+    "dockerfile",
+    "go",
+    "groovy",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "json",
+    "kotlin",
+    "lua",
+    "markdown",
+    "perl",
+    "php",
+    "plaintext",
+    "powershell",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "shell",
+    "sql",
+    "swift",
+    "text",
+    "toml",
+    "typescript",
+    "xml",
+    "yaml",
+];
+
 // ---------------------------------------------------------------------------
 // Completion Context
 // ---------------------------------------------------------------------------
@@ -342,6 +439,11 @@ pub(crate) enum CompletionContext {
         prefix: String,
         span: TargetSpan,
     },
+    /// `[NO` — style slot of a block attribute line. `span` covers the style
+    /// token typed so far and the rest of it after the cursor.
+    BlockStyle { prefix: String, span: TargetSpan },
+    /// `[source,ru` — language slot of a `source` block attribute line.
+    SourceLanguage { prefix: String, span: TargetSpan },
     /// `kbd` mid-line or at line start — inline macro prefix (no `:` typed yet)
     InlineMacroPrefix {
         prefix: String,
@@ -659,6 +761,48 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                 span: attr_span_from(prefix_start),
                 closing: "",
             });
+        }
+    }
+
+    // Priority 4c: block attribute line — `[` in column 0 (`[[id]]` is a block
+    // anchor). Style slot: `[NO`; language slot of `source`: `[source,ru`. The
+    // line is still unfinished while typing (Asciidoctor reads `[NO` without
+    // `]` as text), so this is a syntax check of the line itself, not a tree
+    // question. Must precede Priority 8 (`[li` is no `link:`).
+    if let Some(attrs) = before_cursor
+        .strip_prefix('[')
+        .filter(|attrs| !attrs.starts_with('['))
+    {
+        fn is_style_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
+        }
+        fn is_lang_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+')
+        }
+        let token_span = |start: usize, is_token_char: fn(char) -> bool| {
+            let token_len = after_cursor
+                .find(|c: char| !is_token_char(c))
+                .unwrap_or(after_cursor.len());
+            TargetSpan {
+                end_col: pos.character + utf16_len(&after_cursor[..token_len]),
+                ..span_from(start)
+            }
+        };
+        if attrs.chars().all(is_style_char) {
+            return Some(CompletionContext::BlockStyle {
+                prefix: attrs.to_string(),
+                span: token_span(1, is_style_char),
+            });
+        }
+        if let Some((first, rest)) = attrs.split_once(',') {
+            let style = first.split(['#', '.', '%']).next().unwrap_or(first);
+            let lang = rest.trim_start_matches(' ');
+            if style == "source" && lang.chars().all(is_lang_char) {
+                return Some(CompletionContext::SourceLanguage {
+                    prefix: lang.to_string(),
+                    span: token_span(before_cursor.len() - lang.len(), is_lang_char),
+                });
+            }
         }
     }
 
@@ -1359,6 +1503,53 @@ fn resolve_doc_attribute_completions(prefix: &str) -> Vec<CompletionItem> {
     resolve_syntax_catalog(DOC_ATTRIBUTES, prefix, CompletionItemKind::PROPERTY)
 }
 
+/// Items for `names` that start with `prefix` (ASCII case-insensitive), each
+/// replacing the token `span` with the correctly written name.
+fn resolve_block_attribute_completions<'a>(
+    names: impl Iterator<Item = (&'a str, &'a str)>,
+    prefix: &str,
+    span: TargetSpan,
+    kind: CompletionItemKind,
+) -> Vec<CompletionItem> {
+    let prefix = prefix.to_ascii_lowercase();
+    names
+        .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&prefix))
+        .map(|(name, detail)| CompletionItem {
+            label: name.to_string(),
+            kind: Some(kind),
+            detail: Some(detail.to_string()),
+            filter_text: Some(name.to_string()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: span.range_to(span.end_col),
+                new_text: name.to_string(),
+            })),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Resolve block style completions (`[NO` → `NOTE`).
+fn resolve_block_style_completions(prefix: &str, span: TargetSpan) -> Vec<CompletionItem> {
+    resolve_block_attribute_completions(
+        BLOCK_STYLES.iter().copied(),
+        prefix,
+        span,
+        CompletionItemKind::KEYWORD,
+    )
+}
+
+/// Resolve source language completions (`[source,ru` → `rust`).
+fn resolve_source_language_completions(prefix: &str, span: TargetSpan) -> Vec<CompletionItem> {
+    resolve_block_attribute_completions(
+        SOURCE_LANGUAGES
+            .iter()
+            .map(|name| (*name, "Source language")),
+        prefix,
+        span,
+        CompletionItemKind::VALUE,
+    )
+}
+
 /// The values of a snippet's choice list (`${1|a,b|}`). Placeholders
 /// (`${1:images}`) and snippets without a placeholder yield `None`.
 fn snippet_choices(snippet: &str) -> Option<impl Iterator<Item = &str>> {
@@ -1564,6 +1755,12 @@ pub(crate) fn resolve_completions(
         }
         CompletionContext::AttributeValue { name, prefix, span } => {
             resolve_attribute_value_completions(name, &prefix, span)
+        }
+        CompletionContext::BlockStyle { prefix, span } => {
+            resolve_block_style_completions(&prefix, span)
+        }
+        CompletionContext::SourceLanguage { prefix, span } => {
+            resolve_source_language_completions(&prefix, span)
         }
         CompletionContext::InlineMacroPrefix {
             prefix,
@@ -1779,6 +1976,36 @@ mod tests {
         CompletionContext::AttributeValue { name: "toc", prefix: "l".into(), span: span(6, 7) })]
     #[case("attribute reference in value stays an attribute", ":toc: {doc", 0, 10,
         CompletionContext::Attribute { prefix: "doc".into(), span: span(7, 10), closing: "}" })]
+    #[case("block style prefix", "[NO", 0, 3,
+        CompletionContext::BlockStyle { prefix: "NO".into(), span: span(1, 3) })]
+    #[case("block style after bare bracket", "[", 0, 1,
+        CompletionContext::BlockStyle { prefix: "".into(), span: span(1, 1) })]
+    #[case("block style edit stops before the closing bracket", "[NO]", 0, 3,
+        CompletionContext::BlockStyle { prefix: "NO".into(), span: span(1, 3) })]
+    #[case("block style edit covers the rest of the token only", "[NOTE,x]", 0, 3,
+        CompletionContext::BlockStyle { prefix: "NO".into(), span: span_to(1, 3, 5) })]
+    #[case("block style wins over inline macro prefix", "[li", 0, 3,
+        CompletionContext::BlockStyle { prefix: "li".into(), span: span(1, 3) })]
+    #[case("source language prefix", "[source,ru", 0, 10,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span(8, 10) })]
+    #[case("source language after bare comma", "[source,", 0, 8,
+        CompletionContext::SourceLanguage { prefix: "".into(), span: span(8, 8) })]
+    #[case("source language ignores blanks after the comma", "[source, ru", 0, 11,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span(9, 11) })]
+    #[case("source language after a role shorthand", "[source.role,ru", 0, 15,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span(13, 15) })]
+    #[case("source language after id and option shorthands", "[source#sid%linenums,ru", 0, 23,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span(21, 23) })]
+    #[case("source language edit stops before the closing bracket", "[source,ru]", 0, 10,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 10, 10) })]
+    #[case("source language edit covers the rest of the token", "[source,rust]", 0, 10,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 10, 12) })]
+    #[case("source language may contain a plus", "[source,c+", 0, 10,
+        CompletionContext::SourceLanguage { prefix: "c+".into(), span: span(8, 10) })]
+    #[case("source language wins over link macro", "[source,li", 0, 10,
+        CompletionContext::SourceLanguage { prefix: "li".into(), span: span(8, 10) })]
+    #[case("attribute reference in the language slot stays an attribute", "[source,{lan", 0, 12,
+        CompletionContext::Attribute { prefix: "lan".into(), span: span(9, 12), closing: "}" })]
     fn test_detect_completion_some(
         #[case] _name: &str,
         #[case] content: &str,
@@ -1827,6 +2054,25 @@ mod tests {
     #[case("attribute not in the catalog", ":custom: ", 0, 9)]
     #[case("second word is no value", ":toc: left x", 0, 12)]
     #[case("attribute entry not at line start", "text :toc: ", 0, 11)]
+    #[case("block anchor is no attribute list", "[[NO", 0, 4)]
+    #[case("indented bracket is literal text (Asciidoctor)", " [NO", 0, 4)]
+    #[case(
+        "blank after the bracket is no attribute line (Asciidoctor)",
+        "[ NO",
+        0,
+        4
+    )]
+    #[case("bracket mid-line", "See [NO", 0, 7)]
+    #[case("cursor after the closing bracket", "[NOTE]", 0, 6)]
+    #[case("id shorthand has no style slot", "[#id", 0, 4)]
+    #[case("role shorthand has no style slot", "[.role", 0, 6)]
+    #[case("option shorthand has no style slot", "[%opt", 0, 5)]
+    #[case("named attribute has no style slot", "[role=x", 0, 7)]
+    #[case("shorthand after the style ends the style slot", "[NOTE#id", 0, 8)]
+    #[case("second slot of quote is an attribution", "[quote,Au", 0, 9)]
+    #[case("second slot without style depends on the block", "[,ru", 0, 4)]
+    #[case("style names are case-sensitive (Asciidoctor)", "[Source,ru", 0, 10)]
+    #[case("third slot has no language", "[source,rust,ru", 0, 15)]
     fn test_detect_completion_none(
         #[case] _name: &str,
         #[case] content: &str,
@@ -3949,6 +4195,48 @@ mod tests {
             resolve_attribute_value_completions("source-highlighter", "highlight.", span(21, 31));
         assert_eq!(labels(&items), ["highlight.js"]);
         assert_eq!(edit(&items[0]).new_text, "highlight.js");
+    }
+
+    #[test]
+    fn test_block_style_prefix_case_insensitive() {
+        let items = resolve_block_style_completions("no", span(1, 3));
+        let found = labels(&items);
+        assert!(found.contains(&"NOTE"), "labels: {found:?}");
+        assert!(found.contains(&"normal"), "labels: {found:?}");
+        assert!(!found.contains(&"TIP"), "labels: {found:?}");
+    }
+
+    #[test]
+    fn test_block_style_empty_prefix_lists_catalog() {
+        let items = resolve_block_style_completions("", span(1, 1));
+        assert_eq!(items.len(), BLOCK_STYLES.len());
+        let mut found = labels(&items);
+        found.sort_unstable();
+        found.dedup();
+        assert_eq!(found.len(), BLOCK_STYLES.len(), "one item per name");
+    }
+
+    #[test]
+    fn test_block_style_edit_replaces_token_only() {
+        let items = resolve_block_style_completions("NO", span_to(1, 3, 5));
+        let note = items.iter().find(|i| i.label == "NOTE").unwrap();
+        assert_eq!(edit(note).range, cols(1, 5));
+        assert_eq!(edit(note).new_text, "NOTE");
+        assert_eq!(note.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn test_source_language_rust() {
+        let items = resolve_source_language_completions("ru", span(8, 10));
+        let rust = items.iter().find(|i| i.label == "rust").unwrap();
+        assert_eq!(edit(rust).new_text, "rust");
+        assert_eq!(edit(rust).range, cols(8, 10));
+        assert_eq!(rust.kind, Some(CompletionItemKind::VALUE));
+    }
+
+    #[test]
+    fn test_source_language_unknown_prefix_empty() {
+        assert!(resolve_source_language_completions("zzz", span(8, 11)).is_empty());
     }
 
     #[test]

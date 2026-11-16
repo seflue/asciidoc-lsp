@@ -364,6 +364,7 @@ impl LanguageServer for AsciiDocLsp {
                         ":".into(), // include::
                         "{".into(), // {attribute
                         "/".into(), // next path segment
+                        "[".into(), // [ block attribute line
                     ]),
                     ..Default::default()
                 }),
@@ -2635,6 +2636,50 @@ mod tests {
             .and_then(|c| c.trigger_characters)
             .unwrap_or_default();
         assert!(triggers.iter().any(|t| t == "/"), "triggers: {triggers:?}");
+    }
+
+    #[tokio::test]
+    async fn test_bracket_triggers_completion_but_comma_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let result = service
+            .inner()
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(tmp.path()),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let triggers = result
+            .capabilities
+            .completion_provider
+            .and_then(|c| c.trigger_characters)
+            .unwrap_or_default();
+        assert!(triggers.iter().any(|t| t == "["), "triggers: {triggers:?}");
+        assert!(!triggers.iter().any(|t| t == ","), "triggers: {triggers:?}");
+    }
+
+    #[tokio::test]
+    async fn test_block_attribute_line_completes_style_and_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _socket) = initialized_server(tmp.path()).await;
+        let server = service.inner();
+        let uri = file_uri(&tmp.path().join("doc.adoc"));
+        let text = "= Doc\n\n[NO\n\n[source,ru\n";
+        open_document(server, &uri, text).await;
+
+        let styles = completion_labels(server, &uri, position_of(text, "[NO", 3)).await;
+        let languages = completion_labels(server, &uri, position_of(text, "[source,ru", 10)).await;
+
+        assert!(styles.iter().any(|l| l == "NOTE"), "labels: {styles:?}");
+        assert!(
+            languages.iter().any(|l| l == "rust"),
+            "labels: {languages:?}"
+        );
     }
 
     #[test]
