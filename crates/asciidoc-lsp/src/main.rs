@@ -3,6 +3,7 @@ mod diagnostics_convert;
 mod navigation;
 mod positions;
 mod scopes;
+mod semantic_tokens;
 mod symbols;
 #[cfg(test)]
 mod test_support;
@@ -25,10 +26,12 @@ use tower_lsp_server::ls_types::{
     FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InitializedParams, Location, MarkedString, MessageType, OneOf, Position, PrepareRenameResponse,
-    Range, ReferenceParams, Registration, RenameOptions, RenameParams, SaveOptions,
-    ServerCapabilities, ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    Range, ReferenceParams, Registration, RenameOptions, RenameParams, SaveOptions, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -337,6 +340,16 @@ impl LanguageServer for AsciiDocLsp {
                     },
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: semantic_tokens::legend(),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: None,
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                        },
+                    ),
+                ),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -625,6 +638,26 @@ impl LanguageServer for AsciiDocLsp {
         let symbols = symbols::build_document_symbols(&sections, &includes, &attributes, &content);
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let Some(content) = self.get_document_content(&params.text_document.uri) else {
+            return Ok(None);
+        };
+
+        let data = semantic_tokens::semantic_tokens(&content).map_err(|e| {
+            let mut error = jsonrpc::Error::internal_error();
+            error.message = format!("semantic tokens: {e:#}").into();
+            error
+        })?;
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1261,6 +1294,9 @@ mod tests {
     use std::path::Path;
     use std::str::FromStr;
     use tower_lsp_server::jsonrpc::ErrorCode;
+    use tower_lsp_server::ls_types::{
+        PartialResultParams, SemanticTokenType, TextDocumentIdentifier, WorkDoneProgressParams,
+    };
 
     // --- Document Lifecycle tests ---
 
@@ -2680,6 +2716,40 @@ mod tests {
             languages.iter().any(|l| l == "rust"),
             "labels: {languages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_offers_full_semantic_tokens_only() {
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+
+        let result = service
+            .inner()
+            .initialize(InitializeParams::default())
+            .await
+            .unwrap();
+
+        let Some(SemanticTokensServerCapabilities::SemanticTokensOptions(options)) =
+            result.capabilities.semantic_tokens_provider
+        else {
+            panic!("no semantic tokens provider");
+        };
+        assert_eq!(
+            options.full,
+            Some(SemanticTokensFullOptions::Bool(true)),
+            "full requests only: no delta"
+        );
+        assert_eq!(options.range, None, "no range requests");
+        assert_eq!(options.legend, semantic_tokens::legend());
+        // Markup has no standard type, so the legend carries custom ones next
+        // to standard ones; the extension declares the custom ones.
+        let types: Vec<&str> = options
+            .legend
+            .token_types
+            .iter()
+            .map(SemanticTokenType::as_str)
+            .collect();
+        assert!(types.contains(&"heading"), "types: {types:?}");
+        assert!(types.contains(&"comment"), "types: {types:?}");
     }
 
     #[test]
@@ -4267,6 +4337,38 @@ mod tests {
             definition_at(server, &uri, position_of(&text, "Uses {product}", 6), &fx).await,
             "main.adoc:1"
         );
+    }
+
+    /// The full request answers with the tokens of the open document, as the
+    /// legend announced them (committed fixture `tests/fixtures/semantic_tokens`).
+    #[tokio::test]
+    async fn test_fixture_semantic_tokens_full_returns_tokens_of_the_document() {
+        let fx = fixture_dir("semantic_tokens");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+
+        let result = service
+            .inner()
+            .semantic_tokens_full(SemanticTokensParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri },
+            })
+            .await
+            .unwrap();
+
+        let Some(SemanticTokensResult::Tokens(tokens)) = result else {
+            panic!("no tokens: {result:?}");
+        };
+        assert_eq!(
+            tokens.data,
+            semantic_tokens::semantic_tokens(&text).unwrap()
+        );
+        let heading = semantic_tokens::legend()
+            .token_types
+            .iter()
+            .position(|t| t.as_str() == "heading")
+            .unwrap();
+        assert_eq!(tokens.data[0].token_type as usize, heading);
     }
 
     /// Hover on `pdf-theme`, `pdf-themesdir` and `pdf-fontsdir` shows the

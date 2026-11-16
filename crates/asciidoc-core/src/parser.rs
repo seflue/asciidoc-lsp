@@ -1,6 +1,18 @@
-use tree_sitter::{Parser, Tree};
+use tree_sitter::{Language, Parser, Tree};
 
 use crate::error::CoreError;
+
+/// The tree-sitter language of the block-level `AsciiDoc` grammar.
+#[must_use]
+pub fn block_language() -> Language {
+    tree_sitter_asciidoc::language()
+}
+
+/// The tree-sitter language of the inline-level `AsciiDoc` grammar.
+#[must_use]
+pub fn inline_language() -> Language {
+    tree_sitter_asciidoc_inline::language()
+}
 
 /// Initialize a tree-sitter parser for the block-level `AsciiDoc` grammar.
 ///
