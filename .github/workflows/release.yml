@@ -1,4 +1,4 @@
-name: Release binaries
+name: Release
 
 on:
   release:
@@ -76,3 +76,78 @@ jobs:
       - name: Upload to release
         shell: bash
         run: gh release upload "$TAG" "$ASSET" --clobber
+      - name: Keep binary for the VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/asciidoc-lsp
+            target/${{ matrix.target }}/release/asciidoc-lsp.exe
+          if-no-files-found: error
+
+  vsix:
+    name: VSIX ${{ matrix.code_target }}
+    needs: binaries
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - code_target: linux-x64
+            target: x86_64-unknown-linux-musl
+          - code_target: alpine-x64
+            target: x86_64-unknown-linux-musl
+          - code_target: linux-arm64
+            target: aarch64-unknown-linux-musl
+          - code_target: alpine-arm64
+            target: aarch64-unknown-linux-musl
+          - code_target: darwin-x64
+            target: x86_64-apple-darwin
+          - code_target: darwin-arm64
+            target: aarch64-apple-darwin
+          - code_target: win32-x64
+            target: x86_64-pc-windows-msvc
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      CODE_TARGET: ${{ matrix.code_target }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Fetch server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: editors/vscode/server
+      - name: Make binary executable
+        run: chmod +x editors/vscode/server/asciidoc-lsp*
+      - name: Install dependencies
+        run: npm --prefix editors/vscode ci
+      - name: Package
+        run: npm --prefix editors/vscode run package -- "${TAG#v}" --no-git-tag-version --target "$CODE_TARGET" --out "../../asciidoc-lsp-${CODE_TARGET}.vsix"
+      - name: Upload to release
+        run: gh release upload "$TAG" "asciidoc-lsp-${CODE_TARGET}.vsix" --clobber
+
+  vsix-universal:
+    name: VSIX universal
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install dependencies
+        run: npm --prefix editors/vscode ci
+      - name: Package
+        run: npm --prefix editors/vscode run package -- "${TAG#v}" --no-git-tag-version --out ../../asciidoc-lsp-universal.vsix
+      - name: Upload to release
+        run: gh release upload "$TAG" asciidoc-lsp-universal.vsix --clobber

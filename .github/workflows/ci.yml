@@ -64,3 +64,18 @@ jobs:
           rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+
+  vscode-extension:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - run: npm --prefix editors/vscode ci
+      - run: npm --prefix editors/vscode run compile
+      - run: npm --prefix editors/vscode test
+      - run: npm --prefix editors/vscode run package
