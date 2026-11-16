@@ -335,6 +335,13 @@ pub(crate) enum CompletionContext {
     Admonition { prefix: String },
     /// `:to` at line start — document attribute completion
     DocumentAttribute { prefix: String },
+    /// `:toc: le` — value of a catalog attribute with a choice list. `name` is
+    /// the catalog name (lowercase); `span` covers the value token.
+    AttributeValue {
+        name: &'static str,
+        prefix: String,
+        span: TargetSpan,
+    },
     /// `kbd` mid-line or at line start — inline macro prefix (no `:` typed yet)
     InlineMacroPrefix {
         prefix: String,
@@ -370,6 +377,43 @@ fn shorthand_closing(content: &str, line: u32, after_cursor: &str) -> &'static s
 /// and directives.
 fn is_attribute_name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+/// A character of the name in an attribute entry line (`:name:`, `:name!:`
+/// without the `!`). ASCII only, unlike `is_attribute_name_char` for
+/// references.
+fn is_attribute_entry_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// A character of an attribute entry value as far as completion cares
+/// (`highlight.js`).
+fn is_attribute_value_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// For `:name: value-so-far` at line start: the catalog name of an attribute
+/// with a choice list and the byte offset where the value starts. Asciidoctor
+/// needs a blank (or tab) after the closing `:` and reads the name
+/// case-insensitively; the unset forms `:toc!:` / `:!toc:` fall out of the
+/// name class.
+fn attribute_value_target(before_cursor: &str) -> Option<(&'static str, usize)> {
+    let (name, after) = before_cursor.strip_prefix(':')?.split_once(':')?;
+    if name.is_empty()
+        || !name.chars().all(is_attribute_entry_name_char)
+        || !after.starts_with([' ', '\t'])
+    {
+        return None;
+    }
+    let value = after.trim_start_matches([' ', '\t']);
+    if !value.chars().all(is_attribute_value_char) {
+        return None;
+    }
+    let entry = DOC_ATTRIBUTES
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name))?;
+    snippet_choices(entry.snippet).is_some().then_some(())?;
+    Some((entry.name, before_cursor.len() - value.len()))
 }
 
 /// Detect the completion context at the given cursor position by scanning
@@ -620,15 +664,27 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
 
     // Priority 5: DocumentAttribute — `:prefix` at line start, no closing `:`
     if let Some(rest) = before_cursor.strip_prefix(':') {
-        if !rest.contains(':')
-            && rest
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !rest.contains(':') && rest.chars().all(is_attribute_entry_name_char) {
             return Some(CompletionContext::DocumentAttribute {
                 prefix: rest.to_string(),
             });
         }
+    }
+
+    // Priority 5b: AttributeValue — `:name: val` of an attribute with choices.
+    // The value token runs on past the cursor over value characters.
+    if let Some((name, value_start)) = attribute_value_target(before_cursor) {
+        let token_len = after_cursor
+            .find(|c: char| !is_attribute_value_char(c))
+            .unwrap_or(after_cursor.len());
+        return Some(CompletionContext::AttributeValue {
+            name,
+            prefix: before_cursor[value_start..].to_string(),
+            span: TargetSpan {
+                end_col: pos.character + utf16_len(&after_cursor[..token_len]),
+                ..span_from(value_start)
+            },
+        });
     }
 
     // Priority 6: BlockMacro — only lowercase at line start, AND must match catalog
@@ -1322,6 +1378,33 @@ pub(crate) fn doc_attribute_doc(name: &str) -> Option<(&'static str, Vec<&'stati
     Some((entry.detail, values))
 }
 
+/// Resolve the values of the catalog attribute `name` that start with
+/// `prefix`. Each item replaces the value token (`span`).
+fn resolve_attribute_value_completions(
+    name: &str,
+    prefix: &str,
+    span: TargetSpan,
+) -> Vec<CompletionItem> {
+    let Some(entry) = DOC_ATTRIBUTES.iter().find(|e| e.name == name) else {
+        return Vec::new();
+    };
+    snippet_choices(entry.snippet)
+        .into_iter()
+        .flatten()
+        .filter(|value| value.starts_with(prefix))
+        .map(|value| CompletionItem {
+            label: value.to_string(),
+            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            detail: Some(entry.detail.to_string()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: span.range_to(span.end_col),
+                new_text: value.to_string(),
+            })),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Resolve inline macro completions for a known macro name.
 fn resolve_inline_macro_completions(macro_name: &str) -> Vec<CompletionItem> {
     INLINE_MACROS
@@ -1478,6 +1561,9 @@ pub(crate) fn resolve_completions(
         CompletionContext::Admonition { prefix } => resolve_admonition_completions(&prefix),
         CompletionContext::DocumentAttribute { prefix } => {
             resolve_doc_attribute_completions(&prefix)
+        }
+        CompletionContext::AttributeValue { name, prefix, span } => {
+            resolve_attribute_value_completions(name, &prefix, span)
         }
         CompletionContext::InlineMacroPrefix {
             prefix,
@@ -1669,6 +1755,30 @@ mod tests {
         CompletionContext::Attribute { prefix: "äb".into(), span: span(7, 9), closing: "" })]
     #[case("attribute in single-line ifdef content", "ifdef::a[{pro", 0, 13,
         CompletionContext::Attribute { prefix: "pro".into(), span: span(10, 13), closing: "}" })]
+    #[case("attribute value empty", ":toc: ", 0, 6,
+        CompletionContext::AttributeValue { name: "toc", prefix: "".into(), span: span(6, 6) })]
+    #[case("attribute value prefix", ":toc: le", 0, 8,
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span(6, 8) })]
+    #[case("attribute value after several blanks", ":toc:   le", 0, 10,
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span(8, 10) })]
+    #[case("attribute value after tab", ":toc:\tle", 0, 8,
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span(6, 8) })]
+    #[case("attribute value with dot", ":source-highlighter: highlight.", 0, 31,
+        CompletionContext::AttributeValue { name: "source-highlighter", prefix: "highlight.".into(), span: span(21, 31) })]
+    #[case("attribute value mid-token", ":toc: left", 0, 8,
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8, 10) })]
+    #[case("attribute value edit stops at a blank after the cursor", ":toc: left x", 0, 8,
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8, 10) })]
+    #[case("attribute value edit stops at a non-value character", ":toc: le{x}", 0, 8,
+        CompletionContext::AttributeValue { name: "toc", prefix: "le".into(), span: span_to(6, 8, 8) })]
+    #[case("attribute value name case-insensitive", ":TOC: ", 0, 6,
+        CompletionContext::AttributeValue { name: "toc", prefix: "".into(), span: span(6, 6) })]
+    #[case("attribute value wins over inline macro", ":icons: fo", 0, 10,
+        CompletionContext::AttributeValue { name: "icons", prefix: "fo".into(), span: span(8, 10) })]
+    #[case("attribute value wins over link macro", ":toc: l", 0, 7,
+        CompletionContext::AttributeValue { name: "toc", prefix: "l".into(), span: span(6, 7) })]
+    #[case("attribute reference in value stays an attribute", ":toc: {doc", 0, 10,
+        CompletionContext::Attribute { prefix: "doc".into(), span: span(7, 10), closing: "}" })]
     fn test_detect_completion_some(
         #[case] _name: &str,
         #[case] content: &str,
@@ -1705,6 +1815,18 @@ mod tests {
     #[case("ifdef after closed brackets", "ifdef::sectnums[]", 0, 17)]
     #[case("ifdef content after bracket", "ifdef::a[sec", 0, 12)]
     #[case("ifdef name list broken by space", "ifdef::a sec", 0, 12)]
+    #[case(
+        "attribute value needs a blank after the colon (Asciidoctor: no entry)",
+        ":toc:left",
+        0,
+        9
+    )]
+    #[case("unset suffix form has no value", ":toc!: ", 0, 7)]
+    #[case("unset prefix form has no value", ":!toc: ", 0, 7)]
+    #[case("attribute without choices", ":imagesdir: ", 0, 12)]
+    #[case("attribute not in the catalog", ":custom: ", 0, 9)]
+    #[case("second word is no value", ":toc: left x", 0, 12)]
+    #[case("attribute entry not at line start", "text :toc: ", 0, 11)]
     fn test_detect_completion_none(
         #[case] _name: &str,
         #[case] content: &str,
@@ -3792,6 +3914,64 @@ mod tests {
         let items = resolve_completions(ctx, doc_path, 1, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "kbd:");
+    }
+
+    // --- Attribute value completions ---
+
+    #[test]
+    fn test_attribute_value_completions_offer_toc_choices() {
+        let items = resolve_attribute_value_completions("toc", "", span(6, 6));
+        assert_eq!(labels(&items), ["auto", "left", "right", "preamble"]);
+        for item in &items {
+            assert_eq!(item.kind, Some(CompletionItemKind::ENUM_MEMBER));
+            assert_eq!(item.detail.as_deref(), Some("Table of contents placement"));
+            assert_eq!(edit(item).new_text, item.label);
+            assert_eq!(edit(item).range, cols(6, 6));
+        }
+    }
+
+    #[test]
+    fn test_attribute_value_completions_filter_by_prefix() {
+        let items = resolve_attribute_value_completions("toc", "le", span(6, 8));
+        assert_eq!(labels(&items), ["left"]);
+        assert_eq!(edit(&items[0]).range, cols(6, 8));
+    }
+
+    #[test]
+    fn test_attribute_value_edit_covers_the_token_after_the_cursor() {
+        let items = resolve_attribute_value_completions("toc", "le", span_to(6, 8, 10));
+        assert_eq!(edit(&items[0]).range, cols(6, 10));
+    }
+
+    #[test]
+    fn test_attribute_value_completions_keep_the_dot() {
+        let items =
+            resolve_attribute_value_completions("source-highlighter", "highlight.", span(21, 31));
+        assert_eq!(labels(&items), ["highlight.js"]);
+        assert_eq!(edit(&items[0]).new_text, "highlight.js");
+    }
+
+    #[test]
+    fn test_attribute_value_completions_are_plain_text() {
+        let items = resolve_attribute_value_completions("toc", "", span(6, 6));
+        assert!(items.iter().all(|i| i.insert_text_format.is_none()));
+    }
+
+    #[test]
+    fn test_attribute_value_verify_toc() {
+        let ctx = detect_completion_context(
+            ":toc: ",
+            Position {
+                line: 0,
+                character: 6,
+            },
+        )
+        .expect("context after `:toc: `");
+        let items = resolve_completions(ctx, Path::new("/tmp/doc.adoc"), 1, None);
+        let labels = labels(&items);
+        for expected in ["auto", "left", "right", "preamble"] {
+            assert!(labels.contains(&expected), "missing {expected}: {labels:?}");
+        }
     }
 
     // --- Syntax Completions: Catalog ---
