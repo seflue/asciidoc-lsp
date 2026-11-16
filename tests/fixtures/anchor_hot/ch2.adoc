@@ -1,0 +1,23 @@
+== Two
+
+<<hot>> 1.
+<<hot>> 2.
+<<hot>> 3.
+<<hot>> 4.
+<<hot>> 5.
+<<hot>> 6.
+<<hot>> 7.
+<<hot>> 8.
+<<hot>> 9.
+<<hot>> 10.
+
+xref:ch1.adoc#hot[] 1.
+xref:ch1.adoc#hot[] 2.
+xref:ch1.adoc#hot[] 3.
+xref:ch1.adoc#hot[] 4.
+xref:ch1.adoc#hot[] 5.
+xref:ch1.adoc#hot[] 6.
+xref:ch1.adoc#hot[] 7.
+xref:ch1.adoc#hot[] 8.
+xref:ch1.adoc#hot[] 9.
+xref:ch1.adoc#hot[] 10.

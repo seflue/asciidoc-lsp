@@ -1,0 +1,10 @@
+= Solo Two
+
+== First
+
+Jump to <<_first>>.
+
+== Second
+
+[[note]]
+Solo2 note, see <<note>>.

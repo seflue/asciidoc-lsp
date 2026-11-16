@@ -1,0 +1,5 @@
+= Book
+
+include::a/intro.adoc[]
+
+include::b/intro.adoc[]

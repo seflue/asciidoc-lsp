@@ -1,0 +1,5 @@
+// tag::a[]
+Inside a.
+// end::a[]
+
+Text [[p]]one and [[q]]two.

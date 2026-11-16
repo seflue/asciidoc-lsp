@@ -1,0 +1,8 @@
+= Selection
+:attribute-missing: warn
+
+include::b.adoc[]
+
+include::a.adoc[tags=**;!t]
+
+See xref:a.adoc#b-id[].

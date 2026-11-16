@@ -1,0 +1,5 @@
+= Foreign
+
+Link to xref:../chapters/setup.adoc#setup-only[a foreign document] and xref:../chapters/setup.adoc#nope[a missing id].
+
+Shared in xref:../chapters/reference.adoc#shared[the reference] and xref:../chapters/setup.adoc#shared[the setup].

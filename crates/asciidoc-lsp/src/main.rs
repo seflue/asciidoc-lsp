@@ -1420,9 +1420,9 @@ mod tests {
             "workspace should contain entry file"
         );
 
-        // Reference index should have anchors from the fixture
+        // The ID catalogs should define anchors from the fixture
         assert!(
-            !ws.reference_index().anchors().is_empty(),
+            !ws.anchor_definitions().is_empty(),
             "arc42 fixture should have anchors (e.g. [[project-goals]])"
         );
     }
@@ -3364,7 +3364,9 @@ mod tests {
             .diagnostics_for(path)
             .iter()
             .filter_map(|d| match &d.kind {
-                asciidoc_core::types::DiagnosticKind::BrokenXref { target } => Some(target.clone()),
+                asciidoc_core::types::DiagnosticKind::BrokenXref { target, .. } => {
+                    Some(target.clone())
+                }
                 _ => None,
             })
             .collect()

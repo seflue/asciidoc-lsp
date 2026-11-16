@@ -1,0 +1,7 @@
+= Foo Doc
+
+== Foo
+
+== Foo
+
+Valid <<_foo_2>>, broken <<_foo_3>>.

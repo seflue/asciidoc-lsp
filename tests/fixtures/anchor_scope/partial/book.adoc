@@ -1,0 +1,7 @@
+= Partial
+
+include::a.adoc[lines=1..2]
+
+include::b.adoc[]
+
+See xref:b.adoc#a-id[] and xref:a.adoc#b-id[].

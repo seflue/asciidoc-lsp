@@ -311,8 +311,8 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
         }
     }
 
-    // Anchors from ReferenceIndex
-    for (id, loc) in ws.reference_index().anchors() {
+    // Every definition of an ID, in each top-level document
+    for (id, loc) in &ws.anchor_definitions() {
         if !query_lower.is_empty() && !id.to_lowercase().contains(&query_lower) {
             continue;
         }
@@ -664,6 +664,43 @@ mod tests {
         let anchor_sym = symbols.iter().find(|s| s.name == "my-anchor");
         assert!(anchor_sym.is_some(), "expected anchor symbol 'my-anchor'");
         assert_eq!(anchor_sym.unwrap().kind, SymbolKind::CONSTANT);
+    }
+
+    /// `shared` is defined in `setup.adoc`, `reference.adoc` (both read by
+    /// `book.adoc`, where the second is a duplicate) and `standalone.adoc`:
+    /// the symbol list has every definition, not one per ID.
+    #[test]
+    fn test_workspace_symbols_list_every_definition_of_an_id() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/anchor_scope")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+
+        let mut found: Vec<(String, u32)> = collect_workspace_symbols(&ws, "shared")
+            .into_iter()
+            .filter(|symbol| symbol.name == "shared")
+            .map(|symbol| {
+                let file = symbol.location.uri.path().as_str().to_string();
+                (
+                    file.strip_prefix(root.to_str().unwrap())
+                        .unwrap()
+                        .to_string(),
+                    symbol.location.range.start.line,
+                )
+            })
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                ("/chapters/reference.adoc".to_string(), 0),
+                ("/chapters/setup.adoc".to_string(), 0),
+                ("/standalone.adoc".to_string(), 2),
+            ]
+        );
     }
 
     #[test]

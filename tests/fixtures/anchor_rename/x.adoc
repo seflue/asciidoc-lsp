@@ -1,0 +1,5 @@
+= X
+
+include::y.adoc[]
+
+include::z.adoc[]

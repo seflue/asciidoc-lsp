@@ -1,0 +1,10 @@
+// tag::top[]
+[[ref-top]]
+== Reference
+// end::top[]
+
+See <<setup-only>>.
+
+// tag::inner[]
+Inner <<nowhere>>.
+// end::inner[]

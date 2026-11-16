@@ -1,0 +1,9 @@
+= Book
+
+include::chapters/setup.adoc[]
+
+include::chapters/reference.adoc[]
+
+See <<shared>>, xref:chapters/reference.adoc#setup-only[] and <<_details_2>>.
+
+Also xref:chapters/reference.adoc#shared[].

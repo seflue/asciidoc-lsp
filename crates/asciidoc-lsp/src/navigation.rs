@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
+use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::extractors::{element_attr_id, find_child_text};
 use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
-use asciidoc_core::types::{AnchorKind, DiagnosticKind, FileLocation, ResolvedXref};
+use asciidoc_core::references::{parse_xref_target, xref_names_file};
+use asciidoc_core::types::{
+    AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref,
+};
 use asciidoc_core::workspace::{
     entry_name, AttributeDefinition, AttributeOrigin, AttributeScope, ConfigOverride, Workspace,
 };
@@ -170,8 +174,9 @@ pub fn resolve_goto_definitions(
             let Some(ws) = workspace else {
                 return Vec::new();
             };
+            let catalogs = CatalogCache::new(ws);
             unique_in_order(
-                resolve_xref_targets(ws, doc_path, target, node_info.line)
+                resolve_xref_targets(ws, &catalogs, doc_path, target, node_info.line)
                     .into_iter()
                     .filter_map(|(_, resolved)| resolved.ok())
                     .map(|resolved| (resolved.file, resolved.line)),
@@ -197,6 +202,7 @@ pub fn resolve_references(
 ) -> Option<Vec<FileLocation>> {
     let node_info = find_node_at_position(content, pos)?;
     let ws = workspace?;
+    let catalogs = CatalogCache::new(ws);
 
     let mut results = match &node_info.kind {
         NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. } => {
@@ -218,11 +224,28 @@ pub fn resolve_references(
             }
             r
         }
-        NodeKind::Anchor { id } => anchor_locations(ws, id, include_declaration, overrides),
+        NodeKind::Anchor { id } => {
+            let definitions = anchor_definitions_of_anchor(ws, &catalogs, doc_path, id);
+            anchor_reference_locations(&catalogs, id, &definitions, include_declaration, overrides)
+        }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
-            // Extract anchor part from xref target
+            // A file-only xref has no anchor to find references for.
             let anchor_id = xref_anchor_id(target)?;
-            anchor_locations(ws, anchor_id, include_declaration, overrides)
+            let definitions = anchor_definitions_of_xref(
+                ws,
+                &catalogs,
+                doc_path,
+                target,
+                anchor_id,
+                node_info.line,
+            );
+            anchor_reference_locations(
+                &catalogs,
+                anchor_id,
+                &definitions,
+                include_declaration,
+                overrides,
+            )
         }
         NodeKind::Image { .. } => {
             // Images have no references semantics — find-references is a no-op
@@ -267,45 +290,21 @@ fn xref_span_near(
     line: usize,
     cursor_col: usize,
 ) -> Option<(usize, usize)> {
-    ws.find_all_anchor_references(anchor_id)
-        .into_iter()
-        .filter(|loc| loc.line == line && loc.path == doc_path)
-        .min_by_key(|loc| {
-            if cursor_col < loc.col {
-                loc.col - cursor_col
+    ws.documents()
+        .get(doc_path)?
+        .xrefs
+        .iter()
+        .filter(|xref| xref.line == line)
+        .filter_map(asciidoc_core::types::Xref::id_span)
+        .filter(|(id, _, _)| *id == anchor_id)
+        .min_by_key(|&(_, col, end_col)| {
+            if cursor_col < col {
+                col - cursor_col
             } else {
-                cursor_col.saturating_sub(loc.end_col)
+                cursor_col.saturating_sub(end_col)
             }
         })
-        .map(|loc| (loc.col, loc.end_col))
-}
-
-/// The xrefs to `anchor_id`, and with `include_declaration` its definition,
-/// each at the span of the id on its line (the spans rename edits). An xref
-/// carries its span from extraction; the declaration's is found in its line
-/// (`[[id]]` or `[[id,reftext]]`). A declaration whose line holds no such
-/// span, such as a section's implicit id, stays a zero-width location at the
-/// line start.
-fn anchor_locations(
-    ws: &Workspace,
-    anchor_id: &str,
-    include_declaration: bool,
-    overrides: &HashMap<PathBuf, Arc<String>>,
-) -> Vec<FileLocation> {
-    let mut locations = ws.find_all_anchor_references(anchor_id);
-    if include_declaration {
-        if let Some(loc) = ws.reference_index().lookup(anchor_id) {
-            let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
-            let text = read_file_cached(&mut file_cache, &loc.file, overrides);
-            let line_text = text
-                .lines()
-                .nth(loc.line.saturating_sub(1))
-                .unwrap_or_default();
-            let (col, end_col) = find_anchor_def_columns(line_text, anchor_id).unwrap_or((0, 0));
-            locations.push(FileLocation::new(loc.file.clone(), loc.line, col, end_col));
-        }
-    }
-    locations
+        .map(|(_, col, end_col)| (col, end_col))
 }
 
 /// Where go-to-definition lands, as locations: from an xref, the id inside
@@ -459,7 +458,8 @@ pub fn resolve_hover(
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             let ws = workspace?;
-            let resolved = resolve_xref_targets(ws, doc_path, target, node_info.line);
+            let catalogs = CatalogCache::new(ws);
+            let resolved = resolve_xref_targets(ws, &catalogs, doc_path, target, node_info.line);
             if resolved.iter().all(|(_, resolved)| resolved.is_err()) {
                 return None;
             }
@@ -745,11 +745,199 @@ fn existing_targets(targets: &[DocTarget]) -> Vec<PathBuf> {
     )
 }
 
-/// How an xref on `line` resolves, per top-level document and, for a file
-/// others include, in the editor's preview of it (ADR-4), each with its
-/// scope's label. Shared by go-to-definition, hover and the explain report.
+/// Where the ID `id` is defined for a cursor on a definition in `doc_path`:
+/// its first definition in each top-level document that reads the file, and
+/// the explicit definitions after it, which a rename keeps in step.
+fn anchor_definitions_of_anchor(
+    ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
+    doc_path: &Path,
+    id: &str,
+) -> Vec<AnchorLocation> {
+    let mut definitions = Vec::new();
+    for catalog in catalogs.scopes_at(doc_path) {
+        let repeated = catalog
+            .duplicates()
+            .iter()
+            .filter(|duplicate| duplicate.id == id)
+            .map(|duplicate| &duplicate.second);
+        for location in catalog.lookup(id).into_iter().chain(repeated) {
+            push_definition(&mut definitions, location.clone());
+        }
+    }
+    close_definitions(ws, catalogs, id, definitions)
+}
+
+/// Where the xref `target` on `line` of `doc_path` finds its ID, in each
+/// top-level document that reads the file, closed as [`close_definitions`].
+fn anchor_definitions_of_xref(
+    ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
+    doc_path: &Path,
+    target: &str,
+    id: &str,
+    line: usize,
+) -> Vec<AnchorLocation> {
+    let definitions = xref_definitions(ws, catalogs, doc_path, target, id, line);
+    close_definitions(ws, catalogs, id, definitions)
+}
+
+/// `definitions` of `id` plus every definition the xrefs that reach them
+/// reach in other top-level documents: an xref in a chapter two books share
+/// finds a definition in each, and renaming only one would break the other.
+/// Repeats until nothing is added, so the result is the same wherever a
+/// rename or find-references starts. An xref reaches the same definitions
+/// whatever is known, so each reference is followed once, when it first
+/// shows up.
+fn close_definitions(
+    ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
+    id: &str,
+    mut definitions: Vec<AnchorLocation>,
+) -> Vec<AnchorLocation> {
+    let mut followed: HashSet<(PathBuf, usize, usize)> = HashSet::new();
+    loop {
+        let known = definitions.len();
+        for reference in catalogs.anchor_references(id, &definitions) {
+            if !followed.insert((reference.path.clone(), reference.line, reference.col)) {
+                continue;
+            }
+            let Some(xref) = ws.documents().get(&reference.path).and_then(|doc| {
+                doc.xrefs.iter().find(|xref| {
+                    xref.line == reference.line
+                        && xref
+                            .id_span()
+                            .is_some_and(|(_, col, _)| col == reference.col)
+                })
+            }) else {
+                continue;
+            };
+            for location in
+                xref_definitions(ws, catalogs, &reference.path, &xref.target, id, xref.line)
+            {
+                push_definition(&mut definitions, location);
+            }
+        }
+        if definitions.len() == known {
+            return definitions;
+        }
+    }
+}
+
+/// Where the xref `target` on `line` of `doc_path` finds its ID, in each
+/// top-level document that reads the file, with the explicit definitions
+/// that follow it.
+fn xref_definitions(
+    ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
+    doc_path: &Path,
+    target: &str,
+    id: &str,
+    line: usize,
+) -> Vec<AnchorLocation> {
+    let mut definitions = Vec::new();
+    for (_, resolved) in resolve_xref_targets(ws, catalogs, doc_path, target, line) {
+        if let Ok(ResolvedXref {
+            file,
+            line,
+            kind: Some(kind),
+        }) = resolved
+        {
+            push_definition(&mut definitions, AnchorLocation { file, line, kind });
+        }
+    }
+    // The explicit definitions that follow a found one in its document are
+    // the same ID defined again, which a rename keeps in step. The document
+    // is the one the xref resolved in: that of the reading file, or, for a
+    // link to another document, one that reads the definition's file or the
+    // definition's file on its own.
+    let scopes = catalogs
+        .scopes_at(doc_path)
+        .into_iter()
+        .chain(definitions.iter().flat_map(|d| {
+            let mut scopes = catalogs.scopes_at(&d.file);
+            scopes.push(catalogs.get(&d.file));
+            scopes
+        }))
+        .collect::<Vec<_>>();
+    for catalog in &scopes {
+        let found = catalog.lookup(id).is_some_and(|first| {
+            definitions
+                .iter()
+                .any(|known| known.file == first.file && known.line == first.line)
+        });
+        if found {
+            for duplicate in catalog.duplicates().iter().filter(|d| d.id == id) {
+                push_definition(&mut definitions, duplicate.second.clone());
+            }
+        }
+    }
+    definitions
+}
+
+/// Adds `location` unless a definition on that line is known already.
+fn push_definition(definitions: &mut Vec<AnchorLocation>, location: AnchorLocation) {
+    if !definitions
+        .iter()
+        .any(|known| known.file == location.file && known.line == location.line)
+    {
+        definitions.push(location);
+    }
+}
+
+/// The xrefs that reach any of `definitions` of `id`, and the definitions
+/// too when `include_declaration` is set, each at the span of the id on its
+/// line (the spans rename edits). An xref carries its span from extraction;
+/// the declaration's is found in its line (`[[id]]` or `[[id,reftext]]`). A
+/// declaration whose line holds no such span, such as a section's implicit
+/// id, stays a zero-width location at the line start.
+fn anchor_reference_locations(
+    catalogs: &CatalogCache<'_>,
+    id: &str,
+    definitions: &[AnchorLocation],
+    include_declaration: bool,
+    overrides: &HashMap<PathBuf, Arc<String>>,
+) -> Vec<FileLocation> {
+    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+    let mut locations = catalogs.anchor_references(id, definitions);
+    if include_declaration {
+        for definition in definitions {
+            let text = read_file_cached(&mut file_cache, &definition.file, overrides);
+            let line_text = text
+                .lines()
+                .nth(definition.line.saturating_sub(1))
+                .unwrap_or_default();
+            let (col, end_col) = find_anchor_def_columns(line_text, id).unwrap_or((0, 0));
+            locations.push(FileLocation::new(
+                definition.file.clone(),
+                definition.line,
+                col,
+                end_col,
+            ));
+        }
+    }
+    // One entry per span: a rename edits each once.
+    locations.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+    });
+    locations.dedup_by(|a, b| a.path == b.path && a.line == b.line && a.col == b.col);
+    locations
+}
+
+/// How an xref on `line` resolves, per top-level document, with each
+/// document's own ID catalog. A target with a file part also resolves
+/// in the editor's preview of a file others include (ADR-4): the path as
+/// the preview sees it, and the ID in the catalog of that file read alone,
+/// which is what Asciidoctor knows when it converts the file on its own. A
+/// bare ID has no preview, where every reference to a neighbouring chapter
+/// would be broken. Each result comes with its scope's label. Shared by
+/// go-to-definition, hover and the explain report.
 fn resolve_xref_targets(
     ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
     doc_path: &Path,
     target: &str,
     line: usize,
@@ -761,18 +949,57 @@ fn resolve_xref_targets(
         span: None,
         target_col: 0,
     };
+    // A document that reads `doc_path` only in part is no judge of what is
+    // missing there (the walk knows no tag regions): a failure is dropped.
+    let known = |catalog: &AnchorScope, resolved: Result<ResolvedXref, DiagnosticKind>| {
+        (resolved.is_ok() || catalog.reads_whole(doc_path)).then_some(resolved)
+    };
+    if !xref_names_file(target) {
+        return catalogs
+            .scopes_at(doc_path)
+            .iter()
+            .filter_map(|catalog| {
+                let resolved = catalogs.resolve_xref_in(catalog, &xref, |_| None);
+                known(catalog, resolved)
+                    .map(|resolved| (file_display_name(catalog.document()), resolved))
+            })
+            .collect();
+    }
     let dir = document_dir(doc_path, Some(ws));
-    path_scopes(ws, doc_path, line)
-        .map(|scope| {
-            let resolved = ws
-                .reference_index()
-                .resolve_xref_with(&xref, ws.documents(), |file| {
+    if target.contains('{') {
+        // An attribute reference in the file part reads differently in each
+        // scope, so each scope is read for its own attributes.
+        return path_scopes(ws, doc_path, line)
+            .filter_map(|scope| {
+                let catalog = catalogs.get(scope.document());
+                let resolved = catalogs.resolve_xref_in(&catalog, &xref, |file| {
                     Some(canonicalize_if_exists(join_doc_path(
                         dir,
                         &scope.substitute(file),
                     )))
                 });
-            (scope_label(&scope), resolved)
+                known(&catalog, resolved).map(|resolved| (scope_label(&scope), resolved))
+            })
+            .collect();
+    }
+    // The same scopes as `path_scopes`: one per top-level document and, for a
+    // file others include, its preview, which reads the file alone.
+    let preview = catalogs
+        .is_included(doc_path)
+        .then(|| catalogs.get(doc_path));
+    catalogs
+        .scopes_at(doc_path)
+        .into_iter()
+        .map(|catalog| (file_display_name(catalog.document()), catalog))
+        .chain(preview.map(|catalog| {
+            let label = format!("{} (preview)", file_display_name(catalog.document()));
+            (label, catalog)
+        }))
+        .filter_map(|(label, catalog)| {
+            let resolved = catalogs.resolve_xref_in(&catalog, &xref, |file| {
+                Some(canonicalize_if_exists(join_doc_path(dir, file)))
+            });
+            known(&catalog, resolved).map(|resolved| (label, resolved))
         })
         .collect()
 }
@@ -886,14 +1113,24 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
                 explain_xref(ws, doc_path, target, info.line)
             }),
         NodeKind::Anchor { id } => workspace.map_or_else(no_workspace, |ws| {
-            let definition = ws.reference_index().lookup(id).map(|loc| {
-                json!({
-                    "file": path_string(&loc.file),
-                    "line": loc.line,
-                    "kind": anchor_kind_name(loc.kind),
+            let scopes: Vec<Value> = ws
+                .anchor_scopes_at(doc_path)
+                .iter()
+                .map(|catalog| {
+                    let definition = catalog.lookup(id).map(|loc| {
+                        json!({
+                            "file": path_string(&loc.file),
+                            "line": loc.line,
+                            "kind": anchor_kind_name(loc.kind),
+                        })
+                    });
+                    json!({
+                        "scope": file_display_name(catalog.document()),
+                        "definition": definition,
+                    })
                 })
-            });
-            json!({ "definition": definition })
+                .collect();
+            json!({ "scopes": scopes })
         }),
         NodeKind::Include { path } => {
             let scopes: Vec<Value> = resolve_doc_targets(path, doc_path, workspace, info.line)
@@ -986,7 +1223,8 @@ fn definition_json(definition: &AttributeDefinition) -> Value {
 }
 
 fn explain_xref(ws: &Workspace, doc_path: &Path, target: &str, line: usize) -> Value {
-    let scopes: Vec<Value> = resolve_xref_targets(ws, doc_path, target, line)
+    let catalogs = CatalogCache::new(ws);
+    let scopes: Vec<Value> = resolve_xref_targets(ws, &catalogs, doc_path, target, line)
         .into_iter()
         .map(|(label, resolved)| match resolved {
             Ok(resolved) => json!({
@@ -1304,12 +1542,16 @@ pub fn prepare_rename(
 
     match &node_info.kind {
         NodeKind::Anchor { id } => {
-            // Reject implicit section IDs
+            // Reject implicit section IDs, and an anchor no catalog defines.
             if let Some(ws) = workspace {
-                if let Some(loc) = ws.reference_index().lookup(id) {
-                    if loc.kind == AnchorKind::ImplicitSection {
-                        return None;
-                    }
+                let catalogs = CatalogCache::new(ws);
+                let definitions = anchor_definitions_of_anchor(ws, &catalogs, doc_path, id);
+                if definitions.is_empty()
+                    || definitions
+                        .iter()
+                        .any(|loc| loc.kind == AnchorKind::ImplicitSection)
+                {
+                    return None;
                 }
             }
             let (start, end) = find_anchor_def_columns(line_text, id)?;
@@ -1321,24 +1563,29 @@ pub fn prepare_rename(
             })
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
-            let anchor_id = if let Some((_file, anchor)) = target.split_once('#') {
-                if anchor.is_empty() {
+            let anchor_id = parse_xref_target(target).1?;
+            // Reject implicit section IDs, and an xref no definition answers:
+            // a rename would find no edit.
+            if let Some(ws) = workspace {
+                let catalogs = CatalogCache::new(ws);
+                let definitions = anchor_definitions_of_xref(
+                    ws,
+                    &catalogs,
+                    doc_path,
+                    target,
+                    anchor_id,
+                    node_info.line,
+                );
+                if definitions.is_empty()
+                    || definitions
+                        .iter()
+                        .any(|loc| loc.kind == AnchorKind::ImplicitSection)
+                {
                     return None;
                 }
-                anchor
-            } else if target.contains('.') {
-                return None; // file-only xref
-            } else {
-                target.as_str()
-            };
-            // Reject implicit section IDs
-            if let Some(ws) = workspace {
-                if let Some(loc) = ws.reference_index().lookup(anchor_id) {
-                    if loc.kind == AnchorKind::ImplicitSection {
-                        return None;
-                    }
-                }
             }
+            // Only the xref under the cursor: another one on the line may
+            // name the same ID and reach a different definition.
             let (_, cursor_col) = positions::from_lsp_position(pos, content);
             let (start, end) = workspace
                 .and_then(|ws| xref_span_near(ws, doc_path, anchor_id, node_info.line, cursor_col))
@@ -1425,35 +1672,40 @@ pub fn resolve_rename(
                 Some(edits)
             }
         }
-        NodeKind::Anchor { id } => resolve_rename_anchor(id, ws, overrides),
+        NodeKind::Anchor { id } => {
+            let catalogs = CatalogCache::new(ws);
+            let definitions = anchor_definitions_of_anchor(ws, &catalogs, doc_path, id);
+            resolve_rename_anchor(id, &definitions, &catalogs, overrides)
+        }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
-            let anchor_id = if let Some((_file, anchor)) = target.split_once('#') {
-                if anchor.is_empty() {
-                    return None;
-                }
-                anchor
-            } else if target.contains('.') {
-                return None;
-            } else {
-                target.as_str()
-            };
-            resolve_rename_anchor(anchor_id, ws, overrides)
+            let anchor_id = parse_xref_target(target).1?;
+            let catalogs = CatalogCache::new(ws);
+            let definitions = anchor_definitions_of_xref(
+                ws,
+                &catalogs,
+                doc_path,
+                target,
+                anchor_id,
+                node_info.line,
+            );
+            resolve_rename_anchor(anchor_id, &definitions, &catalogs, overrides)
         }
         NodeKind::Include { .. } | NodeKind::Image { .. } => None,
     }
 }
 
-/// Rename all occurrences of an anchor (definition + all references + duplicates).
+/// Rename all occurrences of an anchor: its `definitions` (the first one per
+/// top-level document and the duplicates) and the xrefs that reach them.
 fn resolve_rename_anchor(
     anchor_id: &str,
-    ws: &Workspace,
+    definitions: &[AnchorLocation],
+    catalogs: &CatalogCache<'_>,
     overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Option<RenameEdits> {
     let mut edits: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
     let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
 
-    // Anchor definition
-    if let Some(loc) = ws.reference_index().lookup(anchor_id) {
+    for loc in definitions {
         let file_content = read_file_cached(&mut file_cache, &loc.file, overrides);
         let line_text = file_content
             .lines()
@@ -1467,25 +1719,8 @@ fn resolve_rename_anchor(
         }
     }
 
-    // Duplicate anchor definitions
-    for (dup_id, dup_loc) in ws.reference_index().duplicates() {
-        if dup_id == anchor_id {
-            let file_content = read_file_cached(&mut file_cache, &dup_loc.file, overrides);
-            let line_text = file_content
-                .lines()
-                .nth(dup_loc.line.saturating_sub(1))
-                .unwrap_or_default();
-            if let Some((start, end)) = find_anchor_def_columns(line_text, anchor_id) {
-                edits
-                    .entry(dup_loc.file.clone())
-                    .or_default()
-                    .push((dup_loc.line, start, end));
-            }
-        }
-    }
-
     // Anchor references (xrefs)
-    for loc in ws.find_all_anchor_references(anchor_id) {
+    for loc in anchor_reference_locations(catalogs, anchor_id, definitions, false, overrides) {
         edits
             .entry(loc.path)
             .or_default()
@@ -1751,6 +1986,587 @@ mod tests {
         };
 
         assert!(resolve_goto_definitions(&content, pos, &a, None).is_empty());
+    }
+
+    // --- xrefs resolve per top-level document (fixture `anchor_scope`) ---
+
+    fn anchor_scope_fixture() -> (PathBuf, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/anchor_scope")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
+    }
+
+    fn goto_in_fixture(file: &str, line: u32, character: u32) -> (PathBuf, Vec<(PathBuf, usize)>) {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        let targets =
+            resolve_goto_definitions(&content, Position { line, character }, &path, Some(&ws));
+        (root, targets)
+    }
+
+    /// Asciidoctor resolves `<<_second>>` in the document it converts: each
+    /// of the two unrelated documents has its own `_second` and `_first`.
+    /// Both directions are asked, so a global first-wins cannot pass by
+    /// luck.
+    #[test]
+    fn test_goto_def_bare_xref_stays_in_its_own_top_level_document() {
+        let (root, targets) = goto_in_fixture("solo/main.adoc", 6, 12);
+        assert_eq!(targets, vec![(root.join("solo/main.adoc"), 5)]);
+
+        let (root, targets) = goto_in_fixture("solo2/main.adoc", 4, 12);
+        assert_eq!(targets, vec![(root.join("solo2/main.adoc"), 3)]);
+    }
+
+    /// Asciidoctor (`book.adoc`): the xref names `reference.adoc`, which
+    /// `book.adoc` includes, so it is internal and `setup-only` is found in
+    /// `setup.adoc`, wherever it is defined in the document.
+    #[test]
+    fn test_goto_def_file_xref_into_included_file_finds_id_in_whole_document() {
+        let (root, targets) = goto_in_fixture("book.adoc", 6, 30);
+        assert_eq!(targets, vec![(root.join("chapters/setup.adoc"), 4)]);
+    }
+
+    /// `reference.adoc` is part of `book.adoc` and `web.adoc`; `setup-only`
+    /// exists in the first only, so only it offers a target.
+    #[test]
+    fn test_goto_def_bare_xref_in_shared_file_follows_the_documents_that_define_it() {
+        let (root, targets) = goto_in_fixture("chapters/reference.adoc", 5, 8);
+        assert_eq!(targets, vec![(root.join("chapters/setup.adoc"), 4)]);
+    }
+
+    /// Asciidoctor (`book.adoc`): `xref:chapters/reference.adoc#shared[]`
+    /// renders `href="#shared"`, the first `shared` of the document, which is
+    /// the one in `setup.adoc`, although `reference.adoc` defines it too. The
+    /// named file does not narrow the search. (`shared` is also a duplicate,
+    /// which Asciidoctor warns about.)
+    #[test]
+    fn test_goto_def_file_xref_prefers_first_definition_in_document_over_the_named_file() {
+        let (root, targets) = goto_in_fixture("book.adoc", 8, 12);
+        assert_eq!(targets, vec![(root.join("chapters/setup.adoc"), 1)]);
+    }
+
+    /// `setup.adoc` and `reference.adoc` belong to no document that
+    /// `solo/foreign.adoc` is part of: Asciidoctor renders links
+    /// (`../chapters/reference.html#shared`, `../chapters/setup.html#shared`)
+    /// to the documents rendered from those files, each with its own
+    /// `shared`. Both define it, so a first-wins index over all files would
+    /// send one of the two to the wrong file.
+    #[test]
+    fn test_goto_def_file_xref_into_foreign_document_uses_that_files_ids() {
+        let (root, targets) = goto_in_fixture("solo/foreign.adoc", 4, 20);
+        assert_eq!(targets, vec![(root.join("chapters/reference.adoc"), 1)]);
+
+        let (root, targets) = goto_in_fixture("solo/foreign.adoc", 4, 87);
+        assert_eq!(targets, vec![(root.join("chapters/setup.adoc"), 1)]);
+    }
+
+    /// Asciidoctor: `web.adoc` gives `INFO: possible invalid reference:
+    /// setup-only` (it includes `reference.adoc` without `setup.adoc`),
+    /// `book.adoc` gives nothing. Hover names each document and what it finds.
+    #[test]
+    fn test_hover_bare_xref_in_shared_file_shows_each_document_that_differs() {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join("chapters/reference.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let pos = Position {
+            line: 5,
+            character: 8,
+        };
+
+        let hover = resolve_hover(&content, pos, &path, Some(&ws)).unwrap();
+
+        assert!(hover.contains("In book.adoc:"), "got: {hover}");
+        assert!(hover.contains("setup.adoc:4"), "got: {hover}");
+        assert!(
+            hover.contains("In web.adoc:\n\u{2717} Target not found"),
+            "got: {hover}"
+        );
+    }
+
+    /// Asciidoctor: no message for `web3.adoc`, which reads `reference.adoc`
+    /// with `tag=top`, where `<<setup-only>>` does not lie. The LSP knows no
+    /// tag regions, so a document that reads the file only in part shows no
+    /// "not found": hover names `book.adoc` alone.
+    #[test]
+    fn test_hover_xref_in_file_read_only_in_part_by_a_document_shows_no_missing_target() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/anchor_region_xref")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let path = root.join("chapters/reference.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let pos = Position {
+            line: 5,
+            character: 8,
+        };
+
+        let hover = resolve_hover(&content, pos, &path, Some(&ws)).unwrap();
+
+        assert!(hover.contains("setup.adoc:1"), "got: {hover}");
+        assert!(!hover.contains("web3.adoc"), "got: {hover}");
+        assert!(!hover.contains("not found"), "got: {hover}");
+    }
+
+    /// Asciidoctor (`partial/book.adoc`, `a.adoc` included with `lines=1..2`,
+    /// `b.adoc` in full): `xref:b.adoc#a-id[]` renders `href="#a-id"`, so
+    /// `b.adoc` is part of the document and the ID is found in `a.adoc`.
+    /// `xref:a.adoc#b-id[]` renders `href="a.html#b-id"`: a partially
+    /// included file is not part of the document, the xref is a link.
+    #[test]
+    fn test_goto_def_file_xref_into_fully_included_file_is_internal() {
+        let (root, targets) = goto_in_fixture("partial/book.adoc", 6, 12);
+        assert_eq!(targets, vec![(root.join("partial/a.adoc"), 1)]);
+    }
+
+    /// Same fixture: the link goes to the document rendered from `a.adoc`,
+    /// which does not define `b-id`, so it does not jump into `b.adoc`.
+    #[test]
+    fn test_goto_def_file_xref_into_partially_included_file_is_a_link_not_internal() {
+        let (_root, targets) = goto_in_fixture("partial/book.adoc", 6, 35);
+        assert_eq!(targets, vec![]);
+    }
+
+    // --- one catalog build per document and request (fixture `anchor_hot`) ---
+
+    /// `anchor_hot`: `ch1.adoc` defines `hot`; each of the three chapters has
+    /// ten `<<hot>>` and ten `xref:ch1.adoc#hot[]`, so 60 xrefs. `book.adoc`
+    /// includes all three, `web.adoc` only `ch2.adoc`.
+    fn hot_fixture() -> (PathBuf, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/anchor_hot")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
+    }
+
+    /// The documents of the fixture: no request needs more catalogs than
+    /// there are documents, each read once.
+    const HOT_DOCUMENTS: usize = 5;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Request {
+        References,
+        PrepareRename,
+        Rename,
+    }
+
+    /// Runs `request` on the cursor at (`line`, `character`) of `file` and
+    /// returns the number of catalogs it read and the number of locations or
+    /// edits it found.
+    fn run_hot_request(request: Request, file: &str, line: u32, character: u32) -> (usize, usize) {
+        let (root, ws) = hot_fixture();
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        let pos = Position { line, character };
+        let before = ws.catalog_builds();
+        let found = match request {
+            Request::References => {
+                resolve_references(&content, pos, &path, Some(&ws), true, &HashMap::new())
+                    .map_or(0, |locations| locations.len())
+            }
+            Request::PrepareRename => {
+                usize::from(prepare_rename(&content, pos, &path, Some(&ws)).is_some())
+            }
+            Request::Rename => resolve_rename(&content, pos, &path, Some(&ws), &HashMap::new())
+                .map_or(0, |edits| edits.values().map(Vec::len).sum()),
+        };
+        (ws.catalog_builds() - before, found)
+    }
+
+    /// A request rebuilt catalogs per xref (1200 xrefs took 8 s). Now each
+    /// catalog is read once per request, wherever the cursor stands.
+    #[rstest]
+    #[case::references_from_definition(Request::References, "ch1.adoc", 0, 3)]
+    #[case::references_from_xref(Request::References, "ch2.adoc", 2, 4)]
+    #[case::references_from_file_xref(Request::References, "ch2.adoc", 13, 18)]
+    #[case::prepare_rename_from_definition(Request::PrepareRename, "ch1.adoc", 0, 3)]
+    #[case::prepare_rename_from_xref(Request::PrepareRename, "ch2.adoc", 2, 4)]
+    #[case::rename_from_definition(Request::Rename, "ch1.adoc", 0, 3)]
+    #[case::rename_from_xref(Request::Rename, "ch2.adoc", 2, 4)]
+    fn test_request_reads_each_catalog_at_most_once(
+        #[case] request: Request,
+        #[case] file: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+    ) {
+        let (builds, _) = run_hot_request(request, file, line, character);
+
+        assert!(
+            builds <= HOT_DOCUMENTS,
+            "{request:?} read {builds} catalogs, the fixture has {HOT_DOCUMENTS} documents"
+        );
+    }
+
+    /// Pins the results the cache must not change: 60 xrefs and the
+    /// definition.
+    #[rstest]
+    #[case::references_from_definition(Request::References, "ch1.adoc", 0, 3, 61)]
+    #[case::references_from_xref(Request::References, "ch2.adoc", 2, 4, 61)]
+    #[case::rename_from_definition(Request::Rename, "ch1.adoc", 0, 3, 61)]
+    #[case::rename_from_xref(Request::Rename, "ch2.adoc", 2, 4, 61)]
+    #[case::prepare_rename_from_definition(Request::PrepareRename, "ch1.adoc", 0, 3, 1)]
+    fn test_request_on_hot_id_finds_every_xref(
+        #[case] request: Request,
+        #[case] file: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] expected: usize,
+    ) {
+        let (_, found) = run_hot_request(request, file, line, character);
+
+        assert_eq!(found, expected);
+    }
+
+    // --- references, rename and explain per top-level document ---
+
+    /// The files a rename edits, as paths relative to the fixture, with the
+    /// edited lines.
+    fn rename_in_fixture(file: &str, line: u32, character: u32) -> Vec<(String, Vec<usize>)> {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        let edits = resolve_rename(
+            &content,
+            Position { line, character },
+            &path,
+            Some(&ws),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut files: Vec<(String, Vec<usize>)> = edits
+            .into_iter()
+            .map(|(file, edits)| {
+                let mut lines: Vec<usize> = edits.iter().map(|(line, _, _)| *line).collect();
+                lines.sort_unstable();
+                (
+                    file.strip_prefix(&root).unwrap().display().to_string(),
+                    lines,
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn references_in_fixture(
+        file: &str,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Vec<(String, usize)> {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        resolve_references(
+            &content,
+            Position { line, character },
+            &path,
+            Some(&ws),
+            include_declaration,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|loc| {
+            (
+                loc.path.strip_prefix(&root).unwrap().display().to_string(),
+                loc.line,
+            )
+        })
+        .collect()
+    }
+
+    /// `solo/main.adoc` and `solo2/main.adoc` are two documents that both
+    /// define `note`. Asciidoctor knows each only in its own document, so
+    /// renaming one leaves the other alone, whichever of the two is renamed.
+    #[test]
+    fn test_rename_anchor_stays_in_its_own_top_level_document() {
+        assert_eq!(
+            rename_in_fixture("solo/main.adoc", 8, 4),
+            vec![("solo/main.adoc".to_string(), vec![9, 10])]
+        );
+        assert_eq!(
+            rename_in_fixture("solo2/main.adoc", 8, 4),
+            vec![("solo2/main.adoc".to_string(), vec![9, 10])]
+        );
+    }
+
+    /// Rename started on a reference finds the definition of its own
+    /// document, not the other document's.
+    #[test]
+    fn test_rename_from_xref_stays_in_its_own_top_level_document() {
+        assert_eq!(
+            rename_in_fixture("solo2/main.adoc", 9, 22),
+            vec![("solo2/main.adoc".to_string(), vec![9, 10])]
+        );
+        assert_eq!(
+            rename_in_fixture("solo/main.adoc", 9, 22),
+            vec![("solo/main.adoc".to_string(), vec![9, 10])]
+        );
+    }
+
+    #[test]
+    fn test_references_stay_in_their_own_top_level_document() {
+        assert_eq!(
+            references_in_fixture("solo/main.adoc", 8, 4, true),
+            vec![
+                ("solo/main.adoc".to_string(), 9),
+                ("solo/main.adoc".to_string(), 10)
+            ]
+        );
+        assert_eq!(
+            references_in_fixture("solo2/main.adoc", 9, 22, false),
+            vec![("solo2/main.adoc".to_string(), 10)]
+        );
+    }
+
+    /// `book.adoc` reads `shared` in `setup.adoc` first and again in
+    /// `reference.adoc` (a duplicate): renaming from the xref renames both
+    /// definitions and every xref that reaches either (the links in
+    /// `solo/foreign.adoc` to the chapters rendered on their own among them),
+    /// and leaves `standalone.adoc`, a document of its own, alone.
+    #[test]
+    fn test_rename_shared_id_renames_the_documents_definitions_only() {
+        assert_eq!(
+            rename_in_fixture("book.adoc", 6, 10),
+            vec![
+                ("book.adoc".to_string(), vec![7, 9]),
+                ("chapters/reference.adoc".to_string(), vec![1]),
+                ("chapters/setup.adoc".to_string(), vec![1]),
+                // links to the documents rendered from the two chapters, one
+                // edit per xref
+                ("solo/foreign.adoc".to_string(), vec![5, 5]),
+                ("solo/mixed.adoc".to_string(), vec![3]),
+            ]
+        );
+    }
+
+    /// The columns a rename edits in `file`, in order, for a rename started
+    /// in `start_file` at `line`, `character`.
+    fn rename_columns_in_fixture(
+        start_file: &str,
+        line: u32,
+        character: u32,
+        file: &str,
+    ) -> Vec<(usize, usize, usize)> {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join(start_file);
+        let content = fs::read_to_string(&path).unwrap();
+        let mut edits = resolve_rename(
+            &content,
+            Position { line, character },
+            &path,
+            Some(&ws),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .remove(&root.join(file))
+        .unwrap_or_default();
+        edits.sort_unstable();
+        edits
+    }
+
+    /// The byte column of the `n`-th `#shared` in line `line` (1-based) of a
+    /// fixture file, plus one: the start of the ID.
+    fn shared_column(file: &str, line: usize, n: usize) -> usize {
+        let (root, _) = anchor_scope_fixture();
+        let text = fs::read_to_string(root.join(file)).unwrap();
+        let text = text.lines().nth(line - 1).unwrap().to_string();
+        text.match_indices("#shared").nth(n).unwrap().0 + 1
+    }
+
+    /// Both xrefs of `solo/foreign.adoc:5` reach a `shared` definition of the
+    /// document (the chapters rendered on their own), so both are renamed.
+    #[test]
+    fn test_rename_edits_every_reaching_xref_on_one_line() {
+        let first = shared_column("solo/foreign.adoc", 5, 0);
+        let second = shared_column("solo/foreign.adoc", 5, 1);
+        assert_eq!(
+            rename_columns_in_fixture("book.adoc", 6, 10, "solo/foreign.adoc"),
+            vec![(5, first, first + 6), (5, second, second + 6)]
+        );
+    }
+
+    /// `solo/mixed.adoc:3` has an xref to the `shared` of `standalone.adoc`
+    /// (another document's ID, left alone) before one to `setup.adoc`'s:
+    /// only the second is renamed.
+    #[test]
+    fn test_rename_skips_an_xref_on_the_same_line_that_reaches_another_document() {
+        let setup = shared_column("solo/mixed.adoc", 3, 1);
+        assert_eq!(
+            rename_columns_in_fixture("book.adoc", 6, 10, "solo/mixed.adoc"),
+            vec![(3, setup, setup + 6)]
+        );
+    }
+
+    /// An xref without a definition has nothing to rename, so the client is
+    /// not offered a rename that returns no edits.
+    #[test]
+    fn test_prepare_rename_rejects_an_xref_without_definition() {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join("solo/foreign.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let col = content.lines().nth(2).unwrap().find("#nope").unwrap() + 2;
+        let pos = Position {
+            line: 2,
+            character: u32::try_from(col).unwrap(),
+        };
+        assert!(prepare_rename(&content, pos, &path, Some(&ws)).is_none());
+    }
+
+    // --- rename and references reach every definition an xref reaches ---
+
+    fn anchor_rename_fixture() -> (PathBuf, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/anchor_rename")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
+    }
+
+    /// The lines a rename edits, per file relative to the fixture, and the
+    /// lines find-references lists with the declaration, for a request at
+    /// `line`, `character` of `file`.
+    fn rename_and_references_in_anchor_rename(
+        file: &str,
+        line: u32,
+        character: u32,
+    ) -> (Vec<(String, Vec<usize>)>, Vec<(String, usize)>) {
+        let (root, ws) = anchor_rename_fixture();
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        let pos = Position { line, character };
+        let relative = |path: &Path| path.strip_prefix(&root).unwrap().display().to_string();
+        let mut renamed: Vec<(String, Vec<usize>)> =
+            resolve_rename(&content, pos, &path, Some(&ws), &HashMap::new())
+                .unwrap()
+                .into_iter()
+                .map(|(file, edits)| {
+                    let mut lines: Vec<usize> = edits.iter().map(|(line, _, _)| *line).collect();
+                    lines.sort_unstable();
+                    (relative(&file), lines)
+                })
+                .collect();
+        renamed.sort();
+        let references = resolve_references(&content, pos, &path, Some(&ws), true, &HashMap::new())
+            .unwrap()
+            .into_iter()
+            .map(|loc| (relative(&loc.path), loc.line))
+            .collect();
+        (renamed, references)
+    }
+
+    /// `book1.adoc` and `book2.adoc` each define `id` in their own chapter
+    /// and share `c.adoc` with `<<id>>`: Asciidoctor resolves that xref in
+    /// both books. A rename (and the references) must not depend on where
+    /// it starts: both definitions and the shared xref, or book2 breaks.
+    #[test]
+    fn test_rename_and_references_cover_both_definitions_of_a_shared_xref() {
+        let renamed = vec![
+            ("a.adoc".to_string(), vec![1]),
+            ("b.adoc".to_string(), vec![1]),
+            ("c.adoc".to_string(), vec![3]),
+        ];
+        let referenced = vec![
+            ("a.adoc".to_string(), 1),
+            ("b.adoc".to_string(), 1),
+            ("c.adoc".to_string(), 3),
+        ];
+        for (file, line, character) in [("a.adoc", 0, 3), ("b.adoc", 0, 3), ("c.adoc", 2, 7)] {
+            let (edits, references) = rename_and_references_in_anchor_rename(file, line, character);
+            assert_eq!(edits, renamed, "rename from {file}");
+            assert_eq!(references, referenced, "references from {file}");
+        }
+    }
+
+    /// `foreign.adoc` links `x.adoc#dup`; `x.adoc` includes `y.adoc` and
+    /// `z.adoc`, which both define `dup`. The link resolves to `y.adoc` with
+    /// `z.adoc` as the duplicate: a rename from the link edits the same set
+    /// as one from the definition.
+    #[test]
+    fn test_rename_from_a_foreign_xref_renames_the_duplicates_of_its_document() {
+        let expected = vec![
+            ("foreign.adoc".to_string(), vec![3]),
+            ("y.adoc".to_string(), vec![1]),
+            ("z.adoc".to_string(), vec![1]),
+        ];
+        for (file, line, character) in [("foreign.adoc", 2, 17), ("y.adoc", 0, 3), ("z.adoc", 0, 3)]
+        {
+            let (edits, _) = rename_and_references_in_anchor_rename(file, line, character);
+            assert_eq!(edits, expected, "rename from {file}");
+        }
+    }
+
+    /// `solo/mixed.adoc:3` has two xrefs on one line: the prepare range of
+    /// the second (`setup.adoc#shared`) must hold the cursor, not the first
+    /// one's (`standalone.adoc#shared`).
+    #[test]
+    fn test_prepare_rename_range_is_the_xref_under_the_cursor() {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join("solo/mixed.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let second = shared_column("solo/mixed.adoc", 3, 1);
+        let pos = Position {
+            line: 2,
+            character: u32::try_from(second + 2).unwrap(),
+        };
+        let range = prepare_rename(&content, pos, &path, Some(&ws)).unwrap();
+        assert_eq!((range.start_col, range.end_col), (second, second + 6));
+    }
+
+    /// `reference.adoc` is part of `book.adoc` and `web.adoc`: its `shared`
+    /// is the first one in `web.adoc`, so the report has one definition per
+    /// document.
+    #[test]
+    fn test_explain_anchor_reports_the_definition_per_top_level_document() {
+        let (root, ws) = anchor_scope_fixture();
+        let path = root.join("chapters/reference.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let pos = Position {
+            line: 0,
+            character: 4,
+        };
+
+        let report = explain_position(&content, pos, &path, &path, Some(&ws));
+
+        let scopes = report["resolution"]["scopes"].as_array().unwrap();
+        let found: Vec<(String, String, u64)> = scopes
+            .iter()
+            .map(|scope| {
+                let definition = &scope["definition"];
+                (
+                    scope["scope"].as_str().unwrap().to_string(),
+                    definition["file"].as_str().unwrap().to_string(),
+                    definition["line"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "book.adoc".to_string(),
+                    path_string(&root.join("chapters/setup.adoc")),
+                    1
+                ),
+                ("web.adoc".to_string(), path_string(&path), 1),
+            ]
+        );
     }
 
     // --- resolve_goto_definitions for xref ---
@@ -2906,7 +3722,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &b);
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&b).unwrap();
         // cursor on xref:a.adoc#target[link]
         let pos = Position {
@@ -2937,7 +3753,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         )
         .unwrap();
 
-        let ws = Workspace::build(tmp.path(), &b);
+        let ws = Workspace::build(tmp.path(), &a);
         let content = fs::read_to_string(&b).unwrap();
         // cursor on <<anchor>>
         let pos = Position {
@@ -5445,7 +6261,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         assert_eq!(report["node"]["kind"], "anchor");
         assert_eq!(report["node"]["fields"]["id"], "my-anchor");
-        let def = &report["resolution"]["definition"];
+        let def = &report["resolution"]["scopes"][0]["definition"];
         assert_eq!(def["file"], path_string(&a));
         assert_eq!(def["line"], 3);
         assert_eq!(def["kind"], "explicit");

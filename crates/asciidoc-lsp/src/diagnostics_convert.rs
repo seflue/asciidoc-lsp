@@ -63,6 +63,7 @@ mod tests {
             span: None,
             kind: DiagnosticKind::BrokenXref {
                 target: "missing".into(),
+                documents: vec![],
             },
         }];
 
@@ -109,6 +110,7 @@ mod tests {
                 id: "dup".into(),
                 first_file: PathBuf::from("/other.adoc"),
                 first_line: 1,
+                documents: vec![PathBuf::from("/test.adoc")],
             },
         }];
 
@@ -245,6 +247,7 @@ mod tests {
             span: None,
             kind: DiagnosticKind::BrokenXref {
                 target: "missing".into(),
+                documents: vec![],
             },
         }];
 
@@ -265,13 +268,19 @@ mod tests {
                 file: PathBuf::from("/test.adoc"),
                 line: 3,
                 span: None,
-                kind: DiagnosticKind::BrokenXref { target: "a".into() },
+                kind: DiagnosticKind::BrokenXref {
+                    target: "a".into(),
+                    documents: vec![],
+                },
             },
             CoreDiagnostic {
                 file: PathBuf::from("/test.adoc"),
                 line: 5,
                 span: None,
-                kind: DiagnosticKind::BrokenXref { target: "b".into() },
+                kind: DiagnosticKind::BrokenXref {
+                    target: "b".into(),
+                    documents: vec![],
+                },
             },
         ];
 

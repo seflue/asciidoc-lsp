@@ -1,0 +1,7 @@
+= Twice After
+
+include::first.adoc[]
+
+include::part.adoc[]
+
+include::part.adoc[]

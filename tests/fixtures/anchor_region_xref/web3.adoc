@@ -1,0 +1,3 @@
+= Web3
+
+include::chapters/reference.adoc[tag=top]
