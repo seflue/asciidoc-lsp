@@ -489,9 +489,12 @@ impl Workspace {
     /// Recalculate diagnostics from current workspace state.
     ///
     /// Call this after `ensure_file()` or `update_file()` to refresh diagnostics.
-    /// The reference index is already kept up-to-date incrementally by those methods.
-    /// Refreshes `{docdir}` first: it depends on the whole include graph.
+    /// Not a pure recomputation: it first parses and indexes include targets
+    /// from disk that appeared since their includer was parsed (mutating
+    /// `documents` and the reference index), then refreshes `{docdir}`, which
+    /// depends on the whole include graph.
     pub fn recalculate_diagnostics(&mut self) {
+        self.index_include_targets();
         self.refresh_doc_roots();
         self.diagnostics = collect_diagnostics(
             &self.documents,
@@ -647,27 +650,55 @@ impl Workspace {
                 self.ensure_file(file, &overrides);
             }
         }
+        self.index_include_targets();
+    }
+
+    /// Index every `.adoc` file an indexed document includes that is on disk
+    /// but not indexed yet, transitively.
+    ///
+    /// Includes created after their includer was parsed are the case this
+    /// covers; open buffers are already indexed and stay untouched. Targets
+    /// are keyed by their canonical path, like every other document; an
+    /// includer whose edge held a non-canonical path gets its edges resolved
+    /// again, so the graph points at the canonical key.
+    fn index_include_targets(&mut self) {
+        let overrides = HashMap::new();
         // Asciidoctor reads an include wherever it points, also outside the
-        // root (`include::../shared/attributes.adoc[]`), so the scan does too.
+        // root (`include::../shared/attributes.adoc[]`), so this walk does too.
         let mut stack: Vec<PathBuf> = self.documents.keys().cloned().collect();
         while let Some(file) = stack.pop() {
-            let targets: Vec<PathBuf> = self
-                .include_graph
-                .includes_of(&file)
-                .iter()
-                .map(|edge| edge.target.clone())
-                .filter(|target| {
-                    !self.documents.contains_key(target)
-                        && target.extension().is_some_and(|ext| ext == "adoc")
-                        && target.is_file()
-                })
-                .collect();
-            for target in targets {
-                if let Some(dir) = target.parent() {
-                    self.attributes.set_doc_dir(&target, dir);
+            let mut stale = false;
+            let mut new_targets: Vec<(PathBuf, PathBuf)> = Vec::new();
+            for edge in self.include_graph.includes_of(&file) {
+                let target = &edge.target;
+                if target.extension().is_none_or(|ext| ext != "adoc") || !target.is_file() {
+                    continue;
                 }
-                self.ensure_file(&target, &overrides);
-                stack.push(target);
+                let Ok(canonical) = target.canonicalize() else {
+                    continue;
+                };
+                stale |= canonical != *target;
+                if !self.documents.contains_key(&canonical)
+                    && !new_targets.iter().any(|(c, _)| *c == canonical)
+                {
+                    new_targets.push((canonical, target.clone()));
+                }
+            }
+            if stale {
+                if let Some(doc) = self.documents.get(&file) {
+                    let edges = include_edges(&file, &doc.includes, &self.attributes);
+                    self.include_graph.remove_edges_from(&file);
+                    for edge in edges {
+                        self.include_graph.add_edge(&file, edge);
+                    }
+                }
+            }
+            for (canonical, addressed) in new_targets {
+                if let Some(dir) = addressed.parent() {
+                    self.attributes.set_doc_dir(&canonical, dir);
+                }
+                self.ensure_file(&canonical, &overrides);
+                stack.push(canonical);
             }
         }
     }
@@ -3025,5 +3056,263 @@ mod tests {
         let loc = ws.reference_index().lookup("intro-audience").unwrap();
         assert!(loc.file.ends_with("chapters/intro.adoc"));
         assert_eq!(loc.line, 9);
+    }
+
+    /// Builds a root whose `index.adoc` includes `chapters/extra.adoc` and
+    /// references `extra-anchor` before that file exists.
+    fn setup_include_target_created_later() -> (tempfile::TempDir, PathBuf, Workspace) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("chapters")).unwrap();
+        fs::write(root.join("chapters/intro.adoc"), "== Intro\n").unwrap();
+        fs::write(
+            root.join("index.adoc"),
+            "= I\n\ninclude::chapters/extra.adoc[]\n\nSee <<extra-anchor>>.\n",
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let index = root.join("index.adoc");
+        let kinds = |ws: &Workspace| -> Vec<crate::types::DiagnosticKind> {
+            ws.diagnostics_for(&index)
+                .iter()
+                .map(|d| d.kind.clone())
+                .collect()
+        };
+        assert!(
+            kinds(&ws)
+                .iter()
+                .any(|k| matches!(k, crate::types::DiagnosticKind::BrokenInclude { .. })),
+            "precondition: include is broken"
+        );
+        assert!(
+            kinds(&ws).iter().any(|k| matches!(
+                k,
+                crate::types::DiagnosticKind::BrokenXref { target } if target == "extra-anchor"
+            )),
+            "precondition: xref is broken"
+        );
+        (tmp, root, ws)
+    }
+
+    fn assert_extra_target_indexed(ws: &Workspace, root: &Path) {
+        let index = root.join("index.adoc");
+        assert!(
+            !ws.diagnostics_for(&index)
+                .iter()
+                .any(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenXref { .. })),
+            "xref must resolve: {:?}",
+            ws.diagnostics_for(&index)
+        );
+        assert!(ws.documents.contains_key(&root.join("chapters/extra.adoc")));
+        assert!(ws.reference_index.lookup("extra-anchor").is_some());
+    }
+
+    /// An include target created on disk after the includer was parsed is
+    /// indexed by the next re-parse of the includer (no watcher event needed).
+    #[test]
+    fn test_update_file_indexes_include_target_created_after_parse() {
+        let (_tmp, root, mut ws) = setup_include_target_created_later();
+        fs::write(
+            root.join("chapters/extra.adoc"),
+            "[[extra-anchor]]\n== Extra\n",
+        )
+        .unwrap();
+        ws.update_file(&root.join("index.adoc"), &HashMap::new());
+        ws.recalculate_diagnostics();
+        assert_extra_target_indexed(&ws, &root);
+    }
+
+    /// The includer's stale edge is enough: `recalculate_diagnostics` alone
+    /// picks up a target that appeared after the includer was parsed.
+    #[test]
+    fn test_recalculate_indexes_include_target_created_after_parse() {
+        let (_tmp, root, mut ws) = setup_include_target_created_later();
+        fs::write(
+            root.join("chapters/extra.adoc"),
+            "[[extra-anchor]]\n== Extra\n",
+        )
+        .unwrap();
+        ws.recalculate_diagnostics();
+        assert_extra_target_indexed(&ws, &root);
+    }
+
+    /// A target that includes another new file pulls it in transitively.
+    #[test]
+    fn test_recalculate_indexes_new_include_targets_transitively() {
+        let (_tmp, root, mut ws) = setup_include_target_created_later();
+        fs::write(
+            root.join("chapters/extra.adoc"),
+            "[[extra-anchor]]\n== Extra\n\ninclude::extra2.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("chapters/extra2.adoc"),
+            "[[extra2-anchor]]\n== Two\n",
+        )
+        .unwrap();
+        ws.recalculate_diagnostics();
+        assert_extra_target_indexed(&ws, &root);
+        assert!(ws.reference_index.lookup("extra2-anchor").is_some());
+    }
+
+    fn has_broken(ws: &Workspace, file: &Path) -> (bool, bool) {
+        let d = ws.diagnostics_for(file);
+        (
+            d.iter()
+                .any(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenInclude { .. })),
+            d.iter()
+                .any(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenXref { .. })),
+        )
+    }
+
+    fn count_extra(ws: &Workspace) -> usize {
+        ws.documents
+            .keys()
+            .filter(|k| k.file_name().is_some_and(|n| n == "extra.adoc"))
+            .count()
+    }
+
+    /// Created, indexed, then deleted: both errors return, no orphan stays.
+    #[test]
+    fn test_recalculate_deleted_walk_indexed_target_breaks_again() {
+        let (_tmp, root, mut ws) = setup_include_target_created_later();
+        let extra = root.join("chapters/extra.adoc");
+        fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
+        ws.recalculate_diagnostics();
+        assert_extra_target_indexed(&ws, &root);
+        fs::remove_file(&extra).unwrap();
+        ws.remove_file(&extra);
+        ws.recalculate_diagnostics();
+        assert_eq!(has_broken(&ws, &root.join("index.adoc")), (true, true));
+        assert_eq!(count_extra(&ws), 0);
+    }
+
+    /// Only `.adoc` targets are parsed; a created YAML include is left alone.
+    #[test]
+    fn test_recalculate_does_not_index_non_adoc_include_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("snippets")).unwrap();
+        fs::write(
+            root.join("index.adoc"),
+            "= I\n\ninclude::snippets/config.yml[]\n",
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        fs::write(root.join("snippets/config.yml"), "[[yml-anchor]]\n").unwrap();
+        ws.recalculate_diagnostics();
+        assert_eq!(ws.documents.len(), 1);
+    }
+
+    /// An open buffer keeps its unsaved content; no disk copy shadows it.
+    #[test]
+    fn test_recalculate_keeps_open_buffer_include_target() {
+        let (_tmp, root, mut ws) = setup_include_target_created_later();
+        let extra = root.join("chapters/extra.adoc");
+        let overrides: HashMap<PathBuf, Arc<String>> = HashMap::from([(
+            extra.clone(),
+            Arc::new("[[buffer-anchor]]\n== B\n".to_string()),
+        )]);
+        fs::write(&extra, "[[disk-anchor]]\n== D\n").unwrap();
+        ws.ensure_file(&extra, &overrides);
+        ws.recalculate_diagnostics();
+        assert!(ws.reference_index.lookup("buffer-anchor").is_some());
+        assert!(ws.reference_index.lookup("disk-anchor").is_none());
+        assert_eq!(count_extra(&ws), 1);
+    }
+
+    /// Include targets outside the root are indexed too (Asciidoctor reads them).
+    #[test]
+    fn test_recalculate_indexes_include_target_outside_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("proj");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("index.adoc"),
+            "= I\n\ninclude::../shared/extra.adoc[]\n\nSee <<extra-anchor>>.\n",
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        fs::create_dir_all(base.join("shared")).unwrap();
+        fs::write(base.join("shared/extra.adoc"), "[[extra-anchor]]\n== E\n").unwrap();
+        ws.recalculate_diagnostics();
+        assert!(ws.reference_index.lookup("extra-anchor").is_some());
+        assert_eq!(has_broken(&ws, &root.join("index.adoc")), (false, false));
+    }
+
+    /// The include path crosses a directory symlink: one document, keyed
+    /// canonically, and deleting it breaks both again.
+    #[cfg(unix)]
+    #[test]
+    fn test_recalculate_include_target_via_symlinked_dir_has_one_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("chapters")).unwrap();
+        fs::write(
+            root.join("index.adoc"),
+            "= I\n\ninclude::chapters/extra.adoc[]\n\nSee <<extra-anchor>>.\n",
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let extra = root.join("real/extra.adoc");
+        fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
+        ws.recalculate_diagnostics();
+        assert_eq!(count_extra(&ws), 1);
+        assert!(ws.documents.contains_key(&extra));
+        assert_eq!(has_broken(&ws, &root.join("index.adoc")), (false, false));
+        // Re-parse of the includer must not add a second key.
+        ws.update_file(&root.join("index.adoc"), &HashMap::new());
+        ws.recalculate_diagnostics();
+        assert_eq!(count_extra(&ws), 1);
+        fs::remove_file(&extra).unwrap();
+        ws.remove_file(&extra);
+        ws.recalculate_diagnostics();
+        assert_eq!(has_broken(&ws, &root.join("index.adoc")), (true, true));
+        assert_eq!(count_extra(&ws), 0);
+    }
+
+    /// Project opened through a symlinked root, file created, CREATED event
+    /// path (`ensure_file` on the canonical path, then recalculate).
+    #[cfg(unix)]
+    #[test]
+    fn test_created_event_with_symlinked_root_has_one_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let real = base.join("realroot");
+        fs::create_dir_all(real.join("chapters")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("linkroot")).unwrap();
+        fs::write(
+            real.join("index.adoc"),
+            "= I\n\ninclude::chapters/extra.adoc[]\n\nSee <<extra-anchor>>.\n",
+        )
+        .unwrap();
+        let link_index = base.join("linkroot/index.adoc");
+        let mut ws = Workspace::new(&base.join("linkroot"));
+        // Like did_open: addressed by the link, keyed canonically.
+        ws.set_doc_dir(&real.join("index.adoc"), &base.join("linkroot"));
+        ws.ensure_file(&real.join("index.adoc"), &HashMap::new());
+        ws.recalculate_diagnostics();
+        let index = real.join("index.adoc");
+        assert!(link_index.exists());
+        assert_eq!(has_broken(&ws, &index), (true, true));
+        let extra = real.join("chapters/extra.adoc");
+        fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
+        ws.ensure_file(&extra, &HashMap::new());
+        ws.recalculate_diagnostics();
+        assert_eq!(count_extra(&ws), 1);
+        assert_eq!(has_broken(&ws, &index), (false, false));
+        fs::remove_file(&extra).unwrap();
+        ws.remove_file(&extra);
+        ws.recalculate_diagnostics();
+        assert_eq!(has_broken(&ws, &index), (true, true));
+        assert_eq!(count_extra(&ws), 0);
     }
 }

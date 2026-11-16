@@ -3370,6 +3370,21 @@ mod tests {
             .collect()
     }
 
+    fn broken_includes(server: &AsciiDocLsp, path: &Path) -> usize {
+        let ws = server.workspace.lock();
+        ws.as_ref()
+            .unwrap()
+            .diagnostics_for(path)
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    asciidoc_core::types::DiagnosticKind::BrokenInclude { .. }
+                )
+            })
+            .count()
+    }
+
     /// T9.1–T9.3: creating, changing and deleting the config changes hover
     /// on an open document without any edit to it.
     #[tokio::test]
@@ -3471,6 +3486,75 @@ mod tests {
         fs::write(&b, "= B\n").unwrap();
         notify_watched(server, &b, FileChangeType::CHANGED).await;
         assert_eq!(broken_xrefs(server, &a), broken, "T9.6: edit");
+    }
+
+    /// Without a watcher event for a new subdirectory file (Neovim's
+    /// `watchdirs` fallback), the next edit of the including document
+    /// indexes the include target and clears both errors.
+    #[tokio::test]
+    async fn test_edit_indexes_include_target_created_without_watch_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("chapters")).unwrap();
+        fs::write(root.join("chapters/intro.adoc"), "== Intro\n").unwrap();
+        let index = root.join("index.adoc");
+        let text = "= I\n\ninclude::chapters/extra.adoc[]\n\nSee <<extra-anchor>>.\n";
+        fs::write(&index, text).unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        open_document(server, &file_uri(&index), text).await;
+        assert_eq!(broken_xrefs(server, &index), vec!["extra-anchor"]);
+
+        fs::write(
+            root.join("chapters/extra.adoc"),
+            "[[extra-anchor]]\n== Extra\n",
+        )
+        .unwrap();
+        change_document(server, &file_uri(&index), 2, &format!("{text}\n")).await;
+        assert!(broken_xrefs(server, &index).is_empty());
+        assert_eq!(broken_includes(server, &index), 0);
+    }
+
+    /// The CREATED event for a subdirectory include target clears both
+    /// errors at once, with no edit of the including document; also when the
+    /// project is reached through a symlinked root.
+    #[tokio::test]
+    async fn test_created_event_clears_subdir_include_errors() {
+        for symlinked_root in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().canonicalize().unwrap();
+            let real = base.join("real");
+            fs::create_dir_all(real.join("chapters")).unwrap();
+            let root = if symlinked_root {
+                std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+                base.join("link")
+            } else {
+                real.clone()
+            };
+            let text = "= I\n\ninclude::chapters/extra.adoc[]\n\nSee <<extra-anchor>>.\n";
+            fs::write(real.join("index.adoc"), text).unwrap();
+            let (service, _socket) = initialized_server(&root).await;
+            let server = service.inner();
+            let index = root.join("index.adoc");
+            open_document(server, &file_uri(&index), text).await;
+            let key = real.join("index.adoc");
+            assert_eq!(broken_xrefs(server, &key), vec!["extra-anchor"]);
+            assert_eq!(broken_includes(server, &key), 1);
+
+            let extra = real.join("chapters/extra.adoc");
+            fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
+            notify_watched(server, &extra, FileChangeType::CREATED).await;
+            assert!(
+                broken_xrefs(server, &key).is_empty(),
+                "link={symlinked_root}"
+            );
+            assert_eq!(broken_includes(server, &key), 0, "link={symlinked_root}");
+
+            fs::remove_file(&extra).unwrap();
+            notify_watched(server, &extra, FileChangeType::DELETED).await;
+            assert_eq!(broken_xrefs(server, &key), vec!["extra-anchor"]);
+            assert_eq!(broken_includes(server, &key), 1);
+        }
     }
 
     /// T9.7: a watcher event for an open document keeps the editor's
