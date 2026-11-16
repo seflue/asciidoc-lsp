@@ -1,0 +1,13 @@
+= Main Doc
+
+include::ch1.adoc[leveloffset=+1]
+
+include::ch2.adoc[leveloffset=+1]
+
+include::ch3.adoc[leveloffset=+1]
+
+include::ch4.adoc[leveloffset=+1]
+
+See <<_ch_one>>, <<_ch_two>>, <<_ch_three>>, <<_ch_four_with_role>>.
+
+See <<cid1>>, <<_ch_four_with_role>>.

@@ -1,0 +1,38 @@
+= Product Manual
+
+[[intro]]
+== Introduction
+
+[#audience]
+== Audience
+
+[id=by-attr]
+== By Attr
+
+[[stacked]]
+[#stacked2]
+== Stacked
+
+== Options
+
+[.role]
+== With Role
+
+[appendix]
+== Appx
+
+== Inline Anchor [[tid]]
+
+See <<_inline_anchor_tid>>, <<_with_role>>, <<_appx>>, <<tid>>.
+
+See <<_introduction>>, <<_audience>>, <<_by_attr>>, <<_stacked>>, <<_product_manual>>, <<_options>>.
+
+== Escaped \[[esc]]
+
+== Bad Anchor [[1bad]]
+
+== NoSpace[[nsp]]
+
+See <<_escaped_esc>>, <<_bad_anchor_1bad>>, <<_nospace>>, <<nsp>>.
+
+== Empty Reftext [[etid,]]

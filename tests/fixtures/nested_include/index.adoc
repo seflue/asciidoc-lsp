@@ -1,0 +1,5 @@
+= Main Doc
+
+include::mid.adoc[leveloffset=+1]
+
+See <<_mid_title>>, <<_inner_title>>.

@@ -1,0 +1,9 @@
+:doctype: book
+
+Preamble text.
+
+= Part One
+
+== Chapter
+
+See <<_part_one>>.

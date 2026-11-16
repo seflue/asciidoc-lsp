@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::attributes::AttributeRegistry;
 use crate::graph::IncludeGraph;
 use crate::paths::resolve_doc_target;
-use crate::types::{AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, ResolvedXref, Xref};
+use crate::types::{
+    AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, ResolvedXref, Section, Xref,
+};
 
 pub struct ReferenceIndex {
     pub(crate) anchors: HashMap<String, AnchorLocation>,
@@ -63,7 +65,10 @@ impl ReferenceIndex {
         self.anchors.get(id)
     }
 
-    /// Add a single file's anchors and implicit section IDs to the index.
+    /// Add a single file's anchors and implicit section IDs to the index,
+    /// treating the file as a top-level document (no ID for its header
+    /// title). `Workspace` knows the include graph and adds the header title
+    /// ID of included files.
     ///
     /// Call `remove_file()` first if the file was already indexed.
     pub fn add_file(&mut self, path: &Path, doc: &DocumentModel, registry: &AttributeRegistry) {
@@ -82,17 +87,49 @@ impl ReferenceIndex {
         // Implicit section IDs
         let prefix = registry.resolve(path, "idprefix").unwrap_or("_");
         let separator = registry.resolve(path, "idseparator").unwrap_or("_");
-        for section in &doc.sections {
-            let id = generate_section_id(&section.title, prefix, separator);
-            self.add_anchor(
-                &id,
-                AnchorLocation {
-                    file: path.to_path_buf(),
-                    line: section.line,
-                    kind: AnchorKind::ImplicitSection,
-                },
-            );
+        // The document header title gets no ID; see `add_header_title_id`.
+        for section in doc
+            .sections
+            .iter()
+            .filter(|s| !s.explicit_id && !s.is_header)
+        {
+            self.add_section_id(path, section, prefix, separator);
         }
+    }
+
+    /// Add the implicit ID of the file's header title (`= Title`).
+    ///
+    /// Asciidoctor generates none for the document header, so `add_file`
+    /// skips it. In a file another document includes the title is a section
+    /// and keeps its ID: the workspace, which knows the include graph, calls
+    /// this for such files.
+    pub fn add_header_title_id(
+        &mut self,
+        path: &Path,
+        doc: &DocumentModel,
+        registry: &AttributeRegistry,
+    ) {
+        let Some(section) = doc.sections.first().filter(|s| s.is_header) else {
+            return;
+        };
+        if section.explicit_id {
+            return;
+        }
+        let prefix = registry.resolve(path, "idprefix").unwrap_or("_");
+        let separator = registry.resolve(path, "idseparator").unwrap_or("_");
+        self.add_section_id(path, section, prefix, separator);
+    }
+
+    fn add_section_id(&mut self, path: &Path, section: &Section, prefix: &str, separator: &str) {
+        let id = generate_section_id(&section.title, prefix, separator);
+        self.add_anchor(
+            &id,
+            AnchorLocation {
+                file: path.to_path_buf(),
+                line: section.line,
+                kind: AnchorKind::ImplicitSection,
+            },
+        );
     }
 
     /// Remove all anchors belonging to a file from the index.
@@ -419,6 +456,8 @@ mod tests {
                 level: 1,
                 title: "Building Block View".into(),
                 line: 10,
+                explicit_id: false,
+                is_header: false,
             }]),
         );
 
@@ -521,6 +560,8 @@ mod tests {
                 level: 1,
                 title: "My Section".into(),
                 line: 5,
+                explicit_id: false,
+                is_header: false,
             }]),
         );
 
@@ -864,6 +905,8 @@ mod tests {
             level: 1,
             title: "My Section".into(),
             line: 3,
+            explicit_id: false,
+            is_header: false,
         }]);
 
         index.add_file(&file_a, &doc_a, &registry);
@@ -871,5 +914,125 @@ mod tests {
         // Implicit section ID generated
         assert!(index.anchors.contains_key("_my_section"));
         assert_eq!(index.by_file.get(&file_a).unwrap().len(), 1);
+    }
+
+    // --- Committed fixtures: tests/fixtures/{explicit_section_ids,book_parts,leveloffset_*,nested_include,book_part_include} ---
+    //
+    // Asciidoctor generates no `_title` ID for a section that carries an
+    // explicit ID, nor for the document header title. The xref completion
+    // reads `reference_index()`, so the index assertions cover it too.
+
+    fn fixture_workspace(name: &str) -> crate::workspace::Workspace {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name);
+        crate::workspace::Workspace::build(&root, &root.join("index.adoc"))
+    }
+
+    fn broken_targets(ws: &crate::workspace::Workspace) -> Vec<String> {
+        let mut broken: Vec<String> = ws
+            .all_diagnostics()
+            .into_iter()
+            .filter_map(|d| match d.kind {
+                crate::types::DiagnosticKind::BrokenXref { target } => Some(target),
+                _ => None,
+            })
+            .collect();
+        broken.sort();
+        broken
+    }
+
+    #[test]
+    fn test_fixture_explicit_section_ids_suppress_implicit_ids() {
+        let ws = fixture_workspace("explicit_section_ids");
+
+        assert_eq!(
+            broken_targets(&ws),
+            [
+                "_audience",
+                "_by_attr",
+                "_inline_anchor_tid",
+                "_introduction",
+                "_product_manual",
+                "_stacked",
+                "nsp"
+            ]
+        );
+        // Not an anchor in Asciidoctor (escaped, invalid ID start, no space
+        // before `[[`): the section keeps its implicit ID.
+        for id in ["_escaped_esc", "_bad_anchor_1bad", "_nospace"] {
+            assert!(ws.reference_index().lookup(id).is_some(), "{id}");
+        }
+        // Attribute lists without an ID keep the implicit ID.
+        for id in ["_options", "_with_role", "_appx"] {
+            assert!(ws.reference_index().lookup(id).is_some(), "{id}");
+        }
+        assert!(ws.reference_index().lookup("_introduction").is_none());
+        assert!(ws.reference_index().lookup("tid").is_some());
+        // `[[id,]]` (empty reftext) is no section anchor: the anchor text
+        // becomes part of the title.
+        assert!(ws.reference_index().lookup("_empty_reftext_etid").is_some());
+        assert!(ws.reference_index().lookup("etid").is_none());
+    }
+
+    #[test]
+    fn test_fixture_included_title_with_block_id_has_no_implicit_id() {
+        let ws = fixture_workspace("included_title_block_id");
+
+        assert_eq!(broken_targets(&ws), ["_ch_one", "_ch_three", "_ch_two"]);
+        // `[#id]` / `[id=]` are not indexed as anchors yet (separate backlog
+        // item), so only `[[cid1]]` is asserted as an anchor.
+        for id in ["cid1", "_ch_four_with_role"] {
+            assert!(ws.reference_index().lookup(id).is_some(), "{id}");
+        }
+        assert!(ws.reference_index().lookup("_ch_one").is_none());
+    }
+
+    #[test]
+    fn test_fixture_headerless_book_part_keeps_implicit_id() {
+        let ws = fixture_workspace("headerless_book");
+
+        assert!(broken_targets(&ws).is_empty());
+        assert!(ws.reference_index().lookup("_part_one").is_some());
+    }
+
+    #[test]
+    fn test_fixture_book_part_keeps_implicit_id_header_title_does_not() {
+        let ws = fixture_workspace("book_parts");
+
+        assert_eq!(broken_targets(&ws), ["_my_book"]);
+        assert!(ws.reference_index().lookup("_part_one").is_some());
+    }
+
+    #[test]
+    fn test_fixture_leveloffset_argument_include_keeps_title_id() {
+        let ws = fixture_workspace("leveloffset_chapter");
+
+        assert_eq!(broken_targets(&ws), ["_main_doc"]);
+        assert!(ws.reference_index().lookup("_chapter_foo").is_some());
+    }
+
+    #[test]
+    fn test_fixture_leveloffset_attribute_include_keeps_title_id() {
+        let ws = fixture_workspace("leveloffset_attribute");
+
+        assert!(broken_targets(&ws).is_empty());
+        assert!(ws.reference_index().lookup("_chapter_foo").is_some());
+    }
+
+    #[test]
+    fn test_fixture_nested_include_keeps_title_id() {
+        let ws = fixture_workspace("nested_include");
+
+        assert!(broken_targets(&ws).is_empty());
+        assert!(ws.reference_index().lookup("_inner_title").is_some());
+    }
+
+    #[test]
+    fn test_fixture_book_part_include_keeps_title_id() {
+        let ws = fixture_workspace("book_part_include");
+
+        assert!(broken_targets(&ws).is_empty());
+        assert!(ws.reference_index().lookup("_chapter_foo").is_some());
     }
 }

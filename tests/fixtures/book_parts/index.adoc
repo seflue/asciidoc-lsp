@@ -1,0 +1,8 @@
+= My Book
+:doctype: book
+
+= Part One
+
+== Chap One
+
+See <<_part_one>>, <<_my_book>>, <<_chap_one>>.

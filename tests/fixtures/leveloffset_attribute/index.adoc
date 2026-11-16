@@ -1,0 +1,9 @@
+= Main Doc
+
+:leveloffset: +1
+
+include::chapter.adoc[]
+
+:leveloffset: -1
+
+See <<_chapter_foo>>.
