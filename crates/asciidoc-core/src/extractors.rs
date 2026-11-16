@@ -339,16 +339,9 @@ fn walk_for_sections(node: tree_sitter::Node, source: &[u8], results: &mut Vec<S
         let text = find_child_text(node, "line", source).unwrap_or_default();
         let (title, inline_anchor) = split_trailing_anchor(text.trim());
         if !title.is_empty() {
-            let header = if kind == "document_title" {
-                header_prefix(node, source)
-            } else {
-                None
-            };
-            let is_header = header.is_some();
+            let is_header = kind == "document_title" && header_prefix(node);
             // ID lines above the title beat the one trailing the title.
-            let id = section_block_id(node, source)
-                .or(header.and_then(|prefix| prefix.id))
-                .or_else(|| inline_anchor.map(str::to_string));
+            let id = section_block_id(node, source).or_else(|| inline_anchor.map(str::to_string));
             results.push(Section {
                 level,
                 title: title.to_string(),
@@ -511,71 +504,39 @@ fn section_block_id(title: tree_sitter::Node, source: &[u8]) -> Option<String> {
         .map(|(id, _)| id)
 }
 
-/// What precedes a document header.
-struct HeaderPrefix {
-    /// The ID one of the ID / attribute lines carries, if any.
-    id: Option<String>,
-}
-
-/// For a level-0 title: `None` if something other than comments, attribute
-/// entries and ID / attribute lines precedes it (a book part, not the
-/// document header). Otherwise the ID one of those lines carries, if any; the
-/// last one wins.
-/// The ID / attribute lines directly above the title are children of its
-/// `block_element`; attribute entries and comments further up are blocks of
-/// their own. ID / attribute lines above an attribute entry form a
-/// `section_block` of their own; the one nearest the title wins.
-fn header_prefix(title: tree_sitter::Node, source: &[u8]) -> Option<HeaderPrefix> {
-    let block = title.parent()?;
-    for line in lines_above_title(title) {
-        if !matches!(
+/// Whether a level-0 title is the document header: only comments, attribute
+/// entries and ID / attribute lines precede it. Anything else makes it a book
+/// part. The lines directly above the title are children of its
+/// `block_element`; those further up are blocks of their own.
+fn header_prefix(title: tree_sitter::Node) -> bool {
+    let Some(block) = title.parent() else {
+        return false;
+    };
+    let lines_ok = lines_above_title(title).iter().all(|line| {
+        matches!(
             line.kind(),
-            "block_anchor" | "element_attr" | "line_comment" | "block_comment"
-        ) {
-            return None;
-        }
+            "block_anchor" | "element_attr" | "document_attr" | "line_comment" | "block_comment"
+        )
+    });
+    if !lines_ok {
+        return false;
     }
-    let mut id = section_block_id(title, source);
     let mut prev = block.prev_sibling();
     while let Some(node) = prev {
-        let inner = node.child(0)?;
-        if node.kind() != "block_element" {
-            return None;
-        }
-        match inner.kind() {
-            "document_attr" | "line_comment" | "block_comment" => {}
-            "section_block" => {
-                if !is_attribute_entry_run(inner, source) {
-                    return None;
-                }
-                let mut cursor = inner.walk();
-                let run_last = inner
-                    .children(&mut cursor)
-                    .filter_map(|child| block_line_id(child, source))
-                    .last();
-                id = id.or(run_last.map(|(id, _)| id));
-            }
-            _ => return None,
+        let Some(inner) = node.child(0) else {
+            return false;
+        };
+        if node.kind() != "block_element"
+            || !matches!(
+                inner.kind(),
+                "document_attr" | "line_comment" | "block_comment"
+            )
+        {
+            return false;
         }
         prev = node.prev_sibling();
     }
-    Some(HeaderPrefix { id })
-}
-
-/// A run of ID / attribute lines that the grammar split off the title
-/// because attribute entries follow it: the lines are read as a
-/// `section_block` whose paragraph holds only attribute entries. `None` if
-/// `block` is anything else.
-fn is_attribute_entry_run(block: tree_sitter::Node, source: &[u8]) -> bool {
-    let mut cursor = block.walk();
-    let all_fit = block.children(&mut cursor).all(|child| match child.kind() {
-        "block_anchor" | "element_attr" | "line_comment" | "block_comment" => true,
-        "paragraph" => child
-            .utf8_text(source)
-            .is_ok_and(|text| text.lines().all(crate::ventilate::is_attribute_entry)),
-        _ => false,
-    });
-    all_fit
+    true
 }
 
 fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<IncludeMacro>) {
@@ -1016,8 +977,8 @@ mod tests {
 
     #[test]
     fn test_extract_sections_header_with_attribute_entry_between_lines_and_title() {
-        // The grammar splits the run above the title at the attribute entry;
-        // Asciidoctor still reads all of it as header metadata.
+        // Attribute entries between ID / attribute lines and the title stay
+        // part of the header run, as in Asciidoctor.
         let mut p = parser::init_block_parser().unwrap();
         for (source, id) in [
             ("[.role]\n:a: b\n= T\n", None),
