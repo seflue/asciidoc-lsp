@@ -1,0 +1,8 @@
+// tag::t[]
+Inside tag.
+// end::t[]
+
+[[x]]
+Outside.
+
+== Intro

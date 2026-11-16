@@ -1,0 +1,3 @@
+= Doc One
+
+include::multi_part.adoc[]

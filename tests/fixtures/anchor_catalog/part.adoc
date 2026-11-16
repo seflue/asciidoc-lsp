@@ -1,0 +1,11 @@
+// tag::a[]
+[[in-a]]
+Text a.
+
+== Sec A
+// end::a[]
+
+[[outside]]
+Text out.
+
+== Sec Out

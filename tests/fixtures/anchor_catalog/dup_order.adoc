@@ -1,0 +1,5 @@
+= Doc
+
+include::dup_z.adoc[]
+
+include::dup_a.adoc[]

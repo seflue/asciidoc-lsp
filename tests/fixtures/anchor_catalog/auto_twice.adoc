@@ -1,0 +1,9 @@
+= Doc
+
+== Foo
+
+== Foo
+
+include::auto_foo.adoc[]
+
+<<_foo_2>> <<_foo_3>> <<_foo_4>> <<_foo_5>>
