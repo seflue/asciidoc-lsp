@@ -361,7 +361,7 @@ fn is_delimiter_line(line: &str) -> bool {
 
 /// Whether `line` starts with an attribute entry, `:name:` followed by
 /// whitespace or the end of the line.
-fn is_attribute_entry(line: &str) -> bool {
+pub(crate) fn is_attribute_entry(line: &str) -> bool {
     let Some(rest) = line.strip_prefix(':') else {
         return false;
     };
@@ -914,6 +914,13 @@ mod tests {
         1,
         "One.\nTwo.\n\n[unclosed\n"
     )]
+    // Asciidoctor reads an unclosed bracket line as paragraph text
+    #[case::unclosed_bracket_line_is_text(
+        "One. Two.\n[unclosed\nThree. Four.\n",
+        1,
+        "One.\nTwo. [unclosed Three.\nFour.\n"
+    )]
+    #[case::join_makes_bracket_text("[x\ny]\nfoo.\n", 1, "[x y] foo.\n")]
     #[case::block_anchor("[[sec-a]]\nFirst. Second.\n", 2, "[[sec-a]]\nFirst.\nSecond.\n")]
     #[case::block_id("[#intro]\nFirst. Second.\n", 2, "[#intro]\nFirst.\nSecond.\n")]
     #[case::block_id_after_paragraph_and_blank_line(
@@ -1429,7 +1436,6 @@ mod tests {
     #[case::block_attribute_line("[source,rust]\nlet a = 1;\n", 1)]
     #[case::block_title_line(".Title. With dot\nFirst. Second.\n", 1)]
     #[case::quote_block("____\nQuote. Two.\n____\n", 2)]
-    #[case::block_parse_error_right_below("One. Two.\n[unclosed\nThree. Four.\n", 1)]
     #[case::description_list_with_lowercase_term("term:: Def. Two.\nmore. Yes.\n", 2)]
     #[case::hard_line_break("Hard. Break +\nnext. Line.\n", 1)]
     #[case::hard_line_break_on_later_line("First. Line.\nHard. Break +\nnext.\n", 1)]
@@ -1454,7 +1460,6 @@ mod tests {
     #[case::join_makes_admonition("NOTE:\nfoo.\n", 1)]
     #[case::join_makes_block_macro("image::a.png[x\ny]\n", 1)]
     #[case::join_makes_include_directive("include::a.adoc[x\ny]\n", 1)]
-    #[case::join_makes_block_attribute_line("[x\ny]\nfoo.\n", 1)]
     fn offers_no_edit(#[case] source: &str, #[case] line: usize) {
         assert_eq!(ventilate_paragraph(source, line).unwrap(), None);
     }
