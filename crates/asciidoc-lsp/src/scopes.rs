@@ -49,6 +49,13 @@ pub(crate) fn scope_image_base(scope: &AttributeScope<'_>, file_dir: &Path) -> (
     (base, imagesdir)
 }
 
+/// The folder paths resolve against in `scope`: its `docdir`, else `file_dir`.
+pub(crate) fn scope_docdir(scope: &AttributeScope<'_>, file_dir: &Path) -> PathBuf {
+    scope
+        .value(DOCDIR)
+        .map_or_else(|| file_dir.to_path_buf(), PathBuf::from)
+}
+
 /// The directory relative paths in `doc_path` resolve against: the document
 /// directory from the workspace (a symlink's folder for a symlinked
 /// document), else `doc_path`'s parent.
