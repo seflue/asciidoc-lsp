@@ -1,6 +1,6 @@
 use crate::types::{
     Anchor, AttributeDef, AttributeRef, ConditionalDirective, ConditionalKind, ConditionalOperator,
-    IncludeMacro, Section, Xref,
+    IncludeMacro, Section, Span, Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -555,10 +555,14 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
     results.extend(run_last);
 }
 
-/// Byte columns `(start, end)` of `node`, or `None` if it spans several lines.
-fn single_line_span(node: tree_sitter::Node) -> Option<(usize, usize)> {
+/// Range of `node`, which may span several lines.
+fn node_span(node: tree_sitter::Node) -> Span {
     let (start, end) = (node.start_position(), node.end_position());
-    (start.row == end.row).then_some((start.column, end.column))
+    Span {
+        start_col: start.column,
+        end_line: end.row + 1,
+        end_col: end.column,
+    }
 }
 
 fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref>) {
@@ -585,7 +589,7 @@ fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref
                 target,
                 display_text: display.filter(|s| !s.is_empty()),
                 line: node.start_position().row + 1,
-                span: single_line_span(node),
+                span: Some(node_span(node)),
                 target_col: target_node.map_or(0, |n| n.start_position().column),
             });
             return; // Don't recurse into matched macro children
@@ -606,7 +610,7 @@ fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref
                 target,
                 display_text: display,
                 line: node.start_position().row + 1,
-                span: single_line_span(node),
+                span: Some(node_span(node)),
                 target_col: node.start_position().column + 2 + leading_blanks,
             });
         }
