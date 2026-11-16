@@ -11,6 +11,9 @@
 //! - Sections read from a part of a file (`tag`, `lines`) or from a part the
 //!   grammar could not parse are unknown: they hide their parent from the
 //!   check until a section of the same or a shallower level closes them.
+//! - An include whose target the LSP does not read (missing, a path with a
+//!   build attribute, not in the index) is unknown the same way, from level 1
+//!   on.
 //! - A `leveloffset` the walk cannot evaluate stops the check for the rest of
 //!   the document.
 
@@ -41,6 +44,7 @@ pub(crate) fn out_of_sequence(workspace: &Workspace, document: &Path) -> Vec<Out
         .preset(document, "doctype")
         .map(|(_, hit)| hit.value);
     let mut walk = SectionWalk {
+        workspace,
         offset: 0,
         saved_offsets: Vec::new(),
         doctype,
@@ -75,7 +79,8 @@ enum Item<'a> {
     Section(&'a Section),
 }
 
-struct SectionWalk {
+struct SectionWalk<'w> {
+    workspace: &'w Workspace,
     /// The `leveloffset` in force.
     offset: i32,
     /// One entry per include being read: the offset to restore after it.
@@ -101,7 +106,7 @@ fn reads_region(edge: &IncludeEdge) -> bool {
     include_selection(edge) != IncludeSelection::Whole || edge.placement == Placement::Unparsed
 }
 
-impl SectionWalk {
+impl SectionWalk<'_> {
     /// A section of `level` ends every section of that level or deeper, and
     /// every unknown region that starts at `level` or deeper.
     fn close(&mut self, level: usize) {
@@ -202,7 +207,7 @@ impl SectionWalk {
     }
 }
 
-impl<'a> ReadingVisitor<'a> for SectionWalk {
+impl<'a> ReadingVisitor<'a> for SectionWalk<'_> {
     type Item = Item<'a>;
 
     fn items(&self, _file: &Path, doc: &'a DocumentModel) -> Vec<(usize, Item<'a>)> {
@@ -250,6 +255,14 @@ impl<'a> ReadingVisitor<'a> for SectionWalk {
     }
 
     fn leave(&mut self, edge: &IncludeEdge) {
+        // A target the LSP did not read (missing, a path with a build
+        // attribute, not indexed) may hold sections. Titles of level 0 and 1
+        // are never out of sequence, so one that follows closes the unknown
+        // part exactly; a larger `min` would be wrong (`=== Y` right below
+        // the header, target `== X`).
+        if self.block_depth == 0 && !self.workspace.documents.contains_key(&edge.target) {
+            self.uncertain(1);
+        }
         if let Some(Some(offset)) = self.saved_offsets.pop() {
             self.offset = offset;
         }
@@ -316,11 +329,24 @@ mod tests {
         a: DocumentModel,
         parts: Vec<(DocumentModel, IncludeEdge)>,
     ) -> Vec<(String, usize, Vec<usize>, usize)> {
+        walk_with_unread(a, parts, vec![])
+    }
+
+    /// Like `walk_documents`, with edges from `/a.adoc` whose target has no
+    /// document in the workspace (a path the LSP cannot read).
+    fn walk_with_unread(
+        a: DocumentModel,
+        parts: Vec<(DocumentModel, IncludeEdge)>,
+        unread: Vec<IncludeEdge>,
+    ) -> Vec<(String, usize, Vec<usize>, usize)> {
         let mut graph = IncludeGraph::new();
         let mut documents = HashMap::new();
         for (part, edge) in parts {
             graph.add_edge(Path::new("/a.adoc"), edge);
             documents.insert(part.path.clone(), part);
+        }
+        for edge in unread {
+            graph.add_edge(Path::new("/a.adoc"), edge);
         }
         documents.insert(PathBuf::from("/a.adoc"), a);
         let workspace = Workspace::new_with(
@@ -360,6 +386,94 @@ mod tests {
         assert_eq!(
             walk_documents(a, vec![]),
             vec![("/a.adoc".to_string(), 11, vec![2], 3)]
+        );
+    }
+
+    /// Asciidoctor (`-a partials=parts`, `parts/x.adoc` is `=== X`): no
+    /// warning for the `====` after the include. A target the LSP does not
+    /// read may hold sections of any depth, so the parent is unknown.
+    #[test]
+    fn test_unread_include_target_hides_the_parent_of_deeper_sections() {
+        let a =
+            DocumentModel::test("/a.adoc").with_sections(vec![body(0, 1), body(1, 3), body(3, 7)]);
+
+        assert_eq!(
+            walk_with_unread(
+                a,
+                vec![],
+                vec![edge("/missing.adoc", 5, None, Placement::Body)]
+            ),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor (target `== X`, then `=== Y`): quiet. A title of level 1
+    /// or less is never out of sequence, so the unknown region starts at 1,
+    /// not deeper.
+    #[test]
+    fn test_unread_include_under_header_leaves_next_title_unchecked() {
+        let a = DocumentModel::test("/a.adoc").with_sections(vec![body(0, 1), body(2, 5)]);
+
+        assert_eq!(
+            walk_with_unread(
+                a,
+                vec![],
+                vec![edge("/missing.adoc", 3, None, Placement::Body)]
+            ),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor (`-a partials=parts`, `parts/x.adoc` is `=== X`): no
+    /// warning for the `====` after a `tag=` include of a target the LSP
+    /// does not read. Regression test for the region edge on an unread target.
+    #[test]
+    fn test_unread_region_include_hides_the_parent_of_deeper_sections() {
+        let mut tagged = edge("/missing.adoc", 5, None, Placement::Body);
+        tagged.attributes.push(("tag".into(), "t".into()));
+        let a =
+            DocumentModel::test("/a.adoc").with_sections(vec![body(0, 1), body(1, 3), body(3, 7)]);
+
+        assert_eq!(walk_with_unread(a, vec![], vec![tagged]), vec![]);
+    }
+
+    /// Asciidoctor: a `== B` after the include switches the check on again,
+    /// the `==== W` after it is reported.
+    #[test]
+    fn test_level_1_title_after_unread_include_resumes_the_check() {
+        let a = DocumentModel::test("/a.adoc").with_sections(vec![
+            body(0, 1),
+            body(1, 3),
+            body(2, 7),
+            body(3, 9),
+            body(1, 11),
+            body(3, 13),
+        ]);
+
+        assert_eq!(
+            walk_with_unread(
+                a,
+                vec![],
+                vec![edge("/missing.adoc", 5, None, Placement::Body)]
+            ),
+            vec![("/a.adoc".to_string(), 13, vec![2], 3)]
+        );
+    }
+
+    /// Asciidoctor: an include inside a block reads block content, the
+    /// `====` after it is reported either way.
+    #[test]
+    fn test_unread_include_inside_a_block_keeps_the_check() {
+        let a =
+            DocumentModel::test("/a.adoc").with_sections(vec![body(0, 1), body(1, 3), body(3, 7)]);
+
+        assert_eq!(
+            walk_with_unread(
+                a,
+                vec![],
+                vec![edge("/missing.adoc", 5, None, Placement::Block)]
+            ),
+            vec![("/a.adoc".to_string(), 7, vec![2], 3)]
         );
     }
 

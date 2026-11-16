@@ -1895,6 +1895,21 @@ mod tests {
         );
     }
 
+    /// Asciidoctor (`unread.adoc`), with `-a partials=shared` (`shared/
+    /// unread_x.adoc` is `=== X`): only `line 11: expected level 2, got level
+    /// 3`. Without the attribute it also reports line 7, next to `include
+    /// file not found`. The LSP cannot resolve `{partials}`, so the include
+    /// target is unread and the title after it stays unchecked.
+    #[test]
+    fn test_include_with_build_attribute_in_path_hides_the_parent() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            out_of_sequence(&ws, &root.join("unread.adoc")),
+            vec![(11, vec![2], 3, vec![])]
+        );
+    }
+
     /// Asciidoctor: no warning for the project, whose chapters come in with
     /// `leveloffset=+1`.
     #[test]
