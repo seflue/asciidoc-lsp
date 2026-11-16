@@ -1,0 +1,30 @@
+= {product} User Manual
+Jane Doe <jane@example.org>
+v1.2, 2026-11-16
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+:source-highlighter: highlight.js
+:version-label: Release
+:min-ram: 4 GB
+:url-repo: https://example.org/acme/widget
+
+This manual describes {product} by {company}.
+See <<intro>> for an overview and <<setup-install,the installation guide>> to get started.
+
+include::partials/legal.adoc[]
+
+include::chapters/intro.adoc[leveloffset=+1]
+
+include::chapters/setup.adoc[leveloffset=+1]
+
+include::chapters/reference.adoc[leveloffset=+1]
+
+[appendix]
+[[glossary]]
+== Glossary
+
+[horizontal]
+Widget:: The thing {product} manages.
+Gadget:: A smaller widget, see xref:chapters/reference.adoc#ref-options[Options].

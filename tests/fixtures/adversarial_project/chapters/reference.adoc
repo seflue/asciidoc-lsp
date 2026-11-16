@@ -1,0 +1,30 @@
+[[reference]]
+= Reference
+:table-caption: Table
+
+[[ref-options]]
+== Options
+
+.Supported options
+[cols="1,1,3"]
+|===
+|Option |Default |Description
+
+|`verbose`
+|`false`
+|Enables verbose logging, see <<setup-config>>.
+
+|`threads`
+|`4`
+|Worker threads. Requires {min-ram}.
+|===
+
+[[ref-cli]]
+== Command line
+
+[source,bash,subs="attributes+"]
+----
+widget --version # {version-label}
+----
+
+Back to <<glossary>>.

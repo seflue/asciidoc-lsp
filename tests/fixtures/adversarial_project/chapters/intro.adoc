@@ -1,0 +1,15 @@
+[[intro]]
+= Introduction
+
+{product} helps you manage widgets.
+It needs at least {min-ram} of RAM.
+
+image::logo.png[Logo,200]
+
+[#intro-audience]
+== Audience
+
+This guide is for administrators.
+Continue with <<setup-install>> or jump to <<ref-options>>.
+
+TIP: The source lives at {url-repo}.
