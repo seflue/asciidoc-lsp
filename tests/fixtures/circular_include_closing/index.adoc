@@ -1,0 +1,7 @@
+= Handbook
+
+== Legal
+
+include::partials/legal.adoc[]
+
+include::chapters/intro.adoc[leveloffset=+1]

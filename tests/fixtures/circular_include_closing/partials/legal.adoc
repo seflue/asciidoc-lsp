@@ -1,0 +1,6 @@
+[NOTE]
+====
+Legal.
+====
+
+include::../index.adoc[]
