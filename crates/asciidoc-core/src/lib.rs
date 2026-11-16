@@ -7,6 +7,7 @@ pub mod graph;
 pub mod parser;
 pub mod paths;
 pub mod pdf_theme;
+pub mod quick_fix;
 mod reading;
 pub mod references;
 pub mod types;

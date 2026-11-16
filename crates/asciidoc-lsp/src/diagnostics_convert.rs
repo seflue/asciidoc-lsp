@@ -12,7 +12,7 @@ pub fn convert_diagnostics(diags: &[CoreDiagnostic], content: &str) -> Vec<ls_ty
     diags.iter().map(|d| convert_one(d, content)).collect()
 }
 
-fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
+pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Diagnostic {
     let line_text = content
         .lines()
         .nth(diag.line.saturating_sub(1))

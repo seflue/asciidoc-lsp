@@ -333,6 +333,7 @@ mod tests {
                 path: "nonexistent.adoc".into(),
                 attributes: vec![],
                 line: 3,
+                target_col: 9,
             }]),
         );
 
@@ -509,6 +510,7 @@ mod tests {
                 path: "b.adoc".into(),
                 attributes: vec![],
                 line: 3,
+                target_col: 9,
             }]),
         );
         documents.insert(
@@ -517,6 +519,7 @@ mod tests {
                 path: "a.adoc".into(),
                 attributes: vec![],
                 line: 5,
+                target_col: 9,
             }]),
         );
 
@@ -578,6 +581,7 @@ mod tests {
                 path: "{docdir}/appendix/glossary.adoc".into(),
                 attributes: vec![],
                 line: 20,
+                target_col: 9,
             }]),
         );
 
@@ -638,6 +642,7 @@ mod tests {
                 path: "missing.adoc".into(),
                 attributes: vec![],
                 line: 4,
+                target_col: 9,
             }]),
         );
 

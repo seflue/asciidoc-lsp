@@ -8,6 +8,7 @@ license.workspace = true
 tree-sitter = "0.27"
 tree-sitter-asciidoc = "0.11"
 tree-sitter-asciidoc-inline = "0.11"
+strsim = "0.11"
 thiserror = "2"
 tracing = "0.1"
 unicode-segmentation = "1"

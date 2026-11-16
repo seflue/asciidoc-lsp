@@ -76,6 +76,51 @@ impl AsciiDocLsp {
         }
     }
 
+    /// Quick-fixes for the diagnostics of `uri` that touch `range`, taken from
+    /// the workspace's own diagnostics rather than the client's copy.
+    fn quick_fix_actions(&self, uri: &Uri, range: Range, content: &str) -> CodeActionResponse {
+        let Some(doc_path) = document_path(uri) else {
+            return Vec::new();
+        };
+        let guard = self.workspace.lock();
+        let Some(ws) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        for core_diagnostic in ws.diagnostics_for(&doc_path) {
+            let lsp_diagnostic = diagnostics_convert::convert_one(core_diagnostic, content);
+            let touches =
+                lsp_diagnostic.range.start <= range.end && range.start <= lsp_diagnostic.range.end;
+            if !touches {
+                continue;
+            }
+            for fix in asciidoc_core::quick_fix::quick_fixes(ws, &doc_path, core_diagnostic) {
+                let edit_range = Range {
+                    start: positions::to_lsp_position(fix.line, fix.start_col, content),
+                    end: positions::to_lsp_position(fix.line, fix.end_col, content),
+                };
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Change spelling to '{}'", fix.new_text),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![lsp_diagnostic.clone()]),
+                    is_preferred: fix.preferred.then_some(true),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(HashMap::from([(
+                            uri.clone(),
+                            vec![TextEdit {
+                                range: edit_range,
+                                new_text: fix.new_text,
+                            }],
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+        actions
+    }
+
     /// Compute the diagnostics map after applying a batch of watcher events.
     /// Returns `None` when nothing relevant happened (no events, all events
     /// belonged to open buffers, or the workspace has not been initialized);
@@ -302,7 +347,10 @@ impl LanguageServer for AsciiDocLsp {
                 })),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
-                        code_action_kinds: Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            CodeActionKind::REFACTOR_REWRITE,
+                        ]),
                         ..Default::default()
                     },
                 )),
@@ -873,37 +921,37 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        let mut actions = self.quick_fix_actions(uri, params.range, &content);
+
         let (line, _) = positions::from_lsp_position(params.range.start, &content);
-        let edit = match asciidoc_core::ventilate::ventilate_paragraph(&content, line) {
-            Ok(Some(edit)) => edit,
-            Ok(None) => return Ok(None),
-            Err(err) => {
-                tracing::warn!(?err, "ventilate_paragraph failed");
-                return Ok(None);
+        match asciidoc_core::ventilate::ventilate_paragraph(&content, line) {
+            Ok(Some(edit)) => {
+                let range = Range {
+                    start: positions::offset_to_lsp_position(edit.range.start, &content),
+                    end: positions::offset_to_lsp_position(edit.range.end, &content),
+                };
+                let changes = HashMap::from([(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range,
+                        new_text: edit.new_text,
+                    }],
+                )]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "One sentence per line".to_string(),
+                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
             }
-        };
+            Ok(None) => {}
+            Err(err) => tracing::warn!(?err, "ventilate_paragraph failed"),
+        }
 
-        let range = Range {
-            start: positions::offset_to_lsp_position(edit.range.start, &content),
-            end: positions::offset_to_lsp_position(edit.range.end, &content),
-        };
-        let changes = HashMap::from([(
-            uri.clone(),
-            vec![TextEdit {
-                range,
-                new_text: edit.new_text,
-            }],
-        )]);
-
-        Ok(Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: "One sentence per line".to_string(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })]))
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn execute_command(
@@ -3341,6 +3389,161 @@ mod tests {
                 "{needle}"
             );
         }
+    }
+
+    /// The quick-fix actions the server offers for `range` of `uri`.
+    async fn quick_fixes_at(server: &AsciiDocLsp, uri: &Uri, range: Range) -> Vec<CodeAction> {
+        server
+            .code_action(CodeActionParams {
+                text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                    uri: uri.clone(),
+                },
+                range,
+                context: Default::default(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|action| match action {
+                CodeActionOrCommand::CodeAction(a) if a.kind == Some(CodeActionKind::QUICKFIX) => {
+                    Some(a)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn only_edit(action: &CodeAction, uri: &Uri) -> TextEdit {
+        let edits = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[uri];
+        let [edit] = edits.as_slice() else {
+            panic!("expected one edit, got {edits:?}");
+        };
+        edit.clone()
+    }
+
+    /// Asciidoctor (`quick_fixes/main.adoc`): `INFO: possible invalid
+    /// reference: setup-instal`.
+    #[tokio::test]
+    async fn test_fixture_code_action_quick_fixes_a_broken_xref() {
+        let fx = fixture_dir("quick_fixes");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let at = position_of(&text, "<<setup-instal>>", 5);
+
+        let fixes = quick_fixes_at(service.inner(), &uri, Range::new(at, at)).await;
+
+        let [fix] = fixes.as_slice() else {
+            panic!("expected one quick-fix, got {fixes:?}");
+        };
+        assert_eq!(fix.title, "Change spelling to 'setup-install'");
+        assert_eq!(fix.is_preferred, Some(true));
+        let diagnostics = fix.diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, at.line);
+        assert_eq!(
+            apply_edit(&text, &only_edit(fix, &uri)),
+            text.replacen("<<setup-instal>>", "<<setup-install>>", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fixture_code_action_fixes_only_the_xref_under_the_cursor() {
+        let fx = fixture_dir("quick_fixes");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let at = position_of(&text, "Setup-Install", 2);
+
+        let fixes = quick_fixes_at(service.inner(), &uri, Range::new(at, at)).await;
+
+        let [fix] = fixes.as_slice() else {
+            panic!("expected one quick-fix, got {fixes:?}");
+        };
+        let edit = only_edit(fix, &uri);
+        assert_eq!(edit.range.start.line, at.line);
+        assert!(edit.range.start <= at && at <= edit.range.end);
+        assert_eq!(edit.new_text, "setup-install");
+    }
+
+    /// A cursor directly before or after the xref still counts as touching it.
+    #[tokio::test]
+    async fn test_fixture_code_action_quick_fix_at_the_edges_of_the_xref() {
+        let fx = fixture_dir("quick_fixes");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+
+        for offset in [0, 16] {
+            let at = position_of(&text, "<<setup-instal>>", offset);
+
+            let fixes = quick_fixes_at(service.inner(), &uri, Range::new(at, at)).await;
+
+            let [fix] = fixes.as_slice() else {
+                panic!("offset {offset}: expected one quick-fix, got {fixes:?}");
+            };
+            assert_eq!(only_edit(fix, &uri).new_text, "setup-install");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fixture_code_action_quick_fixes_a_broken_include() {
+        let fx = fixture_dir("quick_fixes");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let at = position_of(&text, "include::snippets/config.yaml[]", 3);
+
+        let fixes = quick_fixes_at(service.inner(), &uri, Range::new(at, at)).await;
+
+        let [fix] = fixes.as_slice() else {
+            panic!("expected one quick-fix, got {fixes:?}");
+        };
+        assert_eq!(
+            apply_edit(&text, &only_edit(fix, &uri)),
+            text.replacen(
+                "include::snippets/config.yaml[]",
+                "include::snippets/config.yml[]",
+                1
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fixture_no_quick_fix_on_a_valid_xref() {
+        let fx = fixture_dir("quick_fixes");
+        let (service, _socket, uri, text) = open_fixture(&fx, &fx.join("main.adoc")).await;
+        let at = position_of(&text, "<<setup-install>>", 4);
+
+        let fixes = quick_fixes_at(service.inner(), &uri, Range::new(at, at)).await;
+
+        assert_eq!(fixes, vec![]);
+    }
+
+    #[tokio::test]
+    async fn test_code_action_capability_lists_quickfix_and_rewrite() {
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let fx = fixture_dir("quick_fixes");
+
+        let result = service
+            .inner()
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(&fx),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let Some(CodeActionProviderCapability::Options(options)) =
+            result.capabilities.code_action_provider
+        else {
+            panic!("code action options expected");
+        };
+        assert_eq!(
+            options.code_action_kinds,
+            Some(vec![
+                CodeActionKind::QUICKFIX,
+                CodeActionKind::REFACTOR_REWRITE
+            ])
+        );
     }
 
     // --- External file changes (manual test plan T9) ---

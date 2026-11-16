@@ -1,0 +1,45 @@
+= Main
+:snippetsdir: snippets
+:name: chaptr
+
+[[setup-install]]
+== Install
+
+=== Configure
+
+[[part-a]]
+== Part A
+[[part-b]]
+== Part B
+[[part-c]]
+== Part C
+[[part-d]]
+== Part D
+
+See <<setup-instal>>, <<Setup-Install>> and xref:setup-instal[here].
+
+See <<setup-instal,the install step>> and <<setup-install>>.
+
+See xref:chapter.adoc#chapter-intr[intro], <<_configur>>, <<part-e>> and <<zzz-nothing>>.
+
+See xref:chaptr.adoc#chapter-intro[] and <<{prefix}-instal>>.
+
+See <<{x}setup-install>>.
+
+See xref:other.adoc#other-intr[] and xref:other.adoc#setup-instal[].
+
+include::chapter.adoc[]
+
+include::chaptr.adoc[]
+
+include::snippets/config.yaml[]
+
+include::{snippetsdir}/config.yaml[]
+
+include::{name}.adoc[]
+
+include::snipets/config.yml[]
+
+include::snippets/notes.yml[]
+
+include::man.adoc[]
