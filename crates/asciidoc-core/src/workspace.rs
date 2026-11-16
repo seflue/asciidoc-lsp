@@ -392,24 +392,31 @@ impl Workspace {
     /// Find all xrefs that reference the given anchor ID.
     ///
     /// Matches xrefs with targets like `file.adoc#anchor`, `#anchor`, or `anchor`.
+    /// Each location spans the anchor id in the xref, as byte columns of its line.
     #[must_use]
     pub fn find_all_anchor_references(&self, anchor_id: &str) -> Vec<FileLocation> {
         let mut results = Vec::new();
         for doc in self.documents.values() {
             for xref in &doc.xrefs {
-                let xref_anchor = if let Some((_file, anchor)) = xref.target.split_once('#') {
-                    if anchor.is_empty() {
-                        continue;
-                    }
-                    anchor
-                } else if xref.target.contains('.') {
-                    continue; // file-only reference, no anchor
-                } else {
-                    // Plain anchor ID (shorthand xref target)
-                    xref.target.as_str()
-                };
+                let (xref_anchor, anchor_col) =
+                    if let Some((file, anchor)) = xref.target.split_once('#') {
+                        if anchor.is_empty() {
+                            continue;
+                        }
+                        (anchor, xref.target_col + file.len() + 1)
+                    } else if xref.target.contains('.') {
+                        continue; // file-only reference, no anchor
+                    } else {
+                        // Plain anchor ID (shorthand xref target)
+                        (xref.target.as_str(), xref.target_col)
+                    };
                 if xref_anchor == anchor_id {
-                    results.push(FileLocation::new(doc.path.clone(), xref.line, 0, 0));
+                    results.push(FileLocation::new(
+                        doc.path.clone(),
+                        xref.line,
+                        anchor_col,
+                        anchor_col + anchor_id.len(),
+                    ));
                 }
             }
         }

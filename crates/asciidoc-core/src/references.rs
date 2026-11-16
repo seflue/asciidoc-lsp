@@ -502,6 +502,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
         let result = index
             .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry)
@@ -531,6 +532,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
         let result = index
             .resolve_xref(
@@ -557,6 +559,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
         let result =
             index.resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry);
@@ -584,6 +587,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
         let result = index
             .resolve_xref(&xref, Path::new("/src.adoc"), &graph, &documents, &registry)
@@ -623,6 +627,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
         let resolved = index
             .resolve_xref(&xref, &source, &graph, &documents, &registry)
@@ -661,6 +666,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
         let resolved = index
             .resolve_xref(&xref, &source, &graph, &documents, &registry)
@@ -689,6 +695,7 @@ mod tests {
             display_text: None,
             line: 1,
             span: None,
+            target_col: 0,
         };
 
         let resolved = index

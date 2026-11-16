@@ -1,0 +1,4 @@
+[[other-id]]
+== Other
+
+Back to <<target,the target>>.

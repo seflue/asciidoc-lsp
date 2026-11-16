@@ -184,13 +184,15 @@ pub fn resolve_goto_definitions(
 /// Resolve a find-references request to a list of reference locations.
 ///
 /// When `include_declaration` is true and cursor is on a `{name}` reference,
-/// the definition location is included in the results.
+/// the definition location is included in the results. `overrides` holds the
+/// content of unsaved buffers, which spans on anchor declarations are read from.
 pub fn resolve_references(
     content: &str,
     pos: Position,
     doc_path: &Path,
     workspace: Option<&Workspace>,
     include_declaration: bool,
+    overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Option<Vec<FileLocation>> {
     let node_info = find_node_at_position(content, pos)?;
     let ws = workspace?;
@@ -215,34 +217,11 @@ pub fn resolve_references(
             }
             r
         }
-        NodeKind::Anchor { id } => {
-            let mut r = ws.find_all_anchor_references(id);
-            if include_declaration {
-                if let Some(loc) = ws.reference_index().lookup(id) {
-                    r.push(FileLocation::new(loc.file.clone(), loc.line, 0, 0));
-                }
-            }
-            r
-        }
+        NodeKind::Anchor { id } => anchor_locations(ws, id, include_declaration, overrides),
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             // Extract anchor part from xref target
-            let anchor_id = if let Some((_file, anchor)) = target.split_once('#') {
-                if anchor.is_empty() {
-                    return None;
-                }
-                anchor
-            } else if target.contains('.') {
-                return None; // file-only xref, no anchor to find references for
-            } else {
-                target.as_str()
-            };
-            let mut r = ws.find_all_anchor_references(anchor_id);
-            if include_declaration {
-                if let Some(loc) = ws.reference_index().lookup(anchor_id) {
-                    r.push(FileLocation::new(loc.file.clone(), loc.line, 0, 0));
-                }
-            }
-            r
+            let anchor_id = xref_anchor_id(target)?;
+            anchor_locations(ws, anchor_id, include_declaration, overrides)
         }
         NodeKind::Image { .. } => {
             // Images have no references semantics — find-references is a no-op
@@ -251,14 +230,114 @@ pub fn resolve_references(
     };
 
     // Deduplicate results (same file+line can appear from multiple sources)
-    results.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    results.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+    results.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+    });
+    results.dedup_by(|a, b| a.path == b.path && a.line == b.line && a.col == b.col);
 
     if results.is_empty() {
         None
     } else {
         Some(results)
     }
+}
+
+/// The anchor id an xref target names: the part after `#`, or a plain id.
+/// `None` for a file-only target or an empty anchor.
+fn xref_anchor_id(target: &str) -> Option<&str> {
+    if let Some((_file, anchor)) = target.split_once('#') {
+        (!anchor.is_empty()).then_some(anchor)
+    } else if target.contains('.') {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// The span of the xref to `anchor_id` on `line` of `doc_path` closest to the
+/// byte column `cursor_col`, as the workspace extracted it.
+fn xref_span_near(
+    ws: &Workspace,
+    doc_path: &Path,
+    anchor_id: &str,
+    line: usize,
+    cursor_col: usize,
+) -> Option<(usize, usize)> {
+    ws.find_all_anchor_references(anchor_id)
+        .into_iter()
+        .filter(|loc| loc.line == line && loc.path == doc_path)
+        .min_by_key(|loc| {
+            if cursor_col < loc.col {
+                loc.col - cursor_col
+            } else {
+                cursor_col.saturating_sub(loc.end_col)
+            }
+        })
+        .map(|loc| (loc.col, loc.end_col))
+}
+
+/// The xrefs to `anchor_id`, and with `include_declaration` its definition,
+/// each at the span of the id on its line (the spans rename edits). An xref
+/// carries its span from extraction; the declaration's is found in its line
+/// (`[[id]]` or `[[id,reftext]]`). A declaration whose line holds no such
+/// span, such as a section's implicit id, stays a zero-width location at the
+/// line start.
+fn anchor_locations(
+    ws: &Workspace,
+    anchor_id: &str,
+    include_declaration: bool,
+    overrides: &HashMap<PathBuf, Arc<String>>,
+) -> Vec<FileLocation> {
+    let mut locations = ws.find_all_anchor_references(anchor_id);
+    if include_declaration {
+        if let Some(loc) = ws.reference_index().lookup(anchor_id) {
+            let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+            let text = read_file_cached(&mut file_cache, &loc.file, overrides);
+            let line_text = text
+                .lines()
+                .nth(loc.line.saturating_sub(1))
+                .unwrap_or_default();
+            let (col, end_col) = find_anchor_def_columns(line_text, anchor_id).unwrap_or((0, 0));
+            locations.push(FileLocation::new(loc.file.clone(), loc.line, col, end_col));
+        }
+    }
+    locations
+}
+
+/// Where go-to-definition lands, as locations: from an xref, the id inside
+/// the anchor's `[[id]]` (the line start when no line spells it); anywhere
+/// else the line start of each target of [`resolve_goto_definitions`].
+pub fn resolve_definition_locations(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+    overrides: &HashMap<PathBuf, Arc<String>>,
+) -> Vec<FileLocation> {
+    let anchor_id = match find_node_at_position(content, pos).map(|info| info.kind) {
+        Some(NodeKind::Xref { target } | NodeKind::ShorthandXref { target }) => {
+            xref_anchor_id(&target).map(str::to_string)
+        }
+        _ => None,
+    };
+    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+    resolve_goto_definitions(content, pos, doc_path, workspace)
+        .into_iter()
+        .map(|(path, line)| {
+            let (col, end_col) = anchor_id
+                .as_deref()
+                .and_then(|id| {
+                    let text = read_file_cached(&mut file_cache, &path, overrides);
+                    let line_text = text.lines().nth(line.saturating_sub(1))?;
+                    find_anchor_def_columns(line_text, id)
+                })
+                .unwrap_or((0, 0));
+            FileLocation::new(path, line, col, end_col)
+        })
+        .collect()
 }
 
 /// Resolved PDF paths for hover: absolute paths as such, a bundled theme
@@ -676,6 +755,7 @@ fn resolve_xref_targets(
         display_text: None,
         line,
         span: None,
+        target_col: 0,
     };
     let dir = document_dir(doc_path, Some(ws));
     path_scopes(ws, doc_path, line)
@@ -1165,7 +1245,7 @@ pub(crate) struct PrepareRenameResult {
 pub fn prepare_rename(
     content: &str,
     pos: Position,
-    _doc_path: &Path,
+    doc_path: &Path,
     workspace: Option<&Workspace>,
 ) -> Option<PrepareRenameResult> {
     let node_info = find_node_at_position(content, pos)?;
@@ -1209,7 +1289,10 @@ pub fn prepare_rename(
                     }
                 }
             }
-            let (start, end) = find_anchor_ref_columns(line_text, anchor_id)?;
+            let (_, cursor_col) = positions::from_lsp_position(pos, content);
+            let (start, end) = workspace
+                .and_then(|ws| xref_span_near(ws, doc_path, anchor_id, node_info.line, cursor_col))
+                .or_else(|| find_anchor_ref_columns(line_text, anchor_id))?;
             Some(PrepareRenameResult {
                 placeholder: anchor_id.to_string(),
                 line: node_info.line,
@@ -1352,19 +1435,11 @@ fn resolve_rename_anchor(
     }
 
     // Anchor references (xrefs)
-    let refs = ws.find_all_anchor_references(anchor_id);
-    for loc in refs {
-        let file_content = read_file_cached(&mut file_cache, &loc.path, overrides);
-        let line_text = file_content
-            .lines()
-            .nth(loc.line.saturating_sub(1))
-            .unwrap_or_default();
-        if let Some((start, end)) = find_anchor_ref_columns(line_text, anchor_id) {
-            edits
-                .entry(loc.path)
-                .or_default()
-                .push((loc.line, start, end));
-        }
+    for loc in ws.find_all_anchor_references(anchor_id) {
+        edits
+            .entry(loc.path)
+            .or_default()
+            .push((loc.line, loc.col, loc.end_col));
     }
 
     if edits.is_empty() {
@@ -1403,13 +1478,15 @@ fn read_file_cached<'a>(
 // Column-finder helpers
 // ---------------------------------------------------------------------------
 
-/// Find the byte offsets of `id` inside `[[id]]` on a line.
+/// Find the byte offsets of `id` inside `[[id]]` or `[[id,reftext]]` on a line.
 /// Returns `(start, end)` byte offsets of the id (exclusive end).
 fn find_anchor_def_columns(line_text: &str, id: &str) -> Option<(usize, usize)> {
-    let pattern = format!("[[{id}]]");
-    let pos = line_text.find(&pattern)?;
-    let start = pos + 2; // skip `[[`
-    Some((start, start + id.len()))
+    let pattern = format!("[[{id}");
+    line_text.match_indices(&pattern).find_map(|(pos, _)| {
+        let end = pos + pattern.len();
+        matches!(line_text[end..].chars().next(), Some(']' | ',')).then_some((pos + 2, end))
+        // skip `[[`
+    })
 }
 
 /// Find the byte offsets of `id` in an xref reference on a line.
@@ -1892,7 +1969,8 @@ mod tests {
         );
         let edits = resolve_rename(chapter, pos, chapter_path, Some(&ws), &HashMap::new()).unwrap();
         assert!(edits.contains_key(attrs), "edits: {edits:?}");
-        let refs = resolve_references(chapter, pos, chapter_path, Some(&ws), true).unwrap();
+        let refs = resolve_references(chapter, pos, chapter_path, Some(&ws), true, &HashMap::new())
+            .unwrap();
         assert!(
             refs.iter().any(|loc| loc.path == *attrs && loc.line == 1),
             "refs: {refs:?}"
@@ -2134,7 +2212,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 11,
         };
 
-        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         assert_eq!(results.len(), 2, "Expected 2 usages, got: {:?}", results);
     }
 
@@ -2152,7 +2231,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 3,
         };
 
-        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         assert_eq!(results.len(), 1, "Expected 1 usage, got: {:?}", results);
     }
 
@@ -2176,11 +2256,12 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         // Without includeDeclaration — just usages
-        let without = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let without =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         assert_eq!(without.len(), 1);
 
         // With includeDeclaration — usages + definition
-        let with = resolve_references(&content, pos, &a, Some(&ws), true).unwrap();
+        let with = resolve_references(&content, pos, &a, Some(&ws), true, &HashMap::new()).unwrap();
         assert_eq!(
             with.len(),
             2,
@@ -2224,7 +2305,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             resolve_goto_definitions(&content, pos, &config, Some(&ws)),
             vec![(config.clone(), 2)]
         );
-        let refs = resolve_references(&content, pos, &config, Some(&ws), true).unwrap();
+        let refs =
+            resolve_references(&content, pos, &config, Some(&ws), true, &HashMap::new()).unwrap();
         let found: Vec<(&Path, usize)> = refs
             .iter()
             .map(|loc| (loc.path.as_path(), loc.line))
@@ -2285,8 +2367,15 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 19, // inside {source-dir}
         };
 
-        let results =
-            resolve_references(&concepts_content, pos, &concepts_path, Some(&ws), false).unwrap();
+        let results = resolve_references(
+            &concepts_content,
+            pos,
+            &concepts_path,
+            Some(&ws),
+            false,
+            &HashMap::new(),
+        )
+        .unwrap();
         // {source-dir} is used in concepts.adoc (line 3) and building.adoc (line 3)
         assert_eq!(
             results.len(),
@@ -2336,8 +2425,15 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 5, // inside "source-dir" in ":source-dir: ../src"
         };
 
-        let results =
-            resolve_references(&config_content, pos, &config_path, Some(&ws), false).unwrap();
+        let results = resolve_references(
+            &config_content,
+            pos,
+            &config_path,
+            Some(&ws),
+            false,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -2401,7 +2497,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         // b.adoc is included from a.adoc (line 3) and c.adoc (line 3)
         assert_eq!(results.len(), 2, "Expected 2 refs, got: {:?}", results);
     }
@@ -2427,7 +2524,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 12,
         };
 
-        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         // include ref + xref to b.adoc
         assert_eq!(
             results.len(),
@@ -2464,7 +2562,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 4,
         };
 
-        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         assert_eq!(results.len(), 2, "Expected 2 refs, got: {:?}", results);
     }
 
@@ -2490,11 +2589,12 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         // Without includeDeclaration
-        let without = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let without =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         assert_eq!(without.len(), 1, "Expected 1 ref without declaration");
 
         // With includeDeclaration — should include anchor definition
-        let with = resolve_references(&content, pos, &a, Some(&ws), true).unwrap();
+        let with = resolve_references(&content, pos, &a, Some(&ws), true, &HashMap::new()).unwrap();
         assert_eq!(
             with.len(),
             2,
@@ -2530,7 +2630,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 8,
         };
 
-        let results = resolve_references(&content, pos, &b, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &b, Some(&ws), false, &HashMap::new()).unwrap();
         // Both xref and shorthand xref reference "target"
         assert_eq!(results.len(), 2, "Expected 2 co-refs, got: {:?}", results);
     }
@@ -2560,7 +2661,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 7,
         };
 
-        let results = resolve_references(&content, pos, &b, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &b, Some(&ws), false, &HashMap::new()).unwrap();
         assert_eq!(results.len(), 2, "Expected 2 co-refs, got: {:?}", results);
     }
 
@@ -2598,7 +2700,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 15,
         };
 
-        let results = resolve_references(&content, pos, &index, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &index, Some(&ws), false, &HashMap::new()).unwrap();
         // Should find: 1 include ref (from index.adoc) + 1 xref (from concepts.adoc)
         assert_eq!(
             results.len(),
@@ -2634,7 +2737,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 5,
         };
 
-        let results = resolve_references(&content, pos, &a, Some(&ws), false).unwrap();
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
         // Should find 2 refs: xref in b.adoc + shorthand xref in c.adoc
         assert_eq!(
             results.len(),
@@ -4547,12 +4651,14 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             character: 4,
         };
 
-        // Without overrides: would fail because disk has "old-id" but we search "new-id"
+        // Without overrides the xref still has its span from the workspace, but
+        // the stale disk line holds no `[[new-id]]`, so the definition is missed.
         let result_no_override =
-            resolve_rename(new_content, pos, &a_canon, Some(&ws), &HashMap::new());
-        assert!(
-            result_no_override.is_none(),
-            "without overrides, stale disk content should cause column search to miss"
+            resolve_rename(new_content, pos, &a_canon, Some(&ws), &HashMap::new()).unwrap();
+        assert_eq!(
+            result_no_override.get(&a_canon).map(Vec::len),
+            Some(1),
+            "without overrides only the xref is found, got: {result_no_override:?}"
         );
 
         // With overrides: should find both definition and reference

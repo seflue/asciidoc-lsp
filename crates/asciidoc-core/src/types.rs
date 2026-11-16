@@ -22,6 +22,8 @@ pub struct Xref {
     pub line: usize,
     /// Byte columns `(start, end)` of the xref on its line, if it fits on one line.
     pub span: Option<(usize, usize)>,
+    /// Byte column, on `line`, where `target` starts.
+    pub target_col: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

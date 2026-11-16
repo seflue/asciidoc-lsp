@@ -1,0 +1,23 @@
+= Doc
+
+include::other.adoc[]
+
+[[target]]
+== Target
+
+See <<target>> and <<other-id>>.
+
+Umlaut: äö xref:target[the target].
+
+Old <<target-old>> then <<target>>.
+
+Twice <<target>> and <<target,again>>.
+
+[[reftext-id,Ref Text]]
+Anchored paragraph.
+
+See <<reftext-id>>.
+
+== Implicit Section
+
+Go <<_implicit_section>>.

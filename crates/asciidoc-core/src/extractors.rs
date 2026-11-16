@@ -397,13 +397,18 @@ fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref
     if kind == "inline_macro" {
         let macro_name = find_child_text(node, "macro_name", source).unwrap_or_default();
         if macro_name == "xref" {
-            let target = find_child_text(node, "target", source).unwrap_or_default();
+            let target_node = find_child_node(node, "target");
+            let target = target_node
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or_default()
+                .to_string();
             let display = find_child_text(node, "attr", source);
             results.push(Xref {
                 target,
                 display_text: display.filter(|s| !s.is_empty()),
                 line: node.start_position().row + 1,
                 span: single_line_span(node),
+                target_col: target_node.map_or(0, |n| n.start_position().column),
             });
             return; // Don't recurse into matched macro children
         }
@@ -418,11 +423,13 @@ fn walk_for_xrefs(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Xref
                 Some((t, d)) => (t.trim().to_string(), Some(d.trim().to_string())),
                 None => (inner.trim().to_string(), None),
             };
+            let leading_blanks = inner.len() - inner.trim_start().len();
             results.push(Xref {
                 target,
                 display_text: display,
                 line: node.start_position().row + 1,
                 span: single_line_span(node),
+                target_col: node.start_position().column + 2 + leading_blanks,
             });
         }
         return; // Don't recurse into matched xref children
@@ -575,6 +582,14 @@ fn find_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter:
 // --- Helpers ---
 
 /// Find the first child with the given kind and return its text.
+fn find_child_node<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == kind);
+    found
+}
+
 pub fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
