@@ -709,7 +709,13 @@ fn is_raw_quote_line(
     source: &[u8],
     raw_delimiter: &mut Option<String>,
 ) -> bool {
-    let text = line.utf8_text(source).unwrap_or_default().trim_end();
+    is_raw_text_line(line.utf8_text(source).unwrap_or_default(), raw_delimiter)
+}
+
+/// Text variant of [`is_raw_quote_line`], shared with the substituted
+/// reference scan for the raw text of `a` cells.
+pub(crate) fn is_raw_text_line(line: &str, raw_delimiter: &mut Option<String>) -> bool {
+    let text = line.trim_end();
     if let Some(open) = raw_delimiter {
         if text == open {
             *raw_delimiter = None;

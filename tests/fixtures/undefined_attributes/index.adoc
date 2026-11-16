@@ -1,0 +1,34 @@
+= Index
+:product: Foo
+:imagesdir: img
+
+Typo {prodcut} here.
+
+:product!:
+
+Unset {product} here.
+
+See https://example.com/{host}/ page.
+
+[source,subs="attributes+"]
+----
+Listing {inlisting}
+----
+
+----
+Listing {quiet-listing}
+----
+
+// comment {quiet-comment}
+
+Escaped \{quiet-escaped} and +++{quiet-pass}+++ text.
+
+:other: Bar
+
+ifdef::backend-pdf[]
+:other!:
+endif::[]
+
+Still {other} here.
+
+include::chapter.adoc[]

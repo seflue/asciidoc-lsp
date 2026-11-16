@@ -1,0 +1,4 @@
+= Excerpt
+:product: P
+
+include::shared.adoc[tag=t]

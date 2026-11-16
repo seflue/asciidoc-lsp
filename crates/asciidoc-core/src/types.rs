@@ -129,6 +129,20 @@ pub struct DocumentModel {
     pub attributes: Vec<AttributeDef>,
     pub attribute_refs: Vec<AttributeRef>,
     pub conditionals: Vec<ConditionalDirective>,
+    /// Attribute references Asciidoctor substitutes, in document order.
+    pub substituted_refs: Vec<AttributeRef>,
+    /// Entries the LSP cannot be sure of, see [`PossibleDefinition`].
+    pub possible_definitions: Vec<PossibleDefinition>,
+}
+
+/// An attribute that may be defined at `line` without the LSP being able to
+/// tell: an entry in a single-line conditional (`ifndef::x[:x: v]`) or a
+/// `{counter:x}` / `{set:x:v}` reference. Never reported as undefined from
+/// there on, until a sure entry or unset follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PossibleDefinition {
+    pub name: String,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,8 +157,12 @@ pub enum DiagnosticKind {
     BrokenInclude {
         path: String,
     },
+    /// `documents` names the top-level documents where the attribute is not
+    /// set when several read the file; empty when the file belongs to one
+    /// document only.
     UndefinedAttribute {
         name: String,
+        documents: Vec<PathBuf>,
     },
     /// `documents` are the top-level documents in which the second
     /// definition (the diagnostic's own position) follows the first.
@@ -211,8 +229,13 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::BrokenInclude { path } => {
                 write!(f, "Broken include: {path}")
             }
-            DiagnosticKind::UndefinedAttribute { name } => {
-                write!(f, "Undefined attribute: {{{name}}}")
+            DiagnosticKind::UndefinedAttribute { name, documents } => {
+                write!(f, "Undefined attribute: {{{name}}}")?;
+                if documents.is_empty() {
+                    return Ok(());
+                }
+                let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
+                write!(f, " (not set in {})", documents.join(", "))
             }
             DiagnosticKind::DuplicateAnchor {
                 id,
@@ -343,6 +366,8 @@ impl DocumentModel {
             attributes: vec![],
             attribute_refs: vec![],
             conditionals: vec![],
+            substituted_refs: vec![],
+            possible_definitions: vec![],
         }
     }
 
@@ -372,6 +397,17 @@ impl DocumentModel {
     }
     pub fn with_conditionals(mut self, conditionals: Vec<ConditionalDirective>) -> Self {
         self.conditionals = conditionals;
+        self
+    }
+    pub fn with_substituted_refs(mut self, substituted_refs: Vec<AttributeRef>) -> Self {
+        self.substituted_refs = substituted_refs;
+        self
+    }
+    pub fn with_possible_definitions(
+        mut self,
+        possible_definitions: Vec<PossibleDefinition>,
+    ) -> Self {
+        self.possible_definitions = possible_definitions;
         self
     }
 }
@@ -408,8 +444,20 @@ mod tests {
         };
         assert_eq!(d2.to_string(), "Broken include: missing.adoc");
 
-        let d3 = DiagnosticKind::UndefinedAttribute { name: "foo".into() };
+        let d3 = DiagnosticKind::UndefinedAttribute {
+            name: "foo".into(),
+            documents: vec![],
+        };
         assert_eq!(d3.to_string(), "Undefined attribute: {foo}");
+
+        let d3b = DiagnosticKind::UndefinedAttribute {
+            name: "foo".into(),
+            documents: vec![PathBuf::from("web.adoc"), PathBuf::from("print.adoc")],
+        };
+        assert_eq!(
+            d3b.to_string(),
+            "Undefined attribute: {foo} (not set in web.adoc, print.adoc)"
+        );
 
         let d4 = DiagnosticKind::DuplicateAnchor {
             id: "my-id".into(),
