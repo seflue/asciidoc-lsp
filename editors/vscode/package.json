@@ -33,7 +33,8 @@
           ".asciidoc",
           ".asc",
           ".ad"
-        ]
+        ],
+        "configuration": "./language-configuration.json"
       }
     ],
     "configuration": {
@@ -62,7 +63,160 @@
         "title": "Restart Language Server",
         "category": "AsciiDoc LSP"
       }
-    ]
+    ],
+    "semanticTokenTypes": [
+      {
+        "id": "heading",
+        "description": "Style for section titles and the document title."
+      },
+      {
+        "id": "strong",
+        "description": "Style for bold text."
+      },
+      {
+        "id": "emphasis",
+        "description": "Style for italic and highlighted text."
+      },
+      {
+        "id": "raw",
+        "superType": "string",
+        "description": "Style for monospace text and the body of listing blocks."
+      },
+      {
+        "id": "link",
+        "description": "Style for URLs, e-mail addresses and the targets of cross references."
+      },
+      {
+        "id": "listMarker",
+        "description": "Style for list bullets, numbers and description list markers."
+      },
+      {
+        "id": "subscript",
+        "description": "Style for subscript text."
+      },
+      {
+        "id": "superscript",
+        "description": "Style for superscript text."
+      },
+      {
+        "id": "punctuation",
+        "description": "Style for delimiters, block markers and brackets."
+      },
+      {
+        "id": "admonition",
+        "description": "Style for admonition labels such as NOTE and WARNING."
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "level1",
+        "description": "Level 1 of a section title."
+      },
+      {
+        "id": "level2",
+        "description": "Level 2 of a section title."
+      },
+      {
+        "id": "level3",
+        "description": "Level 3 of a section title."
+      },
+      {
+        "id": "level4",
+        "description": "Level 4 of a section title."
+      },
+      {
+        "id": "level5",
+        "description": "Level 5 of a section title."
+      },
+      {
+        "id": "level6",
+        "description": "Level 6 of a section title."
+      },
+      {
+        "id": "note",
+        "description": "Admonition of kind NOTE or TIP."
+      },
+      {
+        "id": "warning",
+        "description": "Admonition of kind WARNING or CAUTION."
+      },
+      {
+        "id": "error",
+        "description": "Admonition of kind IMPORTANT."
+      },
+      {
+        "id": "checked",
+        "description": "Marker of a checked checklist item."
+      },
+      {
+        "id": "unchecked",
+        "description": "Marker of an unchecked checklist item."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "asciidoc",
+        "scopes": {
+          "heading": [
+            "markup.heading"
+          ],
+          "heading.level1": [
+            "markup.heading",
+            "markup.heading.markdown heading.1.markdown entity.name.section.markdown"
+          ],
+          "heading.level2": [
+            "markup.heading",
+            "markup.heading.markdown heading.2.markdown entity.name.section.markdown"
+          ],
+          "heading.level3": [
+            "markup.heading",
+            "markup.heading.markdown heading.3.markdown entity.name.section.markdown"
+          ],
+          "heading.level4": [
+            "markup.heading",
+            "markup.heading.markdown heading.4.markdown entity.name.section.markdown"
+          ],
+          "heading.level5": [
+            "markup.heading",
+            "markup.heading.markdown heading.5.markdown entity.name.section.markdown"
+          ],
+          "heading.level6": [
+            "markup.heading",
+            "markup.heading.markdown heading.6.markdown entity.name.section.markdown"
+          ],
+          "strong": [
+            "markup.bold"
+          ],
+          "emphasis": [
+            "markup.italic"
+          ],
+          "raw": [
+            "markup.inline.raw"
+          ],
+          "link": [
+            "markup.underline.link"
+          ],
+          "listMarker": [
+            "punctuation.definition.list.begin.markdown"
+          ],
+          "punctuation": [
+            "punctuation"
+          ],
+          "admonition": [
+            "markup.bold"
+          ],
+          "label": [
+            "entity.name.label",
+            "entity.name.tag"
+          ]
+        }
+      }
+    ],
+    "configurationDefaults": {
+      "[asciidoc]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p . && esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",

@@ -4,7 +4,7 @@ Client for [asciidoc-lsp](https://github.com/seflue/asciidoc-lsp): navigation, c
 
 The platform-specific packages bundle the server. The universal package does not; it uses `asciidoc-lsp` from `PATH` or the path in `asciidoc-lsp.server.path`.
 
-The extension ships no syntax highlighting. Install an AsciiDoc grammar extension for that.
+Highlighting comes from the server's semantic tokens, with semantic highlighting turned on for AsciiDoc files whatever the theme says. Colors follow the theme's markup rules; `editor.semanticTokenColorCustomizations` restyles the token types (`heading`, `strong`, `emphasis`, `raw`, `link`, `listMarker`, ...). Nothing is colored until the server has started.
 
 ## Settings
 
