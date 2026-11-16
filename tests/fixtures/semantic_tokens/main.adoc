@@ -1,0 +1,30 @@
+= Document Title
+:author-name: Ada
+
+// a line comment
+
+== Section One
+
+Some *bold* text, see <<_section_two>> and https://example.com now.
+
+A paragraph with *bold that
+spans two lines* inside.
+
+Umlaut Ünï 😀 *bold* after non-BMP.
+
+////
+block comment
+spanning lines
+////
+
+[source,rust]
+----
+fn main() {}
+----
+
+NOTE: Mind the gap.
+
+[[_section_two]]
+== Section Two
+
+* first item
