@@ -14,7 +14,9 @@ use asciidoc_core::types::AnchorLocation;
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 use crate::positions;
-use crate::scopes::{collapse_if_agree, document_dir, path_scopes, scope_image_base, scope_label};
+use crate::scopes::{
+    collapse_if_agree, document_dir, path_scopes, scope_docdir, scope_image_base, scope_label,
+};
 
 // ---------------------------------------------------------------------------
 // Syntax Completion Catalog
@@ -821,7 +823,9 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     )
 }
 
-/// Resolve xref path completions: `.adoc` files relative to the document directory.
+/// Resolve xref path completions: `.adoc` files relative to each scope's
+/// `docdir` (the top-level document's folder, an included file's own folder
+/// for its preview), as Asciidoctor resolves xref paths.
 /// Reuses `resolve_path_completions` (which appends `[]` to file entries).
 pub(crate) fn resolve_xref_path_completions(
     prefix: &str,
@@ -832,8 +836,8 @@ pub(crate) fn resolve_xref_path_completions(
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
     let base = document_dir(doc_path, ws);
-    let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |_| {
-        base.to_path_buf()
+    let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |scope| {
+        scope_docdir(scope, base)
     });
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
@@ -1624,6 +1628,12 @@ mod tests {
     /// a section titled after its ID, which therefore starts with `_` and
     /// has no other separator than `_`.
     fn ws_with_anchors(anchors: Vec<(&str, AnchorLocation)>) -> Workspace {
+        ws_with_anchors_at(Path::new("/tmp"), anchors)
+    }
+
+    /// Like [`ws_with_anchors`], with `root` as the workspace root and so as
+    /// the `docdir` its documents resolve paths against.
+    fn ws_with_anchors_at(root: &Path, anchors: Vec<(&str, AnchorLocation)>) -> Workspace {
         let mut documents: HashMap<PathBuf, DocumentModel> = HashMap::new();
         for (id, loc) in anchors {
             let doc = documents
@@ -1655,8 +1665,8 @@ mod tests {
             }
         }
         Workspace::new_with(
-            PathBuf::from("/tmp"),
-            AttributeRegistry::new(Path::new("/tmp")),
+            root.to_path_buf(),
+            AttributeRegistry::new(root),
             IncludeGraph::new(),
             documents,
             HashMap::new(),
@@ -2001,6 +2011,83 @@ mod tests {
 
     // --- resolve_xref_path_completions ---
 
+    /// Asciidoctor resolves xref paths in a book relative to the `docdir`
+    /// of the top-level document, also in an included chapter: from
+    /// `chapters/setup.adoc`, `xref:` lists the folder of `index.adoc`
+    /// (book scope) and the chapter's own folder (preview scope).
+    #[test]
+    fn test_xref_path_in_included_file_lists_the_top_level_document_folder() {
+        let labels = labels_in(
+            fixture("adversarial_project"),
+            "chapters/setup.adoc",
+            "xref:",
+        );
+        for expected in ["chapters/", "index.adoc", "reference.adoc", "ref-options"] {
+            assert!(labels.contains(&expected.to_string()), "{labels:?}");
+        }
+    }
+
+    #[test]
+    fn test_xref_path_in_included_file_completes_below_the_top_level_folder() {
+        let (root, ws) = fixture("adversarial_project");
+        let doc = root.join("chapters/setup.adoc");
+        let typed = "xref:chapters/";
+        let ctx = detect_completion_context(typed, Position::new(0, 14)).unwrap();
+        let items = resolve_completions(ctx, &doc, 1, Some(&ws));
+        let reference = items.iter().find(|i| i.label == "reference.adoc").unwrap();
+        assert_eq!(
+            new_text(reference),
+            "chapters/reference.adoc${1}[${2:label}]"
+        );
+    }
+
+    #[test]
+    fn test_xref_without_path_offers_folders_and_anchors_of_the_document() {
+        let labels = labels_in(fixture("adversarial_project"), "index.adoc", "xref:");
+        for expected in ["chapters/", "intro", "setup-install"] {
+            assert!(labels.contains(&expected.to_string()), "{labels:?}");
+        }
+        assert!(
+            !labels.contains(&"reference.adoc".to_string()),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_xref_path_offers_only_adoc_files() {
+        let snippets = labels_in(
+            fixture("adversarial_project"),
+            "index.adoc",
+            "xref:snippets/",
+        );
+        assert!(
+            !snippets.contains(&"config.yml".to_string()),
+            "{snippets:?}"
+        );
+        let images = labels_in(fixture("adversarial_project"), "index.adoc", "xref:images/");
+        assert!(images.contains(&"diagrams/".to_string()), "{images:?}");
+        assert!(!images.contains(&"logo.png".to_string()), "{images:?}");
+    }
+
+    #[test]
+    fn test_xref_path_in_a_standalone_document_lists_its_own_folder() {
+        let labels = labels_in(anchor_scope_fixture(), "solo/main.adoc", "xref:");
+        for expected in ["foreign.adoc", "mixed.adoc"] {
+            assert!(labels.contains(&expected.to_string()), "{labels:?}");
+        }
+        assert!(!labels.contains(&"book.adoc".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn test_xref_path_from_an_included_file_chains_into_its_anchors() {
+        let labels = labels_in(
+            fixture("adversarial_project"),
+            "chapters/setup.adoc",
+            "xref:chapters/reference.adoc#",
+        );
+        assert!(labels.contains(&"ref-options".to_string()), "{labels:?}");
+    }
+
     #[test]
     fn test_xref_path_lists_adoc_siblings() {
         let dir = setup_include_dir();
@@ -2061,14 +2148,17 @@ mod tests {
     fn test_xref_items_replace_from_after_the_macro_utf16() {
         let dir = setup_include_dir();
         let doc = dir.path().join("a.adoc");
-        let ws = ws_with_anchors(vec![(
-            "_goals",
-            AnchorLocation {
-                file: dir.path().join("a.adoc"),
-                line: 1,
-                kind: AnchorKind::Explicit,
-            },
-        )]);
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![(
+                "_goals",
+                AnchorLocation {
+                    file: dir.path().join("a.adoc"),
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            )],
+        );
         // `Ü` is two bytes but one UTF-16 unit: the path starts at column 10.
         let content = "Über xref:chapters/";
         let ctx = detect_completion_context(content, Position::new(0, 19)).unwrap();
@@ -2094,14 +2184,17 @@ mod tests {
     fn test_xref_items_before_existing_brackets_differ_in_range() {
         let dir = setup_include_dir();
         let doc = dir.path().join("a.adoc");
-        let ws = ws_with_anchors(vec![(
-            "b_anchor",
-            AnchorLocation {
-                file: dir.path().join("a.adoc"),
-                line: 1,
-                kind: AnchorKind::Explicit,
-            },
-        )]);
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![(
+                "b_anchor",
+                AnchorLocation {
+                    file: dir.path().join("a.adoc"),
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            )],
+        );
         // `xref:b|[Text]`: the path item keeps the brackets and replaces
         // only up to the cursor; the anchor item swallows them and
         // re-emits the label slot.
