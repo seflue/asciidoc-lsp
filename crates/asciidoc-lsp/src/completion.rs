@@ -987,8 +987,11 @@ fn anchors_of_documents(
     anchors
 }
 
+/// Rank of path items in an `xref:` completion: after every `anchor_rank`.
+const PATH_RANK: u8 = 2;
+
 /// Where an ID of this kind of definition is listed: explicit IDs first, the
-/// IDs generated from a title after them.
+/// IDs generated from a title after them. Every rank stays below `PATH_RANK`.
 fn anchor_rank(kind: AnchorKind) -> u8 {
     match kind {
         AnchorKind::Explicit | AnchorKind::BlockId => 0,
@@ -1749,9 +1752,16 @@ pub(crate) fn resolve_completions(
             } else {
                 resolve_xref_completions(&prefix, doc_path, ws, closing, span)
             };
-            items.extend(resolve_xref_path_completions(
-                &prefix, doc_path, line, ws, closing, span,
-            ));
+            // Paths rank `PATH_RANK`, after every `anchor_rank`, whatever
+            // their label starts with.
+            items.extend(
+                resolve_xref_path_completions(&prefix, doc_path, line, ws, closing, span)
+                    .into_iter()
+                    .map(|item| CompletionItem {
+                        sort_text: Some(format!("{PATH_RANK}{}", item.label)),
+                        ..item
+                    }),
+            );
             // Sorted as a client sorts: by `sortText`, else by label.
             items.sort_by(|a, b| {
                 a.sort_text
@@ -2615,7 +2625,7 @@ mod tests {
     }
 
     /// The merged list for `xref:` is in the order a client sorts it: by
-    /// `sortText`, else by label. Path items carry no `sortText`.
+    /// `sortText`, else by label. Path items rank after every anchor.
     #[test]
     fn test_xref_or_path_completions_follow_sort_text() {
         let dir = TempDir::new().unwrap();
@@ -2650,6 +2660,68 @@ mod tests {
         let index = |wanted: &str| labels.iter().position(|l| *l == wanted).unwrap();
         assert!(index("zed") < index("_alpha"), "{labels:?}");
         assert!(labels.contains(&"b.adoc"), "{labels:?}");
+    }
+
+    /// Every anchor kind ranks below `PATH_RANK`, as a single digit. A new
+    /// kind fails to compile here until it is listed, and fails the assert
+    /// when its rank reaches the path rank.
+    #[test]
+    fn test_anchor_rank_stays_below_path_rank() {
+        for kind in [
+            AnchorKind::Explicit,
+            AnchorKind::ImplicitSection,
+            AnchorKind::BlockId,
+        ] {
+            match kind {
+                AnchorKind::Explicit | AnchorKind::ImplicitSection | AnchorKind::BlockId => {}
+            }
+            assert!(anchor_rank(kind) < PATH_RANK, "{kind:?}");
+        }
+        assert!(PATH_RANK <= 9, "sort_text rank is one digit");
+    }
+
+    /// Path items rank after every anchor, also when a label starts with a
+    /// digit: `01_intro.adoc` must not sort before the ID `setup`.
+    #[test]
+    fn test_xref_or_path_completions_list_paths_after_anchors() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.adoc");
+        std::fs::write(&a, "= A\n").unwrap();
+        std::fs::write(dir.path().join("01_intro.adoc"), "= Intro\n").unwrap();
+        std::fs::create_dir(dir.path().join("00_parts")).unwrap();
+        let at = |kind, line| AnchorLocation {
+            file: a.clone(),
+            line,
+            kind,
+        };
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![
+                ("setup", at(AnchorKind::Explicit, 2)),
+                ("_alpha", at(AnchorKind::ImplicitSection, 4)),
+            ],
+        );
+        let ctx = CompletionContext::XrefAnchorOrPath {
+            prefix: String::new(),
+            closing: "[]",
+            span: AT_LINE_START,
+        };
+        let items = resolve_completions(ctx, &a, 1, Some(&ws));
+
+        let got: Vec<_> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.sort_text.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("setup", Some("0setup")),
+                ("_alpha", Some("1_alpha")),
+                ("00_parts/", Some("200_parts/")),
+                ("01_intro.adoc", Some("201_intro.adoc")),
+                ("a.adoc", Some("2a.adoc")),
+            ]
+        );
     }
 
     /// `book.adoc` includes `reference.adoc`, so after `reference.adoc#`
