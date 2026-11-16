@@ -1,0 +1,7 @@
+= One
+
+[[dup]]
+== Section One
+
+[[dup]]
+== Section Two

@@ -1,0 +1,2 @@
+= Absolute Paths
+:pdf-themesdir: /nonexistent-review/themes

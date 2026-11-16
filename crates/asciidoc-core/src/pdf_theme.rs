@@ -447,26 +447,28 @@ mod tests {
     #[test]
     fn missing_directories_and_theme_file_are_errors() {
         let (root, ws) = fixture();
-        let missing = |p: &str| root.join(p).display().to_string();
         assert_eq!(
             pdf_diags(&ws, &root.join("missing.adoc")),
             vec![
-                (
-                    2,
-                    format!("pdf-themesdir: not found: {}", missing("missing-themes"))
-                ),
-                (
-                    3,
-                    format!("pdf-fontsdir: not found: {}", missing("missing-fonts"))
-                ),
+                (2, "pdf-themesdir: not found: missing-themes".to_string()),
+                (3, "pdf-fontsdir: not found: missing-fonts".to_string()),
                 (
                     4,
-                    format!(
-                        "pdf-theme: not found: {}",
-                        missing("missing-themes/custom-theme.yml")
-                    )
+                    "pdf-theme: not found: missing-themes/custom-theme.yml".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn absolute_path_outside_root_is_shown_as_written() {
+        let (root, ws) = fixture();
+        assert_eq!(
+            pdf_diags(&ws, &root.join("absolute.adoc")),
+            vec![(
+                2,
+                "pdf-themesdir: not found: /nonexistent-review/themes".to_string()
+            )]
         );
     }
 
@@ -496,23 +498,15 @@ mod tests {
                 ),
                 (
                     4,
-                    format!(
-                        "pdf-theme: theme file must end in .yml, not .yaml: {}",
-                        root.join("theme/custom-theme.yaml").display()
-                    )
+                    "pdf-theme: theme file must end in .yml, not .yaml: theme/custom-theme.yaml"
+                        .to_string()
                 ),
                 (
                     5,
                     "pdf-theme: relative path 'theme/custom-theme.yml' resolves against the build's working directory; anchor it with {docdir}"
                         .to_string()
                 ),
-                (
-                    7,
-                    format!(
-                        "pdf-theme: not found: {}",
-                        root.join("theme/none-theme.yml").display()
-                    )
-                ),
+                (7, "pdf-theme: not found: theme/none-theme.yml".to_string()),
             ]
         );
     }
@@ -657,6 +651,82 @@ mod tests {
                 // Asciidoctor PDF does not trim list entries.
                 PdfPath::Relative(" b".into()),
             ]
+        );
+    }
+
+    /// A path outside the workspace root stays absolute, also one folder
+    /// above it, whether the user wrote it literally or through
+    /// `{docdir}/..`. Only paths under the root are shown root-relative.
+    #[test]
+    fn path_outside_root_stays_absolute_even_one_folder_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let literal = base.join("nothemes");
+        let via_docdir = base.join("nofonts");
+        let inside = root.join("nodir");
+        let doc = root.join("doc.adoc");
+        std::fs::write(
+            &doc,
+            format!(
+                "= Doc\n:pdf-themesdir: {}\n:pdf-fontsdir: {{docdir}}/../nofonts\n:pdf-theme: {}\n",
+                literal.display(),
+                inside.join("t.yaml").display()
+            ),
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let messages: Vec<String> = pdf_diags(&ws, &doc).into_iter().map(|(_, m)| m).collect();
+        for expected in [
+            format!("not found: {}", literal.display()),
+            format!("not found: {}", via_docdir.display()),
+            "not .yaml: nodir/t.yaml".to_string(),
+        ] {
+            assert!(
+                messages.iter().any(|m| m.ends_with(&expected)),
+                "missing {expected:?} in {messages:?}"
+            );
+        }
+    }
+
+    /// An absolute value that shares a real ancestor with a deep workspace
+    /// root is shown exactly as the user wrote it, not as a longer `../` chain.
+    #[test]
+    fn absolute_value_sharing_ancestor_with_deep_root_stays_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("d1/d2/d3/d4/d5/d6/d7/d8");
+        std::fs::create_dir_all(&root).unwrap();
+        let themes = base.join("n-themes");
+        let theme_yaml = base.join("n.yaml");
+        let doc = root.join("doc.adoc");
+        std::fs::write(
+            &doc,
+            format!(
+                "= Doc\n:pdf-themesdir: {}\n:pdf-theme: {}\n",
+                themes.display(),
+                theme_yaml.display()
+            ),
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let messages: Vec<String> = pdf_diags(&ws, &doc).into_iter().map(|(_, m)| m).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.ends_with(&format!("not found: {}", themes.display()))),
+            "got: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.ends_with(&format!("not .yaml: {}", theme_yaml.display()))),
+            "got: {messages:?}"
         );
     }
 }
