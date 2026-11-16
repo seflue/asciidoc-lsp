@@ -1,0 +1,4 @@
+= A
+:edition: x
+
+include::s.adoc[]

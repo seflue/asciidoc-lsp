@@ -1,0 +1,9 @@
+[[shared]]
+== Setup
+
+[[setup-only]]
+Only in setup.
+
+== Details
+
+Text.

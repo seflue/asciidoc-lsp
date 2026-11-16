@@ -1,0 +1,3 @@
+= Mixed
+
+See xref:../standalone.adoc#shared[standalone] and xref:../chapters/setup.adoc#shared[setup].

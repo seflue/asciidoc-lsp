@@ -1,11 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use crate::attributes::AttributeRegistry;
-use crate::graph::IncludeGraph;
+use crate::anchor_scope::{AnchorScope, CatalogCache};
 use crate::paths::{is_uri, resolve_doc_target};
-use crate::references::ReferenceIndex;
-use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
+use crate::types::{Diagnostic, DiagnosticKind};
+use crate::workspace::Workspace;
+
+/// A duplicate: the second definition (file, line), the ID, and the first.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct DuplicateKey<'a> {
+    file: &'a Path,
+    line: usize,
+    id: &'a str,
+    first_file: &'a Path,
+    first_line: usize,
+}
 
 /// Collect all diagnostics across the workspace, grouped by file.
 ///
@@ -14,26 +24,59 @@ use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
 #[must_use]
 pub fn collect_diagnostics(
     root: &Path,
-    documents: &HashMap<PathBuf, DocumentModel>,
-    graph: &IncludeGraph,
-    ref_index: &ReferenceIndex,
-    registry: &AttributeRegistry,
+    workspace: &Workspace,
 ) -> HashMap<PathBuf, Vec<Diagnostic>> {
+    let documents = &workspace.documents;
+    let graph = &workspace.include_graph;
+    let registry = &workspace.attributes;
+    // One catalog per top-level document, read once per recalculation; a
+    // file outside every top-level document's reach is added on first use.
+    let catalogs = CatalogCache::new(workspace);
+    let top_level: Vec<Rc<AnchorScope>> = catalogs.all();
     let mut diags: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
 
     for (path, doc) in documents {
-        // 1. Broken xrefs
+        // 1. Broken xrefs, checked in each top-level document that reads the
+        // file (the same ones go-to-definition uses): one diagnostic, naming
+        // the documents where the target is missing when several read it.
+        let reading: Vec<Rc<AnchorScope>> = if doc.xrefs.is_empty() {
+            Vec::new()
+        } else {
+            catalogs.scopes_at(path)
+        };
         for xref in &doc.xrefs {
-            if ref_index
-                .resolve_xref(xref, path, graph, documents, registry)
-                .is_err()
-            {
+            // The file part of the target is resolved in each reading
+            // document's own attribute scope, as go-to-definition does; the
+            // scopes are only needed when the target has an attribute.
+            let attribute_scopes = if xref.target.contains('{') {
+                workspace.scopes_at(path, xref.line)
+            } else {
+                Vec::new()
+            };
+            // A document that reads the file only in part is no judge of what
+            // is missing in it, so it counts neither as missing nor as found.
+            let missing: Vec<PathBuf> = reading
+                .iter()
+                .filter(|scope| scope.reads_whole(path))
+                .filter(|scope| {
+                    catalogs
+                        .resolve_read(scope, path, xref, &attribute_scopes)
+                        .is_err()
+                })
+                .map(|scope| display_path(root, scope.document()))
+                .collect();
+            if !missing.is_empty() {
                 diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: xref.line,
                     span: xref.span,
                     kind: DiagnosticKind::BrokenXref {
                         target: xref.target.clone(),
+                        documents: if reading.len() > 1 {
+                            missing
+                        } else {
+                            Vec::new()
+                        },
                     },
                 });
             }
@@ -60,23 +103,44 @@ pub fn collect_diagnostics(
         }
     }
 
-    // 3. Duplicate anchors
-    for (id, dup_loc) in &ref_index.duplicates {
-        if let Some(first_loc) = ref_index.anchors.get(id) {
-            diags
-                .entry(dup_loc.file.clone())
-                .or_default()
-                .push(Diagnostic {
-                    file: dup_loc.file.clone(),
-                    line: dup_loc.line,
-                    span: None,
-                    kind: DiagnosticKind::DuplicateAnchor {
-                        id: id.clone(),
-                        first_file: display_path(root, &first_loc.file),
-                        first_line: first_loc.line,
-                    },
-                });
+    // 3. Duplicate anchors, per top-level document: the second definition in
+    // reading order. Documents that read the same pair share one diagnostic.
+    let mut found: BTreeMap<DuplicateKey<'_>, Vec<PathBuf>> = BTreeMap::new();
+    for scope in &top_level {
+        for duplicate in scope.duplicates() {
+            let key = DuplicateKey {
+                file: &duplicate.second.file,
+                line: duplicate.second.line,
+                id: &duplicate.id,
+                first_file: &duplicate.first.file,
+                first_line: duplicate.first.line,
+            };
+            let readers = found.entry(key).or_default();
+            // A document that reads the pair more than once is named once.
+            if !readers.iter().any(|d| d == scope.document()) {
+                readers.push(scope.document().to_path_buf());
+            }
         }
+    }
+    for (key, mut documents) in found {
+        documents.sort();
+        diags
+            .entry(key.file.to_path_buf())
+            .or_default()
+            .push(Diagnostic {
+                file: key.file.to_path_buf(),
+                line: key.line,
+                span: None,
+                kind: DiagnosticKind::DuplicateAnchor {
+                    id: key.id.to_string(),
+                    first_file: display_path(root, key.first_file),
+                    first_line: key.first_line,
+                    documents: documents
+                        .iter()
+                        .map(|document| display_path(root, document))
+                        .collect(),
+                },
+            });
     }
 
     // 4. Undefined conditional attributes (ifdef/ifndef)
@@ -191,12 +255,41 @@ fn pdf_display_path(root: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Anchor, IncludeMacro, Section, Xref};
+    use crate::attributes::AttributeRegistry;
+    use crate::graph::IncludeGraph;
+    use crate::types::{Anchor, DocumentModel, IncludeMacro, Section, Xref};
     use pretty_assertions::assert_eq;
     use std::path::Path;
 
     fn make_registry() -> AttributeRegistry {
         AttributeRegistry::new(Path::new("/tmp"))
+    }
+
+    /// The diagnostics of a workspace made of `documents`, as `Workspace::build`
+    /// would index them.
+    fn diagnose(
+        documents: HashMap<PathBuf, DocumentModel>,
+        graph: IncludeGraph,
+        registry: AttributeRegistry,
+    ) -> HashMap<PathBuf, Vec<Diagnostic>> {
+        diagnose_in(Path::new("/"), documents, graph, registry)
+    }
+
+    /// As `diagnose`, with messages shown relative to `root`.
+    fn diagnose_in(
+        root: &Path,
+        documents: HashMap<PathBuf, DocumentModel>,
+        graph: IncludeGraph,
+        registry: AttributeRegistry,
+    ) -> HashMap<PathBuf, Vec<Diagnostic>> {
+        let workspace = Workspace::new_with(
+            PathBuf::from("/tmp"),
+            registry,
+            graph,
+            documents,
+            HashMap::new(),
+        );
+        collect_diagnostics(root, &workspace)
     }
 
     /// Flatten per-file diagnostics into a single Vec for simpler test assertions.
@@ -220,14 +313,13 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
         let flat = flatten(&diags);
 
         assert_eq!(flat.len(), 1);
         assert!(matches!(
             &flat[0].kind,
-            DiagnosticKind::BrokenXref { target } if target == "nonexistent"
+            DiagnosticKind::BrokenXref { target, .. } if target == "nonexistent"
         ));
     }
 
@@ -245,8 +337,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
 
         let flat = flatten(&diags);
         assert!(flat
@@ -275,8 +366,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
 
         let flat = flatten(&diags);
         assert!(flat
@@ -307,14 +397,7 @@ mod tests {
             ]),
         );
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(
-            Path::new("/work/deep/root"),
-            &documents,
-            &graph,
-            &ref_index,
-            &registry,
-        );
+        let diags = diagnose_in(Path::new("/work/deep/root"), documents, graph, registry);
         let messages: Vec<String> = flatten(&diags).iter().map(|d| d.kind.to_string()).collect();
         assert!(
             messages
@@ -405,8 +488,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
 
         let flat = flatten(&diags);
         assert!(!flat
@@ -456,8 +538,7 @@ mod tests {
             },
         );
 
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
         let flat = flatten(&diags);
 
         let circular: Vec<_> = flat
@@ -501,8 +582,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
         let flat = flatten(&diags);
 
         let broken_includes: Vec<_> = flat
@@ -562,8 +642,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
 
         // Diagnostics must cover multiple files — HashMap keys are the files
         assert!(
@@ -596,8 +675,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
         let flat = flatten(&diags);
 
         let cond_diags: Vec<_> = flat
@@ -627,8 +705,7 @@ mod tests {
         );
 
         let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        let diags = diagnose(documents, graph, registry);
         let flat = flatten(&diags);
 
         let cond_diags: Vec<_> = flat
@@ -685,11 +762,437 @@ mod tests {
             }]),
         );
 
-        let graph = IncludeGraph::new();
-        let ref_index = ReferenceIndex::build(&documents, &registry);
-        let diags = collect_diagnostics(Path::new("/"), &documents, &graph, &ref_index, &registry);
+        // Asciidoctor knows an ID only within the document it converts: `b.adoc`
+        // is part of `a.adoc`, so the xref resolves. Without the include it
+        // would be `INFO: possible invalid reference` (see the next test).
+        let mut graph = IncludeGraph::new();
+        graph.add_edge(
+            Path::new("/a.adoc"),
+            crate::types::IncludeEdge {
+                target: PathBuf::from("/b.adoc"),
+                line: 7,
+                attributes: vec![],
+            },
+        );
+        let diags = diagnose(documents, graph, registry);
         let flat = flatten(&diags);
 
         assert!(flat.is_empty(), "Expected no diagnostics, got: {:?}", flat);
+    }
+
+    /// Asciidoctor on `b.adoc` alone: `INFO: possible invalid reference:
+    /// valid-anchor`. An ID of a document nobody includes is no ID of `b.adoc`.
+    #[test]
+    fn test_xref_to_id_of_unrelated_top_level_document_is_broken() {
+        let registry = make_registry();
+        let mut documents = HashMap::new();
+        documents.insert(
+            PathBuf::from("/a.adoc"),
+            DocumentModel::test("/a.adoc").with_anchors(vec![Anchor {
+                id: "valid-anchor".into(),
+                reftext: None,
+                line: 5,
+            }]),
+        );
+        documents.insert(
+            PathBuf::from("/b.adoc"),
+            DocumentModel::test("/b.adoc").with_xrefs(vec![Xref {
+                target: "valid-anchor".into(),
+                display_text: None,
+                line: 2,
+                span: None,
+                target_col: 0,
+            }]),
+        );
+
+        let diags = diagnose(documents, IncludeGraph::new(), registry);
+
+        assert!(matches!(
+            flatten(&diags)[..],
+            [Diagnostic {
+                kind: DiagnosticKind::BrokenXref { .. },
+                ..
+            }]
+        ));
+    }
+    // --- Anchor scope per top-level document (fixture `anchor_scope`) ---
+
+    fn fixture_workspace(name: &str) -> (PathBuf, crate::workspace::Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+            .canonicalize()
+            .unwrap();
+        let mut ws = crate::workspace::Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
+    }
+
+    fn anchor_scope_workspace() -> (PathBuf, crate::workspace::Workspace) {
+        fixture_workspace("anchor_scope")
+    }
+
+    fn broken_xrefs<'a>(
+        ws: &'a crate::workspace::Workspace,
+        file: &Path,
+    ) -> Vec<(&'a str, Vec<String>)> {
+        ws.diagnostics_for(file)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::BrokenXref { target, documents } => Some((
+                    target.as_str(),
+                    documents
+                        .iter()
+                        .map(|doc| doc.file_name().unwrap().to_string_lossy().into_owned())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Asciidoctor (`web.adoc`): `INFO: possible invalid reference:
+    /// setup-only`, nothing for `book.adoc`, where `setup.adoc` defines it.
+    /// The shared chapter is checked per top-level document; the message
+    /// names the one that lacks the target.
+    #[test]
+    fn test_broken_xref_in_shared_file_names_documents_where_target_is_missing() {
+        let (root, ws) = anchor_scope_workspace();
+
+        let broken = broken_xrefs(&ws, &root.join("chapters/reference.adoc"));
+
+        assert_eq!(broken, vec![("setup-only", vec!["web.adoc".to_string()])]);
+    }
+
+    /// Asciidoctor (`book.adoc`): no message. `xref:chapters/reference.adoc#setup-only[]`
+    /// is internal because `reference.adoc` is part of the document, and
+    /// `_details_2` is the generated ID of the second `== Details`.
+    #[test]
+    fn test_xrefs_resolving_within_the_top_level_document_are_not_broken() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(broken_xrefs(&ws, &root.join("book.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`solo/main.adoc`, `solo2/main.adoc`): no message for
+    /// `<<_second>>` in either; each document has its own `_second`. This
+    /// pins only that a document's own ID is no broken xref; that another
+    /// document's ID is invisible is pinned by
+    /// `test_xref_to_id_of_unrelated_top_level_document_is_broken`.
+    #[test]
+    fn test_bare_xref_to_the_documents_own_id_is_not_broken() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(broken_xrefs(&ws, &root.join("solo/main.adoc")), vec![]);
+        assert_eq!(broken_xrefs(&ws, &root.join("solo2/main.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`foo.adoc`): `INFO: possible invalid reference: _foo_3`
+    /// only; the second `== Foo` is `_foo_2`.
+    #[test]
+    fn test_generated_id_suffix_resolves_and_the_next_does_not() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("foo.adoc")),
+            vec![("_foo_3", vec![])]
+        );
+    }
+
+    /// Asciidoctor does not check `file#id` into a document that is not part
+    /// of the converted one (link, not reference); the LSP does, against the
+    /// catalog of that file read as a document of its own, because the link
+    /// would be dead in the HTML.
+    #[test]
+    fn test_file_xref_into_foreign_document_is_checked_against_that_file() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("solo/foreign.adoc")),
+            vec![("../chapters/setup.adoc#nope", vec![])]
+        );
+    }
+
+    /// Asciidoctor (`partial/book.adoc`): `xref:b.adoc#a-id[]` is internal
+    /// (`b.adoc` is included in full) and fine; `xref:a.adoc#b-id[]` renders
+    /// the link `a.html#b-id` because `a.adoc` is included with `lines=` and
+    /// so is no part of the document. Asciidoctor does not check a link; the
+    /// LSP checks it against the catalog of `a.adoc` alone, where `b-id` is
+    /// missing.
+    #[test]
+    fn test_file_xref_into_partially_included_file_is_checked_against_that_file() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("partial/book.adoc")),
+            vec![("a.adoc#b-id", vec![])]
+        );
+    }
+
+    /// Asciidoctor (`anchor_selection/book.adoc`): no message, the xref
+    /// renders as `href="#b-id"`. `tags=**;!t` reads all but a named tag, which
+    /// is no partial include, so `a.adoc` is part of the document and `b-id`
+    /// is found in `b.adoc`.
+    #[test]
+    fn test_file_xref_into_file_included_without_a_named_tag_is_internal() {
+        let (root, ws) = fixture_workspace("anchor_selection");
+
+        assert_eq!(broken_xrefs(&ws, &root.join("book.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`anchor_region_xref/web3.adoc`, `reference.adoc[tag=top]`):
+    /// no message, `<<setup-only>>` lies outside the tag. `book.adoc` reads
+    /// the whole file and finds `setup-only`. The LSP knows no tag regions:
+    /// `web3.adoc` reads only a part of the file, so it is no judge of what
+    /// is missing there (prefer no diagnostic over a false one).
+    #[test]
+    fn test_broken_xref_outside_tag_not_reported_lsp_knows_no_tag_regions() {
+        let (root, ws) = fixture_workspace("anchor_region_xref");
+
+        let broken = broken_xrefs(&ws, &root.join("chapters/reference.adoc"));
+
+        assert!(
+            broken.iter().all(|(target, _)| *target != "setup-only"),
+            "{broken:?}"
+        );
+    }
+
+    /// Asciidoctor (`book.adoc`): `INFO: possible invalid reference: nowhere`;
+    /// `web3.adoc` reads only the tag `top`, so it is not named. The xref
+    /// inside `tag=inner` that a document reading `tag=inner` would report is
+    /// a false negative, accepted.
+    #[test]
+    fn test_broken_xref_names_only_whole_readers() {
+        let (root, ws) = fixture_workspace("anchor_region_xref");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("chapters/reference.adoc")),
+            vec![("nowhere", vec!["book.adoc".to_string()])]
+        );
+    }
+
+    /// Asciidoctor (`anchor_region_nested/web.adoc`): `INFO: possible invalid
+    /// reference: nowhere`, because `snippet.adoc` lies inside `tag=x` of the
+    /// wrapper. The LSP cannot tell, so a file read only below a region
+    /// include gets no diagnostic (false negative, accepted).
+    #[test]
+    fn test_broken_xref_file_read_only_below_region_include_not_reported() {
+        let (root, ws) = fixture_workspace("anchor_region_nested");
+
+        assert_eq!(broken_xrefs(&ws, &root.join("snippet.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`anchor_single_master/master.adoc`): `INFO: possible
+    /// invalid reference: nope`. With a single reading document the message
+    /// names none.
+    #[test]
+    fn test_broken_xref_in_file_with_one_master_names_no_document() {
+        let (root, ws) = fixture_workspace("anchor_single_master");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("part.adoc")),
+            vec![("nope", vec![])]
+        );
+    }
+
+    /// Asciidoctor (`a.adoc`, `b.adoc`, both including `s.adoc`): `INFO:
+    /// possible invalid reference: nope` in each build. A target missing in
+    /// every document that reads the file is still reported with all of
+    /// them named (decision: a broken xref is reported per top-level
+    /// document).
+    #[test]
+    fn test_broken_xref_missing_in_every_reading_document_names_all_of_them() {
+        let (root, ws) = fixture_workspace("shared_missing");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("s.adoc")),
+            vec![("nope", vec!["a.adoc".to_string(), "b.adoc".to_string()])]
+        );
+    }
+
+    /// `s.adoc` is read by `a.adoc` (`edition` is `x`) and `b.adoc` (`y`).
+    /// `x/doc.adoc` defines `t`, `y/doc.adoc` does not, so the file part of
+    /// the xref is resolved in each document's own scope (as go-to-definition
+    /// does) and only `b.adoc` lacks the target. Asciidoctor does not check
+    /// such a link; the LSP does, as for any file outside the document.
+    #[test]
+    fn test_broken_xref_resolves_the_file_part_in_each_reading_documents_scope() {
+        let (root, ws) = fixture_workspace("attr_xref");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("s.adoc")),
+            vec![("{edition}/doc.adoc#t", vec!["b.adoc".to_string()])]
+        );
+    }
+
+    /// The `DuplicateAnchor`s of `file` as (line, file name of the first
+    /// definition, its line, names of the documents).
+    fn duplicates(
+        ws: &crate::workspace::Workspace,
+        file: &Path,
+    ) -> Vec<(usize, String, usize, Vec<String>)> {
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        ws.diagnostics_for(file)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::DuplicateAnchor {
+                    first_file,
+                    first_line,
+                    documents,
+                    ..
+                } => Some((
+                    d.line,
+                    name(first_file),
+                    *first_line,
+                    documents.iter().map(|doc| name(doc)).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Asciidoctor (`book.adoc`): `WARNING: chapters/reference.adoc: line 2:
+    /// id assigned to section already in use: shared`, nothing for `web.adoc`,
+    /// which includes `reference.adoc` alone. The warning stands at the second
+    /// definition in reading order and names the document that reads both.
+    #[test]
+    fn test_duplicate_id_across_included_files_is_reported_at_the_second_in_reading_order() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(
+            duplicates(&ws, &root.join("chapters/reference.adoc")),
+            vec![(
+                1,
+                "setup.adoc".to_string(),
+                1,
+                vec!["book.adoc".to_string()]
+            )]
+        );
+        assert_eq!(duplicates(&ws, &root.join("chapters/setup.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`standalone.adoc`, `web.adoc`): no warning. Documents that
+    /// do not include each other may reuse an ID.
+    #[test]
+    fn test_same_id_in_unrelated_top_level_documents_is_no_duplicate() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(duplicates(&ws, &root.join("standalone.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`pair/x.adoc`, `pair/y.adoc`: one warning each at
+    /// `two.adoc`; `pair/z.adoc` reads `two.adoc` first: its warning is at
+    /// `one.adoc`). Documents that agree on the place share one diagnostic.
+    #[test]
+    fn test_duplicate_id_names_every_document_that_reads_both_in_the_same_order() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(
+            duplicates(&ws, &root.join("pair/two.adoc")),
+            vec![(
+                1,
+                "one.adoc".to_string(),
+                1,
+                vec!["x.adoc".to_string(), "y.adoc".to_string()]
+            )]
+        );
+        assert_eq!(
+            duplicates(&ws, &root.join("pair/one.adoc")),
+            vec![(1, "two.adoc".to_string(), 1, vec!["z.adoc".to_string()])]
+        );
+    }
+
+    /// Asciidoctor (`foo.adoc`): the second `== Foo` is `_foo_2`, no warning.
+    #[test]
+    fn test_repeated_section_title_is_no_duplicate() {
+        let (root, ws) = anchor_scope_workspace();
+
+        assert_eq!(duplicates(&ws, &root.join("foo.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`thrice.adoc`: `part.adoc` with `[[dup]]` included three
+    /// times): two warnings, both at `part.adoc`'s line 1 within the one
+    /// document. The diagnostic names that document once.
+    #[test]
+    fn test_duplicate_read_repeatedly_names_the_document_once() {
+        let (root, ws) = fixture_workspace("anchor_reread");
+
+        let found = duplicates(&ws, &root.join("part.adoc"));
+        let rereads: Vec<_> = found.iter().filter(|d| d.1 == "part.adoc").collect();
+        assert_eq!(
+            rereads,
+            vec![&(
+                1,
+                "part.adoc".to_string(),
+                1,
+                vec!["thrice.adoc".to_string()]
+            )]
+        );
+    }
+
+    /// Asciidoctor (`twice_after.adoc`: `first.adoc` defines `dup`, then
+    /// `part.adoc` is included twice): two warnings in the one document, so
+    /// the one document is named once.
+    #[test]
+    fn test_duplicate_pair_met_twice_after_a_first_definition_names_the_document_once() {
+        let (root, ws) = fixture_workspace("anchor_reread");
+
+        let found = duplicates(&ws, &root.join("part.adoc"));
+        let after_first: Vec<_> = found.iter().filter(|d| d.1 == "first.adoc").collect();
+        assert_eq!(
+            after_first,
+            vec![&(
+                1,
+                "first.adoc".to_string(),
+                1,
+                vec!["twice_after.adoc".to_string()]
+            )]
+        );
+    }
+
+    /// Asciidoctor (`implicit_then_explicit.adoc`): `== Foo` takes `_foo`,
+    /// the later `[[_foo]]` warns at its line.
+    #[test]
+    fn test_explicit_id_after_generated_one_is_reported_at_the_explicit_id() {
+        let (root, ws) = fixture_workspace("anchor_catalog");
+
+        assert_eq!(
+            duplicates(&ws, &root.join("implicit_then_explicit.adoc")),
+            vec![(
+                5,
+                "implicit_then_explicit.adoc".to_string(),
+                3,
+                vec!["implicit_then_explicit.adoc".to_string()]
+            )]
+        );
+    }
+
+    /// Asciidoctor (`explicit_then_implicit.adoc`): `[[_foo]]` first, the
+    /// generated ID of `== Foo` becomes `_foo_2`; no warning.
+    #[test]
+    fn test_generated_id_after_explicit_one_is_no_duplicate() {
+        let (root, ws) = fixture_workspace("anchor_catalog");
+
+        assert_eq!(
+            duplicates(&ws, &root.join("explicit_then_implicit.adoc")),
+            vec![]
+        );
+    }
+
+    /// `a.adoc` and `b.adoc` include each other (no top-level document), `a`
+    /// includes `c.adoc`. Go-to-definition reads `c.adoc` as its own document,
+    /// so diagnostics check its xref there only and name no document, as
+    /// Asciidoctor on `c.adoc` alone reports `INFO: possible invalid
+    /// reference: only-in-a`. (On `a.adoc` Asciidoctor recurses to the
+    /// include depth limit; the cycle itself is diagnosed separately.)
+    #[test]
+    fn test_xref_in_file_included_only_from_a_cycle_is_checked_in_its_own_document() {
+        let (root, ws) = fixture_workspace("anchor_cycle");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("c.adoc")),
+            vec![("only-in-a", vec![])]
+        );
     }
 }

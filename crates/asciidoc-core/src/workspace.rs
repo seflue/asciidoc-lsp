@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::attributes::{
@@ -12,7 +13,6 @@ use crate::graph::{
 use crate::paths::relative_path;
 use crate::pdf_theme::PdfResolution;
 use crate::reading::{read_in_order, ReadingVisitor};
-use crate::references::ReferenceIndex;
 use crate::types::{AttributeDef, Diagnostic, DocumentModel, FileLocation};
 
 /// Recursively find all `.adoc` files under a directory, as `(path as
@@ -53,9 +53,10 @@ pub struct Workspace {
     canonical_root: PathBuf,
     pub(crate) attributes: AttributeRegistry,
     pub(crate) include_graph: IncludeGraph,
-    pub(crate) reference_index: ReferenceIndex,
     pub(crate) documents: HashMap<PathBuf, DocumentModel>,
     pub(crate) diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// How many ID catalogs were read, for tests and `explain`.
+    pub(crate) catalog_builds: AtomicUsize,
 }
 
 impl std::fmt::Debug for Workspace {
@@ -92,12 +93,6 @@ impl Workspace {
         &self.include_graph
     }
 
-    /// Cross-reference / anchor index.
-    #[must_use]
-    pub fn reference_index(&self) -> &ReferenceIndex {
-        &self.reference_index
-    }
-
     /// Parsed document models keyed by canonical path.
     #[must_use]
     pub fn documents(&self) -> &HashMap<PathBuf, DocumentModel> {
@@ -113,13 +108,12 @@ impl Workspace {
     /// Construct a workspace with explicit field values.
     ///
     /// Used by tests in downstream crates that need custom
-    /// `ReferenceIndex` or `AttributeRegistry` configurations.
+    /// `AttributeRegistry` configurations.
     #[must_use]
     pub fn new_with(
         root: PathBuf,
         attributes: AttributeRegistry,
         include_graph: IncludeGraph,
-        reference_index: ReferenceIndex,
         documents: HashMap<PathBuf, DocumentModel>,
         diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     ) -> Self {
@@ -128,10 +122,18 @@ impl Workspace {
             root,
             attributes,
             include_graph,
-            reference_index,
             documents,
             diagnostics,
+            catalog_builds: AtomicUsize::new(0),
         }
+    }
+
+    /// How many ID catalogs this workspace has read so far. A counter for
+    /// tests and `explain`: it shows whether a request reads each catalog
+    /// once.
+    #[must_use]
+    pub fn catalog_builds(&self) -> usize {
+        self.catalog_builds.load(Ordering::Relaxed)
     }
 
     /// Create a new workspace with no documents or graph edges.
@@ -145,9 +147,9 @@ impl Workspace {
             root: root.into(),
             attributes: AttributeRegistry::new(root),
             include_graph: IncludeGraph::new(),
-            reference_index: ReferenceIndex::default(),
             documents: HashMap::new(),
             diagnostics: HashMap::new(),
+            catalog_builds: AtomicUsize::new(0),
         }
     }
 
@@ -162,7 +164,6 @@ impl Workspace {
         let (graph, documents) = build_graph(entry, &mut ws.attributes);
         ws.include_graph = graph;
         ws.documents = documents;
-        ws.reindex_all();
         ws.recalculate_diagnostics();
         ws
     }
@@ -306,10 +307,7 @@ impl Workspace {
     /// The top-level documents that include `file`; `None` when there are
     /// none, so `file` is its own.
     fn top_level_documents_of(&self, file: &Path) -> Option<Vec<PathBuf>> {
-        self.include_graph
-            .doc_roots(&self.documents)
-            .remove(file)
-            .filter(|roots| !roots.is_empty() && roots.iter().any(|root| root != file))
+        top_level_documents_in(&self.include_graph.doc_roots(&self.documents), file)
     }
 
     /// The scope on `line` of `file`, reading the document `root`.
@@ -399,40 +397,6 @@ impl Workspace {
         results
     }
 
-    /// Find all xrefs that reference the given anchor ID.
-    ///
-    /// Matches xrefs with targets like `file.adoc#anchor`, `#anchor`, or `anchor`.
-    /// Each location spans the anchor id in the xref, as byte columns of its line.
-    #[must_use]
-    pub fn find_all_anchor_references(&self, anchor_id: &str) -> Vec<FileLocation> {
-        let mut results = Vec::new();
-        for doc in self.documents.values() {
-            for xref in &doc.xrefs {
-                let (xref_anchor, anchor_col) =
-                    if let Some((file, anchor)) = xref.target.split_once('#') {
-                        if anchor.is_empty() {
-                            continue;
-                        }
-                        (anchor, xref.target_col + file.len() + 1)
-                    } else if xref.target.contains('.') {
-                        continue; // file-only reference, no anchor
-                    } else {
-                        // Plain anchor ID (shorthand xref target)
-                        (xref.target.as_str(), xref.target_col)
-                    };
-                if xref_anchor == anchor_id {
-                    results.push(FileLocation::new(
-                        doc.path.clone(),
-                        xref.line,
-                        anchor_col,
-                        anchor_col + anchor_id.len(),
-                    ));
-                }
-            }
-        }
-        results
-    }
-
     /// Ensure a file is present in the workspace, parsing it on-demand if needed.
     ///
     /// This is idempotent: if the file is already in `documents`, it returns immediately.
@@ -451,10 +415,6 @@ impl Workspace {
         }
 
         self.documents.insert(file.to_path_buf(), doc);
-        self.reindex_file(file);
-        for edge in &edges {
-            self.reindex_file(&edge.target);
-        }
     }
 
     /// Get diagnostics for a specific file.
@@ -501,18 +461,12 @@ impl Workspace {
     /// Call this after `ensure_file()` or `update_file()` to refresh diagnostics.
     /// Not a pure recomputation: it first parses and indexes include targets
     /// from disk that appeared since their includer was parsed (mutating
-    /// `documents` and the reference index), then refreshes `{docdir}`, which
-    /// depends on the whole include graph.
+    /// `documents`), then refreshes `{docdir}`, which depends on the whole
+    /// include graph.
     pub fn recalculate_diagnostics(&mut self) {
         self.index_include_targets();
         self.refresh_doc_roots();
-        self.diagnostics = collect_diagnostics(
-            &self.canonical_root,
-            &self.documents,
-            &self.include_graph,
-            &self.reference_index,
-            &self.attributes,
-        );
+        self.diagnostics = collect_diagnostics(&self.canonical_root, self);
     }
 
     /// Re-parse a single file that is already in the workspace.
@@ -521,23 +475,13 @@ impl Workspace {
     /// and updates `documents` and `include_graph`. Does NOT rebuild diagnostics
     /// — the caller is responsible for collecting diagnostics after the update.
     pub fn update_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, Arc<String>>) {
-        // Remove old edges and index entries for this file
-        let old_targets: Vec<PathBuf> = self
-            .include_graph
-            .includes_of(file)
-            .iter()
-            .map(|edge| edge.target.clone())
-            .collect();
+        // Remove old edges for this file
         self.include_graph.remove_edges_from(file);
-        self.reference_index.remove_file(file);
 
         // Re-parse
         let Some((doc, edges)) = parse_single_file(file, &mut self.attributes, overrides) else {
             // File can't be parsed — remove from documents
             self.documents.remove(file);
-            for target in &old_targets {
-                self.reindex_file(target);
-            }
             return;
         };
 
@@ -546,58 +490,19 @@ impl Workspace {
         }
 
         self.documents.insert(file.to_path_buf(), doc);
-        self.reindex_file(file);
-        for target in old_targets
-            .iter()
-            .chain(edges.iter().map(|edge| &edge.target))
-        {
-            self.reindex_file(target);
-        }
-    }
-
-    /// Rebuild a file's reference index entries, including its header title
-    /// ID when another document includes the file: only the header of a
-    /// top-level document gets no ID.
-    fn reindex_file(&mut self, file: &Path) {
-        let Some(doc) = self.documents.get(file) else {
-            return;
-        };
-        self.reference_index.remove_file(file);
-        self.reference_index.add_file(file, doc, &self.attributes);
-        if !self.include_graph.included_by(file).is_empty() {
-            self.reference_index
-                .add_header_title_id(file, doc, &self.attributes);
-        }
-    }
-
-    fn reindex_all(&mut self) {
-        let files: Vec<PathBuf> = self.documents.keys().cloned().collect();
-        for file in &files {
-            self.reindex_file(file);
-        }
     }
 
     /// Remove a file from the workspace entirely.
     ///
-    /// Drops include edges originating from the file, the reference index entries
-    /// for its anchors, the parsed document model, any cached diagnostics, and the
-    /// per-file attribute entry. Called when a `.adoc` file is deleted on disk.
+    /// Drops include edges originating from the file, the parsed document
+    /// model, any cached diagnostics, and the per-file attribute entry. Called
+    /// when a `.adoc` file is deleted on disk.
     /// Caller is responsible for `recalculate_diagnostics()` afterwards.
     pub fn remove_file(&mut self, file: &Path) {
-        let targets: Vec<PathBuf> = self
-            .include_graph
-            .includes_of(file)
-            .iter()
-            .map(|edge| edge.target.clone())
-            .collect();
         self.include_graph.remove_edges_from(file);
-        self.reference_index.remove_file(file);
         self.documents.remove(file);
         self.diagnostics.remove(file);
         self.attributes.forget_file(file);
-        for target in &targets {
-            self.reindex_file(target);
-        }
     }
 
     /// Record the folder of the path `file` is addressed by (a symlink's
@@ -725,7 +630,6 @@ impl Workspace {
         let (graph, documents) = build_graph_with_overrides(entry, &mut ws.attributes, overrides);
         ws.include_graph = graph;
         ws.documents = documents;
-        ws.reindex_all();
         ws.recalculate_diagnostics();
         ws
     }
@@ -975,10 +879,37 @@ impl ReadingWalk<'_> {
     }
 }
 
+/// `file` is a top-level document itself: no other document reaches it.
+/// `roots` is its entry of `IncludeGraph::doc_roots`.
+pub(crate) fn is_own_top_level(roots: Option<&[PathBuf]>, file: &Path) -> bool {
+    roots.is_none_or(|roots| roots.iter().all(|root| root == file))
+}
+
+/// The top-level documents that include `file`, from a precomputed
+/// `IncludeGraph::doc_roots`; `None` when `file` is its own.
+pub(crate) fn top_level_documents_in(
+    roots: &HashMap<PathBuf, Vec<PathBuf>>,
+    file: &Path,
+) -> Option<Vec<PathBuf>> {
+    let own = roots.get(file).map(Vec::as_slice);
+    if is_own_top_level(own, file) {
+        return None;
+    }
+    own.map(<[PathBuf]>::to_vec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Where `id` is defined in the workspace, in any top-level document.
+    fn anchor_of(ws: &Workspace, id: &str) -> Option<crate::types::AnchorLocation> {
+        ws.anchor_definitions()
+            .into_iter()
+            .find(|(defined, _)| defined == id)
+            .map(|(_, location)| location)
+    }
 
     #[test]
     fn test_workspace_new_without_entry_point() {
@@ -1155,10 +1086,10 @@ mod tests {
         assert_eq!(refs.len(), 2, "Expected 2 file xrefs, got: {:?}", refs);
     }
 
-    // --- find_all_anchor_references ---
+    // --- anchor_references ---
 
     #[test]
-    fn test_find_anchor_refs_xref_macro() {
+    fn test_anchor_refs_xref_macro() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.adoc");
         let b = tmp.path().join("b.adoc");
@@ -1171,13 +1102,16 @@ mod tests {
         fs::write(&b, "[[my-anchor]]\n== Chapter B\n\nContent.\n").unwrap();
 
         let ws = Workspace::build(tmp.path(), &a);
-        let refs = ws.find_all_anchor_references("my-anchor");
+        let refs = crate::anchor_scope::CatalogCache::new(&ws).anchor_references(
+            "my-anchor",
+            &[ws.anchor_scope_of(&a).lookup("my-anchor").unwrap().clone()],
+        );
 
         assert_eq!(refs.len(), 1, "Expected 1 anchor ref, got: {:?}", refs);
     }
 
     #[test]
-    fn test_find_anchor_refs_shorthand() {
+    fn test_anchor_refs_shorthand() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.adoc");
         let b = tmp.path().join("b.adoc");
@@ -1190,13 +1124,16 @@ mod tests {
         fs::write(&b, "== Chapter B\n\nSee <<my-anchor>>.\n").unwrap();
 
         let ws = Workspace::build(tmp.path(), &a);
-        let refs = ws.find_all_anchor_references("my-anchor");
+        let refs = crate::anchor_scope::CatalogCache::new(&ws).anchor_references(
+            "my-anchor",
+            &[ws.anchor_scope_of(&a).lookup("my-anchor").unwrap().clone()],
+        );
 
         assert_eq!(refs.len(), 1, "Expected 1 anchor ref, got: {:?}", refs);
     }
 
     #[test]
-    fn test_find_anchor_refs_cross_file() {
+    fn test_anchor_refs_cross_file() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.adoc");
         let b = tmp.path().join("b.adoc");
@@ -1211,20 +1148,26 @@ mod tests {
         fs::write(&c, "== Chapter C\n\nAlso <<target-id>>.\n").unwrap();
 
         let ws = Workspace::build(tmp.path(), &a);
-        let refs = ws.find_all_anchor_references("target-id");
+        let refs = crate::anchor_scope::CatalogCache::new(&ws).anchor_references(
+            "target-id",
+            &[ws.anchor_scope_of(&a).lookup("target-id").unwrap().clone()],
+        );
 
         assert_eq!(refs.len(), 2, "Expected 2 anchor refs, got: {:?}", refs);
     }
 
     #[test]
-    fn test_find_anchor_refs_no_match() {
+    fn test_anchor_refs_defined_id_without_xrefs_has_no_references() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.adoc");
 
         fs::write(&a, "= Doc A\n\n[[my-anchor]]\n== Section\n\nContent.\n").unwrap();
 
         let ws = Workspace::build(tmp.path(), &a);
-        let refs = ws.find_all_anchor_references("nonexistent");
+        let refs = crate::anchor_scope::CatalogCache::new(&ws).anchor_references(
+            "my-anchor",
+            &[ws.anchor_scope_of(&a).lookup("my-anchor").unwrap().clone()],
+        );
 
         assert!(refs.is_empty(), "Expected no anchor refs, got: {:?}", refs);
     }
@@ -1245,7 +1188,7 @@ mod tests {
         let ws = Workspace::build(tmp.path(), &a);
 
         assert_eq!(ws.documents.len(), 2);
-        assert!(ws.reference_index.anchors.contains_key("my-anchor"));
+        assert!(anchor_of(&ws, "my-anchor").is_some());
     }
 
     // --- Sibling config integration tests ---
@@ -1722,7 +1665,7 @@ mod tests {
             .all_diagnostics()
             .into_iter()
             .filter_map(|d| match d.kind {
-                crate::types::DiagnosticKind::BrokenXref { target } => Some(target),
+                crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target),
                 _ => None,
             })
             .collect();
@@ -1946,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_file_updates_reference_index_incrementally() {
+    fn test_ensure_file_updates_anchor_definitions() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
 
@@ -1961,25 +1904,25 @@ mod tests {
         let a_canon = file_a.canonicalize().unwrap();
         ws.ensure_file(&a_canon, &overrides);
 
-        // After adding file A, index should know anchor-a
+        // After adding file A, the catalogs define anchor-a
         assert!(
-            ws.reference_index.lookup("anchor-a").is_some(),
-            "anchor-a should be in index after ensure_file"
+            anchor_of(&ws, "anchor-a").is_some(),
+            "anchor-a should be defined after ensure_file"
         );
 
         let b_canon = file_b.canonicalize().unwrap();
         ws.ensure_file(&b_canon, &overrides);
 
-        // After adding file B, index should know both
-        assert!(ws.reference_index.lookup("anchor-a").is_some());
+        // After adding file B, the catalogs define both
+        assert!(anchor_of(&ws, "anchor-a").is_some());
         assert!(
-            ws.reference_index.lookup("anchor-b").is_some(),
-            "anchor-b should be in index after ensure_file"
+            anchor_of(&ws, "anchor-b").is_some(),
+            "anchor-b should be defined after ensure_file"
         );
     }
 
     #[test]
-    fn test_update_file_updates_reference_index() {
+    fn test_update_file_updates_anchor_definitions() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
 
@@ -1991,7 +1934,7 @@ mod tests {
 
         let overrides = HashMap::new();
         ws.ensure_file(&a_canon, &overrides);
-        assert!(ws.reference_index.lookup("old-anchor").is_some());
+        assert!(anchor_of(&ws, "old-anchor").is_some());
 
         // Update with new content that has a different anchor
         let mut overrides_new = HashMap::new();
@@ -2002,12 +1945,12 @@ mod tests {
         ws.update_file(&a_canon, &overrides_new);
 
         assert!(
-            ws.reference_index.lookup("old-anchor").is_none(),
+            anchor_of(&ws, "old-anchor").is_none(),
             "old anchor should be removed after update"
         );
         assert!(
-            ws.reference_index.lookup("new-anchor").is_some(),
-            "new anchor should be in index after update"
+            anchor_of(&ws, "new-anchor").is_some(),
+            "new anchor should be defined after update"
         );
     }
 
@@ -2038,12 +1981,12 @@ mod tests {
 
         // Anchors from all files should be in the index
         assert!(
-            ws.reference_index.lookup("anchor-a").is_some(),
-            "anchor-a should be in index"
+            anchor_of(&ws, "anchor-a").is_some(),
+            "anchor-a should be defined"
         );
         assert!(
-            ws.reference_index.lookup("anchor-c").is_some(),
-            "anchor-c should be in index"
+            anchor_of(&ws, "anchor-c").is_some(),
+            "anchor-c should be defined"
         );
     }
 
@@ -2115,7 +2058,7 @@ mod tests {
         ws.recalculate_diagnostics();
 
         // go-to-definition: my-target should resolve to defs.adoc
-        let loc = ws.reference_index.lookup("my-target").unwrap();
+        let loc = anchor_of(&ws, "my-target").unwrap();
         assert!(
             loc.file.ends_with("defs.adoc"),
             "my-target should be in defs.adoc, got: {:?}",
@@ -2149,7 +2092,7 @@ mod tests {
 
         let a_canon = file_a.canonicalize().unwrap();
         assert!(
-            ws.reference_index.lookup("disk-anchor").is_some(),
+            anchor_of(&ws, "disk-anchor").is_some(),
             "disk-anchor should be indexed from scan"
         );
 
@@ -2162,12 +2105,12 @@ mod tests {
         ws.update_file(&a_canon, &overrides);
 
         assert!(
-            ws.reference_index.lookup("disk-anchor").is_none(),
+            anchor_of(&ws, "disk-anchor").is_none(),
             "disk-anchor should be gone after editor override"
         );
         assert!(
-            ws.reference_index.lookup("editor-anchor").is_some(),
-            "editor-anchor should be in index after override"
+            anchor_of(&ws, "editor-anchor").is_some(),
+            "editor-anchor should be defined after override"
         );
     }
 
@@ -2203,11 +2146,11 @@ mod tests {
         ws.recalculate_diagnostics();
 
         assert!(
-            ws.reference_index.lookup("editor-anchor").is_some(),
-            "editor-anchor should be in index while file is open"
+            anchor_of(&ws, "editor-anchor").is_some(),
+            "editor-anchor should be defined while file is open"
         );
         assert!(
-            ws.reference_index.lookup("disk-anchor").is_none(),
+            anchor_of(&ws, "disk-anchor").is_none(),
             "disk-anchor should be gone while editor has different content"
         );
 
@@ -2221,11 +2164,11 @@ mod tests {
             "file should still be in workspace after close"
         );
         assert!(
-            ws.reference_index.lookup("disk-anchor").is_some(),
-            "disk-anchor should be back in index after re-indexing from disk"
+            anchor_of(&ws, "disk-anchor").is_some(),
+            "disk-anchor should be defined again after re-indexing from disk"
         );
         assert!(
-            ws.reference_index.lookup("editor-anchor").is_none(),
+            anchor_of(&ws, "editor-anchor").is_none(),
             "editor-anchor should be gone after re-indexing from disk"
         );
     }
@@ -2267,7 +2210,7 @@ mod tests {
         ws.recalculate_diagnostics();
 
         // gd on disk-target should still resolve to defs.adoc
-        let lookup = ws.reference_index.lookup("disk-target");
+        let lookup = anchor_of(&ws, "disk-target");
         assert!(
             lookup.is_some(),
             "disk-target should still be resolvable after did_close re-index"
@@ -2352,7 +2295,7 @@ mod tests {
 
         // Pre-condition: both files indexed everywhere
         assert!(ws.documents.contains_key(&a_canon));
-        assert!(ws.reference_index.lookup("anchor-a").is_some());
+        assert!(anchor_of(&ws, "anchor-a").is_some());
         assert_eq!(ws.include_graph.includes_of(&a_canon).len(), 1);
 
         // Remove file A
@@ -2360,8 +2303,8 @@ mod tests {
 
         assert!(!ws.documents.contains_key(&a_canon), "documents drops A");
         assert!(
-            ws.reference_index.lookup("anchor-a").is_none(),
-            "anchor index drops A's anchor"
+            anchor_of(&ws, "anchor-a").is_none(),
+            "the ID catalogs drop A's ID"
         );
         assert!(
             ws.include_graph.includes_of(&a_canon).is_empty(),
@@ -2374,7 +2317,7 @@ mod tests {
 
         // B must remain
         assert!(ws.documents.contains_key(&b_canon));
-        assert!(ws.reference_index.lookup("anchor-b").is_some());
+        assert!(anchor_of(&ws, "anchor-b").is_some());
     }
 
     /// Workspace with `doc.adoc` (`{greeting}`) indexed from disk.
@@ -2883,7 +2826,7 @@ mod tests {
             .diagnostics_for(&main)
             .iter()
             .filter_map(|d| match &d.kind {
-                crate::types::DiagnosticKind::BrokenXref { target } => {
+                crate::types::DiagnosticKind::BrokenXref { target, .. } => {
                     Some((d.line, target.clone()))
                 }
                 _ => None,
@@ -2923,17 +2866,17 @@ mod tests {
         fs::write(&child, "= Child Title\n\nText.\n").unwrap();
 
         let mut ws = Workspace::build(&root, &index);
-        assert!(ws.reference_index().lookup("_child_title").is_some());
+        assert!(anchor_of(&ws, "_child_title").is_some());
 
         // Parent drops the include: the child is a top-level document again.
         let none = HashMap::new();
         let dropped = HashMap::from([(index.clone(), Arc::new("= Main\n".to_string()))]);
         ws.update_file(&index, &dropped);
-        assert!(ws.reference_index().lookup("_child_title").is_none());
+        assert!(anchor_of(&ws, "_child_title").is_none());
 
         // Parent includes it again.
         ws.update_file(&index, &none);
-        assert!(ws.reference_index().lookup("_child_title").is_some());
+        assert!(anchor_of(&ws, "_child_title").is_some());
     }
 
     #[test]
@@ -2948,12 +2891,12 @@ mod tests {
         let none = HashMap::new();
         let mut ws = Workspace::new(&root);
         ws.ensure_file(&child, &none);
-        assert!(ws.reference_index().lookup("_child_title").is_none());
+        assert!(anchor_of(&ws, "_child_title").is_none());
         ws.ensure_file(&index, &none);
-        assert!(ws.reference_index().lookup("_child_title").is_some());
+        assert!(anchor_of(&ws, "_child_title").is_some());
 
         ws.remove_file(&index);
-        assert!(ws.reference_index().lookup("_child_title").is_none());
+        assert!(anchor_of(&ws, "_child_title").is_none());
     }
 
     /// `[#id]` / `[id=...]` lines register block IDs, and only the last ID
@@ -2974,7 +2917,7 @@ mod tests {
             .diagnostics_for(&index)
             .into_iter()
             .filter_map(|d| match &d.kind {
-                crate::types::DiagnosticKind::BrokenXref { target } => Some(target.clone()),
+                crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target.clone()),
                 _ => None,
             })
             .collect();
@@ -3001,7 +2944,7 @@ mod tests {
             .diagnostics_for(&index)
             .into_iter()
             .filter_map(|d| match &d.kind {
-                crate::types::DiagnosticKind::BrokenXref { target } => Some(target.clone()),
+                crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target.clone()),
                 _ => None,
             })
             .collect();
@@ -3018,8 +2961,8 @@ mod tests {
             })
             .count();
         assert_eq!(duplicates, 1);
-        assert_eq!(ws.reference_index().lookup("plain").unwrap().line, 5);
-        assert_eq!(ws.reference_index().lookup("withtext").unwrap().line, 5);
+        assert_eq!(anchor_of(&ws, "plain").unwrap().line, 5);
+        assert_eq!(anchor_of(&ws, "withtext").unwrap().line, 5);
     }
 
     /// The adversarial fixture's `[#intro-audience]` above a section
@@ -3040,11 +2983,11 @@ mod tests {
             .diagnostics_for(&setup)
             .into_iter()
             .filter(|d| {
-                matches!(&d.kind, crate::types::DiagnosticKind::BrokenXref { target } if target == "intro-audience")
+                matches!(&d.kind, crate::types::DiagnosticKind::BrokenXref { target, .. } if target == "intro-audience")
             })
             .count();
         assert_eq!(broken, 0);
-        let loc = ws.reference_index().lookup("intro-audience").unwrap();
+        let loc = anchor_of(&ws, "intro-audience").unwrap();
         assert!(loc.file.ends_with("chapters/intro.adoc"));
         assert_eq!(loc.line, 9);
     }
@@ -3080,7 +3023,7 @@ mod tests {
         assert!(
             kinds(&ws).iter().any(|k| matches!(
                 k,
-                crate::types::DiagnosticKind::BrokenXref { target } if target == "extra-anchor"
+                crate::types::DiagnosticKind::BrokenXref { target, .. } if target == "extra-anchor"
             )),
             "precondition: xref is broken"
         );
@@ -3097,7 +3040,7 @@ mod tests {
             ws.diagnostics_for(&index)
         );
         assert!(ws.documents.contains_key(&root.join("chapters/extra.adoc")));
-        assert!(ws.reference_index.lookup("extra-anchor").is_some());
+        assert!(anchor_of(ws, "extra-anchor").is_some());
     }
 
     /// An include target created on disk after the includer was parsed is
@@ -3145,7 +3088,7 @@ mod tests {
         .unwrap();
         ws.recalculate_diagnostics();
         assert_extra_target_indexed(&ws, &root);
-        assert!(ws.reference_index.lookup("extra2-anchor").is_some());
+        assert!(anchor_of(&ws, "extra2-anchor").is_some());
     }
 
     fn has_broken(ws: &Workspace, file: &Path) -> (bool, bool) {
@@ -3210,8 +3153,8 @@ mod tests {
         fs::write(&extra, "[[disk-anchor]]\n== D\n").unwrap();
         ws.ensure_file(&extra, &overrides);
         ws.recalculate_diagnostics();
-        assert!(ws.reference_index.lookup("buffer-anchor").is_some());
-        assert!(ws.reference_index.lookup("disk-anchor").is_none());
+        assert!(anchor_of(&ws, "buffer-anchor").is_some());
+        assert!(anchor_of(&ws, "disk-anchor").is_none());
         assert_eq!(count_extra(&ws), 1);
     }
 
@@ -3232,7 +3175,7 @@ mod tests {
         fs::create_dir_all(base.join("shared")).unwrap();
         fs::write(base.join("shared/extra.adoc"), "[[extra-anchor]]\n== E\n").unwrap();
         ws.recalculate_diagnostics();
-        assert!(ws.reference_index.lookup("extra-anchor").is_some());
+        assert!(anchor_of(&ws, "extra-anchor").is_some());
         assert_eq!(has_broken(&ws, &root.join("index.adoc")), (false, false));
     }
 

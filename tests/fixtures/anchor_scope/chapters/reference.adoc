@@ -1,0 +1,6 @@
+[[shared]]
+== Reference
+
+== Details
+
+See <<setup-only>>.

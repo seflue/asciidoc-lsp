@@ -1,0 +1,5 @@
+= Book Two
+
+include::b.adoc[]
+
+include::c.adoc[]

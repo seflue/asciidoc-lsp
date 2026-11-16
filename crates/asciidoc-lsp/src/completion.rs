@@ -6,6 +6,9 @@ use tower_lsp_server::ls_types::{
     TextEdit,
 };
 
+use asciidoc_core::anchor_scope::AnchorScope;
+use asciidoc_core::references::find_target_file;
+use asciidoc_core::types::AnchorLocation;
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 use crate::positions;
@@ -663,13 +666,70 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
     None
 }
 
-/// Resolve xref anchor completions by listing all anchors from the workspace's
-/// `ReferenceIndex`, filtered by prefix. Each item's edit replaces `span`
+/// The IDs the top-level documents that read `doc_path` define, with where
+/// they are defined. With `files`, the IDs a `file#id` xref to one of those
+/// files can name: in a document that includes the file, the IDs the
+/// document defines in it (Asciidoctor resolves `file#id` in the whole
+/// document, but one defined in another file would jump there); in any
+/// other, every ID of the file read as a document of its own, those of its
+/// included chapters too, which goto and the diagnostics accept. An ID that
+/// several documents define is listed once per definition.
+fn anchors_of_documents(
+    ws: &Workspace,
+    doc_path: &Path,
+    files: &[PathBuf],
+) -> Vec<(String, AnchorLocation)> {
+    let catalogs = ws.anchor_scopes_at(doc_path);
+    let ids_of = |catalog: &AnchorScope| -> Vec<(String, AnchorLocation)> {
+        catalog
+            .ids()
+            .map(|(id, location)| (id.to_string(), location.clone()))
+            .collect()
+    };
+    if files.is_empty() {
+        return catalogs.iter().flat_map(ids_of).collect();
+    }
+    let mut anchors = Vec::new();
+    for file in files {
+        let mut external = false;
+        for catalog in &catalogs {
+            if catalog.contains_file(file) {
+                anchors.extend(ids_of(catalog).into_iter().filter(|(_, location)| {
+                    std::fs::canonicalize(&location.file).is_ok_and(|located| located == *file)
+                }));
+            } else {
+                external = true;
+            }
+        }
+        if external {
+            anchors.extend(ids_of(&ws.anchor_scope_of(file)));
+        }
+    }
+    anchors
+}
+
+/// Completion items for `anchors`, sorted by ID, one per ID.
+fn anchor_items<'a>(
+    anchors: impl IntoIterator<Item = &'a (String, AnchorLocation)>,
+    edit: AnchorEdit<'_>,
+) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = anchors
+        .into_iter()
+        .map(|(id, location)| anchor_completion_item(id, location, edit))
+        .collect();
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items.dedup_by(|a, b| a.label == b.label);
+    items
+}
+
+/// Resolve xref anchor completions by listing the IDs of the top-level
+/// documents that read `doc_path`, filtered by prefix. Each item's edit replaces `span`
 /// with the anchor, followed by `closing` (`">>"` or `"[]"`). When
 /// `trailing` is `Some`, an existing `[…]` is
 /// overwritten with a snippet so the `label` placeholder ends up selected.
 pub(crate) fn resolve_xref_completions(
     prefix: &str,
+    doc_path: &Path,
     ws: Option<&Workspace>,
     closing: &str,
     span: TargetSpan,
@@ -684,25 +744,21 @@ pub(crate) fn resolve_xref_completions(
         span,
         trailing,
     };
-    let mut items: Vec<CompletionItem> = ws
-        .reference_index()
-        .anchors()
-        .iter()
-        .filter(|(id, _)| id.starts_with(prefix))
-        .map(|(id, loc)| anchor_completion_item(id, loc, edit))
-        .collect();
-
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items
+    anchor_items(
+        anchors_of_documents(ws, doc_path, &[])
+            .iter()
+            .filter(|(id, _)| id.starts_with(prefix)),
+        edit,
+    )
 }
 
 /// Resolve cross-file xref anchor completions: anchors filtered to a specific
 /// target file. Empty `file` means the current document.
 ///
-/// File matching is layered to mirror `references::resolve_xref` semantics:
+/// The file is matched as go-to-definition matches it:
 ///   1. Canonical-path equality (handles `../foo.adoc`, symlinks, when target exists)
-///   2. Path-suffix match (`subdir/foo.adoc` ends-with comparison on stored anchor path)
-///   3. Filename-only fallback (any indexed file with matching basename)
+///   2. Otherwise the indexed file whose path ends in the typed one or has
+///      its file name (`references::find_target_file`)
 pub(crate) fn resolve_xref_cross_anchor_completions(
     file: &str,
     anchor_prefix: &str,
@@ -718,22 +774,19 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     if file.is_empty() {
         let doc_canonical =
             std::fs::canonicalize(doc_path).unwrap_or_else(|_| doc_path.to_path_buf());
-        let mut items: Vec<CompletionItem> = ws
-            .reference_index()
-            .anchors()
-            .iter()
-            .filter(|(id, loc)| {
-                if !id.starts_with(anchor_prefix) {
-                    return false;
-                }
-                let loc_canonical =
-                    std::fs::canonicalize(&loc.file).unwrap_or_else(|_| loc.file.clone());
-                loc_canonical == doc_canonical
-            })
-            .map(|(id, loc)| anchor_completion_item(id, loc, edit))
-            .collect();
-        items.sort_by(|a, b| a.label.cmp(&b.label));
-        return items;
+        return anchor_items(
+            anchors_of_documents(ws, doc_path, &[])
+                .iter()
+                .filter(|(id, loc)| {
+                    if !id.starts_with(anchor_prefix) {
+                        return false;
+                    }
+                    let loc_canonical =
+                        std::fs::canonicalize(&loc.file).unwrap_or_else(|_| loc.file.clone());
+                    loc_canonical == doc_canonical
+                }),
+            edit,
+        );
     }
 
     // The file as each scope reads it (ADR-4); anchors of any of them.
@@ -746,45 +799,24 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         return Vec::new();
     }
 
-    // Only keep canonical (existing-on-disk) results — downstream compares
-    // against `std::fs::canonicalize(&loc.file)` for equality.
+    // A file that exists is matched by its canonical path (downstream
+    // compares against `std::fs::canonicalize(&loc.file)`). One that does not
+    // exist at the typed path is the indexed file whose path ends in it or
+    // has its name, as go-to-definition and the diagnostics find it.
     let canonical_targets: Vec<PathBuf> = resolved
         .iter()
         .filter_map(|resolved| {
-            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(base, resolved)).ok()
+            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(base, resolved))
+                .ok()
+                .or_else(|| find_target_file(ws.documents(), None, resolved).cloned())
         })
         .collect();
-
-    let matches_file = |loc_file: &Path, resolved: &str| {
-        let resolved_path = Path::new(resolved);
-        loc_file.ends_with(resolved_path)
-            || resolved_path
-                .file_name()
-                .is_some_and(|filename| loc_file.file_name().is_some_and(|f| f == filename))
-    };
-
-    let mut items: Vec<CompletionItem> = ws
-        .reference_index()
-        .anchors()
-        .iter()
-        .filter(|(id, loc)| {
-            if !id.starts_with(anchor_prefix) {
-                return false;
-            }
-            if let Ok(loc_canonical) = std::fs::canonicalize(&loc.file) {
-                if canonical_targets.contains(&loc_canonical) {
-                    return true;
-                }
-            }
-            resolved
-                .iter()
-                .any(|resolved| matches_file(&loc.file, resolved))
-        })
-        .map(|(id, loc)| anchor_completion_item(id, loc, edit))
-        .collect();
-
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items
+    anchor_items(
+        anchors_of_documents(ws, doc_path, &canonical_targets)
+            .iter()
+            .filter(|(id, _)| id.starts_with(anchor_prefix)),
+        edit,
+    )
 }
 
 /// Resolve xref path completions: `.adoc` files relative to the document directory.
@@ -1263,7 +1295,7 @@ pub(crate) fn resolve_completions(
             closing,
             span,
             trailing,
-        } => resolve_xref_completions(&prefix, ws, closing, span, trailing),
+        } => resolve_xref_completions(&prefix, doc_path, ws, closing, span, trailing),
         CompletionContext::XrefAnchorOrPath {
             prefix,
             closing,
@@ -1274,7 +1306,8 @@ pub(crate) fn resolve_completions(
             // `closing` is `""` when brackets already exist after the cursor —
             // both arms must respect it to avoid doubling. When `trailing` is
             // Some, anchor items use TextEdit so the existing label is selected.
-            let mut items = resolve_xref_completions(&prefix, ws, closing, span, trailing);
+            let mut items =
+                resolve_xref_completions(&prefix, doc_path, ws, closing, span, trailing);
             items.extend(resolve_xref_path_completions(
                 &prefix, doc_path, line, ws, closing, span,
             ));
@@ -1466,23 +1499,50 @@ mod tests {
 
     use asciidoc_core::attributes::AttributeRegistry;
     use asciidoc_core::graph::IncludeGraph;
-    use asciidoc_core::references::ReferenceIndex;
-    use asciidoc_core::types::{AnchorKind, AnchorLocation};
+    use asciidoc_core::types::{Anchor, AnchorKind, AnchorLocation, DocumentModel, Section};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    /// Helper: build a minimal Workspace with a pre-built ReferenceIndex.
+    /// Helper: build a minimal Workspace whose documents define `anchors`,
+    /// each document a top-level document of its own. An implicit section is
+    /// a section titled after its ID, which therefore starts with `_` and
+    /// has no other separator than `_`.
     fn ws_with_anchors(anchors: Vec<(&str, AnchorLocation)>) -> Workspace {
-        let mut index = ReferenceIndex::new();
+        let mut documents: HashMap<PathBuf, DocumentModel> = HashMap::new();
         for (id, loc) in anchors {
-            index.add_anchor(id, loc);
+            let doc = documents
+                .entry(loc.file.clone())
+                .or_insert_with(|| DocumentModel {
+                    path: loc.file.clone(),
+                    sections: vec![],
+                    includes: vec![],
+                    xrefs: vec![],
+                    anchors: vec![],
+                    attributes: vec![],
+                    attribute_refs: vec![],
+                    conditionals: vec![],
+                });
+            if loc.kind == AnchorKind::ImplicitSection {
+                doc.sections.push(Section {
+                    level: 1,
+                    title: id.trim_start_matches('_').replace('_', " "),
+                    line: loc.line,
+                    explicit_id: false,
+                    is_header: false,
+                });
+            } else {
+                doc.anchors.push(Anchor {
+                    id: id.to_string(),
+                    reftext: None,
+                    line: loc.line,
+                });
+            }
         }
         Workspace::new_with(
             PathBuf::from("/tmp"),
             AttributeRegistry::new(Path::new("/tmp")),
             IncludeGraph::new(),
-            index,
-            HashMap::new(),
+            documents,
             HashMap::new(),
         )
     }
@@ -1491,7 +1551,7 @@ mod tests {
     fn test_xref_completions_basic() {
         let ws = ws_with_anchors(vec![
             (
-                "my-anchor",
+                "_my-anchor",
                 AnchorLocation {
                     file: PathBuf::from("/a.adoc"),
                     line: 5,
@@ -1499,7 +1559,7 @@ mod tests {
                 },
             ),
             (
-                "my-section",
+                "_my_section",
                 AnchorLocation {
                     file: PathBuf::from("/a.adoc"),
                     line: 10,
@@ -1507,7 +1567,7 @@ mod tests {
                 },
             ),
             (
-                "other-id",
+                "_other-id",
                 AnchorLocation {
                     file: PathBuf::from("/b.adoc"),
                     line: 1,
@@ -1516,11 +1576,18 @@ mod tests {
             ),
         ]);
 
-        let items = resolve_xref_completions("my", Some(&ws), ">>", AT_LINE_START, None);
+        let items = resolve_xref_completions(
+            "_my",
+            Path::new("/a.adoc"),
+            Some(&ws),
+            ">>",
+            AT_LINE_START,
+            None,
+        );
         assert_eq!(items.len(), 2);
         // Sorted alphabetically
-        assert_eq!(items[0].label, "my-anchor");
-        assert_eq!(items[1].label, "my-section");
+        assert_eq!(items[0].label, "_my-anchor");
+        assert_eq!(items[1].label, "_my_section");
         // Kind
         assert_eq!(items[0].kind, Some(CompletionItemKind::REFERENCE));
         // Detail contains filename + kind
@@ -1528,15 +1595,15 @@ mod tests {
         assert!(items[0].detail.as_ref().unwrap().contains("explicit"));
         assert!(items[1].detail.as_ref().unwrap().contains("section"));
         // edit text appends >>
-        assert_eq!(new_text(&items[0]), "my-anchor>>");
-        assert_eq!(new_text(&items[1]), "my-section>>");
+        assert_eq!(new_text(&items[0]), "_my-anchor>>");
+        assert_eq!(new_text(&items[1]), "_my_section>>");
     }
 
     #[test]
     fn test_xref_completions_empty_prefix() {
         let ws = ws_with_anchors(vec![
             (
-                "alpha",
+                "_alpha",
                 AnchorLocation {
                     file: PathBuf::from("/a.adoc"),
                     line: 1,
@@ -1544,24 +1611,32 @@ mod tests {
                 },
             ),
             (
-                "beta",
+                "_beta",
                 AnchorLocation {
-                    file: PathBuf::from("/b.adoc"),
+                    file: PathBuf::from("/a.adoc"),
                     line: 2,
                     kind: AnchorKind::ImplicitSection,
                 },
             ),
         ]);
 
-        let items = resolve_xref_completions("", Some(&ws), ">>", AT_LINE_START, None);
+        let items = resolve_xref_completions(
+            "",
+            Path::new("/a.adoc"),
+            Some(&ws),
+            ">>",
+            AT_LINE_START,
+            None,
+        );
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].label, "alpha");
-        assert_eq!(items[1].label, "beta");
+        assert_eq!(items[0].label, "_alpha");
+        assert_eq!(items[1].label, "_beta");
     }
 
     #[test]
     fn test_xref_completions_no_workspace() {
-        let items = resolve_xref_completions("my", None, ">>", AT_LINE_START, None);
+        let items =
+            resolve_xref_completions("my", Path::new("/a.adoc"), None, ">>", AT_LINE_START, None);
         assert!(items.is_empty());
     }
 
@@ -1577,7 +1652,8 @@ mod tests {
         )]);
         // `xref:se` with the cursor at the end of the line
         let typed = span(5, 7);
-        let items = resolve_xref_completions("se", Some(&ws), "[]", typed, None);
+        let items =
+            resolve_xref_completions("se", Path::new("/a.adoc"), Some(&ws), "[]", typed, None);
         assert_eq!(items.len(), 1);
         assert_eq!(edit(&items[0]).range, cols(5, 7));
         assert_eq!(new_text(&items[0]), "sec[${1:label}]");
@@ -1598,7 +1674,14 @@ mod tests {
         // `xref:se[Text]` with the cursor before `[`
         let typed = span(5, 7);
         let trailing = TrailingBrackets { end_col: 13 };
-        let items = resolve_xref_completions("se", Some(&ws), "", typed, Some(trailing));
+        let items = resolve_xref_completions(
+            "se",
+            Path::new("/a.adoc"),
+            Some(&ws),
+            "",
+            typed,
+            Some(trailing),
+        );
         assert_eq!(edit(&items[0]).range, cols(5, 13));
         assert_eq!(new_text(&items[0]), "sec[${1:label}]");
     }
@@ -1614,7 +1697,7 @@ mod tests {
         std::fs::write(&b, "= B\n").unwrap();
         let ws = ws_with_anchors(vec![
             (
-                "sec1",
+                "_sec1",
                 AnchorLocation {
                     file: a.clone(),
                     line: 1,
@@ -1622,7 +1705,7 @@ mod tests {
                 },
             ),
             (
-                "sec2",
+                "_sec2",
                 AnchorLocation {
                     file: b.clone(),
                     line: 1,
@@ -1645,8 +1728,8 @@ mod tests {
             },
         );
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "sec2");
-        assert_eq!(new_text(&items[0]), "sec2[${1:label}]");
+        assert_eq!(items[0].label, "_sec2");
+        assert_eq!(new_text(&items[0]), "_sec2[${1:label}]");
     }
 
     #[test]
@@ -1690,6 +1773,114 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "here");
         assert_eq!(new_text(&items[0]), "here>>");
+    }
+
+    // --- IDs per top-level document (fixture `anchor_scope`) ---
+
+    fn anchor_scope_fixture() -> (PathBuf, Workspace) {
+        fixture("anchor_scope")
+    }
+
+    fn fixture(name: &str) -> (PathBuf, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
+    }
+
+    /// The labels completion offers for `typed` at the end of the first line
+    /// of `file` in the fixture.
+    fn fixture_labels(file: &str, typed: &str) -> Vec<String> {
+        labels_in(anchor_scope_fixture(), file, typed)
+    }
+
+    fn labels_in((root, ws): (PathBuf, Workspace), file: &str, typed: &str) -> Vec<String> {
+        let doc = root.join(file);
+        let column = u32::try_from(typed.len()).unwrap();
+        let ctx = detect_completion_context(typed, Position::new(0, column)).unwrap();
+        resolve_completions(ctx, &doc, 1, Some(&ws))
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    /// `solo/main.adoc` and `solo2/main.adoc` are documents of their own:
+    /// `<<` offers the IDs each defines, whichever of the two asks, and
+    /// none of `book.adoc` (a document header gets no ID).
+    #[test]
+    fn test_xref_completions_offer_only_the_ids_of_the_top_level_document() {
+        assert_eq!(
+            fixture_labels("solo/main.adoc", "<<"),
+            vec!["_first", "_second", "note"]
+        );
+        assert_eq!(
+            fixture_labels("solo2/main.adoc", "<<"),
+            vec!["_first", "_second", "note"]
+        );
+        let book = fixture_labels("book.adoc", "<<");
+        assert!(book.contains(&"setup-only".to_string()), "got: {book:?}");
+        assert!(!book.contains(&"note".to_string()), "got: {book:?}");
+    }
+
+    /// `book.adoc` includes `reference.adoc`, so after `reference.adoc#`
+    /// Asciidoctor resolves an ID in the whole book: offered are the IDs the
+    /// book defines in `reference.adoc` (`_details_2`, not `_details` and
+    /// not `shared`, which the book defines in `setup.adoc`, where a link
+    /// to them would jump). From `solo/main.adoc` the file is another
+    /// document, rendered on its own: its own IDs are offered.
+    #[test]
+    fn test_xref_cross_completions_offer_the_ids_defined_in_the_file() {
+        let book = fixture_labels("book.adoc", "xref:chapters/reference.adoc#");
+        assert!(book.contains(&"_details_2".to_string()), "{book:?}");
+        for not_here in ["_details", "shared", "setup-only"] {
+            assert!(!book.contains(&not_here.to_string()), "{book:?}");
+        }
+
+        let solo = fixture_labels("solo/main.adoc", "xref:../chapters/reference.adoc#");
+        for here in ["shared", "_details"] {
+            assert!(solo.contains(&here.to_string()), "{solo:?}");
+        }
+        for not_here in ["_details_2", "setup-only"] {
+            assert!(!solo.contains(&not_here.to_string()), "{solo:?}");
+        }
+    }
+
+    /// Another document is rendered on its own, and Asciidoctor links to
+    /// every ID it defines, in its included chapters too (goto and the
+    /// diagnostics accept them): from `solo/main.adoc`, `xref:../book.adoc#`
+    /// offers the `setup-only` that `book.adoc` defines in `setup.adoc`.
+    #[test]
+    fn test_xref_cross_completions_offer_every_id_of_another_document() {
+        let labels = fixture_labels("solo/main.adoc", "xref:../book.adoc#");
+        assert!(labels.contains(&"setup-only".to_string()), "{labels:?}");
+    }
+
+    /// `book.adoc` includes `a/intro.adoc` and `b/intro.adoc`: a file that
+    /// exists is matched by path, so the basename does not offer the IDs of
+    /// the other `intro.adoc`.
+    #[test]
+    fn test_xref_cross_completions_match_an_existing_file_by_path_not_basename() {
+        let labels = labels_in(
+            fixture("anchor_completion"),
+            "book.adoc",
+            "xref:a/intro.adoc#",
+        );
+        assert_eq!(labels, vec!["only-a"]);
+    }
+
+    /// `solo/setup.adoc` does not exist; go-to-definition and the diagnostics
+    /// take the indexed file whose path ends in `setup.adoc`
+    /// (`chapters/setup.adoc`), so completion offers its IDs too.
+    #[test]
+    fn test_xref_cross_completions_find_a_file_that_is_not_at_the_typed_path() {
+        let labels = fixture_labels("solo/main.adoc", "xref:setup.adoc#");
+
+        assert!(labels.contains(&"setup-only".to_string()), "{labels:?}");
     }
 
     // --- resolve_xref_path_completions ---
@@ -1757,7 +1948,7 @@ mod tests {
         let ws = ws_with_anchors(vec![(
             "_goals",
             AnchorLocation {
-                file: dir.path().join("chapters/intro.adoc"),
+                file: dir.path().join("a.adoc"),
                 line: 1,
                 kind: AnchorKind::Explicit,
             },
@@ -1790,7 +1981,7 @@ mod tests {
         let ws = ws_with_anchors(vec![(
             "b_anchor",
             AnchorLocation {
-                file: dir.path().join("b.adoc"),
+                file: dir.path().join("a.adoc"),
                 line: 1,
                 kind: AnchorKind::Explicit,
             },
@@ -1937,7 +2128,6 @@ mod tests {
             dir.path().to_path_buf(),
             attrs,
             IncludeGraph::new(),
-            ReferenceIndex::new(),
             HashMap::new(),
             HashMap::new(),
         );
@@ -3149,7 +3339,6 @@ mod tests {
             root.clone(),
             attrs,
             IncludeGraph::new(),
-            ReferenceIndex::new(),
             HashMap::new(),
             HashMap::new(),
         );

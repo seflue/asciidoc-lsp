@@ -1,0 +1,3 @@
+= Foreign
+
+See xref:x.adoc#dup[].

@@ -44,6 +44,23 @@ pub struct Xref {
     pub target_col: usize,
 }
 
+impl Xref {
+    /// The ID the target names with its byte columns on `line`: the part
+    /// after `#`, or a plain ID. `None` for a file-only target or an empty
+    /// anchor.
+    #[must_use]
+    pub fn id_span(&self) -> Option<(&str, usize, usize)> {
+        let (id, col) = if let Some((file, anchor)) = self.target.split_once('#') {
+            (anchor, self.target_col + file.len() + 1)
+        } else if self.target.contains('.') {
+            return None;
+        } else {
+            (self.target.as_str(), self.target_col)
+        };
+        (!id.is_empty()).then(|| (id, col, col + id.len()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeDef {
     pub name: String,
@@ -113,8 +130,12 @@ pub struct DocumentModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagnosticKind {
+    /// `documents` names the top-level documents where the target is
+    /// missing when several read the file; empty when the file belongs to
+    /// one document only.
     BrokenXref {
         target: String,
+        documents: Vec<PathBuf>,
     },
     BrokenInclude {
         path: String,
@@ -122,6 +143,8 @@ pub enum DiagnosticKind {
     UndefinedAttribute {
         name: String,
     },
+    /// `documents` are the top-level documents in which the second
+    /// definition (the diagnostic's own position) follows the first.
     DuplicateAnchor {
         id: String,
         /// Display path, see `display_path` in diagnostics.rs: root-relative
@@ -129,6 +152,7 @@ pub enum DiagnosticKind {
         /// not an addressable location.
         first_file: PathBuf,
         first_line: usize,
+        documents: Vec<PathBuf>,
     },
     CircularInclude {
         path: String,
@@ -173,8 +197,13 @@ pub enum DiagnosticKind {
 impl fmt::Display for DiagnosticKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DiagnosticKind::BrokenXref { target } => {
-                write!(f, "Broken cross-reference: {target}")
+            DiagnosticKind::BrokenXref { target, documents } => {
+                write!(f, "Broken cross-reference: {target}")?;
+                if documents.is_empty() {
+                    return Ok(());
+                }
+                let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
+                write!(f, " (not found in {})", documents.join(", "))
             }
             DiagnosticKind::BrokenInclude { path } => {
                 write!(f, "Broken include: {path}")
@@ -186,11 +215,14 @@ impl fmt::Display for DiagnosticKind {
                 id,
                 first_file,
                 first_line,
+                documents,
             } => {
+                let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
                 write!(
                     f,
-                    "Duplicate anchor '{}', first defined in {}:{}",
+                    "Duplicate anchor '{}' in {}, first defined in {}:{}",
                     id,
+                    documents.join(", "),
                     first_file.display(),
                     first_line
                 )
@@ -291,6 +323,8 @@ impl FileLocation {
 pub struct ResolvedXref {
     pub file: PathBuf,
     pub line: usize,
+    /// What the ID is defined as; `None` for a target that names only a file.
+    pub kind: Option<AnchorKind>,
 }
 
 #[cfg(test)]
@@ -362,6 +396,7 @@ mod tests {
     fn test_diagnostic_display() {
         let d1 = DiagnosticKind::BrokenXref {
             target: "missing-id".into(),
+            documents: vec![],
         };
         assert_eq!(d1.to_string(), "Broken cross-reference: missing-id");
 
@@ -377,8 +412,11 @@ mod tests {
             id: "my-id".into(),
             first_file: PathBuf::from("/a/b.adoc"),
             first_line: 5,
+            documents: vec![PathBuf::from("/book.adoc"), PathBuf::from("/web.adoc")],
         };
-        assert!(d4.to_string().contains("Duplicate anchor 'my-id'"));
+        assert!(d4
+            .to_string()
+            .contains("Duplicate anchor 'my-id' in /book.adoc, /web.adoc"));
         assert!(d4.to_string().contains("/a/b.adoc:5"));
     }
 

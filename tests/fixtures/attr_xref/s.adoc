@@ -1,0 +1,3 @@
+== Shared
+
+See xref:{edition}/doc.adoc#t[].

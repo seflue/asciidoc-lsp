@@ -1,0 +1,6 @@
+include::b.adoc[]
+
+include::c.adoc[]
+
+[[only-in-a]]
+Text.
