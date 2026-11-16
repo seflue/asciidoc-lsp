@@ -1,0 +1,6 @@
+= Web
+
+[[setup]]
+== Setup
+
+include::shared.adoc[]

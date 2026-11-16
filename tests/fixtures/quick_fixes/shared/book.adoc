@@ -1,0 +1,7 @@
+[[setup]]
+== Setup
+
+[[install]]
+== Install
+
+include::shared.adoc[]

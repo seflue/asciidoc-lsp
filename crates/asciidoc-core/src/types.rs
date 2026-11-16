@@ -20,6 +20,8 @@ pub struct IncludeMacro {
     pub path: String,
     pub attributes: Vec<(String, String)>,
     pub line: usize,
+    /// Byte column, on `line`, where `path` starts.
+    pub target_col: usize,
 }
 
 /// A source range that starts on a diagnostic's or xref's `line` and may end on a later one.

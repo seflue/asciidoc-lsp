@@ -457,12 +457,17 @@ fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<I
     if node.kind() == "block_macro" {
         let macro_name = find_child_text(node, "block_macro_name", source).unwrap_or_default();
         if macro_name == "include" {
-            let path = find_child_text(node, "target", source).unwrap_or_default();
+            let target = find_child_node(node, "target");
+            let path = target
+                .and_then(|target| target.utf8_text(source).ok())
+                .unwrap_or_default()
+                .to_string();
             let attributes = extract_block_macro_attrs(node, source);
             results.push(IncludeMacro {
                 path,
                 attributes,
                 line: node.start_position().row + 1,
+                target_col: target.map_or(0, |target| target.start_position().column),
             });
         }
     }
@@ -1238,6 +1243,19 @@ mod tests {
         assert_eq!(includes.len(), 1);
         assert_eq!(includes[0].path, "bare.adoc");
         assert!(includes[0].attributes.is_empty());
+    }
+
+    #[test]
+    fn test_extract_include_target_col() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Title\n\ninclude::a.adoc[]\n\ninclude::{dir}/a.adoc[lines=1]\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let includes = extract_includes(tree.root_node(), source.as_bytes());
+
+        assert_eq!(includes.len(), 2);
+        assert_eq!(includes[0].target_col, 9);
+        assert_eq!(includes[1].target_col, 9);
+        assert_eq!(includes[1].path, "{dir}/a.adoc");
     }
 
     // --- False-positive xref filtering ---
