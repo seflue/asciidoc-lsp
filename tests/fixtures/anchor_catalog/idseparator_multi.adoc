@@ -1,0 +1,5 @@
+:idseparator: --
+
+== Foo Bar
+
+== Foo Bar

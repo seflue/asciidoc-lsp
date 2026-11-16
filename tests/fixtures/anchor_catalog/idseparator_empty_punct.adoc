@@ -1,0 +1,9 @@
+:idseparator:
+
+== Foo-Bar Baz
+
+== Foo_Bar Qux
+
+== Foo.Bar Zap
+
+<<_foo-barbaz>> <<_foo_barqux>> <<_foo.barzap>>
