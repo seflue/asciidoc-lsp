@@ -320,6 +320,8 @@ pub(crate) enum CompletionContext {
     /// `image::prefix` — image path completion
     ImagePath { prefix: String, span: TargetSpan },
     /// `{prefix` — attribute reference; `}` may already follow the cursor.
+    /// Also an attribute name in an `ifdef::`/`ifndef::` directive (`closing`
+    /// is then `""`).
     /// `span` covers the whole name, including the part after the cursor.
     Attribute {
         prefix: String,
@@ -364,10 +366,16 @@ fn shorthand_closing(content: &str, line: u32, after_cursor: &str) -> &'static s
     }
 }
 
+/// A character of an attribute name, as Asciidoctor reads it in references
+/// and directives.
+fn is_attribute_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
 /// Detect the completion context at the given cursor position by scanning
 /// the current line backwards from the cursor.
 ///
-/// Priority: `include::` (longest prefix) > `xref:` > `<<` > `{`
+/// Priority: `include::` (longest prefix) > `xref:` > `<<` > `{` > `ifdef::`
 pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<CompletionContext> {
     let line_str = content.lines().nth(pos.line as usize)?;
 
@@ -387,8 +395,7 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         "[]"
     };
     // The rest of the attribute name after the cursor (`{pr|o}`) counts too.
-    let after_name =
-        after_cursor.trim_start_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_');
+    let after_name = after_cursor.trim_start_matches(is_attribute_name_char);
     let utf16_len = |text: &str| -> u32 {
         // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX.
         #[allow(clippy::cast_possible_truncation)]
@@ -585,6 +592,28 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                 prefix: prefix.to_string(),
                 span: attr_span_from(prefix_start),
                 closing: attr_close,
+            });
+        }
+    }
+
+    // Priority 4b: attribute name in an `ifdef::` / `ifndef::` directive. A
+    // directive starts in column 0 without `\` (Asciidoctor preprocessor);
+    // names are separated by `,` (any) or `+` (all). Nothing is appended: a
+    // `,`, `+` or `[` may follow the name.
+    if let Some(names) = before_cursor
+        .strip_prefix("ifdef::")
+        .or_else(|| before_cursor.strip_prefix("ifndef::"))
+    {
+        if names
+            .chars()
+            .all(|c| is_attribute_name_char(c) || c == ',' || c == '+')
+        {
+            let names_start = before_cursor.len() - names.len();
+            let prefix_start = names_start + names.rfind([',', '+']).map_or(0, |i| i + 1);
+            return Some(CompletionContext::Attribute {
+                prefix: before_cursor[prefix_start..].to_string(),
+                span: attr_span_from(prefix_start),
+                closing: "",
             });
         }
     }
@@ -1622,6 +1651,24 @@ mod tests {
         CompletionContext::XrefAnchor { prefix: "a".into(), closing: ">>", span: span(2, 3), trailing: None })]
     #[case("xref shorthand cross-file before comma and later closing", "<<f.adoc#sec,text>>", 0, 12,
         CompletionContext::XrefCrossAnchor { file: "f.adoc".into(), anchor_prefix: "sec".into(), closing: "", span: span(9, 12), trailing: None })]
+    #[case("ifdef empty name", "ifdef::", 0, 7,
+        CompletionContext::Attribute { prefix: "".into(), span: span(7, 7), closing: "" })]
+    #[case("ifdef name prefix", "ifdef::sectn", 0, 12,
+        CompletionContext::Attribute { prefix: "sectn".into(), span: span(7, 12), closing: "" })]
+    #[case("ifndef name prefix", "ifndef::sec", 0, 11,
+        CompletionContext::Attribute { prefix: "sec".into(), span: span(8, 11), closing: "" })]
+    #[case("ifdef second name after comma", "ifdef::a,sec", 0, 12,
+        CompletionContext::Attribute { prefix: "sec".into(), span: span(9, 12), closing: "" })]
+    #[case("ifdef second name after plus", "ifdef::a+sec", 0, 12,
+        CompletionContext::Attribute { prefix: "sec".into(), span: span(9, 12), closing: "" })]
+    #[case("ifdef mid-name before brackets", "ifdef::sec[]", 0, 9,
+        CompletionContext::Attribute { prefix: "se".into(), span: span_to(7, 9, 10), closing: "" })]
+    #[case("ifdef name that starts like an inline macro", "ifdef::im", 0, 9,
+        CompletionContext::Attribute { prefix: "im".into(), span: span(7, 9), closing: "" })]
+    #[case("ifdef name after multibyte counts UTF-16", "ifdef::äb", 0, 9,
+        CompletionContext::Attribute { prefix: "äb".into(), span: span(7, 9), closing: "" })]
+    #[case("attribute in single-line ifdef content", "ifdef::a[{pro", 0, 13,
+        CompletionContext::Attribute { prefix: "pro".into(), span: span(10, 13), closing: "}" })]
     fn test_detect_completion_some(
         #[case] _name: &str,
         #[case] content: &str,
@@ -1637,6 +1684,27 @@ mod tests {
     #[case("plain text", "Just normal text here.", 0, 10)]
     #[case("closed attribute", "The {imagesdir} is set.", 0, 15)]
     #[case("xref long form closed", "See xref:target[Link Text", 0, 25)]
+    #[case(
+        "ifdef with leading space is no directive (Asciidoctor: literal text)",
+        " ifdef::sec",
+        0,
+        11
+    )]
+    #[case(
+        "escaped ifdef is no directive (Asciidoctor: text)",
+        "\\ifdef::sec",
+        0,
+        11
+    )]
+    #[case(
+        "ifdef mid-line is no directive (Asciidoctor: text)",
+        "text ifdef::sec",
+        0,
+        15
+    )]
+    #[case("ifdef after closed brackets", "ifdef::sectnums[]", 0, 17)]
+    #[case("ifdef content after bracket", "ifdef::a[sec", 0, 12)]
+    #[case("ifdef name list broken by space", "ifdef::a sec", 0, 12)]
     fn test_detect_completion_none(
         #[case] _name: &str,
         #[case] content: &str,
@@ -2974,6 +3042,37 @@ mod tests {
         "ref-options",
         "<<ref-options>>\n\nx>>"
     )]
+    #[case("ifdef name", "ifdef::pro|", "product", "ifdef::product")]
+    #[case(
+        "ifdef mid-name before brackets",
+        "ifdef::pr|o[]",
+        "product",
+        "ifdef::product[]"
+    )]
+    #[case(
+        "ifndef name before brackets",
+        "ifndef::pro|[]",
+        "product",
+        "ifndef::product[]"
+    )]
+    #[case(
+        "ifdef second name after comma",
+        "ifdef::x,pro|",
+        "product",
+        "ifdef::x,product"
+    )]
+    #[case(
+        "ifdef keeps later names",
+        "ifdef::pro|,x[]",
+        "product",
+        "ifdef::product,x[]"
+    )]
+    #[case(
+        "ifdef second name after plus",
+        "ifdef::x+pro|[]",
+        "product",
+        "ifdef::x+product[]"
+    )]
     fn test_accepting_completion_yields_wellformed_text(
         #[case] _name: &str,
         #[case] marked: &str,
@@ -2981,6 +3080,30 @@ mod tests {
         #[case] expected: &str,
     ) {
         assert_eq!(accept(marked, label), expected);
+    }
+
+    #[test]
+    fn test_ifdef_completion_offers_sectnums_in_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let ws = Workspace::build(&root, &index);
+        let file = root.join("chapters/setup.adoc");
+        let mut content = std::fs::read_to_string(&file).unwrap();
+        let line = content.lines().count();
+        content.push_str("ifdef::sectn");
+        let pos = Position::new(u32::try_from(line).unwrap(), 12);
+        let ctx = detect_completion_context(&content, pos).expect("completion context");
+
+        let items = resolve_completions(ctx, &file, line, Some(&ws));
+
+        let item = items
+            .iter()
+            .find(|i| i.label == "sectnums")
+            .expect("sectnums offered");
+        assert_eq!(new_text(item), "sectnums");
     }
 
     #[test]
