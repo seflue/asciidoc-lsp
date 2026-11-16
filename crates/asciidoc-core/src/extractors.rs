@@ -342,27 +342,58 @@ fn split_trailing_anchor(title: &str) -> (&str, bool) {
     }
 }
 
-/// Whether `node` is a `[[id]]` anchor or an attribute list with an ID
-/// (`[#id]`, `[id=...]`).
-fn carries_id(node: tree_sitter::Node, source: &[u8]) -> bool {
-    let is_id_attr = |attr: tree_sitter::Node| match attr.kind() {
-        "positional_attr" => {
-            let mut c = attr.walk();
-            let has_id = attr.children(&mut c).any(|n| n.kind() == "id");
-            has_id
-        }
-        "named_attr" => find_child_text(attr, "attribute_name", source).as_deref() == Some("id"),
-        _ => false,
+/// ID and reftext of an attribute list, as Asciidoctor reads them: the
+/// `#id` shorthand of the first (style) slot beats `id=`; the last of each
+/// wins. An empty ID counts as none.
+#[must_use]
+pub fn element_attr_id(node: tree_sitter::Node, source: &[u8]) -> Option<(String, Option<String>)> {
+    let mut cursor = node.walk();
+    let attrs: Vec<_> = node
+        .children(&mut cursor)
+        .filter(|c| matches!(c.kind(), "positional_attr" | "named_attr"))
+        .collect();
+    let shorthand = attrs
+        .first()
+        .filter(|a| a.kind() == "positional_attr")
+        .and_then(|a| {
+            let mut c = a.walk();
+            let last = a.children(&mut c).filter(|n| n.kind() == "id").last();
+            last.and_then(|n| n.utf8_text(source).ok())
+        });
+    let named = |wanted: &str| {
+        attrs
+            .iter()
+            .filter(|a| {
+                a.kind() == "named_attr"
+                    && find_child_text(**a, "attribute_name", source).as_deref() == Some(wanted)
+            })
+            .filter_map(|a| find_child_text(*a, "attribute_value", source))
+            .map(|v| v.trim_matches(['"', '\'']).to_string())
+            .next_back()
     };
-    match node.kind() {
-        "block_anchor" => true,
-        "element_attr" => {
-            let mut c = node.walk();
-            let found = node.children(&mut c).any(is_id_attr);
-            found
-        }
-        _ => false,
+    let id = shorthand.map(str::to_string).or_else(|| named("id"))?;
+    if id.is_empty() {
+        return None;
     }
+    Some((id, named("reftext")))
+}
+
+/// The ID and reftext a `[[id]]` anchor or an attribute list (`[#id]`,
+/// `[id=...]`) registers, if any.
+fn block_line_id(node: tree_sitter::Node, source: &[u8]) -> Option<(String, Option<String>)> {
+    match node.kind() {
+        "block_anchor" => {
+            let id = find_child_text(node, "id", source).filter(|id| !id.is_empty())?;
+            Some((id, find_child_text(node, "reftext", source)))
+        }
+        "element_attr" => element_attr_id(node, source),
+        _ => None,
+    }
+}
+
+/// Whether `node` is a `[[id]]` anchor or an attribute list with an ID.
+fn carries_id(node: tree_sitter::Node, source: &[u8]) -> bool {
+    block_line_id(node, source).is_some()
 }
 
 /// Whether the `section` holding the title node carries an ID: a
@@ -463,9 +494,8 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
         return;
     }
 
-    // `block_anchor` (block tree) and `id_assignment` (inline tree) both
-    // carry `id` and an optional `reftext`.
-    if matches!(node.kind(), "block_anchor" | "id_assignment") {
+    // `id_assignment` (inline tree) carries `id` and an optional `reftext`.
+    if node.kind() == "id_assignment" {
         let id = find_child_text(node, "id", source).unwrap_or_default();
         let reftext = find_child_text(node, "reftext", source);
         if !id.is_empty() {
@@ -477,10 +507,30 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
         }
     }
 
+    // Consecutive `[[id]]` / `[#id]` lines above one block form a run;
+    // Asciidoctor registers only the last ID of it (title lines and
+    // comments in between do not break the run).
+    let mut run_last: Option<Anchor> = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_for_anchors(child, source, results);
+        if let Some((id, reftext)) = block_line_id(child, source) {
+            run_last = Some(Anchor {
+                id,
+                reftext,
+                line: child.start_position().row + 1,
+            });
+            continue;
+        }
+        let in_run = matches!(
+            child.kind(),
+            "block_anchor" | "element_attr" | "block_title" | "line_comment" | "block_comment"
+        );
+        if !in_run {
+            results.extend(run_last.take());
+            walk_for_anchors(child, source, results);
+        }
     }
+    results.extend(run_last);
 }
 
 /// Byte columns `(start, end)` of `node`, or `None` if it spans several lines.
@@ -899,6 +949,53 @@ mod tests {
         assert_eq!(anchors[1].id, "para");
         assert_eq!(anchors[1].reftext, None);
         assert_eq!(anchors[1].line, 8);
+    }
+
+    /// Block IDs from attribute lists, as Asciidoctor reads them (oracle:
+    /// `tests/fixtures/block_id_attrs/index.adoc`). Each case lists the
+    /// `(id, reftext, line)` triples that must be registered.
+    #[rstest::rstest]
+    #[case::section_shorthand("[#sid]\n== S\n", &[("sid", None, 1)])]
+    #[case::shorthand_with_role("[#sid.role]\n== S\n", &[("sid", None, 1)])]
+    #[case::role_before_shorthand("[.role#sid]\n== S\n", &[("sid", None, 1)])]
+    #[case::shorthand_with_option("[#sid%collapsible]\n== S\n", &[("sid", None, 1)])]
+    #[case::named_id("[id=sid]\n== S\n", &[("sid", None, 1)])]
+    #[case::quoted_named_id("Intro.\n\n[id=\"pid\"]\nPara.\n", &[("pid", None, 3)])]
+    #[case::style_with_shorthand("[source#cid,rust]\n----\ncode\n----\n", &[("cid", None, 1)])]
+    #[case::named_id_in_third_slot("[source,rust,id=cid]\n----\ncode\n----\n", &[("cid", None, 1)])]
+    #[case::admonition_style("[NOTE#nid]\nText.\n", &[("nid", None, 1)])]
+    #[case::shorthand_beats_named("[#a,id=b]\nText.\n", &[("a", None, 1)])]
+    #[case::last_named_id_wins("[id=a,id=b]\nText.\n", &[("b", None, 1)])]
+    #[case::last_shorthand_wins("[#a.r1#b]\nText.\n", &[("b", None, 1)])]
+    #[case::reftext("[#sid,reftext=\"Ref Text\"]\nText.\n", &[("sid", Some("Ref Text"), 1)])]
+    #[case::id_in_second_slot_is_no_id("[source,#x]\n----\ncode\n----\n", &[])]
+    #[case::role_only("[.role]\nText.\n", &[])]
+    #[case::empty_named_id("[id=]\nText.\n", &[])]
+    #[case::attr_then_attr("[#a]\n[#b]\nText.\n", &[("b", None, 2)])]
+    #[case::anchor_then_attr("[[a]]\n[#b]\nText.\n", &[("b", None, 2)])]
+    #[case::attr_then_anchor("[#a]\n[[b]]\nText.\n", &[("b", None, 2)])]
+    #[case::anchor_then_anchor("[[a]]\n[[b]]\nText.\n", &[("b", None, 2)])]
+    #[case::id_survives_idless_line("[#a]\n[.role]\nText.\n", &[("a", None, 1)])]
+    #[case::title_between(
+        "[#a]\n.Title\n[#b]\nText.\n",
+        &[("b", None, 3)]
+    )]
+    #[case::separate_blocks(
+        "[#a]\nOne.\n\n[#b]\nTwo.\n",
+        &[("a", None, 1), ("b", None, 4)]
+    )]
+    fn test_extract_block_ids_from_attribute_lists(
+        #[case] source: &str,
+        #[case] expected: &[(&str, Option<&str>, usize)],
+    ) {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        let anchors = extract_anchors(tree.root_node(), source.as_bytes());
+        let got: Vec<(&str, Option<&str>, usize)> = anchors
+            .iter()
+            .map(|a| (a.id.as_str(), a.reftext.as_deref(), a.line))
+            .collect();
+        assert_eq!(got, expected, "{source:?}");
     }
 
     #[test]
