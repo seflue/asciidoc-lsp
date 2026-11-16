@@ -1,0 +1,5 @@
+= Part
+
+// tag::section[]
+Some text.
+// end::section[]

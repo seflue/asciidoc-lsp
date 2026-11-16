@@ -332,6 +332,8 @@ pub fn parse_single_file(
     // Extract conditional directives (ifdef/ifndef) via byte-scanning
     let conditionals = crate::extractors::extract_conditionals(&source);
 
+    let tags = crate::extractors::extract_tag_directives(&source);
+
     // Attribute references Asciidoctor substitutes, from the trees
     let (substituted_refs, possible_definitions) =
         crate::substituted_refs::extract(root_node, &source, &inline_ranges);
@@ -357,6 +359,7 @@ pub fn parse_single_file(
         conditionals,
         substituted_refs,
         possible_definitions,
+        tags,
     };
 
     Some((doc, edges))
