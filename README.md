@@ -35,6 +35,10 @@ Provides navigation, diagnostics, completions, and refactoring for AsciiDoc proj
 - Xref and anchor context
 - Image paths
 
+### Highlighting
+
+- **Semantic tokens** (`textDocument/semanticTokens/full`): headings, inline formatting, links, comments, lists, admonitions and block markers, from the highlight queries of the tree-sitter-asciidoc grammar. For editors without their own Tree-sitter highlighter. Code in `[source,lang]` blocks is not syntax-highlighted (it gets a plain raw token).
+
 ### Refactoring
 
 - **Rename** (`vim.lsp.buf.rename()`): rename anchors and attributes across the entire workspace, with `prepareRename` validation
@@ -124,6 +128,8 @@ vim.lsp.config('asciidoc_lsp', {
 vim.lsp.enable('asciidoc_lsp')
 ```
 
+The server sends semantic tokens. Neovim already highlights AsciiDoc with Tree-sitter, and the tokens would be drawn over it, so drop the capability when the client initializes: add `on_init = function(client) client.server_capabilities.semanticTokensProvider = nil end` to the config above. The plugin does this itself.
+
 Recommended companion plugins:
 
 - [trouble.nvim](https://github.com/folke/trouble.nvim): workspace-wide diagnostics view
@@ -150,7 +156,7 @@ The extension is not on the Marketplace yet. Install it from a VSIX attached to 
 
 The extension starts the server for `.adoc`, `.asciidoc`, `.asc` and `.ad` files. It picks the server in this order: the `asciidoc-lsp.server.path` setting, the bundled binary, `asciidoc-lsp` on `PATH`. The language status item of an AsciiDoc file shows the running server version. `AsciiDoc LSP: Restart Language Server` restarts it, and `asciidoc-lsp.trace.server` traces the protocol traffic.
 
-The extension ships no syntax highlighting; install an AsciiDoc grammar extension such as [asciidoctor-vscode](https://marketplace.visualstudio.com/items?itemName=asciidoctor.asciidoctor-vscode) for that. Its own completion, hover and symbol providers run next to this server, so expect duplicate suggestions while both are installed.
+The extension highlights AsciiDoc with the server's semantic tokens and turns semantic highlighting on for AsciiDoc files whatever the theme says. The colors come from the theme's markup rules (`markup.heading`, `markup.bold`, ...); the token types are `heading`, `strong`, `emphasis`, `raw`, `link` and others, so `editor.semanticTokenColorCustomizations` can restyle them. The file shows no colors until the server has started. The extension also configures `//` and `////` comments and bracket pairs. If you also install [asciidoctor-vscode](https://marketplace.visualstudio.com/items?itemName=asciidoctor.asciidoctor-vscode), its TextMate grammar and our tokens apply to the same text, and its own completion, hover and symbol providers run next to this server, so expect duplicate suggestions.
 
 ### Other editors
 

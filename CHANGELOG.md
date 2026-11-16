@@ -12,6 +12,11 @@ Before 1.0, a minor version may contain breaking changes.
 
 ### Added
 
+- Syntax highlighting through semantic tokens
+  (`textDocument/semanticTokens/full`), computed from the grammar's own
+  highlight queries. The VS Code extension turns it on for AsciiDoc files and
+  adds `//` and `////` comment toggling and bracket pairs. Code in
+  `[source,lang]` blocks stays unhighlighted.
 - VS Code extension: each release attaches VSIX packages that start the
   server, with the matching binary bundled for Linux, Alpine, macOS and
   Windows plus a universal package without one.
