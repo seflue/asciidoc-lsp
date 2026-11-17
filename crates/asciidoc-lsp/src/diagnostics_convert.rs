@@ -29,7 +29,8 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
         DiagnosticKind::BrokenInclude { .. }
         | DiagnosticKind::PdfPathNotFound { .. }
         | DiagnosticKind::PdfThemeYamlExtension { .. }
-        | DiagnosticKind::UnknownPdfTheme { .. } => ls_types::DiagnosticSeverity::ERROR,
+        | DiagnosticKind::UnknownPdfTheme { .. }
+        | DiagnosticKind::LevelZeroSectionOutsideBook { .. } => ls_types::DiagnosticSeverity::ERROR,
         DiagnosticKind::BrokenXref { .. }
         | DiagnosticKind::DuplicateAnchor { .. }
         | DiagnosticKind::IncludeTagNotFound { .. }
@@ -146,6 +147,27 @@ mod tests {
             Some(ls_types::DiagnosticSeverity::WARNING)
         );
         assert_eq!(result[0].range.start.line, 4);
+    }
+
+    /// Asciidoctor reports it as an `ERROR`.
+    #[test]
+    fn test_convert_level_zero_section_outside_book_is_error() {
+        let content = "= Title\n\n= Part\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 3,
+            span: None,
+            kind: DiagnosticKind::LevelZeroSectionOutsideBook { documents: vec![] },
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(result[0].range.start.line, 2);
     }
 
     #[test]

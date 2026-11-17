@@ -394,7 +394,37 @@ pub fn collect_diagnostics(
         });
     }
 
-    // 8. Unterminated delimited blocks. Code includes are parsed too, but
+    // 8. Level 0 titles outside a book, per top-level document, as in 7.
+    let mut level_zero: BTreeMap<(PathBuf, usize), Vec<PathBuf>> = BTreeMap::new();
+    for scope in &top_level {
+        for found in crate::section_levels::level_zero_outside_book(workspace, scope.document()) {
+            let readers = level_zero.entry((found.file, found.line)).or_default();
+            if !readers.iter().any(|d| d == scope.document()) {
+                readers.push(scope.document().to_path_buf());
+            }
+        }
+    }
+    for ((file, line), mut documents) in level_zero {
+        documents.sort();
+        let several = catalogs.scopes_at(&file).len() > 1;
+        diags.entry(file.clone()).or_default().push(Diagnostic {
+            file,
+            line,
+            span: None,
+            kind: DiagnosticKind::LevelZeroSectionOutsideBook {
+                documents: if several {
+                    documents
+                        .iter()
+                        .map(|document| display_path(root, document))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            },
+        });
+    }
+
+    // 9. Unterminated delimited blocks. Code includes are parsed too, but
     // their lines are verbatim content of the surrounding listing, not
     // delimiters: only `.adoc` files are checked.
     for (path, doc) in documents {
@@ -2104,6 +2134,83 @@ mod tests {
         assert_eq!(
             sequence_rows(&ws, &root.join("book.adoc")),
             vec![(4, vec![0, 1], 2), (8, vec![1], 2), (12, vec![2], 3)]
+        );
+    }
+
+    /// The `LevelZeroSectionOutsideBook`s of `file` as (line, names of the
+    /// documents).
+    fn level_zero_outside_book(
+        ws: &crate::workspace::Workspace,
+        file: &Path,
+    ) -> Vec<(usize, Vec<String>)> {
+        ws.diagnostics_for(file)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::LevelZeroSectionOutsideBook { documents } => Some((
+                    d.line,
+                    documents
+                        .iter()
+                        .map(|doc| doc.display().to_string())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Asciidoctor (`diagnostic_paths/index.adoc`): `ERROR: chapters/one.adoc:
+    /// line 1: level 0 sections can only be used when doctype is book`. The
+    /// included `= One` is a section, not the header; read on its own,
+    /// `chapters/one.adoc` raises no such error.
+    #[test]
+    fn test_level_zero_section_in_article_is_reported() {
+        let (root, ws) = fixture_workspace("diagnostic_paths");
+
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("chapters/one.adoc")),
+            vec![(1, vec![])]
+        );
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("index.adoc")),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor (`book.adoc`, `:doctype: book`): only the three
+    /// out-of-sequence warnings, nothing for `= Part` on line 6.
+    #[test]
+    fn test_level_zero_section_in_book_is_not_reported() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("book.adoc")),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor (`level_zero_book_config/index.adoc`): `ERROR:
+    /// chapters/one.adoc: line 1: level 0 sections can only be used when
+    /// doctype is book` without attributes, nothing with `-a doctype=book`
+    /// (the CLI does not read `.asciidoctorconfig`, which sets it here).
+    #[test]
+    fn test_level_zero_section_with_doctype_book_from_config_is_not_reported() {
+        let (root, ws) = fixture_workspace("level_zero_book_config");
+
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("chapters/one.adoc")),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor (`headerless_level_zero.adoc`): no message. Without a
+    /// document header the level 0 title after a first section is accepted.
+    #[test]
+    fn test_level_zero_section_in_headerless_document_is_not_reported() {
+        let (root, ws) = fixture_workspace("section_levels");
+
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("headerless_level_zero.adoc")),
+            vec![]
         );
     }
 

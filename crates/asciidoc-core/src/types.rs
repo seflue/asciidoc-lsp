@@ -235,6 +235,13 @@ pub enum DiagnosticKind {
         /// sequence when several read the file; empty otherwise.
         documents: Vec<PathBuf>,
     },
+    /// A level 0 section title other than the document header in a document
+    /// whose doctype is not `book`; the level includes `leveloffset`.
+    LevelZeroSectionOutsideBook {
+        /// As in `BrokenXref`: the top-level documents where it is reported
+        /// when several read the file; empty otherwise.
+        documents: Vec<PathBuf>,
+    },
     /// `pdf-themesdir` / `pdf-fontsdir` directory or `pdf-theme` file
     /// that does not exist.
     PdfPathNotFound {
@@ -344,6 +351,14 @@ impl fmt::Display for DiagnosticKind {
                     "Section title out of sequence: expected level{plural} {}, got level {got}",
                     levels.join(" or ")
                 )?;
+                if documents.is_empty() {
+                    return Ok(());
+                }
+                let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
+                write!(f, " (in {})", documents.join(", "))
+            }
+            DiagnosticKind::LevelZeroSectionOutsideBook { documents } => {
+                write!(f, "Level 0 sections can only be used when doctype is book")?;
                 if documents.is_empty() {
                     return Ok(());
                 }
@@ -617,6 +632,20 @@ mod tests {
         assert_eq!(
             d5c.to_string(),
             "Section title out of sequence: expected level 2, got level 3 (in print.adoc, book.adoc)"
+        );
+
+        let d6 = DiagnosticKind::LevelZeroSectionOutsideBook { documents: vec![] };
+        assert_eq!(
+            d6.to_string(),
+            "Level 0 sections can only be used when doctype is book"
+        );
+
+        let d6b = DiagnosticKind::LevelZeroSectionOutsideBook {
+            documents: vec![PathBuf::from("web.adoc"), PathBuf::from("print.adoc")],
+        };
+        assert_eq!(
+            d6b.to_string(),
+            "Level 0 sections can only be used when doctype is book (in web.adoc, print.adoc)"
         );
     }
 

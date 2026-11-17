@@ -1,7 +1,8 @@
 //! Asciidoctor's section sequence check, per top-level document: a title
 //! deeper than one level below the section (or document header) above it is
-//! out of sequence. Levels are effective ones, with `leveloffset` applied in
-//! reading order.
+//! out of sequence, and a level 0 title below the header needs doctype
+//! `book`. Levels are effective ones, with `leveloffset` applied in reading
+//! order.
 //!
 //! The walk deliberately knows less than Asciidoctor, and then stays quiet
 //! instead of guessing:
@@ -36,9 +37,30 @@ pub(crate) struct OutOfSequence {
     pub got: usize,
 }
 
+/// A level 0 section title below the document header of a document whose
+/// doctype is not `book`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LevelZeroOutsideBook {
+    pub file: PathBuf,
+    pub line: usize,
+}
+
 /// The titles of `document`, read in order with its includes, that are out of
 /// sequence.
 pub(crate) fn out_of_sequence(workspace: &Workspace, document: &Path) -> Vec<OutOfSequence> {
+    walk(workspace, document).found
+}
+
+/// The level 0 titles of `document`, read in order with its includes, that
+/// Asciidoctor rejects because the doctype is not `book`.
+pub(crate) fn level_zero_outside_book(
+    workspace: &Workspace,
+    document: &Path,
+) -> Vec<LevelZeroOutsideBook> {
+    walk(workspace, document).level_zero
+}
+
+fn walk<'w>(workspace: &'w Workspace, document: &Path) -> SectionWalk<'w> {
     let doctype = workspace
         .attributes
         .preset(document, "doctype")
@@ -54,9 +76,10 @@ pub(crate) fn out_of_sequence(workspace: &Workspace, document: &Path) -> Vec<Out
         stopped: false,
         frames: Vec::new(),
         found: Vec::new(),
+        level_zero: Vec::new(),
     };
     read_in_order(workspace, document, &mut walk);
-    walk.found
+    walk
 }
 
 /// What the walk knows about the sections above the current line.
@@ -98,6 +121,7 @@ struct SectionWalk<'w> {
     stopped: bool,
     frames: Vec<Frame>,
     found: Vec<OutOfSequence>,
+    level_zero: Vec<LevelZeroOutsideBook>,
 }
 
 /// Whether the include reads only part of its file or stands where the
@@ -173,6 +197,18 @@ impl SectionWalk<'_> {
         if section.placement == Placement::Unparsed {
             self.uncertain(level);
             return;
+        }
+        // Asciidoctor accepts a level 0 title in a document without a header
+        // when a section comes first; the LSP cannot tell whether a block
+        // came first, so only documents with a header are checked.
+        if level == 0
+            && self.doctype.as_deref() != Some("book")
+            && matches!(self.frames.first(), Some(Frame::Document))
+        {
+            self.level_zero.push(LevelZeroOutsideBook {
+                file: file.to_path_buf(),
+                line: section.line,
+            });
         }
         self.close(level);
         let expected = match self.frames.last() {
