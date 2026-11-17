@@ -1,0 +1,7 @@
+= Keys
+
+include::a.adoc[leveloffset=+1, tag=t]
+
+include::b.adoc[]
+
+See xref:a.adoc#b-id[].

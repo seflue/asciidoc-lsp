@@ -19,7 +19,7 @@ struct DuplicateKey<'a> {
 
 /// The tag names an include must find in its target, as Asciidoctor selects
 /// them: `lines` beats `tag` beats `tags`, the first present key decides even
-/// when empty. Keys are trimmed (the grammar keeps the blank after a comma).
+/// when empty. Keys arrive trimmed from `extract_block_macro_attrs`.
 /// `tag` is one name, `tags` splits at `;` and `,`. Entries are
 /// not trimmed; empty ones, negations (`!x`) and wildcards (`*`, `**`) are
 /// never looked up. Duplicates are dropped, written order is kept.
@@ -36,7 +36,7 @@ fn required_tags(
         attributes
             .iter()
             .rev()
-            .find(|(name, _)| name.trim() == key)
+            .find(|(name, _)| name == key)
             .map(|(_, value)| value.as_str())
     };
     if find("lines").is_some() {
@@ -1982,6 +1982,32 @@ mod tests {
         assert_eq!(found, vec![]);
     }
 
+    /// Asciidoctor (`include_attr_keys/levels.adoc`): no message. The blank
+    /// after the comma does not hide `leveloffset=+1`, so `chapter.adoc`
+    /// sits at level 2 and `==== After` follows it in sequence.
+    #[test]
+    fn test_leveloffset_after_comma_space_shifts_included_levels() {
+        let (root, ws) = fixture_workspace("include_attr_keys");
+
+        assert_eq!(out_of_sequence(&ws, &root.join("levels.adoc")), vec![]);
+        assert_eq!(out_of_sequence(&ws, &root.join("chapter.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`include_attr_keys/book.adoc`): no message, the xref
+    /// renders as `href="a.html#b-id"`. `tag=t` after a comma and a blank
+    /// still selects a part of `a.adoc`. Asciidoctor does not check a
+    /// link; the LSP checks it against the catalog of `a.adoc` alone, where
+    /// `b-id` is missing.
+    #[test]
+    fn test_tag_after_comma_space_makes_include_partial() {
+        let (root, ws) = fixture_workspace("include_attr_keys");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("book.adoc")),
+            vec![("a.adoc#b-id", vec![])]
+        );
+    }
+
     /// Asciidoctor (`out_of_sequence/main.adoc`): `line 8: expected level 1,
     /// got level 2`.
     #[test]
@@ -2233,10 +2259,6 @@ mod tests {
     #[case::quoted_comma_value_split_by_grammar_no_diagnostic(&[("tags", "\"present")], &[])]
     #[case::single_quote_split_by_grammar_no_diagnostic(&[("tags", "'a")], &[])]
     #[case::unquoted_comma_in_tag_is_grammar_misparse(&[("tag", ",tags=m22")], &[])]
-    #[case::key_after_comma_space(&[("indent", "0"), (" tag", "m50")], &["m50"])]
-    #[case::tags_key_after_comma_space(&[("indent", "0"), (" tags", "m51")], &["m51"])]
-    #[case::lines_key_after_comma_space(&[("tag", "m36"), (" lines", "1")], &[])]
-    #[case::tag_wins_after_comma_space(&[("tags", "m53"), (" tag", "present")], &["present"])]
     #[case::empty_tags_folds_next_attribute_no_diagnostic(&[("tags", ",lines=1")], &[])]
     #[case::unquoted_tags_comma_ends_value(&[("tags", "present,m30")], &["present"])]
     fn test_required_tags_follows_asciidoctor_selection(

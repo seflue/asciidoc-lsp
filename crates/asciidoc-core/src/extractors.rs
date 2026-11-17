@@ -968,12 +968,17 @@ pub fn find_child_text(node: tree_sitter::Node, kind: &str, source: &[u8]) -> Op
 
 /// Extract attributes from `block_macro_attr` children of a `block_macro` node.
 /// Each `block_macro_attr` has `attribute_name` and `attribute_value` children.
+/// The key is trimmed: the grammar's `attribute_name` takes in the blanks
+/// around it (`[a=1, b=2]` yields `" b"`), which Asciidoctor ignores.
 fn extract_block_macro_attrs(node: tree_sitter::Node, source: &[u8]) -> Vec<(String, String)> {
     let mut attrs = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "block_macro_attr" {
-            let name = find_child_text(child, "attribute_name", source).unwrap_or_default();
+            let name = find_child_text(child, "attribute_name", source)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let value = find_child_text(child, "attribute_value", source).unwrap_or_default();
             if !name.is_empty() {
                 attrs.push((name, value));
@@ -1537,6 +1542,32 @@ mod tests {
             includes[0].attributes[1],
             ("tags".to_string(), "main".to_string())
         );
+    }
+
+    /// Asciidoctor trims blanks around the key, so a key after a comma
+    /// reads as the same key.
+    #[test]
+    fn test_extract_include_attribute_keys_are_trimmed() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "= Title\n\ninclude::file.adoc[leveloffset=+1, tag=t]\n\n\
+                      include::file.adoc[ tag = t , leveloffset = +1 ]\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let includes = extract_includes(tree.root_node(), source.as_bytes());
+
+        assert_eq!(includes.len(), 2);
+        assert_eq!(
+            includes[0].attributes,
+            vec![
+                ("leveloffset".to_string(), "+1".to_string()),
+                ("tag".to_string(), "t".to_string())
+            ]
+        );
+        let names: Vec<&str> = includes[1]
+            .attributes
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["tag", "leveloffset"]);
     }
 
     #[test]
