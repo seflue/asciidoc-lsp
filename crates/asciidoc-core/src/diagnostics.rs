@@ -1965,6 +1965,30 @@ mod tests {
         assert!(ws.diagnostics_for(&file).is_empty());
     }
 
+    // --- Attribute entry glued to a paragraph ---
+
+    /// Asciidoctor (`main.adoc` with `-a attribute-missing=warn`): the
+    /// `:glued: yes` line directly below a paragraph line is paragraph text
+    /// (`<p>A paragraph line directly above.\n:glued: yes\n...`), so only
+    /// `proper` is defined and `{glued}` warns: `skipping reference to
+    /// missing attribute: glued`.
+    #[test]
+    fn test_entry_glued_to_a_paragraph_defines_nothing() {
+        let (root, ws) = fixture_workspace("attribute_entry_glued");
+        let file = root.join("main.adoc");
+
+        let names: Vec<_> = ws.documents()[&file]
+            .attributes
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, ["proper"]);
+        assert_eq!(
+            undefined_in_workspace(&ws),
+            vec![("main.adoc".to_string(), 9, "glued".to_string())]
+        );
+    }
+
     // --- Section titles out of sequence (fixture `section_levels`) ---
 
     /// The `SectionOutOfSequence`s of `file` as (line, expected levels, got

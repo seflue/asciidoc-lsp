@@ -1,0 +1,10 @@
+= Attribute entry glued to a paragraph
+
+:proper: yes
+
+A paragraph line directly above.
+:glued: yes
+Asciidoctor reads the line above as paragraph text, not as an entry.
+
+Expected: {proper} resolves, {glued} is undefined (Asciidoctor with
+attribute-missing=warn: skipping reference to missing attribute: glued).
