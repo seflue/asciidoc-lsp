@@ -12,16 +12,28 @@ Before 1.0, a minor version may contain breaking changes.
 
 ### Added
 
-- Syntax highlighting through semantic tokens
-  (`textDocument/semanticTokens/full`), computed from the grammar's own
-  highlight queries. The VS Code extension turns it on for AsciiDoc files and
-  adds `//` and `////` comment toggling and bracket pairs. Code in
-  `[source,lang]` blocks stays unhighlighted.
-- VS Code extension: each release attaches VSIX packages that start the
-  server, with the matching binary bundled for Linux, Alpine, macOS and
-  Windows plus a universal package without one.
-- The server reports its name and version in the `initialize` result, so
-  clients can show which build is running.
+- Syntax highlighting for AsciiDoc markup via semantic tokens.
+- VS Code extension, attached to each release with the server bundled.
+- Quick-fixes for broken xrefs and includes.
+- Diagnostics for undefined attributes, section levels out of sequence,
+  missing include tags and unclosed delimited blocks.
+- Completion for block styles, source languages, attribute values and
+  attribute names in `ifdef`/`ifndef`.
+- `anchor:id[]` and `[#id]` anchors as xref targets.
+
+### Changed
+
+- Xrefs and duplicate IDs are checked per top-level document, as in
+  Asciidoctor.
+
+### Fixed
+
+- Accepting a completion no longer leaves part of the typed word behind.
+- Xrefs inside admonitions, quotes and description lists are found.
+- Fewer false warnings, for example on URI includes and in `a`/`l` table
+  columns.
+- Document headers, lists and the end of a file are parsed as in
+  Asciidoctor.
 
 ## [0.7.0] - 2026-11-15
 
