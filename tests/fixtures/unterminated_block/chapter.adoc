@@ -1,0 +1,12 @@
+== Chapter
+
+See <<later>> for the rest.
+
+----
+first line
+second line
+
+[[later]]
+== Later
+
+Swallowed by the open block.

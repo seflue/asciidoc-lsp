@@ -104,6 +104,18 @@ pub struct AttributeRef {
     pub end_col: usize,   // byte-offset of closing }
 }
 
+/// A delimited block whose closing delimiter the grammar found missing, see
+/// `extract_unterminated_blocks`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnterminatedBlock {
+    /// Asciidoctor's name for the block kind: `listing`, `example`, ...
+    pub context: &'static str,
+    /// The opening delimiter without trailing blanks, e.g. `----`.
+    pub delimiter: String,
+    /// 1-based line of the opening delimiter.
+    pub line: usize,
+}
+
 #[derive(Debug)]
 pub struct IncludeTree {
     pub file: PathBuf,
@@ -155,6 +167,8 @@ pub struct DocumentModel {
     /// Names of the `tag::name[]` directives in the raw lines, see
     /// `extract_tag_directives`.
     pub tags: Vec<String>,
+    /// Delimited blocks without a closing delimiter.
+    pub unterminated_blocks: Vec<UnterminatedBlock>,
 }
 
 /// An attribute that may be defined at `line` without the LSP being able to
@@ -251,6 +265,13 @@ pub enum DiagnosticKind {
     UndefinedConditionalAttr {
         name: String,
         directive: String,
+    },
+    /// A delimited block that is never closed; `context` is Asciidoctor's
+    /// name for the block kind, `delimiter` the delimiter that closes the block,
+    /// e.g. `----`.
+    UnterminatedBlock {
+        context: String,
+        delimiter: String,
     },
 }
 
@@ -353,6 +374,9 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UndefinedConditionalAttr { name, directive } => {
                 write!(f, "{directive}::{name} references undefined attribute")
             }
+            DiagnosticKind::UnterminatedBlock { context, delimiter } => {
+                write!(f, "Unterminated {context} block: no closing {delimiter}")
+            }
         }
     }
 }
@@ -434,6 +458,7 @@ impl DocumentModel {
             substituted_refs: vec![],
             possible_definitions: vec![],
             tags: vec![],
+            unterminated_blocks: vec![],
         }
     }
 
@@ -467,6 +492,10 @@ impl DocumentModel {
     }
     pub fn with_substituted_refs(mut self, substituted_refs: Vec<AttributeRef>) -> Self {
         self.substituted_refs = substituted_refs;
+        self
+    }
+    pub fn with_unterminated_blocks(mut self, unterminated_blocks: Vec<UnterminatedBlock>) -> Self {
+        self.unterminated_blocks = unterminated_blocks;
         self
     }
     pub fn with_possible_definitions(
@@ -509,6 +538,15 @@ mod tests {
             path: "missing.adoc".into(),
         };
         assert_eq!(d2.to_string(), "Broken include: missing.adoc");
+
+        let unterminated = DiagnosticKind::UnterminatedBlock {
+            context: "listing".into(),
+            delimiter: "----".into(),
+        };
+        assert_eq!(
+            unterminated.to_string(),
+            "Unterminated listing block: no closing ----"
+        );
 
         let tag = DiagnosticKind::IncludeTagNotFound {
             tags: vec!["a".into()],
