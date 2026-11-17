@@ -437,6 +437,7 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Placement;
     use std::fs;
 
     #[test]
@@ -447,20 +448,20 @@ mod tests {
                 attributes: vec![],
                 line: 1,
                 target_col: 0,
-                placement: crate::types::Placement::Block,
+                placement: Placement::Block,
             },
             IncludeMacro {
                 path: "b.adoc".into(),
                 attributes: vec![],
                 line: 2,
                 target_col: 0,
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         ];
         let registry = AttributeRegistry::new(Path::new("/tmp"));
         let edges = include_edges(Path::new("/tmp/x.adoc"), &macros, &registry);
-        assert_eq!(edges[0].placement, crate::types::Placement::Block);
-        assert_eq!(edges[1].placement, crate::types::Placement::Body);
+        assert_eq!(edges[0].placement, Placement::Block);
+        assert_eq!(edges[1].placement, Placement::Body);
     }
 
     #[test]
@@ -486,7 +487,7 @@ mod tests {
                 target: b.clone(),
                 line: 5,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         graph.add_edge(
@@ -495,7 +496,7 @@ mod tests {
                 target: c.clone(),
                 line: 10,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -517,7 +518,7 @@ mod tests {
                 target: b.clone(),
                 line: 5,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -814,7 +815,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         graph.add_edge(
@@ -823,7 +824,7 @@ mod tests {
                 target: a.clone(),
                 line: 5,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -847,7 +848,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         graph.add_edge(
@@ -856,7 +857,7 @@ mod tests {
                 target: c.clone(),
                 line: 5,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         graph.add_edge(
@@ -865,7 +866,7 @@ mod tests {
                 target: a.clone(),
                 line: 7,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -881,7 +882,7 @@ mod tests {
             target: target.to_path_buf(),
             line,
             attributes: vec![],
-            placement: crate::types::Placement::Body,
+            placement: Placement::Body,
         }
     }
 
@@ -988,7 +989,7 @@ mod tests {
                 target: inline.clone(),
                 line: 9,
                 attributes: vec![("leveloffset".to_string(), "+1".to_string())],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -1011,7 +1012,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         graph.add_edge(
@@ -1020,7 +1021,7 @@ mod tests {
                 target: c.clone(),
                 line: 5,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -1039,7 +1040,7 @@ mod tests {
                 target: a.clone(),
                 line: 2,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 

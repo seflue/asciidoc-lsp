@@ -389,6 +389,63 @@ mod tests {
         );
     }
 
+    /// An include where the grammar failed may read anything: what the target
+    /// holds is not judged against the section above it.
+    #[test]
+    fn test_include_in_an_unparsed_region_is_read_as_a_region() {
+        let a = DocumentModel::test("/a.adoc").with_sections(vec![body(0, 1), body(1, 3)]);
+        let b = DocumentModel::test("/b.adoc").with_sections(vec![body(3, 1)]);
+
+        assert_eq!(
+            walk_documents(a, vec![(b, edge("/b.adoc", 5, None, Placement::Unparsed))]),
+            vec![]
+        );
+    }
+
+    /// Asciidoctor (probes with `[appendix]`, `[preface]` and `[abstract]` on
+    /// a level 1 title): `expected level 2, got level 3` for a `====` below
+    /// it, unlike other styles such as `[glossary]`, which take no nested
+    /// sections.
+    #[rstest::rstest]
+    #[case::appendix("appendix", vec![("/a.adoc".to_string(), 5, vec![2], 3)])]
+    #[case::preface("preface", vec![("/a.adoc".to_string(), 5, vec![2], 3)])]
+    #[case::abstract_style("abstract", vec![("/a.adoc".to_string(), 5, vec![2], 3)])]
+    #[case::glossary("glossary", vec![])]
+    fn test_level_1_style_decides_whether_its_children_are_checked(
+        #[case] style: &str,
+        #[case] expected: Vec<(String, usize, Vec<usize>, usize)>,
+    ) {
+        let styled = Section {
+            style: Some(style.into()),
+            ..body(1, 3)
+        };
+        let a = DocumentModel::test("/a.adoc").with_sections(vec![body(0, 1), styled, body(3, 5)]);
+
+        assert_eq!(walk_documents(a, vec![]), expected);
+    }
+
+    /// Asciidoctor (probes): a `[discrete]` or `[float]` title is no section,
+    /// so it closes no section above it and the `====` after it is still
+    /// judged against the `===`.
+    #[rstest::rstest]
+    #[case::discrete("discrete")]
+    #[case::float("float")]
+    fn test_discrete_title_closes_no_section(#[case] style: &str) {
+        let discrete = Section {
+            style: Some(style.into()),
+            ..body(1, 7)
+        };
+        let a = DocumentModel::test("/a.adoc").with_sections(vec![
+            body(0, 1),
+            body(1, 3),
+            body(2, 5),
+            discrete,
+            body(3, 9),
+        ]);
+
+        assert_eq!(walk_documents(a, vec![]), vec![]);
+    }
+
     /// Asciidoctor (`-a partials=parts`, `parts/x.adoc` is `=== X`): no
     /// warning for the `====` after the include. A target the LSP does not
     /// read may hold sections of any depth, so the parent is unknown.
@@ -424,9 +481,11 @@ mod tests {
         );
     }
 
-    /// Asciidoctor (`-a partials=parts`, `parts/x.adoc` is `=== X`): no
-    /// warning for the `====` after a `tag=` include of a target the LSP
-    /// does not read. Regression test for the region edge on an unread target.
+    /// Asciidoctor (`-a partials=parts`, `parts/x.adoc` holds `=== X` inside
+    /// a `tag::t[]`/`end::t[]` region): no warning for the `====` after a
+    /// `tag=` include of a target the LSP does not read. Without the region
+    /// Asciidoctor warns, so the tag matters. Regression test for the region
+    /// edge on an unread target.
     #[test]
     fn test_unread_region_include_hides_the_parent_of_deeper_sections() {
         let mut tagged = edge("/missing.adoc", 5, None, Placement::Body);

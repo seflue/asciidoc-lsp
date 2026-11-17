@@ -583,14 +583,14 @@ mod tests {
         let main = root.join("main.adoc");
         let fixes = fixes_at(&ws, &main, "<<setup-instal>>");
         let (line, _) = locate(&main, "<<setup-instal>>");
-        let (_, (start, end)) = (&fixes[0].0, fixes[0].2);
+        let (new_text, _, (start, end)) = &fixes[0];
         let text = std::fs::read_to_string(&main).unwrap();
         let fixed: Vec<String> = text
             .lines()
             .enumerate()
             .map(|(i, l)| {
                 if i + 1 == line {
-                    format!("{}{}{}", &l[..start], fixes[0].0, &l[end..])
+                    format!("{}{}{}", &l[..*start], new_text, &l[*end..])
                 } else {
                     l.to_string()
                 }

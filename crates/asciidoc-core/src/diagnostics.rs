@@ -17,6 +17,9 @@ struct DuplicateKey<'a> {
     first_line: usize,
 }
 
+/// The quote characters that may wrap an include attribute value.
+const QUOTES: [char; 2] = ['"', '\''];
+
 /// The tag names an include must find in its target, as Asciidoctor selects
 /// them: `lines` beats `tag` beats `tags`, the first present key decides even
 /// when empty. Keys arrive trimmed from `extract_block_macro_attrs`.
@@ -55,13 +58,13 @@ fn required_tags(
     // false one. It also folds a following attribute into an empty value
     // (`tags=,lines=1`); an unquoted value ends at its first comma, as in
     // Asciidoctor, which also substitutes before it parses the list.
-    let unquoted = ['"', '\'']
+    let unquoted = QUOTES
         .iter()
         .find_map(|quote| value.strip_prefix(*quote)?.strip_suffix(*quote));
-    if unquoted.is_none() && value.starts_with(['"', '\'']) {
+    if unquoted.is_none() && value.starts_with(QUOTES) {
         return Vec::new();
     }
-    let value = unquoted.unwrap_or_else(|| value.split(',').next().unwrap_or_default());
+    let value = unquoted.unwrap_or_else(|| value.split_once(',').map_or(value, |(first, _)| first));
     if value.contains('{') {
         return Vec::new();
     }
@@ -473,7 +476,7 @@ mod tests {
     use crate::attributes::AttributeRegistry;
     use crate::graph::IncludeGraph;
     use crate::types::{
-        Anchor, AttributeDef, AttributeRef, DocumentModel, IncludeMacro, Section, Xref,
+        Anchor, AttributeDef, AttributeRef, DocumentModel, IncludeMacro, Placement, Section, Xref,
     };
     use pretty_assertions::assert_eq;
     use std::path::Path;
@@ -549,7 +552,7 @@ mod tests {
             DocumentModel::test("/a.adoc").with_includes(vec![IncludeMacro {
                 path: "nonexistent.adoc".into(),
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
                 line: 3,
                 target_col: 9,
             }]),
@@ -727,7 +730,7 @@ mod tests {
             DocumentModel::test("/a.adoc").with_includes(vec![IncludeMacro {
                 path: "b.adoc".into(),
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
                 line: 3,
                 target_col: 9,
             }]),
@@ -737,7 +740,7 @@ mod tests {
             DocumentModel::test("/b.adoc").with_includes(vec![IncludeMacro {
                 path: "a.adoc".into(),
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
                 line: 5,
                 target_col: 9,
             }]),
@@ -750,7 +753,7 @@ mod tests {
                 target: b.clone(),
                 line: 3,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         graph.add_edge(
@@ -759,7 +762,7 @@ mod tests {
                 target: a.clone(),
                 line: 5,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
 
@@ -802,7 +805,7 @@ mod tests {
             DocumentModel::test(parent.to_str().unwrap()).with_includes(vec![IncludeMacro {
                 path: "{docdir}/appendix/glossary.adoc".into(),
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
                 line: 20,
                 target_col: 9,
             }]),
@@ -839,7 +842,7 @@ mod tests {
                     id: None,
                     is_header: false,
                     style: None,
-                    placement: crate::types::Placement::Body,
+                    placement: Placement::Body,
                 }])
                 .with_anchors(vec![Anchor {
                     id: "entry-anchor".into(),
@@ -866,7 +869,7 @@ mod tests {
             DocumentModel::test("/b.adoc").with_includes(vec![IncludeMacro {
                 path: "missing.adoc".into(),
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
                 line: 4,
                 target_col: 9,
             }]),
@@ -975,7 +978,7 @@ mod tests {
                     id: None,
                     is_header: false,
                     style: None,
-                    placement: crate::types::Placement::Body,
+                    placement: Placement::Body,
                 }])
                 .with_anchors(vec![Anchor {
                     id: "valid-anchor".into(),
@@ -1005,7 +1008,7 @@ mod tests {
                 target: PathBuf::from("/b.adoc"),
                 line: 7,
                 attributes: vec![],
-                placement: crate::types::Placement::Body,
+                placement: Placement::Body,
             },
         );
         let diags = diagnose(documents, graph, registry);
@@ -1777,7 +1780,7 @@ mod tests {
                     target: PathBuf::from("/b.adoc"),
                     line,
                     attributes: vec![],
-                    placement: crate::types::Placement::Body,
+                    placement: Placement::Body,
                 },
             );
         }
@@ -2162,7 +2165,7 @@ mod tests {
             attributes: vec![],
             line,
             target_col: 0,
-            placement: crate::types::Placement::Body,
+            placement: Placement::Body,
         };
         let section = |level, line| Section {
             level,
@@ -2171,7 +2174,7 @@ mod tests {
             id: Some("id".into()),
             is_header: level == 0,
             style: None,
-            placement: crate::types::Placement::Body,
+            placement: Placement::Body,
         };
         let mut documents = HashMap::new();
         documents.insert(
@@ -2192,7 +2195,7 @@ mod tests {
                     target: PathBuf::from("/b.adoc"),
                     line,
                     attributes: vec![],
-                    placement: crate::types::Placement::Body,
+                    placement: Placement::Body,
                 },
             );
         }
@@ -2209,6 +2212,67 @@ mod tests {
                 1,
                 "Section title out of sequence: expected level 2, got level 3".to_string()
             )]
+        );
+    }
+
+    /// A file read twice by one document and once by another names each
+    /// document once.
+    #[test]
+    fn test_out_of_sequence_names_a_document_reading_the_file_twice_once() {
+        let section = |level, line| Section {
+            level,
+            title: "T".into(),
+            line,
+            id: Some("id".into()),
+            is_header: level == 0,
+            style: None,
+            placement: Placement::Body,
+        };
+        let top = |line| IncludeMacro {
+            path: "b.adoc".into(),
+            attributes: vec![],
+            line,
+            target_col: 0,
+            placement: Placement::Body,
+        };
+        let mut documents = HashMap::new();
+        let mut graph = IncludeGraph::new();
+        for (name, lines) in [("/a.adoc", vec![5, 7]), ("/c.adoc", vec![5])] {
+            documents.insert(
+                PathBuf::from(name),
+                DocumentModel::test(name)
+                    .with_sections(vec![section(0, 1), section(1, 3)])
+                    .with_includes(lines.iter().map(|&line| top(line)).collect()),
+            );
+            for line in lines {
+                graph.add_edge(
+                    Path::new(name),
+                    crate::types::IncludeEdge {
+                        target: PathBuf::from("/b.adoc"),
+                        line,
+                        attributes: vec![],
+                        placement: Placement::Body,
+                    },
+                );
+            }
+        }
+        documents.insert(
+            PathBuf::from("/b.adoc"),
+            DocumentModel::test("/b.adoc").with_sections(vec![section(3, 1)]),
+        );
+
+        let diags = diagnose(documents, graph, make_registry());
+
+        let found: Vec<_> = diags[&PathBuf::from("/b.adoc")]
+            .iter()
+            .map(|d| d.kind.to_string())
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                "Section title out of sequence: expected level 2, got level 3 (in /a.adoc, /c.adoc)"
+                    .to_string()
+            ]
         );
     }
 

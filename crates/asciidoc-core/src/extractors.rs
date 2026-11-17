@@ -481,8 +481,9 @@ fn block_line_id(node: tree_sitter::Node, source: &[u8]) -> Option<(String, Opti
 }
 
 /// The siblings of a title node that precede it in its parent: the ID /
-/// attribute lines and comments above it. Above `titleN` the parent is the
-/// `section`, above a level-0 title the `block_element`.
+/// attribute lines and comments above it; above a level-0 title also
+/// attribute entries. Above `titleN` the parent is the `section`, above a
+/// level-0 title the `block_element`.
 fn lines_above_title(title: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     let Some(parent) = title.parent() else {
         return Vec::new();
@@ -1085,6 +1086,20 @@ mod tests {
         let tree = parser::parse(&mut p, source).unwrap();
         let sections = extract_sections(tree.root_node(), source.as_bytes());
         assert!(!sections[0].is_header, "{source:?}");
+    }
+
+    /// Asciidoctor (`<h1 id="p1" class="sect0">`): a book part takes the ID
+    /// of the lines directly above it.
+    #[test]
+    fn test_book_part_takes_the_id_above_it() {
+        let mut p = parser::init_block_parser().unwrap();
+        for line in ["[[p1]]", "[#p1]", "[id=p1]"] {
+            let source = format!("= B\n:doctype: book\n\n{line}\n= Part\n\n== C\n");
+            let tree = parser::parse(&mut p, &source).unwrap();
+            let sections = extract_sections(tree.root_node(), source.as_bytes());
+            assert_eq!(sections[1].id.as_deref(), Some("p1"), "{source:?}");
+            assert!(!sections[1].is_header, "{source:?}");
+        }
     }
 
     #[test]
@@ -2109,7 +2124,13 @@ mod tests {
     /// A closing delimiter on the last line without a newline closes the block.
     #[test]
     fn test_closing_delimiter_at_end_of_file_without_newline_reports_nothing() {
-        for source in ["p\n\n----\na\n----", "p\n\n====\na\n===="] {
+        for source in [
+            "p\n\n----\na\n----",
+            "p\n\n====\na\n====",
+            "p\n\n////\na\n////",
+            "p\n\n....\na\n....",
+            "p\n\n--\na\n--",
+        ] {
             assert_eq!(unterminated(source), [], "{source:?}");
         }
     }

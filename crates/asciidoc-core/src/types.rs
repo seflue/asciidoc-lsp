@@ -2,10 +2,9 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// Where a title or an include stands in the block tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     /// Among sections: a title there is a section.
-    #[default]
     Body,
     /// Inside a delimited block, table cell or list item: Asciidoctor reads
     /// no section there, and an include there reads block content.
@@ -110,7 +109,8 @@ pub struct AttributeRef {
 pub struct UnterminatedBlock {
     /// Asciidoctor's name for the block kind: `listing`, `example`, ...
     pub context: &'static str,
-    /// The opening delimiter without trailing blanks, e.g. `----`.
+    /// The delimiter that closes the block, e.g. `----` (the leading run of
+    /// the opener, without trailing blanks or a fence language).
     pub delimiter: String,
     /// 1-based line of the opening delimiter.
     pub line: usize,

@@ -528,9 +528,9 @@ fn walk_for_layout<'a>(node: tree_sitter::Node, source: &'a str, layout: &mut La
         match child.kind() {
             "paragraph" if node.kind() == "section_block" => {
                 // The grammar reads an `[[id]]` line it rejects as a block
-                // anchor (no block below it, trailing blanks, a `]` in the
-                // reftext) as paragraph text; Asciidoctor reads it as a block
-                // attribute line.
+                // anchor (no block below it, a `]` in the reftext) as
+                // paragraph text; Asciidoctor reads it as a block attribute
+                // line.
                 let mut lines = child.walk();
                 for line in child.children(&mut lines).filter(|n| n.kind() == "line") {
                     let row = line.start_position().row;
