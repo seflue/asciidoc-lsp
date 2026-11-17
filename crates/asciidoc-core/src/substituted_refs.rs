@@ -12,6 +12,8 @@ struct Region {
     /// Text the inline grammar reads: passthroughs inside it are not
     /// substituted. `None` for attribute lists, entry values and macros.
     inline: Option<Range>,
+    /// False when only definitions (`{counter:..}`, `{set:..}`) count.
+    refs: bool,
 }
 
 impl Region {
@@ -20,6 +22,7 @@ impl Region {
             start: node.start_byte(),
             end: node.end_byte(),
             inline: None,
+            refs: true,
         }
     }
 }
@@ -41,16 +44,14 @@ pub fn extract(
     let preprocessor = scan_preprocessor(source);
     let mut regions = Vec::new();
     collect_block_regions(root, source, &mut regions);
-    regions.extend(
-        inline_ranges
-            .iter()
-            .filter(|range| inline_text_is_substituted(root, **range, source))
-            .map(|range| Region {
-                start: range.start_byte,
-                end: range.end_byte,
-                inline: Some(*range),
-            }),
-    );
+    regions.extend(inline_ranges.iter().filter_map(|range| {
+        inline_text_scope(root, *range, source).map(|refs| Region {
+            start: range.start_byte,
+            end: range.end_byte,
+            inline: Some(*range),
+            refs,
+        })
+    }));
 
     let line_starts = line_starts(source);
     let mut inline_parser = crate::parser::init_inline_parser().ok();
@@ -91,6 +92,7 @@ pub fn extract(
                 continue;
             }
             match hit.found {
+                Found::Reference(_) if !region.refs => {}
                 Found::Reference(name) => refs.push(AttributeRef {
                     name: name.to_string(),
                     line: row + 1,
@@ -247,10 +249,11 @@ fn collect_block_regions(node: Node, source: &str, regions: &mut Vec<Region>) {
 struct BlockAttrs {
     style: Option<String>,
     subs: Option<String>,
+    cols: Option<String>,
 }
 
-/// The style and `subs` of the attribute lines right above `node`; a later
-/// line overrides an earlier one.
+/// The style, `subs` and `cols` of the attribute lines right above `node`; a
+/// later line overrides an earlier one.
 fn block_attrs(node: Node, source: &str) -> BlockAttrs {
     let mut lists = Vec::new();
     let mut sibling = node.prev_sibling();
@@ -275,16 +278,19 @@ fn block_attrs(node: Node, source: &str) -> BlockAttrs {
                     }
                 }
                 "named_attr" => {
-                    let is_subs = child_of_kind(child, "attribute_name")
-                        .is_some_and(|name| text(name, source) == "subs");
-                    if let (true, Some(value)) = (is_subs, child_of_kind(child, "attribute_value"))
+                    let name = child_of_kind(child, "attribute_name").map(|n| text(n, source));
+                    if let (Some(name @ ("subs" | "cols")), Some(value)) =
+                        (name, child_of_kind(child, "attribute_value"))
                     {
-                        attrs.subs = Some(
-                            text(value, source)
-                                .trim()
-                                .trim_matches(['"', '\''])
-                                .to_string(),
-                        );
+                        let value = text(value, source)
+                            .trim()
+                            .trim_matches(['"', '\''])
+                            .to_string();
+                        if name == "subs" {
+                            attrs.subs = Some(value);
+                        } else {
+                            attrs.cols = Some(value);
+                        }
                     }
                 }
                 _ => {}
@@ -374,15 +380,48 @@ fn verse_without_attributes(block: Node, source: &str) -> bool {
             .is_some_and(|subs| !subs_has_attributes(subs, true, false))
 }
 
-/// Whether the text of an inline range is substituted: its paragraph or
-/// admonition has `attributes` among its substitutions, no open block around
-/// it takes the text for something else and it is no literal table cell.
+/// Whether a `cols` value has an `a` or `l` column. The style is the last
+/// letter of a column spec.
+fn has_verbatim_column(cols: &str) -> bool {
+    cols.split([',', ';'])
+        .any(|spec| spec.trim().ends_with(['a', 'l']))
+}
+
+/// Whether the table around `cell` has an `a` or `l` column.
+fn table_has_verbatim_column(cell: Node, source: &str) -> bool {
+    let mut node = cell;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "table_block" {
+            return block_attrs(parent, source)
+                .cols
+                .as_deref()
+                .is_some_and(has_verbatim_column);
+        }
+        node = parent;
+    }
+    false
+}
+
+/// The style letter of a cell spec, if it has one.
+fn cell_style(cell: Node, source: &str) -> Option<char> {
+    let attr = child_of_kind(cell, "table_cell_attr")?;
+    text(attr, source)
+        .chars()
+        .last()
+        .filter(|style| "adehlms".contains(*style))
+}
+
+/// How the text of an inline range is substituted. `None`: not at all (its
+/// paragraph or admonition lacks `attributes` among its substitutions, an open
+/// block around it takes the text for something else, or it is a literal
+/// table cell). `Some(true)`: references and definitions count. `Some(false)`:
+/// a cell without a style of its own in a table with an `a` or `l` column,
+/// whose references are not checked but whose counters may still define.
 /// Compound blocks (example, sidebar, quote) ignore `subs`; a quote or open
 /// block with style `verse` is a leaf and obeys them.
-fn inline_text_is_substituted(root: Node, range: Range, source: &str) -> bool {
-    let Some(mut node) = root.descendant_for_byte_range(range.start_byte, range.end_byte) else {
-        return false;
-    };
+fn inline_text_scope(root: Node, range: Range, source: &str) -> Option<bool> {
+    let mut node = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    let mut refs = true;
     let mut leaf_seen = false;
     loop {
         match node.kind() {
@@ -398,11 +437,11 @@ fn inline_text_is_substituted(root: Node, range: Range, source: &str) -> bool {
                     .as_deref()
                     .map_or(default, |subs| subs_has_attributes(subs, default, false));
                 if !has {
-                    return false;
+                    return None;
                 }
             }
             "quoted_block" | "open_block" if verse_without_attributes(node, source) => {
-                return false;
+                return None;
             }
             "open_block"
                 if block_attrs(node, source)
@@ -410,24 +449,22 @@ fn inline_text_is_substituted(root: Node, range: Range, source: &str) -> bool {
                     .as_deref()
                     .is_some_and(|style| VERBATIM_STYLES.contains(&style)) =>
             {
-                return false;
+                return None;
             }
-            "table_cell_content" => {
+            "table_cell" => {
                 // The content of an `a` cell is a document of its own: its
                 // nested blocks are walked here like top-level ones.
-                let literal = node
-                    .parent()
-                    .and_then(|cell| child_of_kind(cell, "table_cell_attr"))
-                    .is_some_and(|attr| text(attr, source).ends_with('l'));
-                if literal {
-                    return false;
+                match cell_style(node, source) {
+                    Some('l') => return None,
+                    Some(_) => {}
+                    None => refs &= !table_has_verbatim_column(node, source),
                 }
             }
             _ => {}
         }
         match node.parent() {
             Some(parent) => node = parent,
-            None => return true,
+            None => return Some(refs),
         }
     }
 }
@@ -870,6 +907,9 @@ mod tests {
     #[case::entry_pass_plus_later_token(":p: pass:c,+a[{x}]\n")]
     #[case::entry_pass_continued_trailing(":p: pass:[a] \\\n{x}\n")]
     #[case::entry_pass_unclosed(":p: pass:[{x}\n")]
+    #[case::cols_cell_spec_overrides("[cols=\"1l,1a\"]\n|===\nd|d1 {x}\n|===\n")]
+    #[case::cols_monospace_column("[cols=\"1m\"]\n|===\n| {x}\n|===\n")]
+    #[case::cols_without_style("[cols=\"1,2\"]\n|===\n| {x}\n|===\n")]
     fn reports_in_contexts(#[case] source: &str) {
         assert_eq!(names(source), ["x"], "{source:?}");
     }
@@ -955,8 +995,51 @@ mod tests {
     #[case::entry_pass_greedy(":p: pass:[a] {x} pass:[b]\n")]
     #[case::entry_pass_continued(":p: pass:[{x} \\\nmore]\n")]
     #[case::entry_pass_in_body("= T\n\n== S\n\n:p: pass:[{x}]\n")]
+    #[case::cols_asciidoc_line_comment("[cols=\"1a,1\"]\n|===\n|\n// c {x}\n| b\n|===\n")]
+    #[case::cols_asciidoc_block_comment("[cols=\"1a\"]\n|===\n|\n////\nb {x}\n////\n|===\n")]
+    #[case::cols_literal("[cols=\"1l\"]\n|===\n|lit {x}\n|===\n")]
+    #[case::cols_literal_nested_list("[cols=\"1l\"]\n|===\n|\n* item {x}\n|===\n")]
+    #[case::literal_cell_nested_list("|===\nl|\n* item {x}\n|===\n")]
+    #[case::cols_multiplier("[cols=\"2*a\"]\n|===\n|x\n// c {x}\n|===\n")]
+    #[case::cols_aligned_semicolon("[cols=\"<.^2a;1\"]\n|===\n|x\n// c {x}\n|===\n")]
+    #[case::cols_titled_table(".T\n[cols=\"1l\"]\n|===\n|lit {x}\n|===\n")]
+    #[case::cols_unknown_cell_style_v("[cols=\"1l\"]\n|===\nv|v1 {x}\n|===\n")]
+    #[case::cols_literal_span_cell("[cols=\"1l,1l\"]\n|===\n2+|lit {x}\n|===\n")]
+    #[case::cols_asciidoc_listing("[cols=\"1a,1\"]\n|===\n|\n----\ncode {x}\n----\n| b\n|===\n")]
     fn quiet_contexts(#[case] source: &str) {
         assert_eq!(names(source), Vec::<String>::new(), "{source:?}");
+    }
+
+    /// Asciidoctor warns for a cell of a column without a style next to an `a`
+    /// or `l` column. Cells are not mapped to columns (spans would make that
+    /// guess wrong), so every unstyled cell of such a table stays unchecked.
+    #[test]
+    fn table_with_asciidoc_or_literal_column_is_not_checked() {
+        assert_eq!(
+            names("[cols=\"1,1a\"]\n|===\n| p {x}\n|===\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The cell is not checked, but a counter in it may still define the
+    /// attribute for the rest of the document.
+    #[test]
+    fn unchecked_cell_keeps_possible_definitions() {
+        for source in [
+            "[cols=\"1,1a\"]\n|===\n|{counter:step}\n|text\n|===\n\nLast {step}\n",
+            "[cols=\"1a\"]\n|===\n|{counter:step}\n|===\n\nLast {step}\n",
+        ] {
+            let (refs, possible) = extract_str(source);
+            assert_eq!(
+                refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                vec!["step"],
+                "{source:?}"
+            );
+            assert!(
+                possible.iter().any(|p| p.name == "step" && p.line == 3),
+                "{source:?}: {possible:?}"
+            );
+        }
     }
 
     #[test]
