@@ -1864,6 +1864,26 @@ mod tests {
         assert_eq!(undefined_in_workspace(&ws), vec![]);
     }
 
+    // --- Comment block directly below the document title ---
+
+    /// Asciidoctor (`attribute.adoc` with `-a attribute-missing=warn`): the
+    /// comment block belongs to the header, so the entry below it defines
+    /// `attr`, `{attr}` resolves and nothing warns.
+    #[test]
+    fn test_comment_block_below_title_keeps_the_header_attribute_defined() {
+        let (root, ws) = fixture_workspace("comment_block_below_title");
+        let file = root.join("attribute.adoc");
+
+        let names: Vec<_> = ws.documents()[&file]
+            .attributes
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, ["attr"]);
+        assert_eq!(undefined_in_workspace(&ws), vec![]);
+        assert!(ws.diagnostics_for(&file).is_empty());
+    }
+
     // --- Section titles out of sequence (fixture `section_levels`) ---
 
     /// The `SectionOutOfSequence`s of `file` as (line, expected levels, got
