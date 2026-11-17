@@ -361,7 +361,7 @@ fn is_delimiter_line(line: &str) -> bool {
 
 /// Whether `line` starts with an attribute entry, `:name:` followed by
 /// whitespace or the end of the line.
-fn is_attribute_entry(line: &str) -> bool {
+pub(crate) fn is_attribute_entry(line: &str) -> bool {
     let Some(rest) = line.strip_prefix(':') else {
         return false;
     };

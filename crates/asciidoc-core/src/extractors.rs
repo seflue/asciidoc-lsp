@@ -555,9 +555,19 @@ fn header_prefix(title: tree_sitter::Node) -> bool {
 /// the container closed. When both really are open, the outer warning is
 /// dropped as well; no diagnostic is better than a false one.
 ///
+/// An opener, closed or not, directly below a line that could be a setext
+/// section title (the underline is one of `= - ~ ^ +` and within one
+/// character of the title's length) is no delimiter for Asciidoctor, which
+/// reads a section. The grammar pairs that underline with a later delimiter
+/// of the same length and misreads everything after it, so every report at
+/// or after the first such underline stays silent. The check looks at the
+/// two lines only, so a title-like last line of a paragraph, a list
+/// continuation or a line inside a delimited block, where Asciidoctor does
+/// warn, stays silent too.
+///
 /// Known gaps, all per-file effects: a block opened in one file and closed
-/// in an included one, a delimiter inside an inactive `ifdef`, and the
-/// grammar not knowing setext titles.
+/// in an included one and a delimiter inside an inactive `ifdef`. Real
+/// unterminated blocks after a setext title go unreported.
 #[must_use]
 pub fn extract_unterminated_blocks(
     node: tree_sitter::Node,
@@ -565,7 +575,103 @@ pub fn extract_unterminated_blocks(
 ) -> Vec<UnterminatedBlock> {
     let mut results = Vec::new();
     walk_for_unterminated_blocks(node, source, &mut results);
+    if results.is_empty() {
+        return results;
+    }
+    let mut opener_lines = Vec::new();
+    collect_block_opener_lines(node, &mut opener_lines);
+    let Some(first_underline) = opener_lines
+        .into_iter()
+        .filter(|&line| is_setext_underline(source, line))
+        .min()
+    else {
+        return results;
+    };
+    results.retain(|block| block.line < first_underline);
     results
+}
+
+/// The 1-based line of the opener of every delimited block, closed or not.
+fn collect_block_opener_lines(node: tree_sitter::Node, lines: &mut Vec<usize>) {
+    if block_context(node.kind()).is_some() {
+        lines.extend(node.child(0).map(|opener| opener.start_position().row + 1));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_block_opener_lines(child, lines);
+    }
+}
+
+/// Whether the 1-based `line` is the underline of a two-line section title.
+fn is_setext_underline(source: &[u8], line: usize) -> bool {
+    let Some(title_index) = line.checked_sub(2) else {
+        return false;
+    };
+    let mut lines = source.split(|&b| b == b'\n').skip(title_index);
+    let (Some(title), Some(underline)) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let (Ok(title), Ok(underline)) = (std::str::from_utf8(title), std::str::from_utf8(underline))
+    else {
+        return false;
+    };
+    let (title, underline) = (title.trim_end(), underline.trim_end());
+    let Some(first) = underline.chars().next() else {
+        return false;
+    };
+    ['=', '-', '~', '^', '+'].contains(&first)
+        && underline.chars().all(|c| c == first)
+        && title.chars().count().abs_diff(underline.chars().count()) <= 1
+        && is_setext_title(title)
+}
+
+/// Whether `line` is read as a section title text rather than as ATX title,
+/// attribute entry, block attribute line, block anchor, comment or
+/// block title.
+fn is_setext_title(line: &str) -> bool {
+    !line.starts_with('.')
+        && line.chars().any(|c| c.is_alphanumeric() || c == '_')
+        && !is_atx_title(line)
+        && !crate::ventilate::is_attribute_entry(line)
+        && !is_block_attribute_syntax(line)
+        && !is_block_anchor_syntax(line)
+        && !is_line_comment(line)
+}
+
+/// `// text`; `///` and longer are no comment for Asciidoctor.
+fn is_line_comment(line: &str) -> bool {
+    line.strip_prefix("//")
+        .is_some_and(|rest| !rest.starts_with('/'))
+}
+
+/// `==` to `======` or `#` to `######`, a blank, then text.
+fn is_atx_title(line: &str) -> bool {
+    let Some(marker) = line.chars().next().filter(|&c| c == '=' || c == '#') else {
+        return false;
+    };
+    let run = line.chars().take_while(|&c| c == marker).count();
+    let rest = &line[run..];
+    (1..=6).contains(&run) && rest.starts_with([' ', '\t']) && !rest.trim().is_empty()
+}
+
+/// `[]`, or `[` followed by a word character or one of `. # % { , " '`,
+/// closed by `]`. `[ x ]` is no attribute line for Asciidoctor.
+fn is_block_attribute_syntax(line: &str) -> bool {
+    let Some(inner) = line.strip_prefix('[') else {
+        return false;
+    };
+    inner.ends_with(']')
+        && (inner == "]"
+            || inner
+                .starts_with(|c: char| c.is_alphanumeric() || c == '_' || ".#%{,\"'".contains(c)))
+}
+
+/// `[[` followed by a letter, `_` or `:`, closed by `]]`.
+fn is_block_anchor_syntax(line: &str) -> bool {
+    line.strip_prefix("[[").is_some_and(|inner| {
+        inner.ends_with("]]")
+            && inner.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == ':')
+    })
 }
 
 /// `(end marker kind, Asciidoctor context)` of a delimited block node kind.
@@ -2182,6 +2288,134 @@ mod tests {
             "p\n\n++++\nraw\n",
             "p\n\n|===\na|b\n",
             "p\n\n====\n----\ncode\n====\n",
+        ];
+        for source in sources {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
+    }
+
+    /// Asciidoctor reads a title line directly above an underline of one
+    /// underline character and about the same length as a section title.
+    /// The grammar parses the underline as a delimiter; no diagnostic.
+    /// Only the `-`, `--` and `=` cases depend on the guard; `~`, `^` and
+    /// `+` are silent anyway, because the grammar opens no reported block
+    /// for them. They stay as regression guards.
+    #[test]
+    fn test_setext_title_underline_reports_nothing() {
+        let sources = [
+            "= Doc\n\nTitle Here\n---------\n\ntext\n",
+            "= Doc\n\nTitle Here\n----------\n\ntext\n",
+            "= Doc\n\nTitle Here\n-----------\n\ntext\n",
+            "= Doc\n:doctype: book\n\nPart Title\n==========\n\ntext\n",
+            "= Doc\n\nTitle Here\n~~~~~~~~~~\n\ntext\n",
+            "= Doc\n\nTitle Here\n^^^^^^^^^^\n\ntext\n",
+            "= Doc\n\nTitle Here\n++++++++++\n\ntext\n",
+            "= Doc\n\nab\n--\n\ntext\n",
+            "= Doc\n\na\n--\n\ntext\n",
+            "= Doc\n\n日本語の見出し\n-------\n\ntext\n",
+            "= Doc\n\n Title Here\n-----------\n\ntext\n",
+            "= Doc\n\n* item\n------\n\ntext\n",
+            "= Doc\n\n[ x ]\n-----\n\ntext\n",
+            "= Doc\n\n:foo:bar\n--------\n\ntext\n",
+            "= Doc\n\nTitle Here   \n----------  \n\ntext\n",
+            "= Doc\n\n[[sec-id]]\nTitle Here\n----------\n\ntext\n",
+            "Intro\n\nTitle Here\n----------\n\ntext\n",
+        ];
+        for source in sources {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
+    }
+
+    /// The grammar pairs the setext underline with a later delimiter of the
+    /// same length, so the real listing's closer is left as the open block.
+    /// Once an underline is misread, later reports cannot be trusted.
+    #[test]
+    fn test_setext_underline_paired_with_later_delimiter_reports_nothing() {
+        let sources = [
+            "= Doc\n\nCode\n----\n\nRun:\n\n[source,sh]\n----\nls -la\n----\n",
+            "= Doc\n\nCode\n----\n\nRun:\n\n[source,sh]\n----\nls\n----\n\nMore\n\n----\nx\n----\n",
+            "= Doc\n\nCode\n----\n\nRun:\n\n[source,sh]\n------\nls -la\n------\n",
+        ];
+        for source in sources {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn test_listing_under_line_of_other_length_is_unterminated() {
+        let cases = [
+            (
+                "= Doc\n\nTitle Here\n--------\n\ntext\n",
+                "listing",
+                "--------",
+            ),
+            (
+                "= Doc\n\nTitle Here\n------------\n\ntext\n",
+                "listing",
+                "------------",
+            ),
+            (
+                "= Doc\n\nPart Title\n========\n\ntext\n",
+                "example",
+                "========",
+            ),
+            ("= Doc\n\nabcd\n--\n\ntext\n", "open", "--"),
+            (
+                "= Doc\n\näöüäöü\n------------\n\ntext\n",
+                "listing",
+                "------------",
+            ),
+        ];
+        for (source, context, delimiter) in cases {
+            assert_eq!(
+                unterminated(source),
+                [(context, delimiter.to_string(), 4)],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_listing_after_blank_line_below_title_is_unterminated() {
+        assert_eq!(
+            unterminated("= Doc\n\nTitle Here\n\n----------\n\ntext\n"),
+            [("listing", "----------".to_string(), 5)]
+        );
+    }
+
+    #[test]
+    fn test_listing_under_non_title_line_is_unterminated() {
+        let cases = [
+            ("= Doc\n\n:foo: bar\n---------\n\ntext\n", "---------"),
+            ("= Doc\n\n[source]\n--------\n\ntext\n", "--------"),
+            ("= Doc\n\n[[id]]\n------\n\ntext\n", "------"),
+            ("= Doc\n\n// note\n-------\n\ntext\n", "-------"),
+            ("= Doc\n\n.Title\n------\n\ntext\n", "------"),
+            ("= Doc\n\n. foo\n-----\n\ntext\n", "-----"),
+            ("= Doc\n\n!!!!\n----\n\ntext\n", "----"),
+            ("= Doc\n\n== Chapter\n----------\n\ntext\n", "----------"),
+            ("= Doc\n\n## Chapter\n----------\n\ntext\n", "----------"),
+        ];
+        for (source, delimiter) in cases {
+            assert_eq!(
+                unterminated(source),
+                [("listing", delimiter.to_string(), 4)],
+                "{source:?}"
+            );
+        }
+    }
+
+    /// Asciidoctor warns here, since the title-like line is a paragraph
+    /// continuation, a list continuation or a line inside a delimited block.
+    /// The guard checks only the two lines of the construct, so these stay
+    /// silent.
+    #[test]
+    fn test_setext_shaped_line_inside_paragraph_list_or_block_reports_nothing() {
+        let sources = [
+            "= Doc\n\nfirst line\nTitle Here\n----------\n\ntext\n",
+            "= Doc\n\n* item\n+\nSome Text\n---------\ncode\n",
+            "= Doc\n\n====\nTitle Here\n----------\ntext\n====\n",
+            "= Doc\n\n--\nTitle Here\n----------\ntext\n--\n",
         ];
         for source in sources {
             assert_eq!(unterminated(source), [], "{source:?}");
