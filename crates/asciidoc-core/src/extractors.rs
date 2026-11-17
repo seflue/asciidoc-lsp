@@ -785,7 +785,14 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
 
     // `id_assignment` (inline tree) carries `id` and an optional `reftext`.
     if node.kind() == "id_assignment" {
-        let id = find_child_text(node, "id", source).unwrap_or_default();
+        let mut id = find_child_text(node, "id", source).unwrap_or_default();
+        // A bibliography anchor `[[[id]]]` parses as `[[` + `[id` + `]]`
+        // followed by a lone `]`.
+        if source.get(node.end_byte()) == Some(&b']') {
+            if let Some(inner) = id.strip_prefix('[') {
+                id = inner.to_string();
+            }
+        }
         let reftext = find_child_text(node, "reftext", source);
         if !id.is_empty() {
             results.push(Anchor {
@@ -1152,6 +1159,22 @@ mod tests {
         let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
         let (_, anchors) = extract_inline_content_safe(&ranges, source);
         anchors
+    }
+
+    #[test]
+    fn test_extract_bibliography_anchors() {
+        let source = "* [[[taoup]]] Raymond.\n* [[[pp,Pragmatic]]] Hunt.\n";
+        let got: Vec<_> = anchors_in(source)
+            .into_iter()
+            .map(|a| (a.id, a.reftext))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("taoup".to_string(), None),
+                ("pp".to_string(), Some("Pragmatic".to_string()))
+            ]
+        );
     }
 
     #[test]

@@ -1,0 +1,14 @@
+= Bibliography anchors
+
+// `[[[id]]]` and `[[[id,reftext]]]` in a bibliography list define anchors.
+// Expected: both citations resolve, no broken-xref diagnostic.
+
+== Design
+
+The approach follows <<taoup>> and <<pp>>.
+
+[bibliography]
+== References
+
+* [[[taoup]]] Eric S. Raymond. The Art of Unix Programming. 2003.
+* [[[pp,Pragmatic]]] Andrew Hunt, David Thomas. The Pragmatic Programmer.

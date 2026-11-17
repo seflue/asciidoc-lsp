@@ -1178,6 +1178,15 @@ mod tests {
         assert_eq!(broken_xrefs(&ws, &root.join("book.adoc")), vec![]);
     }
 
+    /// Asciidoctor (`bibliography_anchors/main.adoc`): no message, `<<taoup>>`
+    /// and `<<pp>>` resolve to the `[[[id]]]` entries of the bibliography.
+    #[test]
+    fn test_xrefs_to_bibliography_anchors_are_not_broken() {
+        let (root, ws) = fixture_workspace("bibliography_anchors");
+
+        assert_eq!(broken_xrefs(&ws, &root.join("main.adoc")), vec![]);
+    }
+
     /// Asciidoctor (`anchor_region_xref/web3.adoc`, `reference.adoc[tag=top]`):
     /// no message, `<<setup-only>>` lies outside the tag. `book.adoc` reads
     /// the whole file and finds `setup-only`. The LSP knows no tag regions:
