@@ -392,14 +392,38 @@ mod tests {
             .unwrap_or_else(|| panic!("no {ty} token {text:?} in {tokens:#?}"))
     }
 
+    /// The document title is two heading tokens, marker and text, as the
+    /// queries style those two parts of the header only.
     #[test]
     fn heading_carries_its_level() {
         let tokens = decoded(FIXTURE);
 
-        let title = find(&tokens, "heading", "= Document Title");
-        assert_eq!(title.mods, ["level1"]);
+        for text in ["=", "Document Title"] {
+            let title = find(&tokens, "heading", text);
+            assert_eq!(title.mods, ["level1"]);
+        }
         let section = find(&tokens, "heading", "== Section One");
         assert_eq!(section.mods, ["level2"]);
+    }
+
+    /// Only the title line of the header is a heading: the author and
+    /// revision lines, gaps included, carry no heading token. Asciidoctor
+    /// reads the lines as author (`Ada Lovelace`), email
+    /// (`ada@example.org`), revnumber (`1.0`), revdate (`2026-01-01`) and
+    /// revremark (`Draft`).
+    #[test]
+    fn author_and_revision_lines_are_no_heading() {
+        let tokens = decoded("= Title\nAda Lovelace <ada@example.org>\nv1.0, 2026-01-01: Draft\n");
+
+        let title = on_line(&tokens, 0);
+        assert!(
+            !title.is_empty() && title.iter().all(|t| t.ty == "heading"),
+            "{title:#?}"
+        );
+        for line in [1, 2] {
+            let on = on_line(&tokens, line);
+            assert!(on.iter().all(|t| t.ty != "heading"), "{on:#?}");
+        }
     }
 
     #[test]
