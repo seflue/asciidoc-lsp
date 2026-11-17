@@ -976,7 +976,9 @@ fn anchor_reference_locations(
 }
 
 /// How an xref on `line` resolves, per top-level document, with each
-/// document's own ID catalog. A target with a file part also resolves
+/// document's own ID catalog. The file part is read from the folder of the
+/// document, as Asciidoctor reads it, also in an included file. A target
+/// with a file part also resolves
 /// in the editor's preview of a file others include (ADR-4): the path as
 /// the preview sees it, and the ID in the catalog of that file read alone,
 /// which is what Asciidoctor knows when it converts the file on its own. A
@@ -1013,13 +1015,13 @@ fn resolve_xref_targets(
             })
             .collect();
     }
-    let dir = document_dir(doc_path, Some(ws));
     if target.contains('{') {
         // An attribute reference in the file part reads differently in each
         // scope, so each scope is read for its own attributes.
         return path_scopes(ws, doc_path, line)
             .filter_map(|scope| {
                 let catalog = catalogs.get(scope.document());
+                let dir = document_dir(scope.document(), Some(ws));
                 let resolved = catalogs.resolve_xref_in(&catalog, &xref, |file| {
                     Some(canonicalize_if_exists(join_doc_path(
                         dir,
@@ -1044,6 +1046,7 @@ fn resolve_xref_targets(
             (label, catalog)
         }))
         .filter_map(|(label, catalog)| {
+            let dir = document_dir(catalog.document(), Some(ws));
             let resolved = catalogs.resolve_xref_in(&catalog, &xref, |file| {
                 Some(canonicalize_if_exists(join_doc_path(dir, file)))
             });
@@ -2184,6 +2187,35 @@ mod tests {
 
         assert_eq!(goto(13), vec![(path.clone(), 9)]);
         assert_eq!(goto(42), vec![(path.clone(), 13)]);
+    }
+
+    /// Asciidoctor (`xref_path_in_include/index.adoc`) reads the file part of
+    /// an xref in the included `chapters/setup.adoc` from the folder of
+    /// `index.adoc`: `xref:chapters/reference.adoc#ref-options[]` renders as
+    /// `#ref-options`, `xref:reference.adoc#ref-options[]` as
+    /// `reference.html#ref-options`, a link to the top-level `reference.adoc`,
+    /// which has no `ref-options`. The preview reads `setup.adoc` alone, from
+    /// its own folder, where the second path names `chapters/reference.adoc`.
+    #[test]
+    fn test_xref_path_in_included_file_resolves_from_the_top_level_document() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/xref_path_in_include")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let path = root.join("chapters/setup.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let at = |line, character| Position { line, character };
+
+        let targets = resolve_goto_definitions(&content, at(8, 40), &path, Some(&ws));
+        assert_eq!(targets, vec![(root.join("chapters/reference.adoc"), 3)]);
+        let hover = resolve_hover(&content, at(10, 55), &path, Some(&ws)).unwrap();
+        assert_eq!(
+            hover,
+            "In index.adoc:\n\u{2717} Target not found\n\n\
+             In setup.adoc (preview):\n\u{2192} Options\n\nreference.adoc:3"
+        );
     }
 
     /// Asciidoctor resolves `<<_second>>` in the document it converts: each

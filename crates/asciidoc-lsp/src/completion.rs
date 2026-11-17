@@ -1098,11 +1098,12 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         );
     }
 
-    // The file as each scope reads it (ADR-4); anchors of any of them.
+    // The file as each scope reads it (ADR-4), from the scope's folder, as
+    // Asciidoctor reads it; anchors of any of them.
     let base = document_dir(doc_path, Some(ws));
-    let resolved: Vec<String> = path_scopes(ws, doc_path, line)
-        .map(|scope| scope.substitute(file))
-        .filter(|resolved| !resolved.contains('{'))
+    let resolved: Vec<(PathBuf, String)> = path_scopes(ws, doc_path, line)
+        .map(|scope| (scope_docdir(&scope, base), scope.substitute(file)))
+        .filter(|(_, resolved)| !resolved.contains('{'))
         .collect();
     if resolved.is_empty() {
         return Vec::new();
@@ -1114,8 +1115,8 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     // has its name, as go-to-definition and the diagnostics find it.
     let canonical_targets: Vec<PathBuf> = resolved
         .iter()
-        .filter_map(|resolved| {
-            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(base, resolved))
+        .filter_map(|(dir, resolved)| {
+            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(dir, resolved))
                 .ok()
                 .or_else(|| find_target_file(ws.documents(), None, resolved).cloned())
         })
@@ -2897,6 +2898,24 @@ mod tests {
             "xref:chapters/reference.adoc#",
         );
         assert!(labels.contains(&"ref-options".to_string()), "{labels:?}");
+    }
+
+    /// Asciidoctor (`xref_path_in_include/index.adoc`) renders
+    /// `xref:reference.adoc#ref-options[]` in the included
+    /// `chapters/setup.adoc` as `reference.html#ref-options`: from the folder
+    /// of `index.adoc` the path names the top-level `reference.adoc`, which
+    /// defines `top-options`. The preview reads it from the chapter's folder,
+    /// where it names `chapters/reference.adoc` with `ref-options`.
+    #[test]
+    fn test_xref_cross_completions_in_included_file_read_each_scope_from_its_folder() {
+        let labels = labels_in(
+            fixture("xref_path_in_include"),
+            "chapters/setup.adoc",
+            "xref:reference.adoc#",
+        );
+        for expected in ["top-options", "ref-options"] {
+            assert!(labels.contains(&expected.to_string()), "{labels:?}");
+        }
     }
 
     #[test]

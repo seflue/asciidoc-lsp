@@ -1,0 +1,11 @@
+= Top-level Reference
+
+// No document includes this file. From the folder of index.adoc,
+// xref:reference.adoc#ref-options in chapters/setup.adoc names this file,
+// which has no ref-options. Read from the folder of chapters/setup.adoc,
+// the same path would name chapters/reference.adoc.
+
+[[top-options]]
+== Top options
+
+Text.

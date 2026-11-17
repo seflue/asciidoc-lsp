@@ -226,10 +226,11 @@ impl<'ws> CatalogCache<'ws> {
         location.ok_or_else(broken)
     }
 
-    /// [`Self::resolve_xref_in`] for an xref that stands in `path`, with the
-    /// file part resolved as `path` sees it: in the attribute scope of the
-    /// document `scope` among `attribute_scopes` (the scopes of the xref's
-    /// line, needed only when the target has an attribute reference).
+    /// [`Self::resolve_xref_in`] for an xref in a file `scope` reads, with the
+    /// file part resolved as Asciidoctor resolves it when it converts the
+    /// document `scope`: from that document's folder, in its attribute scope
+    /// among `attribute_scopes` (the scopes of the xref's line, needed only
+    /// when the target has an attribute reference).
     ///
     /// # Errors
     /// Returns a `DiagnosticKind::BrokenXref` if the file or the ID cannot be
@@ -237,7 +238,6 @@ impl<'ws> CatalogCache<'ws> {
     pub(crate) fn resolve_read(
         &self,
         scope: &AnchorScope,
-        path: &Path,
         xref: &Xref,
         attribute_scopes: &[AttributeScope<'_>],
     ) -> Result<ResolvedXref, DiagnosticKind> {
@@ -245,7 +245,8 @@ impl<'ws> CatalogCache<'ws> {
             .iter()
             .find(|candidate| candidate.document() == scope.document());
         self.resolve_xref_in(scope, xref, |file| {
-            self.workspace.resolve_xref_file(path, attributes, file)
+            self.workspace
+                .resolve_xref_file(scope.document(), attributes, file)
         })
     }
 
@@ -270,7 +271,7 @@ impl<'ws> CatalogCache<'ws> {
                     Vec::new()
                 };
                 let reaches_definition = self.scopes_at(path).iter().any(|scope| {
-                    self.resolve_read(scope, path, xref, &attribute_scopes)
+                    self.resolve_read(scope, xref, &attribute_scopes)
                         .is_ok_and(|resolved| {
                             definitions.iter().any(|definition| {
                                 resolved.file == definition.file && resolved.line == definition.line
@@ -364,21 +365,22 @@ impl Workspace {
         definitions
     }
 
-    /// The file part of an xref in `path`, as a path. `attributes` is the
-    /// scope of the top-level document that reads the xref, which fills in
-    /// attribute references in the target.
+    /// The file part of an xref read in the top-level document `document`,
+    /// as a path. Asciidoctor resolves it from the folder of `document`, also
+    /// when the xref stands in an included file. `attributes` is the scope of
+    /// `document`, which fills in attribute references in the target.
     pub(crate) fn resolve_xref_file(
         &self,
-        path: &Path,
+        document: &Path,
         attributes: Option<&AttributeScope<'_>>,
         file: &str,
     ) -> Option<PathBuf> {
-        match (attributes, self.attributes.doc_dir(path)) {
+        match (attributes, self.attributes.doc_dir(document)) {
             (Some(attributes), Some(dir)) => Some(canonicalize_if_exists(join_doc_path(
                 dir,
                 &attributes.substitute(file),
             ))),
-            _ => resolve_doc_target(path, file, &self.attributes),
+            _ => resolve_doc_target(document, file, &self.attributes),
         }
     }
 

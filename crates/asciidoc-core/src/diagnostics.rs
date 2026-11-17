@@ -160,7 +160,7 @@ pub fn collect_diagnostics(
                 .filter(|scope| scope.reads_whole(path))
                 .filter(|scope| {
                     catalogs
-                        .resolve_read(scope, path, xref, &attribute_scopes)
+                        .resolve_read(scope, xref, &attribute_scopes)
                         .is_err()
                 })
                 .map(|scope| display_path(root, scope.document()))
@@ -1185,6 +1185,22 @@ mod tests {
         let (root, ws) = fixture_workspace("bibliography_anchors");
 
         assert_eq!(broken_xrefs(&ws, &root.join("main.adoc")), vec![]);
+    }
+
+    /// Asciidoctor (`xref_path_in_include/index.adoc`) resolves the file part
+    /// of an xref in the included `chapters/setup.adoc` from the folder of
+    /// `index.adoc`: `xref:chapters/reference.adoc#ref-options[]` renders as
+    /// `#ref-options`, `xref:reference.adoc#ref-options[]` as the dead link
+    /// `reference.html#ref-options` to the top-level `reference.adoc`, whose
+    /// page has only `top-options`. Asciidoctor does not check that link.
+    #[test]
+    fn test_xref_path_in_included_file_resolves_from_the_top_level_document() {
+        let (root, ws) = fixture_workspace("xref_path_in_include");
+
+        assert_eq!(
+            broken_xrefs(&ws, &root.join("chapters/setup.adoc")),
+            vec![("reference.adoc#ref-options", vec![])]
+        );
     }
 
     /// Asciidoctor (`natural_xrefs/main.adoc`): only `INFO: possible invalid

@@ -1,0 +1,11 @@
+= Setup
+
+// In an included file the path of an interdocument xref is relative to
+// the top-level document. Asciidoctor turns the first xref into an
+// internal link (#ref-options) and the second into a dead link
+// (reference.html#ref-options), because the master includes
+// chapters/reference.adoc, not reference.adoc.
+
+Good: xref:chapters/reference.adoc#ref-options[options].
+
+Dead in the converted master: xref:reference.adoc#ref-options[options].

@@ -20,6 +20,6 @@ image::diagrams/arch.svg[Architecture]
 == Configuration
 
 Edit the file shown in <<setup-install>>.
-Options are listed in xref:reference.adoc#ref-options[the reference].
+Options are listed in xref:chapters/reference.adoc#ref-options[the reference].
 
 WARNING: Back up your data first.

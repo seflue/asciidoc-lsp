@@ -94,7 +94,6 @@ fn replacements(
 /// since then the file, not the ID, is the problem.
 fn xref_candidates(
     catalogs: &CatalogCache<'_>,
-    path: &Path,
     xref: &Xref,
     scopes: &[Rc<AnchorScope>],
     attribute_scopes: &[AttributeScope<'_>],
@@ -110,7 +109,7 @@ fn xref_candidates(
                     ..xref.clone()
                 };
                 let resolved = catalogs
-                    .resolve_read(scope, path, &probe, attribute_scopes)
+                    .resolve_read(scope, &probe, attribute_scopes)
                     .ok()?;
                 if scope.contains_file(&resolved.file) {
                     Rc::clone(scope)
@@ -157,7 +156,7 @@ fn xref_fixes(
     } else {
         Vec::new()
     };
-    let Some(ids) = xref_candidates(&catalogs, path, xref, &scopes, &attribute_scopes) else {
+    let Some(ids) = xref_candidates(&catalogs, xref, &scopes, &attribute_scopes) else {
         return Vec::new();
     };
 
@@ -170,7 +169,7 @@ fn xref_fixes(
         };
         scopes.iter().all(|scope| {
             catalogs
-                .resolve_read(scope, path, &fixed, &attribute_scopes)
+                .resolve_read(scope, &fixed, &attribute_scopes)
                 .is_ok()
         })
     };
