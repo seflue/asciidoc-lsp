@@ -1,0 +1,6 @@
+[[a-id]]
+== A
+
+// tag::t[]
+Inside tag t.
+// end::t[]
