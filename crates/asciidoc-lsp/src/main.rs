@@ -892,6 +892,11 @@ impl LanguageServer for AsciiDocLsp {
 
         let ws = self.workspace.lock();
         log_navigation_request("rename", &doc_path, position, &content, ws.is_some());
+        if let Some(reason) =
+            navigation::rename_conflict(&content, position, &doc_path, ws.as_ref(), &new_name)
+        {
+            return Err(jsonrpc::Error::invalid_params(reason));
+        }
         let result =
             navigation::resolve_rename(&content, position, &doc_path, ws.as_ref(), &overrides);
         drop(ws);

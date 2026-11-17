@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::Position;
 use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::diagnostics::display_path;
-use asciidoc_core::extractors::{element_attr_id, find_child_text};
+use asciidoc_core::extractors::{element_attr_id, find_child_text, is_valid_anchor_id};
 use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
 use asciidoc_core::references::{parse_xref_target, xref_names_file};
@@ -1651,6 +1651,7 @@ pub fn prepare_rename(
                     || definitions
                         .iter()
                         .any(|loc| loc.kind == AnchorKind::ImplicitSection)
+                    || names_no_id(&catalogs, doc_path, target, anchor_id)
                 {
                     return None;
                 }
@@ -1667,6 +1668,11 @@ pub fn prepare_rename(
                 start_col: start,
                 end_col: end,
             })
+        }
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. }
+            if crate::completion::doc_attribute_doc(name).is_some() =>
+        {
+            None
         }
         NodeKind::AttributeRef { name } => {
             let (_, byte_col) = positions::from_lsp_position(pos, content);
@@ -1690,6 +1696,73 @@ pub fn prepare_rename(
                 start_col: start,
                 end_col: end,
             })
+        }
+        NodeKind::Include { .. } | NodeKind::Image { .. } => None,
+    }
+}
+
+/// An xref that names its target by title or reftext (`<<Command line>>`)
+/// in every document that reads it, not by ID: renaming the ID would rewrite
+/// the text into an ID reference.
+fn names_no_id(catalogs: &CatalogCache<'_>, doc_path: &Path, target: &str, id: &str) -> bool {
+    parse_xref_target(target).0.is_none()
+        && catalogs
+            .scopes_at(doc_path)
+            .iter()
+            .all(|scope| scope.lookup(id).is_none())
+}
+
+/// A name an attribute reference `{name}` can carry: a word character, then
+/// word characters or `-` (Asciidoctor's `AttributeReferenceRx`).
+fn is_valid_attribute_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+/// Why the symbol at `pos` cannot be renamed to `new_name`, if it cannot:
+/// the name is no valid ID or attribute name, names a built-in attribute, or
+/// the document already defines it (the rename would merge two symbols).
+pub fn rename_conflict(
+    content: &str,
+    pos: Position,
+    doc_path: &Path,
+    workspace: Option<&Workspace>,
+    new_name: &str,
+) -> Option<String> {
+    let node_info = find_node_at_position(content, pos)?;
+    match &node_info.kind {
+        NodeKind::Anchor { .. } | NodeKind::Xref { .. } | NodeKind::ShorthandXref { .. } => {
+            if !is_valid_anchor_id(new_name) {
+                return Some(format!("`{new_name}` is not a valid ID"));
+            }
+            let old_id = match &node_info.kind {
+                NodeKind::Anchor { id } => Some(id.as_str()),
+                NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
+                    parse_xref_target(target).1
+                }
+                _ => None,
+            };
+            let catalogs = CatalogCache::new(workspace?);
+            (old_id != Some(new_name)
+                && catalogs
+                    .scopes_at(doc_path)
+                    .iter()
+                    .any(|scope| scope.lookup(new_name).is_some()))
+            .then(|| format!("ID `{new_name}` is already defined"))
+        }
+        NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. } => {
+            if !is_valid_attribute_name(new_name) {
+                return Some(format!("`{new_name}` is not a valid attribute name"));
+            }
+            if crate::completion::doc_attribute_doc(new_name).is_some() {
+                return Some(format!("`{new_name}` is a built-in attribute"));
+            }
+            let defined = workspace?.definition_sites(doc_path, node_info.line, new_name);
+            (new_name != name && !defined.is_empty())
+                .then(|| format!("attribute `{new_name}` is already defined"))
         }
         NodeKind::Include { .. } | NodeKind::Image { .. } => None,
     }
@@ -1751,6 +1824,9 @@ pub fn resolve_rename(
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             let anchor_id = parse_xref_target(target).1?;
             let catalogs = CatalogCache::new(ws);
+            if names_no_id(&catalogs, doc_path, target, anchor_id) {
+                return None;
+            }
             let definitions = anchor_definitions_of_xref(
                 ws,
                 &catalogs,
@@ -5829,6 +5905,77 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(r.placeholder, "my-anchor");
         assert_eq!(r.start_col, 2);
         assert_eq!(r.end_col, 11);
+    }
+
+    fn conflict_at(source: &str, line: u32, character: u32, new_name: &str) -> Option<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, source).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
+        rename_conflict(
+            source,
+            Position { line, character },
+            &a,
+            Some(&ws),
+            new_name,
+        )
+    }
+
+    #[rstest::rstest]
+    #[case::id_with_space("two words", Some("`two words` is not a valid ID"))]
+    #[case::existing_id("other", Some("ID `other` is already defined"))]
+    #[case::existing_section_id("_more", Some("ID `_more` is already defined"))]
+    #[case::same_id("my-anchor", None)]
+    #[case::free_id("fresh", None)]
+    fn test_rename_conflict_anchor(#[case] new_name: &str, #[case] expected: Option<&str>) {
+        let source = "= T\n\n[[my-anchor]]\n== Section\n\n[[other]]\nText.\n\n== More\n";
+        assert_eq!(conflict_at(source, 2, 4, new_name).as_deref(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::name_with_space("two words", Some("`two words` is not a valid attribute name"))]
+    #[case::builtin("toc", Some("`toc` is a built-in attribute"))]
+    #[case::existing("version", Some("attribute `version` is already defined"))]
+    #[case::same("product", None)]
+    #[case::free("brand", None)]
+    fn test_rename_conflict_attribute(#[case] new_name: &str, #[case] expected: Option<&str>) {
+        let source = "= T\n:product: X\n:version: 1\n\n{product} {version}\n";
+        assert_eq!(conflict_at(source, 4, 2, new_name).as_deref(), expected);
+    }
+
+    #[test]
+    fn test_prepare_rename_rejects_builtin_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        let source = "= T\n:toc: left\n";
+        fs::write(&a, source).unwrap();
+        let ws = Workspace::build(tmp.path(), &a);
+
+        let pos = Position {
+            line: 1,
+            character: 2,
+        };
+        assert_eq!(prepare_rename(source, pos, &a, Some(&ws)), None);
+    }
+
+    /// `<<Command line>>` names the anchor `cli` by its reftext; renaming
+    /// `cli` would turn the text into an ID reference.
+    #[test]
+    fn test_prepare_rename_rejects_natural_xref() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/natural_xrefs")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let path = root.join("main.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+
+        let pos = Position {
+            line: 19,
+            character: 42,
+        };
+        assert_eq!(prepare_rename(&content, pos, &path, Some(&ws)), None);
     }
 
     #[test]
