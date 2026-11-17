@@ -377,6 +377,7 @@ fn pdf_paths_display(name: &str, paths: &[PdfPath]) -> String {
 /// - `pdf-theme`, `pdf-themesdir`, `pdf-fontsdir` (reference or definition):
 ///   resolved absolute path
 /// - `Xref`/`ShorthandXref`: section title + file, or `✗ Target not found`
+/// - `Anchor`: what an xref to its ID shows from there
 /// - `Include`: resolved path + file info
 pub fn resolve_hover(
     content: &str,
@@ -544,7 +545,18 @@ pub fn resolve_hover(
                 .collect();
             Some(per_document_hover(texts))
         }
-        NodeKind::Anchor { .. } => None,
+        NodeKind::Anchor { id } => {
+            let ws = workspace?;
+            let catalogs = CatalogCache::new(ws);
+            let texts: Vec<(String, String)> =
+                resolve_xref_targets(ws, &catalogs, doc_path, id, node_info.line)
+                    .into_iter()
+                    .filter_map(|(label, resolved)| {
+                        Some((label, xref_hover(ws, id, &resolved.ok()?)))
+                    })
+                    .collect();
+            (!texts.is_empty()).then(|| per_document_hover(texts))
+        }
     }
 }
 
@@ -2922,6 +2934,74 @@ mod tests {
         let hover = resolve_hover(&content, pos, &index, Some(&ws)).unwrap();
 
         assert!(hover.contains("reference.adoc"), "got {hover}");
+    }
+
+    /// Hover at `needle` on the first line of `file` (below `root`) that
+    /// contains it, in the workspace of the top-level document `index.adoc`.
+    fn hover_in_fixture(root: &Path, file: &str, needle: &str) -> Option<String> {
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        let ws = Workspace::build(root, &root.join("index.adoc"));
+        let (row, text) = content
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(needle))
+            .unwrap();
+        let pos = Position {
+            line: u32::try_from(row).unwrap(),
+            character: u32::try_from(text.find(needle).unwrap()).unwrap(),
+        };
+        resolve_hover(&content, pos, &path, Some(&ws))
+    }
+
+    /// Hover on an anchor declaration shows what hover on an xref to it
+    /// shows. Asciidoctor (`adversarial_project/index.adoc`): `<<glossary>>`
+    /// renders as `<a href="#glossary">Glossary</a>` and `<<intro-audience,
+    /// ...>>` links `#intro-audience`, the `Audience` section.
+    #[rstest::rstest]
+    #[case::block_anchor(
+        ("index.adoc", "[[glossary]]"),
+        ("chapters/reference.adoc", "<<glossary>>"),
+        "\u{2192} Glossary\n\nindex.adoc:25"
+    )]
+    #[case::block_id(
+        // A `[#id]` attribute list counts with the cursor on the ID only.
+        ("chapters/intro.adoc", "intro-audience]"),
+        ("chapters/setup.adoc", "<<intro-audience"),
+        "\u{2192} Audience\n\nintro.adoc:9"
+    )]
+    fn test_hover_anchor_declaration_shows_what_an_xref_to_it_shows(
+        #[case] declaration: (&str, &str),
+        #[case] xref: (&str, &str),
+        #[case] expected: &str,
+    ) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+
+        let on_declaration = hover_in_fixture(&root, declaration.0, declaration.1);
+        let on_xref = hover_in_fixture(&root, xref.0, xref.1);
+
+        assert_eq!(on_declaration.as_deref(), Some(expected));
+        assert_eq!(on_declaration, on_xref);
+    }
+
+    /// Asciidoctor (`inline_anchor_macro/index.adoc`): `anchor:plain[]`
+    /// renders `<a id="plain"></a>`, `<<plain>>` links it as `[plain]`. An
+    /// anchor outside a section title shows the anchor and its place.
+    #[test]
+    fn test_hover_inline_anchor_macro_declaration_shows_what_an_xref_to_it_shows() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/inline_anchor_macro")
+            .canonicalize()
+            .unwrap();
+
+        let on_declaration = hover_in_fixture(&root, "index.adoc", "anchor:plain[]");
+        let on_xref = hover_in_fixture(&root, "index.adoc", "<<plain>>");
+
+        assert_eq!(on_declaration.as_deref(), Some("[[plain]]\n\nindex.adoc:5"));
+        assert_eq!(on_declaration, on_xref);
     }
 
     #[test]
