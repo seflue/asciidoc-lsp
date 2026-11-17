@@ -363,10 +363,22 @@ const VERBATIM_STYLES: [&str; 8] = [
     "comment",
 ];
 
+/// Whether a delimited block has style `verse` and `subs` without
+/// `attributes`. Verse has the normal substitutions by default.
+fn verse_without_attributes(block: Node, source: &str) -> bool {
+    let attrs = block_attrs(block, source);
+    attrs.style.as_deref() == Some("verse")
+        && attrs
+            .subs
+            .as_deref()
+            .is_some_and(|subs| !subs_has_attributes(subs, true, false))
+}
+
 /// Whether the text of an inline range is substituted: its paragraph or
 /// admonition has `attributes` among its substitutions, no open block around
 /// it takes the text for something else and it is no literal table cell.
-/// Compound blocks (example, sidebar, quote) ignore `subs`.
+/// Compound blocks (example, sidebar, quote) ignore `subs`; a quote or open
+/// block with style `verse` is a leaf and obeys them.
 fn inline_text_is_substituted(root: Node, range: Range, source: &str) -> bool {
     let Some(mut node) = root.descendant_for_byte_range(range.start_byte, range.end_byte) else {
         return false;
@@ -388,6 +400,9 @@ fn inline_text_is_substituted(root: Node, range: Range, source: &str) -> bool {
                 if !has {
                     return false;
                 }
+            }
+            "quoted_block" | "open_block" if verse_without_attributes(node, source) => {
+                return false;
             }
             "open_block"
                 if block_attrs(node, source)
@@ -834,6 +849,11 @@ mod tests {
     #[case::admonition("NOTE: {x}\n")]
     #[case::example_ignores_subs("[subs=\"-attributes\"]\n====\n{x}\n====\n")]
     #[case::verse("[verse]\n{x}\n")]
+    #[case::quote_block_ignores_subs("[quote,subs=-attributes]\n____\n{x}\n____\n")]
+    #[case::quote_block_no_style_ignores_subs("[subs=-attributes]\n____\n{x}\n____\n")]
+    #[case::verse_block("[verse]\n____\n{x}\n____\n")]
+    #[case::verse_block_plus_attributes("[verse,subs=+attributes]\n____\n{x}\n____\n")]
+    #[case::verse_open_block("[verse]\n--\n{x}\n--\n")]
     #[case::paragraph("A {x} b\n")]
     #[case::asciidoc_cell_paragraph("|===\na| Para {x}\n|===\n")]
     #[case::asciidoc_cell_list_item("|===\na|\n* item {x}\n|===\n")]
@@ -911,6 +931,15 @@ mod tests {
     #[case::open_comment("[comment]\n--\n{x}\n--\n")]
     #[case::open_pass("[pass]\n--\n{x}\n--\n")]
     #[case::open_source("[source]\n--\n{x}\n--\n")]
+    #[case::verse_block_minus_attributes("[verse,subs=-attributes]\n____\n{x}\n____\n")]
+    #[case::verse_block_subs_none("[verse,subs=none]\n____\n{x}\n____\n")]
+    #[case::verse_block_subs_quotes("[verse,subs=quotes]\n____\n{x}\n____\n")]
+    #[case::verse_block_split_lists("[verse]\n[subs=-attributes]\n____\n{x}\n____\n")]
+    #[case::verse_block_titled(
+        ".T\n[[a]]\n[verse,Author,Cite,subs=-attributes]\n____\n{x}\n____\n"
+    )]
+    #[case::verse_block_spaced("[verse, Author, Cite, subs=-attributes]\n____\n{x}\n____\n")]
+    #[case::verse_open_block_minus_attributes("[verse,subs=-attributes]\n--\n{x}\n--\n")]
     #[case::fenced("```\n{x}\n```\n")]
     #[case::literal_cell("|===\nl|{x}\n|===\n")]
     #[case::listing_in_a_cell("|===\na|\n----\n{x}\n----\n|===\n")]
