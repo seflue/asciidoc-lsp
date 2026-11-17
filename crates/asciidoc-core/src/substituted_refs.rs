@@ -135,8 +135,9 @@ fn is_asciidoc_cell(root: Node, range: Range, source: &str) -> bool {
 
 /// Rows of the raw text of an `a` cell that Asciidoctor does not read as
 /// text: `//` comments, delimited comment/listing/literal/passthrough blocks
-/// and indented literal paragraphs. The grammar gives the cell as one raw
-/// range, so the nested block structure is recovered line by line.
+/// and indented literal paragraphs. The grammar leaves the text it does not
+/// parse as a block raw in `table_cell_content`; the block structure of
+/// that text is recovered line by line.
 fn asciidoc_cell_raw_rows(
     source: &str,
     start: usize,
@@ -147,15 +148,24 @@ fn asciidoc_cell_raw_rows(
     let mut rows = Vec::new();
     let mut delimiter = None;
     let mut in_literal = false;
-    let mut after_blank = true;
+    let mut block_start = true;
     for (offset, line) in source[start..end].split('\n').enumerate() {
         let row = first_row + offset;
         // The first line starts after `a|`: it is never an indented literal.
         let mid_line = offset == 0 && start != line_starts[first_row];
         let blank = line.trim().is_empty();
+        let was_open = delimiter.is_some();
         let raw = crate::extractors::is_raw_text_line(line, &mut delimiter);
+        // A closing delimiter ends a block; a line comment between blocks
+        // keeps the block start, inside a paragraph it does not end it.
+        // Asciidoctor reads `//` as a comment only when no third `/` follows.
+        let closed = was_open && delimiter.is_none();
+        let comment = delimiter.is_none()
+            && line
+                .strip_prefix("//")
+                .is_some_and(|rest| !rest.starts_with('/'));
         let starts_literal = !mid_line
-            && after_blank
+            && block_start
             && !blank
             && delimiter.is_none()
             && line.starts_with([' ', '\t']);
@@ -163,7 +173,7 @@ fn asciidoc_cell_raw_rows(
             rows.push(row);
         }
         in_literal = !blank && (in_literal || starts_literal);
-        after_blank = blank;
+        block_start = blank || closed || block_start && comment;
     }
     rows
 }
@@ -910,6 +920,10 @@ mod tests {
     #[case::cols_cell_spec_overrides("[cols=\"1l,1a\"]\n|===\nd|d1 {x}\n|===\n")]
     #[case::cols_monospace_column("[cols=\"1m\"]\n|===\n| {x}\n|===\n")]
     #[case::cols_without_style("[cols=\"1,2\"]\n|===\n| {x}\n|===\n")]
+    #[case::cell_indent_continues_paragraph_after_comment(
+        "|===\na|\npara\n// c\n  ind {x}\n|===\n"
+    )]
+    #[case::cell_indent_after_triple_slash_text("|===\na|\n/// x\n  ind {x}\n|===\n")]
     fn reports_in_contexts(#[case] source: &str) {
         assert_eq!(names(source), ["x"], "{source:?}");
     }
@@ -1006,6 +1020,12 @@ mod tests {
     #[case::cols_unknown_cell_style_v("[cols=\"1l\"]\n|===\nv|v1 {x}\n|===\n")]
     #[case::cols_literal_span_cell("[cols=\"1l,1l\"]\n|===\n2+|lit {x}\n|===\n")]
     #[case::cols_asciidoc_listing("[cols=\"1a,1\"]\n|===\n|\n----\ncode {x}\n----\n| b\n|===\n")]
+    #[case::cell_literal_after_line_comment("|===\na|\n// c\n  ind {x}\n|===\n")]
+    #[case::cell_literal_after_block_comment("|===\na|\n////\nc\n////\n  ind {x}\n|===\n")]
+    #[case::cell_literal_after_block_comment_after_text(
+        "|===\na| t\n////\nc\n////\n  ind {x}\n|===\n"
+    )]
+    #[case::cell_literal_after_listing("|===\na|\n----\ncode\n----\n  after {x}\n|===\n")]
     fn quiet_contexts(#[case] source: &str) {
         assert_eq!(names(source), Vec::<String>::new(), "{source:?}");
     }
