@@ -446,6 +446,40 @@ mod tests {
         }
     }
 
+    /// "xref", "link", "image" and "menu" in prose are words, not macros; the
+    /// macro name of `btn:[OK]` stays a keyword. Asciidoctor renders the
+    /// prose line as plain `<p>` text; `btn:[OK]` stays literal there, as
+    /// the `experimental` attribute is unset.
+    #[test]
+    fn macro_names_are_keywords_only_in_a_macro() {
+        let tokens = decoded(FIXTURE);
+
+        let prose = on_line(&tokens, 33);
+        assert!(prose.iter().all(|t| t.ty != "keyword"), "{prose:#?}");
+        let macro_line = on_line(&tokens, 35);
+        assert!(
+            macro_line
+                .iter()
+                .any(|t| t.ty == "keyword" && t.text == "btn"),
+            "{macro_line:#?}"
+        );
+    }
+
+    /// A `....` literal block is verbatim like a listing: its body is raw and
+    /// gets no inline markup. Asciidoctor: `<pre>literal *not bold*</pre>`.
+    #[test]
+    fn literal_block_body_is_raw() {
+        let tokens = decoded(FIXTURE);
+
+        let body = on_line(&tokens, 40);
+        assert!(
+            body.iter()
+                .any(|t| t.ty == "raw" && t.text.contains("literal")),
+            "{body:#?}"
+        );
+        assert!(body.iter().all(|t| t.ty != "strong"), "{body:#?}");
+    }
+
     #[test]
     fn xref_target_is_a_link() {
         let tokens = decoded(FIXTURE);

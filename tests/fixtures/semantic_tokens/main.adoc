@@ -28,3 +28,15 @@ NOTE: Mind the gap.
 == Section Two
 
 * first item
+
+== Prose and edge markup
+
+The words xref, link, image and menu are plain prose here.
+
+Role text [.term]#widget# comes before a later btn:[OK] macro.
+
+The page <https://example.org> sits in angle brackets.
+
+....
+literal *not bold*
+....
