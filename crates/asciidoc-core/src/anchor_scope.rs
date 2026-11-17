@@ -660,6 +660,7 @@ fn is_same_definition(a: &AnchorLocation, b: &AnchorLocation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Placement;
 
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -979,7 +980,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
-            placement: crate::types::Placement::Body,
+            placement: Placement::Body,
         }
     }
 

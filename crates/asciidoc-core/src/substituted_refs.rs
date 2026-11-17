@@ -123,8 +123,7 @@ fn is_asciidoc_cell(root: Node, range: Range, source: &str) -> bool {
         if node.kind() == "table_cell_content" {
             return node
                 .parent()
-                .and_then(|cell| child_of_kind(cell, "table_cell_attr"))
-                .is_some_and(|attr| text(attr, source).ends_with('a'));
+                .is_some_and(|cell| cell_style(cell, source) == Some('a'));
         }
         match node.parent() {
             Some(parent) => node = parent,
@@ -169,7 +168,7 @@ fn asciidoc_cell_raw_rows(
             && !blank
             && delimiter.is_none()
             && line.starts_with([' ', '\t']);
-        if raw || in_literal && !blank || starts_literal {
+        if raw || (in_literal && !blank) || starts_literal {
             rows.push(row);
         }
         in_literal = !blank && (in_literal || starts_literal);
@@ -917,9 +916,11 @@ mod tests {
     #[case::entry_pass_plus_later_token(":p: pass:c,+a[{x}]\n")]
     #[case::entry_pass_continued_trailing(":p: pass:[a] \\\n{x}\n")]
     #[case::entry_pass_unclosed(":p: pass:[{x}\n")]
-    #[case::cols_cell_spec_overrides("[cols=\"1l,1a\"]\n|===\nd|d1 {x}\n|===\n")]
+    #[case::cols_cell_spec_overrides("[cols=\"1l,1a\"]\n|===\nd|d1 {x}\n|b\n|===\n")]
     #[case::cols_monospace_column("[cols=\"1m\"]\n|===\n| {x}\n|===\n")]
-    #[case::cols_without_style("[cols=\"1,2\"]\n|===\n| {x}\n|===\n")]
+    #[case::cols_without_style("[cols=\"1,2\"]\n|===\n| {x}\n|b\n|===\n")]
+    #[case::cell_indent_after_marker_is_text("|===\na|  ind {x}\n|===\n")]
+    #[case::cell_text_after_literal_ends_at_blank("|===\na|\n  lit\n\nafter {x}\n|===\n")]
     #[case::cell_indent_continues_paragraph_after_comment(
         "|===\na|\npara\n// c\n  ind {x}\n|===\n"
     )]
@@ -1014,8 +1015,8 @@ mod tests {
     #[case::cols_literal("[cols=\"1l\"]\n|===\n|lit {x}\n|===\n")]
     #[case::cols_literal_nested_list("[cols=\"1l\"]\n|===\n|\n* item {x}\n|===\n")]
     #[case::literal_cell_nested_list("|===\nl|\n* item {x}\n|===\n")]
-    #[case::cols_multiplier("[cols=\"2*a\"]\n|===\n|x\n// c {x}\n|===\n")]
-    #[case::cols_aligned_semicolon("[cols=\"<.^2a;1\"]\n|===\n|x\n// c {x}\n|===\n")]
+    #[case::cols_multiplier("[cols=\"2*a\"]\n|===\n|x\n// c {x}\n|y\n|===\n")]
+    #[case::cols_aligned_semicolon("[cols=\"<.^2a;1\"]\n|===\n|x\n// c {x}\n|y\n|===\n")]
     #[case::cols_titled_table(".T\n[cols=\"1l\"]\n|===\n|lit {x}\n|===\n")]
     #[case::cols_unknown_cell_style_v("[cols=\"1l\"]\n|===\nv|v1 {x}\n|===\n")]
     #[case::cols_literal_span_cell("[cols=\"1l,1l\"]\n|===\n2+|lit {x}\n|===\n")]
@@ -1036,7 +1037,7 @@ mod tests {
     #[test]
     fn table_with_asciidoc_or_literal_column_is_not_checked() {
         assert_eq!(
-            names("[cols=\"1,1a\"]\n|===\n| p {x}\n|===\n"),
+            names("[cols=\"1,1a\"]\n|===\n| p {x}\n|b\n|===\n"),
             Vec::<String>::new()
         );
     }

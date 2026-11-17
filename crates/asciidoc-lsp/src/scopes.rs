@@ -44,8 +44,7 @@ pub(crate) fn unique_in_order<T: PartialEq>(items: impl IntoIterator<Item = T>) 
 /// `imagesdir`.
 pub(crate) fn scope_image_base(scope: &AttributeScope<'_>, file_dir: &Path) -> (PathBuf, String) {
     let imagesdir = scope.value("imagesdir").unwrap_or_default();
-    let docdir = scope.value(DOCDIR).map(PathBuf::from);
-    let base = image_base_dir(docdir.as_deref().unwrap_or(file_dir), &imagesdir);
+    let base = image_base_dir(&scope_docdir(scope, file_dir), &imagesdir);
     (base, imagesdir)
 }
 

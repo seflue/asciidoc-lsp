@@ -504,8 +504,7 @@ fn attribute_value_target(before_cursor: &str) -> Option<(&'static str, usize)> 
     let entry = DOC_ATTRIBUTES
         .iter()
         .find(|e| e.name.eq_ignore_ascii_case(name))?;
-    snippet_choices(entry.snippet).is_some().then_some(())?;
-    Some((entry.name, before_cursor.len() - value.len()))
+    snippet_choices(entry.snippet).map(|_| (entry.name, before_cursor.len() - value.len()))
 }
 
 /// How far a target token extends past the cursor.
@@ -520,7 +519,11 @@ enum TargetKind {
 /// Detect the completion context at the given cursor position by scanning
 /// the current line backwards from the cursor.
 ///
-/// Priority: `include::` (longest prefix) > `xref:` > `<<` > `{` > `ifdef::`
+/// Priority, after the `endif::` target, which offers nothing: `include::`
+/// (longest prefix) > `image::` > `image:` > `xref:` > `<<` > `{` >
+/// `ifdef::`/`ifndef::` name > block attribute line (`[`) > `:name` (5) >
+/// `:name: value` (5b) > block macro (6) > admonition (7) > inline macro
+/// prefix (8) > `name:` of an inline macro (9).
 pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<CompletionContext> {
     let line_str = content.lines().nth(pos.line as usize)?;
 
@@ -833,9 +836,6 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
         .strip_prefix('[')
         .filter(|attrs| !attrs.starts_with('['))
     {
-        fn is_style_char(c: char) -> bool {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
-        }
         fn is_lang_char(c: char) -> bool {
             c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+')
         }
@@ -848,10 +848,10 @@ pub(crate) fn detect_completion_context(content: &str, pos: Position) -> Option<
                 ..span_from(start)
             }
         };
-        if attrs.chars().all(is_style_char) {
+        if attrs.chars().all(is_attribute_entry_name_char) {
             return Some(CompletionContext::BlockStyle {
                 prefix: attrs.to_string(),
-                span: token_span(1, is_style_char),
+                span: token_span(1, is_attribute_entry_name_char),
             });
         }
         if let Some((first, rest)) = attrs.split_once(',') {
@@ -1491,7 +1491,7 @@ pub(crate) fn resolve_image_completions(
 /// - `detail`: resolved attribute value
 /// - `text_edit`: replaces the name typed so far (`span`, including the part
 ///   after the cursor) with `attr_name` plus `closing` (`}` unless one already
-///   follows the cursor)
+///   follows the cursor; empty in an `ifdef::`/`ifndef::` directive)
 pub(crate) fn resolve_attribute_completions(
     prefix: &str,
     doc_path: &Path,
@@ -1568,9 +1568,11 @@ fn resolve_block_attribute_completions<'a>(
     span: TargetSpan,
     kind: CompletionItemKind,
 ) -> Vec<CompletionItem> {
-    let prefix = prefix.to_ascii_lowercase();
     names
-        .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&prefix))
+        .filter(|(name, _)| {
+            name.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
         .map(|(name, detail)| CompletionItem {
             label: name.to_string(),
             kind: Some(kind),
@@ -2078,6 +2080,8 @@ mod tests {
     #[case("source language edit stops before the closing bracket", "[source,ru]", 0, 10,
         CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 10) })]
     #[case("source language edit covers the rest of the token", "[source,rust]", 0, 10,
+        CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 12) })]
+    #[case("source language edit stops before the next attribute", "[source,rust,linenums]", 0, 10,
         CompletionContext::SourceLanguage { prefix: "ru".into(), span: span_to(8, 12) })]
     #[case("source language may contain a plus", "[source,c+", 0, 10,
         CompletionContext::SourceLanguage { prefix: "c+".into(), span: span(8, 10) })]
@@ -2693,9 +2697,10 @@ mod tests {
         assert!(labels.contains(&"b.adoc"), "{labels:?}");
     }
 
-    /// Every anchor kind ranks below `PATH_RANK`, as a single digit. A new
-    /// kind fails to compile here until it is listed, and fails the assert
-    /// when its rank reaches the path rank.
+    /// Every anchor kind in the array ranks below `PATH_RANK`, as a single
+    /// digit. A new kind fails to compile at the `match` until it is listed
+    /// there; whoever lists it must add it to the array too, or its rank is
+    /// not checked against the path rank.
     #[test]
     fn test_anchor_rank_stays_below_path_rank() {
         for kind in [
@@ -2829,6 +2834,10 @@ mod tests {
         }
     }
 
+    /// Asciidoctor resolves `xref:chapters/reference.adoc` from the `docdir`
+    /// of the top-level document, also when it stands in the included
+    /// `chapters/setup.adoc`. So the path below `chapters/` is relative to
+    /// the top-level folder, not to the including file's own folder.
     #[test]
     fn test_xref_path_in_included_file_completes_below_the_top_level_folder() {
         let (root, ws) = fixture("adversarial_project");
@@ -3113,6 +3122,24 @@ mod tests {
         assert_eq!(items[0].label, "intro.adoc");
         assert_eq!(edit(&items[0]).range, cols(9, 18));
         assert_eq!(new_text(&items[0]), "chapters/intro.adoc[${1:opts}]");
+    }
+
+    /// A document opened through a symlink is the same file as its target:
+    /// neither name is offered as an include of itself.
+    #[cfg(unix)]
+    #[test]
+    fn test_include_completions_skip_the_current_file_opened_through_a_symlink() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("real.adoc"), "= Real\n").unwrap();
+        std::fs::write(dir.path().join("other.adoc"), "= Other\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.adoc"), dir.path().join("link.adoc"))
+            .unwrap();
+
+        let items =
+            resolve_include_completions("", &dir.path().join("link.adoc"), 1, None, AT_LINE_START);
+
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["other.adoc"]);
     }
 
     // --- resolve_include_completions with attribute substitution ---

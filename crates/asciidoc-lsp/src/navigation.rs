@@ -4778,6 +4778,19 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
+    #[test]
+    fn test_hover_attribute_unknown_reference_adds_no_resolution() {
+        let content = "= Doc A\n:imagesdir: {nowhere}/img\n";
+        let (_tmp, ws, paths) = scanned(&[("a.adoc", content)]);
+        let pos = Position {
+            line: 1,
+            character: 3,
+        };
+
+        let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
+        assert_eq!(hover, ":imagesdir: {nowhere}/img\n\nImages directory");
+    }
+
     const TOC_DOC: &str = "Table of contents placement\n\nValues: auto, left, right, preamble";
 
     fn hover_at(content: &str, line: u32, character: u32) -> Option<String> {
@@ -4813,10 +4826,14 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
-    #[test]
-    fn test_hover_unset_entry_of_catalog_attribute_shows_its_description() {
+    #[rstest]
+    #[case(":toc!:")]
+    #[case(":!toc:")]
+    fn test_hover_unset_entry_of_catalog_attribute_shows_its_description(#[case] unset: &str) {
+        // Both spellings of the unset entry are shown in the `:name!:` form.
+        let content = format!("= M\n:toc: left\n{unset}\n");
         assert_eq!(
-            hover_at("= M\n:toc: left\n:toc!:\n", 2, 1).unwrap(),
+            hover_at(&content, 2, 1).unwrap(),
             format!(":toc!:\n\n{TOC_DOC}")
         );
     }
@@ -4850,6 +4867,28 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert!(hover_at("= M\n\n----\n:toc: right\n----\n", 3, 1).is_none());
     }
 
+    /// Verify of the item: hover on `:toc: left` (index.adoc:4) of the
+    /// committed fixture.
+    #[test]
+    fn test_hover_toc_entry_in_adversarial_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/adversarial_project")
+            .canonicalize()
+            .unwrap();
+        let index = root.join("index.adoc");
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let content = fs::read_to_string(&index).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 2,
+        };
+        assert_eq!(
+            resolve_hover(&content, pos, &index, Some(&ws)).unwrap(),
+            format!(":toc: left\n\n{TOC_DOC}")
+        );
+    }
+
     #[test]
     fn test_hover_catalog_entry_in_adversarial_fixture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4869,19 +4908,6 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             resolve_hover(&content, pos, &index, Some(&ws)).unwrap(),
             ":icons: font\n\nIcon mode\n\nValues: font, image"
         );
-    }
-
-    #[test]
-    fn test_hover_attribute_unknown_reference_adds_no_resolution() {
-        let content = "= Doc A\n:imagesdir: {nowhere}/img\n";
-        let (_tmp, ws, paths) = scanned(&[("a.adoc", content)]);
-        let pos = Position {
-            line: 1,
-            character: 3,
-        };
-
-        let hover = resolve_hover(content, pos, &paths[0], Some(&ws)).unwrap();
-        assert_eq!(hover, ":imagesdir: {nowhere}/img\n\nImages directory");
     }
 
     #[test]
