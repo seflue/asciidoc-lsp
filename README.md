@@ -128,6 +128,8 @@ vim.lsp.config('asciidoc_lsp', {
 vim.lsp.enable('asciidoc_lsp')
 ```
 
+On Linux, Neovim leaves file watching off by default, which is why the config turns it on. Install `inotifywait` (inotify-tools) as well: without it, changes to files in subdirectories never reached the server in testing. `:checkhealth vim.lsp` shows the backend Neovim uses under "file watching".
+
 The server sends semantic tokens. Neovim already highlights AsciiDoc with Tree-sitter, and the tokens would be drawn over it, so drop the capability when the client initializes: add `on_init = function(client) client.server_capabilities.semanticTokensProvider = nil end` to the config above. The plugin does this itself.
 
 Recommended companion plugins:
