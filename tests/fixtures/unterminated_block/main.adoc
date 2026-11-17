@@ -1,0 +1,8 @@
+= Unterminated Block
+
+[source,c]
+----
+include::banner.c[]
+----
+
+include::chapter.adoc[]

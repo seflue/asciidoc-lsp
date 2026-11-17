@@ -334,6 +334,9 @@ pub fn parse_single_file(
 
     let tags = crate::extractors::extract_tag_directives(&source);
 
+    let unterminated_blocks =
+        crate::extractors::extract_unterminated_blocks(root_node, source.as_bytes());
+
     // Attribute references Asciidoctor substitutes, from the trees
     let (substituted_refs, possible_definitions) =
         crate::substituted_refs::extract(root_node, &source, &inline_ranges);
@@ -360,6 +363,7 @@ pub fn parse_single_file(
         substituted_refs,
         possible_definitions,
         tags,
+        unterminated_blocks,
     };
 
     Some((doc, edges))

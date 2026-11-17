@@ -1,6 +1,6 @@
 use crate::types::{
     Anchor, AttributeDef, AttributeRef, ConditionalDirective, ConditionalKind, ConditionalOperator,
-    IncludeMacro, Placement, Section, Span, Xref,
+    IncludeMacro, Placement, Section, Span, UnterminatedBlock, Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -537,6 +537,89 @@ fn header_prefix(title: tree_sitter::Node) -> bool {
         prev = node.prev_sibling();
     }
     true
+}
+
+/// Delimited blocks whose closing delimiter the grammar reports as `MISSING`.
+///
+/// The grammar closes an open block with a zero-width end marker at the end
+/// of the file, a `MISSING` node (for `////` a real token of width zero);
+/// the first child is the opener. Only that case is
+/// reported. An open `++++` block, an open table and nested blocks with an
+/// open inner block come out as `ERROR` trees without delimiter pairing;
+/// Asciidoctor warns for them, but guessing the pairing here would risk a
+/// wrong diagnostic, so they stay silent.
+///
+/// Only the innermost unterminated block is reported: an open block inside a
+/// container swallows the container's closer, and Asciidoctor then considers
+/// the container closed. When both really are open, the outer warning is
+/// dropped as well; no diagnostic is better than a false one.
+///
+/// Known gaps, all per-file effects: a block opened in one file and closed
+/// in an included one, a delimiter inside an inactive `ifdef`, and the
+/// grammar not knowing setext titles.
+#[must_use]
+pub fn extract_unterminated_blocks(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Vec<UnterminatedBlock> {
+    let mut results = Vec::new();
+    walk_for_unterminated_blocks(node, source, &mut results);
+    results
+}
+
+/// `(end marker kind, Asciidoctor context)` of a delimited block node kind.
+fn block_context(kind: &str) -> Option<(&'static str, &'static str)> {
+    Some(match kind {
+        "listing_block" => ("listing_block_end_marker", "listing"),
+        "literal_block" => ("literal_block_marker", "literal"),
+        "delimited_block" => ("delimited_block_end_marker", "example"),
+        "sidebar_block" => ("sidebar_block_end_marker", "sidebar"),
+        "quoted_block" => ("quoted_block_end_marker", "quote"),
+        "open_block" => ("open_block_marker", "open"),
+        "block_comment" => ("block_comment_end_marker", "comment"),
+        _ => return None,
+    })
+}
+
+fn walk_for_unterminated_blocks(
+    node: tree_sitter::Node,
+    source: &[u8],
+    results: &mut Vec<UnterminatedBlock>,
+) {
+    let mut cursor = node.walk();
+    let mut inner = Vec::new();
+    for child in node.children(&mut cursor) {
+        walk_for_unterminated_blocks(child, source, &mut inner);
+    }
+    let own = if inner.is_empty() {
+        unterminated_block(node, source)
+    } else {
+        None
+    };
+    results.extend(own);
+    results.append(&mut inner);
+}
+
+/// The report for `node` itself, when it is a delimited block with a missing
+/// end marker. The delimiter is the leading run of the opener's first
+/// character: the opener token may carry trailing blanks or a fence language.
+fn unterminated_block(node: tree_sitter::Node, source: &[u8]) -> Option<UnterminatedBlock> {
+    let (end_marker, context) = block_context(node.kind())?;
+    let mut cursor = node.walk();
+    let missing = node
+        .children(&mut cursor)
+        .any(|c| c.kind() == end_marker && (c.is_missing() || c.byte_range().is_empty()));
+    if !missing {
+        return None;
+    }
+    let opener = node.child(0)?;
+    let text = opener.utf8_text(source).ok()?;
+    let first = text.chars().next()?;
+    Some(UnterminatedBlock {
+        context,
+        delimiter: text.chars().take_while(|&c| c == first).collect(),
+        line: opener.start_position().row + 1,
+    })
 }
 
 fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<IncludeMacro>) {
@@ -1878,5 +1961,178 @@ mod tests {
     #[test]
     fn test_extract_tag_directives_is_case_sensitive() {
         assert_eq!(extract_tag_directives("# tag::Case[]"), ["Case"]);
+    }
+
+    /// `(context, delimiter, line)` of every unterminated block in `source`.
+    fn unterminated(source: &str) -> Vec<(&'static str, String, usize)> {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        extract_unterminated_blocks(tree.root_node(), source.as_bytes())
+            .into_iter()
+            .map(|b| (b.context, b.delimiter, b.line))
+            .collect()
+    }
+
+    #[test]
+    fn test_unterminated_listing_block_reports_opener_line() {
+        let source = "= Doc\n\nText.\n\n== Chapter\n\ntext\n\n----\ncode\n\n[[later]]\n== Later\n";
+        assert_eq!(unterminated(source), [("listing", "----".to_string(), 9)]);
+    }
+
+    #[rstest::rstest]
+    #[case::example("====", "example")]
+    #[case::sidebar("****", "sidebar")]
+    #[case::literal("....", "literal")]
+    #[case::quote("____", "quote")]
+    #[case::open("--", "open")]
+    #[case::comment("////", "comment")]
+    #[case::fenced("```", "listing")]
+    #[case::long_listing("-----", "listing")]
+    #[case::long_example("=====", "example")]
+    fn test_unterminated_block_kinds(#[case] delimiter: &str, #[case] context: &'static str) {
+        let source = format!("para\n\n{delimiter}\ncontent\n");
+        assert_eq!(
+            unterminated(&source),
+            [(context, delimiter.to_string(), 3)],
+            "{source:?}"
+        );
+    }
+
+    /// The opener token includes trailing blanks; the message names the
+    /// delimiter the user has to type.
+    #[test]
+    fn test_unterminated_block_delimiter_is_trimmed() {
+        let source = "para\n\n----  \ncode\n";
+        assert_eq!(unterminated(source), [("listing", "----".to_string(), 3)]);
+    }
+
+    #[test]
+    fn test_unterminated_block_after_attribute_line_reports_delimiter_line() {
+        assert_eq!(
+            unterminated("para\n\n[source,rust]\n----\ncode\n"),
+            [("listing", "----".to_string(), 4)]
+        );
+        assert_eq!(
+            unterminated("para\n\n.Title\n----\ncode\n"),
+            [("listing", "----".to_string(), 4)]
+        );
+    }
+
+    #[test]
+    fn test_unterminated_outer_block_with_closed_inner_block() {
+        assert_eq!(
+            unterminated("para\n\n====\n----\nx\n----\nrest\n"),
+            [("example", "====".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn test_closing_delimiter_of_other_length_leaves_block_unterminated() {
+        let source = "p\n\n----\na\n----\n\n------\nb\n------\n\n----\nc\n------\n";
+        assert_eq!(unterminated(source), [("listing", "----".to_string(), 11)]);
+    }
+
+    #[test]
+    fn test_unterminated_listing_in_list_continuation() {
+        assert_eq!(
+            unterminated("* item\n+\n----\ncode\n"),
+            [("listing", "----".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn test_closed_blocks_report_nothing() {
+        let sources = [
+            "p\n\n----\na\n----\n",
+            "p\n\n....\na\n....\n",
+            "p\n\n====\na\n====\n",
+            "p\n\n****\na\n****\n",
+            "p\n\n____\na\n____\n",
+            "p\n\n--\na\n--\n",
+            "p\n\n////\na\n////\n",
+            "p\n\n```\na\n```\n",
+            "p\n\n----\n====\n----\n",
+            "p\n\n////\n----\n////\n",
+            "p\n\n|===\na|\n----\nx\n----\n\n|===\n",
+            "* item\n+\n----\ncode\n----\n",
+            "p\n\n***\n",
+        ];
+        for source in sources {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
+    }
+
+    /// Asciidoctor accepts trailing blanks on a delimiter line; the grammar
+    /// does too, so a correct block closed by `----  ` reports nothing.
+    #[test]
+    fn test_closing_delimiter_with_trailing_blanks_reports_nothing() {
+        for source in [
+            "p\n\n----\na\n----  \n",
+            "p\n\n----  \na\n----\n",
+            "p\n\n====\na\n==== \t\n",
+        ] {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
+    }
+
+    /// A closing delimiter on the last line without a newline closes the block.
+    #[test]
+    fn test_closing_delimiter_at_end_of_file_without_newline_reports_nothing() {
+        for source in ["p\n\n----\na\n----", "p\n\n====\na\n===="] {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
+    }
+
+    /// Asciidoctor closes a fenced block only with the bare fence, so the
+    /// message names the fence without the language.
+    #[test]
+    fn test_unterminated_fenced_block_with_language_names_bare_fence() {
+        assert_eq!(
+            unterminated("p\n\n```ruby\nputs 1\n"),
+            [("listing", "```".to_string(), 3)]
+        );
+    }
+
+    /// An open comment inside a container ends with a zero-width marker and
+    /// swallows the outer closer; Asciidoctor warns only for the comment.
+    #[test]
+    fn test_open_comment_inside_container_reports_only_comment() {
+        let sources = [
+            "p\n\n====\n////\nx\n====\n",
+            "p\n\n****\n////\nx\n****\n",
+            "p\n\n--\n////\nx\n--\n",
+            "* item\n+\n====\n////\nx\n====\n",
+        ];
+        for source in sources {
+            let line = source.lines().position(|l| l == "////").unwrap() + 1;
+            assert_eq!(
+                unterminated(source),
+                [("comment", "////".to_string(), line)],
+                "{source:?}"
+            );
+        }
+    }
+
+    /// The opener on the last line without a newline is still reported.
+    #[test]
+    fn test_unterminated_opener_at_end_of_file_without_newline() {
+        assert_eq!(
+            unterminated("p\n\n----"),
+            [("listing", "----".to_string(), 3)]
+        );
+    }
+
+    /// Asciidoctor warns for these; the grammar yields an `ERROR` tree
+    /// without pairing, so no diagnostic is better than a guessed one.
+    #[test]
+    fn test_unterminated_block_in_grammar_error_tree_reports_nothing() {
+        let sources = [
+            "p\n\n++++\nraw\n",
+            "p\n\n|===\na|b\n",
+            "p\n\n====\n----\ncode\n====\n",
+        ];
+        for source in sources {
+            assert_eq!(unterminated(source), [], "{source:?}");
+        }
     }
 }

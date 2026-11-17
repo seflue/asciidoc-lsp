@@ -36,6 +36,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
         | DiagnosticKind::UndefinedAttribute { .. }
         | DiagnosticKind::CircularInclude { .. }
         | DiagnosticKind::SectionOutOfSequence { .. }
+        | DiagnosticKind::UnterminatedBlock { .. }
         | DiagnosticKind::UnanchoredPdfPath { .. } => ls_types::DiagnosticSeverity::WARNING,
         DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::HINT,
     };
@@ -145,6 +146,28 @@ mod tests {
             Some(ls_types::DiagnosticSeverity::WARNING)
         );
         assert_eq!(result[0].range.start.line, 4);
+    }
+
+    #[test]
+    fn test_convert_unterminated_block_is_warning() {
+        let content = "para\n\n----\ncode\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 3,
+            span: None,
+            kind: DiagnosticKind::UnterminatedBlock {
+                context: "listing".into(),
+                delimiter: "----".into(),
+            },
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
+        );
     }
 
     #[test]
@@ -385,6 +408,52 @@ mod tests {
                 "xref:gone-b.adoc[B]",
                 "<<gone-c,C>>",
             ]
+        );
+    }
+
+    /// An open listing in an included chapter swallows the rest of the
+    /// chapter (committed fixture `tests/fixtures/unterminated_block`). The
+    /// warning sits on the opener line, in the chapter only; the C file
+    /// included in a closed listing has a `////` line the grammar reads as an
+    /// open comment block, which must not surface. Asciidoctor:
+    /// `chapter.adoc: line 5: unterminated listing block`.
+    #[test]
+    fn test_fixture_unterminated_block_is_reported_on_opener_line_only() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/unterminated_block")
+            .canonicalize()
+            .unwrap();
+        let main = root.join("main.adoc");
+        let chapter = root.join("chapter.adoc");
+        let banner = root.join("banner.c");
+        let ws = asciidoc_core::workspace::Workspace::build(&root, &main);
+
+        let is_open =
+            |d: &&CoreDiagnostic| matches!(d.kind, DiagnosticKind::UnterminatedBlock { .. });
+        assert_eq!(ws.diagnostics_for(&main).iter().filter(is_open).count(), 0);
+
+        let content = std::fs::read_to_string(&chapter).unwrap();
+        let result = convert_diagnostics(ws.diagnostics_for(&chapter), &content);
+        let result: Vec<_> = result
+            .iter()
+            .filter(|d| d.message.starts_with("Unterminated"))
+            .collect();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
+        );
+        assert_eq!(
+            result[0].message,
+            "Unterminated listing block: no closing ----"
+        );
+        assert_eq!(range_text(&content, result[0].range), "----");
+        assert_eq!(result[0].range.start.line, 4);
+
+        assert!(!ws.documents()[&banner].unterminated_blocks.is_empty());
+        assert_eq!(
+            ws.diagnostics_for(&banner).iter().filter(is_open).count(),
+            0
         );
     }
 

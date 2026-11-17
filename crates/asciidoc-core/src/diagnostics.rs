@@ -391,6 +391,26 @@ pub fn collect_diagnostics(
         });
     }
 
+    // 8. Unterminated delimited blocks. Code includes are parsed too, but
+    // their lines are verbatim content of the surrounding listing, not
+    // delimiters: only `.adoc` files are checked.
+    for (path, doc) in documents {
+        if path.extension().is_none_or(|ext| ext != "adoc") {
+            continue;
+        }
+        for block in &doc.unterminated_blocks {
+            diags.entry(path.clone()).or_default().push(Diagnostic {
+                file: path.clone(),
+                line: block.line,
+                span: None,
+                kind: DiagnosticKind::UnterminatedBlock {
+                    context: block.context.to_string(),
+                    delimiter: block.delimiter.clone(),
+                },
+            });
+        }
+    }
+
     diags
 }
 
@@ -1466,6 +1486,43 @@ mod tests {
             .into_iter()
             .map(|(_, line, name)| (line, name))
             .collect()
+    }
+
+    fn open_block(line: usize) -> crate::types::UnterminatedBlock {
+        crate::types::UnterminatedBlock {
+            context: "listing",
+            delimiter: "----".into(),
+            line,
+        }
+    }
+
+    #[test]
+    fn test_unterminated_block_diagnostic() {
+        let diags = diagnose_one(a_doc().with_unterminated_blocks(vec![open_block(7)]));
+        let flat = flatten(&diags);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].line, 7);
+        assert_eq!(flat[0].span, None);
+        assert_eq!(
+            flat[0].kind,
+            DiagnosticKind::UnterminatedBlock {
+                context: "listing".into(),
+                delimiter: "----".into(),
+            }
+        );
+    }
+
+    /// Code includes are parsed too; their lines are verbatim content of the
+    /// listing around the include, not delimiters.
+    #[test]
+    fn test_unterminated_block_in_non_adoc_file_reports_nothing() {
+        let mut documents = HashMap::new();
+        documents.insert(
+            PathBuf::from("/banner.c"),
+            DocumentModel::test("/banner.c").with_unterminated_blocks(vec![open_block(3)]),
+        );
+        let diags = diagnose(documents, IncludeGraph::new(), make_registry());
+        assert!(flatten(&diags).is_empty());
     }
 
     #[test]
