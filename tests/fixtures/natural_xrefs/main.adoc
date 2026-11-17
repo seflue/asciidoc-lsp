@@ -1,0 +1,41 @@
+= Natural cross references
+
+// Asciidoctor resolves an xref target that is no ID, has no `#` and
+// contains a space or an uppercase letter by matching it against the
+// reftext, or the title of a section without reftext.
+// Asciidoctor -v: possible invalid reference for No Such Title, CLI usage,
+// installation, #Installation and Second owner; all others resolve.
+
+== Installation
+
+Text.
+
+[[cli,Command line]]
+== CLI usage
+
+Text.
+
+== Usage
+
+By title: <<Installation>>. By reftext: <<Command line>>.
+With label: <<Installation,the install steps>>.
+Shorthand via macro: xref:Installation[install].
+Unknown title: <<No Such Title>>.
+
+Reftext hides the title: <<CLI usage>>.
+Inline anchor reftext: <<Free text>>, defined by [[free,Free text]]this anchor.
+Lowercase with a space: <<installation steps>>.
+Lowercase without a space is an ID only: <<installation>>.
+With a hash no title is matched: <<#Installation>>.
+
+== installation steps
+
+Text.
+
+[[first-owner,Shared text]]An anchor that holds a reftext first.
+
+[[second-owner,Shared text]]
+== Second owner
+
+A taken reftext still hides the title: <<Second owner>>.
+The reftext names its first owner: <<Shared text>>.

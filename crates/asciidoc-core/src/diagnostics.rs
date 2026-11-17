@@ -1187,6 +1187,32 @@ mod tests {
         assert_eq!(broken_xrefs(&ws, &root.join("main.adoc")), vec![]);
     }
 
+    /// Asciidoctor (`natural_xrefs/main.adoc`): only `INFO: possible invalid
+    /// reference` for `No Such Title`, `CLI usage` (the reftext hides the
+    /// title), `installation` (lowercase without space is an ID only),
+    /// `#Installation` (no title lookup after `#`) and `Second owner` (its
+    /// reftext hides the title even though an earlier anchor holds it).
+    #[test]
+    fn test_natural_xrefs_resolve_by_title_or_reftext() {
+        let (root, ws) = fixture_workspace("natural_xrefs");
+
+        let broken: Vec<&str> = broken_xrefs(&ws, &root.join("main.adoc"))
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
+
+        assert_eq!(
+            broken,
+            [
+                "No Such Title",
+                "CLI usage",
+                "installation",
+                "#Installation",
+                "Second owner"
+            ]
+        );
+    }
+
     /// Asciidoctor (`anchor_region_xref/web3.adoc`, `reference.adoc[tag=top]`):
     /// no message, `<<setup-only>>` lies outside the tag. `book.adoc` reads
     /// the whole file and finds `setup-only`. The LSP knows no tag regions:

@@ -40,6 +40,10 @@ pub struct AnchorScope {
     /// files a chain of whole includes (`IncludeSelection::Whole`) reaches.
     whole: HashSet<PathBuf>,
     ids: HashMap<String, AnchorLocation>,
+    /// The text a natural xref (`<<Section title>>`) matches, mapped to its
+    /// ID: the reftext of an anchor, or the title of a section without one.
+    /// The first definition of a text wins.
+    xreftexts: HashMap<String, String>,
     duplicates: Vec<DuplicateId>,
 }
 
@@ -54,6 +58,18 @@ impl AnchorScope {
     #[must_use]
     pub fn lookup(&self, id: &str) -> Option<&AnchorLocation> {
         self.ids.get(id)
+    }
+
+    /// Where the ID that a natural xref names is first defined. Asciidoctor
+    /// matches a target that is no ID, has no `#` and contains a space or an
+    /// uppercase letter against the reftexts and section titles.
+    fn lookup_natural(&self, target: &str) -> Option<&AnchorLocation> {
+        let natural = !target.contains('#')
+            && (target.contains(' ') || target.chars().any(char::is_uppercase));
+        if !natural {
+            return None;
+        }
+        self.xreftexts.get(target).and_then(|id| self.ids.get(id))
     }
 
     /// Every ID of the document with its first definition.
@@ -181,7 +197,11 @@ impl<'ws> CatalogCache<'ws> {
         };
         let Some(file_ref) = file_part else {
             return anchor_part
-                .and_then(|id| scope.lookup(id))
+                .and_then(|id| {
+                    scope
+                        .lookup(id)
+                        .or_else(|| scope.lookup_natural(&xref.target))
+                })
                 .map(located)
                 .ok_or_else(broken);
         };
@@ -374,10 +394,12 @@ impl Workspace {
                 files: HashSet::from([document.clone()]),
                 whole: HashSet::from([document.clone()]),
                 ids: HashMap::new(),
+                xreftexts: HashMap::new(),
                 duplicates: Vec::new(),
             },
             region_defined: Definitions::default(),
             plain_read: Definitions::default(),
+            reftext_ids: HashSet::new(),
         };
         read_in_order(self, &document, &mut walk);
         walk.scope
@@ -492,6 +514,9 @@ struct AnchorWalk<'a> {
     /// even when a region include read it before. Two definitions on one
     /// line are two readings.
     plain_read: Definitions,
+    /// The IDs that carry a reftext, even one an earlier ID already holds: a
+    /// section among them is not matched by its title.
+    reftext_ids: HashSet<String>,
     scope: AnchorScope,
 }
 
@@ -515,6 +540,10 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
             Definition::Anchor(anchor) => {
                 let plain_reread = self.note_plain_reading(file, anchor.line, Some(&anchor.id));
                 self.define_explicit(file, anchor, plain_reread);
+                if let Some(reftext) = &anchor.reftext {
+                    self.reftext_ids.insert(anchor.id.clone());
+                    self.define_xreftext(reftext, &anchor.id);
+                }
             }
             Definition::Section(section) => {
                 // The header title of the top-level document gets no ID. An
@@ -522,7 +551,9 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
                 // document title (a top-level file without a header of its
                 // own) still gets one here: a false negative, accepted.
                 let is_document_header = section.is_header && stack.len() == 1;
-                if section.id.is_none() && !is_document_header {
+                if let Some(id) = &section.id {
+                    self.define_section_title(&section.title, id);
+                } else if !is_document_header {
                     let plain_reread = self.note_plain_reading(file, section.line, None);
                     self.define_section(file, section, plain_reread);
                 }
@@ -598,6 +629,20 @@ impl AnchorWalk<'_> {
         self.scope.ids.insert(id, location);
     }
 
+    fn define_xreftext(&mut self, text: &str, id: &str) {
+        self.scope
+            .xreftexts
+            .entry(text.to_string())
+            .or_insert_with(|| id.to_string());
+    }
+
+    /// A section with a reftext is matched by the reftext only.
+    fn define_section_title(&mut self, title: &str, id: &str) {
+        if !self.reftext_ids.contains(id) {
+            self.define_xreftext(title, id);
+        }
+    }
+
     /// No duplicate when either reading may have covered only part of its
     /// file, whatever the line: the walk knows no tag regions, and the ID may
     /// lie outside the tag Asciidoctor reads. A real collision inside a tag
@@ -648,6 +693,7 @@ impl AnchorWalk<'_> {
             id = format!("{base}{separator}{suffix}");
             suffix += 1;
         }
+        self.define_section_title(&section.title, &id);
         self.register(id, location);
     }
 }

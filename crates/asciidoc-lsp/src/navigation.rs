@@ -2081,6 +2081,35 @@ mod tests {
         (root, targets)
     }
 
+    /// Asciidoctor (`natural_xrefs/main.adoc`): `<<Installation>>` renders as
+    /// `#_installation` (section title), `<<Command line>>` as `#cli`
+    /// (reftext of the anchor above `== CLI usage`).
+    #[test]
+    fn test_goto_def_natural_xref_lands_on_title_or_reftext_owner() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/natural_xrefs")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let path = root.join("main.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let goto = |character| {
+            resolve_goto_definitions(
+                &content,
+                Position {
+                    line: 19,
+                    character,
+                },
+                &path,
+                Some(&ws),
+            )
+        };
+
+        assert_eq!(goto(13), vec![(path.clone(), 9)]);
+        assert_eq!(goto(42), vec![(path.clone(), 13)]);
+    }
+
     /// Asciidoctor resolves `<<_second>>` in the document it converts: each
     /// of the two unrelated documents has its own `_second` and `_first`.
     /// Both directions are asked, so a global first-wins cannot pass by
