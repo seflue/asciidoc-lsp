@@ -1194,6 +1194,27 @@ mod tests {
         assert!(!sections[0].is_header, "{source:?}");
     }
 
+    /// Asciidoctor: a block title above the attribute entry is block
+    /// metadata of the next block, so it ends the header. The title is a
+    /// level-0 section (`<h1 id="x" class="sect0">`), not the document
+    /// header. The grammar leaves the anchor in the block before the title,
+    /// so the section does not carry the ID `x` yet.
+    #[test]
+    fn test_block_title_above_attribute_entry_ends_the_header() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "[[x]]\n.Title\n:a: b\n= T\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+        // The anchor is a block anchor, not an ERROR node.
+        assert!(!tree.root_node().has_error(), "{source:?}");
+        assert_eq!(sections.len(), 1, "{source:?}");
+        assert_eq!(sections[0].level, 0, "{source:?}");
+        assert!(!sections[0].is_header, "{source:?}");
+        // Asciidoctor gives the section the ID `x`. Flip this to
+        // `Some("x")` once the grammar hands the anchor to the section.
+        assert_eq!(sections[0].id, None, "{source:?}");
+    }
+
     /// Asciidoctor (`<h1 id="p1" class="sect0">`): a book part takes the ID
     /// of the lines directly above it.
     #[test]
@@ -2044,6 +2065,48 @@ mod tests {
         let expected: Vec<_> = expected.iter().map(|(l, t)| (*l, t.to_string())).collect();
         assert_eq!(sections, expected);
         assert_eq!(attrs, ["toc", "a"]);
+    }
+
+    /// `comment_block_below_title/section.adoc`: a closed comment block
+    /// directly below the title belongs to the header, so `== S` after it
+    /// stays a section and the tree has no ERROR.
+    #[test]
+    fn test_fixture_comment_block_below_title_keeps_the_section() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/comment_block_below_title/section.adoc");
+        let source = std::fs::read_to_string(path).expect("section fixture should exist");
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, &source).unwrap();
+
+        let sections = extract_sections(tree.root_node(), source.as_bytes());
+
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let titles: Vec<_> = sections
+            .iter()
+            .map(|s| (s.level, s.title.as_str()))
+            .collect();
+        assert_eq!(titles, [(0, "T"), (1, "S")]);
+        assert!(sections[0].is_header);
+        assert_eq!(unterminated(&source), []);
+    }
+
+    /// Asciidoctor warns `line 2: unterminated comment block` for a comment
+    /// below the title that is never closed, and `line 5` when a closed
+    /// block precedes it. The grammar must not swallow these into the header.
+    #[test]
+    fn test_unterminated_comment_below_title_is_reported() {
+        assert_eq!(
+            unterminated("= T\n////\nx\n"),
+            [("comment", "////".to_string(), 2)]
+        );
+        assert_eq!(
+            unterminated("= T\n////\nx\n////\n////\ny\n"),
+            [("comment", "////".to_string(), 5)]
+        );
     }
 
     /// Asciidoctor reads raw lines of an include target: any prefix before
