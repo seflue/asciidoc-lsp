@@ -9,7 +9,6 @@ use tower_lsp_server::ls_types::{
 
 use asciidoc_core::anchor_scope::AnchorScope;
 use asciidoc_core::paths::canonicalize_if_exists;
-use asciidoc_core::references::find_target_file;
 use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
@@ -1063,10 +1062,9 @@ pub(crate) fn resolve_xref_completions(
 /// Resolve cross-file xref anchor completions: anchors filtered to a specific
 /// target file. Empty `file` means the current document.
 ///
-/// The file is matched as go-to-definition matches it:
-///   1. Canonical-path equality (handles `../foo.adoc`, symlinks, when target exists)
-///   2. Otherwise the indexed file whose path ends in the typed one or has
-///      its file name (`references::find_target_file`)
+/// The file is matched by canonical path (handles `../foo.adoc` and
+/// symlinks), as go-to-definition matches it: a file that does not exist at
+/// the resolved path offers no IDs (ADR-009).
 pub(crate) fn resolve_xref_cross_anchor_completions(
     file: &str,
     anchor_prefix: &str,
@@ -1111,16 +1109,18 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
 
     // A file that exists is matched by its canonical path (downstream
     // compares against `std::fs::canonicalize(&loc.file)`). One that does not
-    // exist at the typed path is the indexed file whose path ends in it or
-    // has its name, as go-to-definition and the diagnostics find it.
+    // exist at the resolved path is no target, as for go-to-definition and
+    // the diagnostics: a file of the same name elsewhere offers nothing.
     let canonical_targets: Vec<PathBuf> = resolved
         .iter()
         .filter_map(|(dir, resolved)| {
-            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(dir, resolved))
-                .ok()
-                .or_else(|| find_target_file(ws.documents(), None, resolved).cloned())
+            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(dir, resolved)).ok()
         })
         .collect();
+    // No targets would mean the current document to `anchors_of_documents`.
+    if canonical_targets.is_empty() {
+        return Vec::new();
+    }
     anchor_items(
         anchors_of_documents(ws, doc_path, &canonical_targets)
             .iter()
@@ -2369,24 +2369,27 @@ mod tests {
         let b = dir.path().join("b.adoc");
         std::fs::write(&a, "= A\n").unwrap();
         std::fs::write(&b, "= B\n").unwrap();
-        let ws = ws_with_anchors(vec![
-            (
-                "_sec1",
-                AnchorLocation {
-                    file: a.clone(),
-                    line: 1,
-                    kind: AnchorKind::ImplicitSection,
-                },
-            ),
-            (
-                "_sec2",
-                AnchorLocation {
-                    file: b.clone(),
-                    line: 1,
-                    kind: AnchorKind::ImplicitSection,
-                },
-            ),
-        ]);
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![
+                (
+                    "_sec1",
+                    AnchorLocation {
+                        file: a.clone(),
+                        line: 1,
+                        kind: AnchorKind::ImplicitSection,
+                    },
+                ),
+                (
+                    "_sec2",
+                    AnchorLocation {
+                        file: b.clone(),
+                        line: 1,
+                        kind: AnchorKind::ImplicitSection,
+                    },
+                ),
+            ],
+        );
 
         let doc_path = a.clone();
         let items = resolve_xref_cross_anchor_completions(
@@ -2808,14 +2811,15 @@ mod tests {
         assert_eq!(labels, vec!["only-a"]);
     }
 
-    /// `solo/setup.adoc` does not exist; go-to-definition and the diagnostics
-    /// take the indexed file whose path ends in `setup.adoc`
-    /// (`chapters/setup.adoc`), so completion offers its IDs too.
+    /// `solo/setup.adoc` does not exist: Asciidoctor renders the dead link
+    /// `setup.html#...`, the diagnostics report it and goto has no target.
+    /// Completion offers no IDs either: not those of the file of that name
+    /// elsewhere (`chapters/setup.adoc`), nor those of the current document.
     #[test]
-    fn test_xref_cross_completions_find_a_file_that_is_not_at_the_typed_path() {
+    fn test_xref_cross_completions_skip_a_file_that_is_not_at_the_typed_path() {
         let labels = fixture_labels("solo/main.adoc", "xref:setup.adoc#");
 
-        assert!(labels.contains(&"setup-only".to_string()), "{labels:?}");
+        assert_eq!(labels, Vec::<String>::new());
     }
 
     // --- resolve_xref_path_completions ---
@@ -3043,14 +3047,17 @@ mod tests {
     fn test_cross_file_anchor_items_replace_after_the_hash_utf16() {
         let dir = setup_include_dir();
         let doc = dir.path().join("a.adoc");
-        let ws = ws_with_anchors(vec![(
-            "_goals",
-            AnchorLocation {
-                file: dir.path().join("chapters/intro.adoc"),
-                line: 1,
-                kind: AnchorKind::Explicit,
-            },
-        )]);
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![(
+                "_goals",
+                AnchorLocation {
+                    file: dir.path().join("chapters/intro.adoc"),
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            )],
+        );
         // `Ü` is two bytes but one UTF-16 unit.
         let content = "Über xref:chapters/intro.adoc#_go";
         let ctx = detect_completion_context(content, Position::new(0, 33)).unwrap();
@@ -4942,14 +4949,17 @@ mod tests {
         let reference = dir.path().join("reference.adoc");
         std::fs::write(&reference, "= R\n").unwrap();
         let doc = dir.path().join("doc.adoc");
-        let ws = ws_with_anchors(vec![(
-            "ref-options",
-            AnchorLocation {
-                file: reference,
-                line: 1,
-                kind: AnchorKind::Explicit,
-            },
-        )]);
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![(
+                "ref-options",
+                AnchorLocation {
+                    file: reference,
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            )],
+        );
         assert_eq!(
             accept_at_cursor(
                 &doc,
@@ -4979,14 +4989,17 @@ mod tests {
         let reference = dir.path().join("a.adoc");
         std::fs::write(&reference, "= R\n").unwrap();
         let doc = dir.path().join("doc.adoc");
-        let ws = ws_with_anchors(vec![(
-            "sec",
-            AnchorLocation {
-                file: reference,
-                line: 1,
-                kind: AnchorKind::Explicit,
-            },
-        )]);
+        let ws = ws_with_anchors_at(
+            dir.path(),
+            vec![(
+                "sec",
+                AnchorLocation {
+                    file: reference,
+                    line: 1,
+                    kind: AnchorKind::Explicit,
+                },
+            )],
+        );
         assert_eq!(
             accept_at_cursor(&doc, Some(&ws), "#xref:a.adoc#se|#", "sec"),
             "#xref:a.adoc#sec[${1:label}]#"
@@ -5179,14 +5192,17 @@ mod tests {
         let other = dir.path().join("a.adoc");
         std::fs::write(&other, "= A\n").unwrap();
         let anchor_ws = |file: &Path| {
-            ws_with_anchors(vec![(
-                "_sec_title",
-                AnchorLocation {
-                    file: file.to_path_buf(),
-                    line: 1,
-                    kind: AnchorKind::Explicit,
-                },
-            )])
+            ws_with_anchors_at(
+                dir.path(),
+                vec![(
+                    "_sec_title",
+                    AnchorLocation {
+                        file: file.to_path_buf(),
+                        line: 1,
+                        kind: AnchorKind::Explicit,
+                    },
+                )],
+            )
         };
         assert_eq!(
             accept_at_cursor(

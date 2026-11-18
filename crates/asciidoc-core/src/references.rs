@@ -1,27 +1,3 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-
-use crate::types::DocumentModel;
-
-/// The document a file reference names: `resolved` when it is one, else the
-/// first one whose path ends in `file_ref` or is named `file_ref`.
-#[must_use]
-pub fn find_target_file<'a>(
-    documents: &'a HashMap<PathBuf, DocumentModel>,
-    resolved: Option<&PathBuf>,
-    file_ref: &str,
-) -> Option<&'a PathBuf> {
-    resolved
-        .and_then(|p| documents.keys().find(|key| *key == p))
-        .or_else(|| {
-            documents.keys().find(|p| {
-                p.ends_with(file_ref)
-                    || p.file_name()
-                        .is_some_and(|f| f.to_string_lossy() == file_ref)
-            })
-        })
-}
-
 /// Whether the xref `target` names a file (`file.adoc#id`, `file.adoc`), as
 /// opposed to an ID in the current document.
 #[must_use]
