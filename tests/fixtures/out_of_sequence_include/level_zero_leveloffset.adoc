@@ -1,0 +1,3 @@
+= Level 0 through a leveloffset
+
+include::partials/level_one.adoc[leveloffset=-1]

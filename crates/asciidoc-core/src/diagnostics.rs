@@ -2148,6 +2148,51 @@ mod tests {
         );
     }
 
+    /// An out-of-sequence title takes the place rule of a level 0 title.
+    /// Asciidoctor (`out_of_sequence_include`): `ends_include.adoc: line 3`
+    /// and `nested.adoc: line 3` (the one-line `partials/deep.adoc`, there
+    /// through `partials/only_include.adoc`),
+    /// `partials/deep_with_text.adoc: line 1`,
+    /// `partials/include_with_text.adoc: line 1`, and for `leveloffset.adoc`
+    /// `partials/deep.adoc: line 1: expected level 2, got level 3`.
+    #[test]
+    fn test_out_of_sequence_title_ending_an_include_is_reported_at_the_include() {
+        let (root, ws) = fixture_workspace("out_of_sequence_include");
+        let rows = |file: &str| sequence_rows(&ws, &root.join(file));
+
+        assert_eq!(rows("ends_include.adoc"), vec![(3, vec![1], 2)]);
+        assert_eq!(rows("nested.adoc"), vec![(3, vec![1], 2)]);
+        assert_eq!(rows("partials/only_include.adoc"), vec![]);
+        assert_eq!(rows("partials/deep_with_text.adoc"), vec![(1, vec![1], 2)]);
+        assert_eq!(rows("title_with_text.adoc"), vec![]);
+        assert_eq!(
+            rows("partials/include_with_text.adoc"),
+            vec![(1, vec![1], 2)]
+        );
+        assert_eq!(rows("include_with_text.adoc"), vec![]);
+        assert_eq!(rows("partials/deep.adoc"), vec![(1, vec![2], 3)]);
+        assert_eq!(rows("leveloffset.adoc"), vec![]);
+    }
+
+    /// Asciidoctor follows the content of an include with a `leveloffset`
+    /// by lines of its own, so a title on the last line of the file stays
+    /// there. Asciidoctor (`out_of_sequence_include/level_zero_leveloffset.adoc`):
+    /// `ERROR: partials/level_one.adoc: line 1: level 0 sections can only be
+    /// used when doctype is book`.
+    #[test]
+    fn test_level_zero_title_ending_an_include_with_leveloffset_stays_in_its_file() {
+        let (root, ws) = fixture_workspace("out_of_sequence_include");
+
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("partials/level_one.adoc")),
+            vec![(1, vec![])]
+        );
+        assert_eq!(
+            level_zero_outside_book(&ws, &root.join("level_zero_leveloffset.adoc")),
+            vec![]
+        );
+    }
+
     /// Asciidoctor (`book.adoc`): `line 4: expected levels 0 or 1, got level
     /// 2`, `line 8: expected level 1, got level 2` (below the part),
     /// `line 12: expected level 2, got level 3`.

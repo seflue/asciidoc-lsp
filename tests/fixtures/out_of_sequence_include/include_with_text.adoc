@@ -1,0 +1,3 @@
+= Include with text below it
+
+include::partials/include_with_text.adoc[]

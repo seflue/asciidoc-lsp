@@ -118,8 +118,10 @@ struct SectionWalk<'w> {
     /// Includes inside a block between the document and the file being read:
     /// their content is block content, not sections.
     block_depth: usize,
-    /// The line of each include being read, in the file that includes it.
-    include_lines: Vec<usize>,
+    /// The line of each include being read, in the file that includes it;
+    /// `None` for one with a `leveloffset`, whose content Asciidoctor
+    /// follows by lines of its own.
+    include_lines: Vec<Option<usize>>,
     /// The levels can no longer be told: no more checks.
     stopped: bool,
     frames: Vec<Frame>,
@@ -179,7 +181,9 @@ impl SectionWalk<'_> {
     /// Where Asciidoctor reports the title at `line` of the innermost file of
     /// `stack`. It reports a title on the last line of an included file at
     /// the include, having left the file by then, and so on outward while
-    /// that include is the last line of its own file.
+    /// that include is the last line of its own file. An include with a
+    /// `leveloffset` ends with lines Asciidoctor adds, so the title stays in
+    /// its file.
     fn reported_at(&self, stack: &[PathBuf], mut line: usize) -> Option<(PathBuf, usize)> {
         let mut depth = stack.len().checked_sub(1)?;
         while depth > 0
@@ -189,16 +193,16 @@ impl SectionWalk<'_> {
                 .get(&stack[depth])
                 .is_some_and(|doc| doc.line_count == line)
         {
+            let Some(include_line) = *self.include_lines.get(depth - 1)? else {
+                break;
+            };
             depth -= 1;
-            line = *self.include_lines.get(depth)?;
+            line = include_line;
         }
         Some((stack[depth].clone(), line))
     }
 
     fn section(&mut self, stack: &[PathBuf], section: &Section) {
-        let Some(file) = stack.last() else {
-            return;
-        };
         let stack_len = stack.len();
         if matches!(section.style.as_deref(), Some("discrete" | "float")) {
             return;
@@ -246,12 +250,14 @@ impl SectionWalk<'_> {
             _ => Vec::new(),
         };
         if expected.last().is_some_and(|deepest| level > *deepest) {
-            self.found.push(OutOfSequence {
-                file: file.clone(),
-                line: section.line,
-                expected,
-                got: level,
-            });
+            if let Some((file, line)) = self.reported_at(stack, section.line) {
+                self.found.push(OutOfSequence {
+                    file,
+                    line,
+                    expected,
+                    got: level,
+                });
+            }
         }
         // Level 1 sections with a style other than the three that take
         // subsections do not support nested ones: Asciidoctor reports that
@@ -291,12 +297,13 @@ impl<'a> ReadingVisitor<'a> for SectionWalk<'_> {
     }
 
     fn enter(&mut self, edge: &IncludeEdge) {
-        self.include_lines.push(edge.line);
         let offset = edge
             .attributes
             .iter()
             .find(|(name, _)| name == "leveloffset")
             .map(|(_, value)| value.trim().trim_matches('"'));
+        self.include_lines
+            .push(offset.is_none().then_some(edge.line));
         match offset {
             Some(value) if value.contains('{') => {
                 self.stopped = true;

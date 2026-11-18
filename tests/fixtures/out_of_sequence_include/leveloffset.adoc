@@ -1,0 +1,7 @@
+= Include with a leveloffset
+
+== One
+
+// Asciidoctor follows the content of an include with a leveloffset by
+// lines of its own, so the title does not end the file it reads.
+include::partials/deep.adoc[leveloffset=+1]

@@ -1,0 +1,6 @@
+= Title on the last line of an include
+
+include::partials/deep.adoc[]
+
+// Asciidoctor has left the one-line file when it reads the title and
+// reports it here, at the include.
