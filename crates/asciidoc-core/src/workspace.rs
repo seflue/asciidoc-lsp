@@ -2147,7 +2147,7 @@ mod tests {
         fs::create_dir_all(root.join("docs")).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(root.join(".asciidoctorconfig"), ":from-config: yes\n").unwrap();
-        fs::write(root.join("docs/part.adoc"), "= Part\n").unwrap();
+        fs::write(root.join("docs/part.adoc"), "== Part\n").unwrap();
         let target = outside.join("doc.adoc");
         fs::write(&target, "= Doc\n\ninclude::part.adoc[]\n").unwrap();
         std::os::unix::fs::symlink(&target, root.join("docs/link.adoc")).unwrap();

@@ -2202,6 +2202,43 @@ mod tests {
 
     /// Asciidoctor (`book.adoc`, `:doctype: book`): only the three
     /// out-of-sequence warnings, nothing for `= Part` on line 6.
+    /// Asciidoctor reports a title on the last line of an included file at
+    /// the include, as it has left the file by then, and so on outward while
+    /// that include is the last line of its file. Asciidoctor
+    /// (`docdir_top_level/docs/handbook/handbook.adoc`, which includes
+    /// `../shared/chapters.adoc`, whose only line includes the one-line
+    /// `chapters/intro.adoc`): `ERROR: handbook.adoc: line 5: level 0 sections
+    /// can only be used when doctype is book`.
+    #[test]
+    fn test_level_zero_title_ending_an_include_is_reported_at_the_include() {
+        let (root, ws) = fixture_workspace("docdir_top_level");
+        let handbook = root.join("docs/handbook");
+
+        assert_eq!(
+            level_zero_outside_book(&ws, &handbook.join("handbook.adoc")),
+            vec![(5, vec![])]
+        );
+        for file in ["chapters/intro.adoc", "../shared/chapters.adoc"] {
+            assert_eq!(level_zero_outside_book(&ws, &handbook.join(file)), vec![]);
+        }
+    }
+
+    /// Asciidoctor (`symlinks/real/project/book/twice.adoc`, which includes
+    /// the one-line `../part-up.adoc` at line 3): `ERROR: twice.adoc: line 3:
+    /// level 0 sections can only be used when doctype is book`.
+    #[test]
+    fn test_level_zero_title_ending_an_include_above_the_document_is_reported_at_the_include() {
+        let (root, ws) = fixture_workspace("symlinks/real/project");
+
+        assert!(
+            level_zero_outside_book(&ws, &root.join("book/twice.adoc"))
+                .iter()
+                .any(|(line, _)| *line == 3),
+            "{:?}",
+            ws.diagnostics_for(&root.join("book/twice.adoc"))
+        );
+    }
+
     #[test]
     fn test_level_zero_section_in_book_is_not_reported() {
         let (root, ws) = fixture_workspace("section_levels");

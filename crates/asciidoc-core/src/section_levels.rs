@@ -73,6 +73,7 @@ fn walk<'w>(workspace: &'w Workspace, document: &Path) -> SectionWalk<'w> {
         region_depth: 0,
         region_min: None,
         block_depth: 0,
+        include_lines: Vec::new(),
         stopped: false,
         frames: Vec::new(),
         found: Vec::new(),
@@ -117,6 +118,8 @@ struct SectionWalk<'w> {
     /// Includes inside a block between the document and the file being read:
     /// their content is block content, not sections.
     block_depth: usize,
+    /// The line of each include being read, in the file that includes it.
+    include_lines: Vec<usize>,
     /// The levels can no longer be told: no more checks.
     stopped: bool,
     frames: Vec<Frame>,
@@ -173,7 +176,30 @@ impl SectionWalk<'_> {
         }
     }
 
-    fn section(&mut self, stack_len: usize, file: &Path, section: &Section) {
+    /// Where Asciidoctor reports the title at `line` of the innermost file of
+    /// `stack`. It reports a title on the last line of an included file at
+    /// the include, having left the file by then, and so on outward while
+    /// that include is the last line of its own file.
+    fn reported_at(&self, stack: &[PathBuf], mut line: usize) -> Option<(PathBuf, usize)> {
+        let mut depth = stack.len().checked_sub(1)?;
+        while depth > 0
+            && self
+                .workspace
+                .documents
+                .get(&stack[depth])
+                .is_some_and(|doc| doc.line_count == line)
+        {
+            depth -= 1;
+            line = *self.include_lines.get(depth)?;
+        }
+        Some((stack[depth].clone(), line))
+    }
+
+    fn section(&mut self, stack: &[PathBuf], section: &Section) {
+        let Some(file) = stack.last() else {
+            return;
+        };
+        let stack_len = stack.len();
         if matches!(section.style.as_deref(), Some("discrete" | "float")) {
             return;
         }
@@ -205,10 +231,9 @@ impl SectionWalk<'_> {
             && self.doctype.as_deref() != Some("book")
             && matches!(self.frames.first(), Some(Frame::Document))
         {
-            self.level_zero.push(LevelZeroOutsideBook {
-                file: file.to_path_buf(),
-                line: section.line,
-            });
+            if let Some((file, line)) = self.reported_at(stack, section.line) {
+                self.level_zero.push(LevelZeroOutsideBook { file, line });
+            }
         }
         self.close(level);
         let expected = match self.frames.last() {
@@ -222,7 +247,7 @@ impl SectionWalk<'_> {
         };
         if expected.last().is_some_and(|deepest| level > *deepest) {
             self.found.push(OutOfSequence {
-                file: file.to_path_buf(),
+                file: file.clone(),
                 line: section.line,
                 expected,
                 got: level,
@@ -258,14 +283,15 @@ impl<'a> ReadingVisitor<'a> for SectionWalk<'_> {
             .collect()
     }
 
-    fn item(&mut self, stack: &[PathBuf], file: &Path, item: Item<'a>) {
+    fn item(&mut self, stack: &[PathBuf], _file: &Path, item: Item<'a>) {
         match item {
             Item::Entry(def) => self.entry(def),
-            Item::Section(section) => self.section(stack.len(), file, section),
+            Item::Section(section) => self.section(stack, section),
         }
     }
 
     fn enter(&mut self, edge: &IncludeEdge) {
+        self.include_lines.push(edge.line);
         let offset = edge
             .attributes
             .iter()
@@ -291,6 +317,7 @@ impl<'a> ReadingVisitor<'a> for SectionWalk<'_> {
     }
 
     fn leave(&mut self, edge: &IncludeEdge) {
+        self.include_lines.pop();
         // A target the LSP did not read (missing, a path with a build
         // attribute, not indexed) may hold sections. Titles of level 0 and 1
         // are never out of sequence, so one that follows closes the unknown

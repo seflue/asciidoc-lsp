@@ -169,6 +169,8 @@ pub struct DocumentModel {
     pub tags: Vec<String>,
     /// Delimited blocks without a closing delimiter.
     pub unterminated_blocks: Vec<UnterminatedBlock>,
+    /// How many lines the file has; a last line without a line break counts.
+    pub line_count: usize,
 }
 
 /// An attribute that may be defined at `line` without the LSP being able to
@@ -477,6 +479,7 @@ impl DocumentModel {
             possible_definitions: vec![],
             tags: vec![],
             unterminated_blocks: vec![],
+            line_count: 0,
         }
     }
 

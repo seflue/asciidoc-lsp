@@ -364,6 +364,7 @@ pub fn parse_single_file(
         possible_definitions,
         tags,
         unterminated_blocks,
+        line_count: source.lines().count(),
     };
 
     Some((doc, edges))
