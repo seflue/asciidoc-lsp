@@ -182,10 +182,17 @@ pub fn resolve_goto_definitions(
             };
             let catalogs = CatalogCache::new(ws);
             unique_in_order(
-                resolve_xref_targets(ws, &catalogs, doc_path, target, node_info.line)
-                    .into_iter()
-                    .filter_map(|(_, resolved)| resolved.ok())
-                    .map(|resolved| (resolved.file, resolved.line)),
+                resolve_xref_targets(
+                    ws,
+                    &catalogs,
+                    doc_path,
+                    target,
+                    node_info.line,
+                    XrefReadings::Documents,
+                )
+                .into_iter()
+                .filter_map(|(_, resolved)| resolved.ok())
+                .map(|resolved| (resolved.file, resolved.line)),
             )
         }
         // On a definition or anchor goto-definition is a no-op.
@@ -475,7 +482,14 @@ pub fn resolve_hover(
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             let ws = workspace?;
             let catalogs = CatalogCache::new(ws);
-            let resolved = resolve_xref_targets(ws, &catalogs, doc_path, target, node_info.line);
+            let resolved = resolve_xref_targets(
+                ws,
+                &catalogs,
+                doc_path,
+                target,
+                node_info.line,
+                XrefReadings::WithPreview,
+            );
             if resolved.is_empty() {
                 return None;
             }
@@ -548,11 +562,17 @@ pub fn resolve_hover(
         NodeKind::Anchor { id } => {
             let ws = workspace?;
             let catalogs = CatalogCache::new(ws);
-            let texts: Vec<(String, String)> =
-                resolve_xref_targets(ws, &catalogs, doc_path, id, node_info.line)
-                    .into_iter()
-                    .filter_map(|(label, resolved)| Some((label, xref_hover(ws, &resolved.ok()?))))
-                    .collect();
+            let texts: Vec<(String, String)> = resolve_xref_targets(
+                ws,
+                &catalogs,
+                doc_path,
+                id,
+                node_info.line,
+                XrefReadings::WithPreview,
+            )
+            .into_iter()
+            .filter_map(|(label, resolved)| Some((label, xref_hover(ws, &resolved.ok()?))))
+            .collect();
             (!texts.is_empty()).then(|| per_document_hover(texts))
         }
     }
@@ -894,7 +914,14 @@ fn xref_definitions(
     line: usize,
 ) -> Vec<AnchorLocation> {
     let mut definitions = Vec::new();
-    for (_, resolved) in resolve_xref_targets(ws, catalogs, doc_path, target, line) {
+    for (_, resolved) in resolve_xref_targets(
+        ws,
+        catalogs,
+        doc_path,
+        target,
+        line,
+        XrefReadings::Documents,
+    ) {
         if let Ok(ResolvedXref {
             file,
             line,
@@ -994,14 +1021,16 @@ fn anchor_reference_locations(
 /// the preview sees it, and the ID in the catalog of that file read alone,
 /// which is what Asciidoctor knows when it converts the file on its own. A
 /// bare ID has no preview, where every reference to a neighbouring chapter
-/// would be broken. Each result comes with its scope's label. Shared by
-/// go-to-definition, hover and the explain report.
+/// would be broken. `readings` says whether the preview takes part. Each
+/// result comes with its scope's label. Shared by go-to-definition, hover,
+/// find-references, rename and the explain report.
 fn resolve_xref_targets(
     ws: &Workspace,
     catalogs: &CatalogCache<'_>,
     doc_path: &Path,
     target: &str,
     line: usize,
+    readings: XrefReadings,
 ) -> Vec<(String, Result<ResolvedXref, DiagnosticKind>)> {
     let xref = asciidoc_core::types::Xref {
         target: target.to_string(),
@@ -1030,6 +1059,7 @@ fn resolve_xref_targets(
         // An attribute reference in the file part reads differently in each
         // scope, so each scope is read for its own attributes.
         return path_scopes(ws, doc_path, line)
+            .filter(|scope| readings == XrefReadings::WithPreview || !scope.is_preview())
             .filter_map(|scope| {
                 let catalog = catalogs.get(scope.document());
                 let dir = document_dir(scope.document(), Some(ws));
@@ -1045,8 +1075,7 @@ fn resolve_xref_targets(
     }
     // The same scopes as `path_scopes`: one per top-level document and, for a
     // file others include, its preview, which reads the file alone.
-    let preview = catalogs
-        .is_included(doc_path)
+    let preview = (readings == XrefReadings::WithPreview && catalogs.is_included(doc_path))
         .then(|| catalogs.get(doc_path));
     catalogs
         .scopes_at(doc_path)
@@ -1064,6 +1093,19 @@ fn resolve_xref_targets(
             known(&catalog, resolved).map(|resolved| (label, resolved))
         })
         .collect()
+}
+
+/// Which readings of a file an xref resolves in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XrefReadings {
+    /// The top-level documents that read the file: the targets goto,
+    /// find-references and rename follow. A target only the preview finds
+    /// is broken where the file is converted, and following it would
+    /// contradict the diagnostic there.
+    Documents,
+    /// Those and, for a file others include, the editor's preview of it:
+    /// what hover shows.
+    WithPreview,
 }
 
 /// Build a debug report of what go-to-definition and hover see at `pos`.
@@ -1286,17 +1328,24 @@ fn definition_json(definition: &AttributeDefinition) -> Value {
 
 fn explain_xref(ws: &Workspace, doc_path: &Path, target: &str, line: usize) -> Value {
     let catalogs = CatalogCache::new(ws);
-    let scopes: Vec<Value> = resolve_xref_targets(ws, &catalogs, doc_path, target, line)
-        .into_iter()
-        .map(|(label, resolved)| match resolved {
-            Ok(resolved) => json!({
-                "scope": label,
-                "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
-                "error": null,
-            }),
-            Err(e) => json!({ "scope": label, "resolved": null, "error": e.to_string() }),
-        })
-        .collect();
+    let scopes: Vec<Value> = resolve_xref_targets(
+        ws,
+        &catalogs,
+        doc_path,
+        target,
+        line,
+        XrefReadings::WithPreview,
+    )
+    .into_iter()
+    .map(|(label, resolved)| match resolved {
+        Ok(resolved) => json!({
+            "scope": label,
+            "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
+            "error": null,
+        }),
+        Err(e) => json!({ "scope": label, "resolved": null, "error": e.to_string() }),
+    })
+    .collect();
     json!({ "scopes": scopes })
 }
 
@@ -2252,6 +2301,48 @@ mod tests {
             "In index.adoc:\n\u{2717} Target not found\n\n\
              In setup.adoc (preview):\n\u{2192} Options\n\nreference.adoc:3"
         );
+    }
+
+    /// Goto, find-references and rename follow an xref only where the
+    /// documents that read its file find the target, not in the preview of
+    /// the file. Asciidoctor (`xref_path_in_include/index.adoc`):
+    /// `xref:reference.adoc#ref-options[]` in `chapters/setup.adoc` is the
+    /// dead link `reference.html#ref-options`, which the preview alone would
+    /// find in `chapters/reference.adoc`;
+    /// `xref:chapters/reference.adoc#ref-options[]` is `#ref-options`.
+    #[test]
+    fn test_xref_broken_in_the_master_is_not_followed_through_the_preview() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/xref_path_in_include")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let path = root.join("chapters/setup.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let at = |line, character| Position { line, character };
+        let none = HashMap::new();
+
+        assert_eq!(
+            resolve_goto_definitions(&content, at(10, 55), &path, Some(&ws)),
+            vec![]
+        );
+        let references = resolve_references(&content, at(10, 55), &path, Some(&ws), true, &none);
+        assert!(references.unwrap_or_default().is_empty());
+        assert_eq!(prepare_rename(&content, at(10, 55), &path, Some(&ws)), None);
+
+        assert_eq!(
+            resolve_goto_definitions(&content, at(8, 40), &path, Some(&ws)),
+            vec![(root.join("chapters/reference.adoc"), 3)]
+        );
+    }
+
+    /// A file no document includes is its own document and keeps goto on a
+    /// link to another document.
+    #[test]
+    fn test_goto_def_file_xref_in_standalone_file_keeps_its_target() {
+        let (root, targets) = goto_in_fixture("solo/foreign.adoc", 2, 20);
+        assert_eq!(targets, vec![(root.join("chapters/setup.adoc"), 4)]);
     }
 
     /// Asciidoctor resolves `<<_second>>` in the document it converts: each
