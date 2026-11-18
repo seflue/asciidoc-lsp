@@ -455,6 +455,9 @@ pub struct ResolvedXref {
     pub line: usize,
     /// What the ID is defined as; `None` for a target that names only a file.
     pub kind: Option<AnchorKind>,
+    /// The ID the target resolved to, also when a natural xref names it by
+    /// its reftext or title; `None` for a target that names only a file.
+    pub id: Option<String>,
 }
 
 #[cfg(test)]

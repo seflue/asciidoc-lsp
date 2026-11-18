@@ -60,16 +60,17 @@ impl AnchorScope {
         self.ids.get(id)
     }
 
-    /// Where the ID that a natural xref names is first defined. Asciidoctor
-    /// matches a target that is no ID, has no `#` and contains a space or an
-    /// uppercase letter against the reftexts and section titles.
-    fn lookup_natural(&self, target: &str) -> Option<&AnchorLocation> {
+    /// The ID that a natural xref names, with its first definition.
+    /// Asciidoctor matches a target that is no ID, has no `#` and contains a
+    /// space or an uppercase letter against the reftexts and section titles.
+    fn lookup_natural(&self, target: &str) -> Option<(&str, &AnchorLocation)> {
         let natural = !target.contains('#')
             && (target.contains(' ') || target.chars().any(char::is_uppercase));
         if !natural {
             return None;
         }
-        self.xreftexts.get(target).and_then(|id| self.ids.get(id))
+        let id = self.xreftexts.get(target)?;
+        Some((id, self.ids.get(id)?))
     }
 
     /// Every ID of the document with its first definition.
@@ -190,19 +191,21 @@ impl<'ws> CatalogCache<'ws> {
             documents: Vec::new(),
         };
         let (file_part, anchor_part) = parse_xref_target(&xref.target);
-        let located = |location: &AnchorLocation| ResolvedXref {
+        let located = |id: &str, location: &AnchorLocation| ResolvedXref {
             file: location.file.clone(),
             line: location.line,
             kind: Some(location.kind),
+            id: Some(id.to_string()),
         };
         let Some(file_ref) = file_part else {
             return anchor_part
                 .and_then(|id| {
                     scope
                         .lookup(id)
+                        .map(|location| (id, location))
                         .or_else(|| scope.lookup_natural(&xref.target))
                 })
-                .map(located)
+                .map(|(id, location)| located(id, location))
                 .ok_or_else(broken);
         };
         let file = find_target_file(
@@ -216,12 +219,15 @@ impl<'ws> CatalogCache<'ws> {
                 file: file.clone(),
                 line: 1,
                 kind: None,
+                id: None,
             });
         };
         let location = if scope.contains_file(file) {
-            scope.lookup(id).map(located)
+            scope.lookup(id).map(|location| located(id, location))
         } else {
-            self.get(file).lookup(id).map(located)
+            self.get(file)
+                .lookup(id)
+                .map(|location| located(id, location))
         };
         location.ok_or_else(broken)
     }

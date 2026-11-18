@@ -484,7 +484,7 @@ pub fn resolve_hover(
                 .map(|(label, resolved)| {
                     let text = resolved.map_or_else(
                         |_| "\u{2717} Target not found".to_string(),
-                        |resolved| xref_hover(ws, target, &resolved),
+                        |resolved| xref_hover(ws, &resolved),
                     );
                     (label, text)
                 })
@@ -551,9 +551,7 @@ pub fn resolve_hover(
             let texts: Vec<(String, String)> =
                 resolve_xref_targets(ws, &catalogs, doc_path, id, node_info.line)
                     .into_iter()
-                    .filter_map(|(label, resolved)| {
-                        Some((label, xref_hover(ws, id, &resolved.ok()?)))
-                    })
+                    .filter_map(|(label, resolved)| Some((label, xref_hover(ws, &resolved.ok()?))))
                     .collect();
             (!texts.is_empty()).then(|| per_document_hover(texts))
         }
@@ -565,8 +563,8 @@ pub fn resolve_hover(
 /// a file, of its document header; then file and line. An ID outside a
 /// section title shows the anchor instead, a file without a header only the
 /// place.
-fn xref_hover(ws: &Workspace, target: &str, resolved: &ResolvedXref) -> String {
-    let (_, id) = parse_xref_target(target);
+fn xref_hover(ws: &Workspace, resolved: &ResolvedXref) -> String {
+    let id = resolved.id.as_deref();
     let title = match (resolved.kind, id) {
         (Some(kind), Some(id)) => ws.anchor_title(
             id,
@@ -901,6 +899,7 @@ fn xref_definitions(
             file,
             line,
             kind: Some(kind),
+            ..
         }) = resolved
         {
             push_definition(&mut definitions, AnchorLocation { file, line, kind });
@@ -2199,6 +2198,31 @@ mod tests {
 
         assert_eq!(goto(13), vec![(path.clone(), 9)]);
         assert_eq!(goto(42), vec![(path.clone(), 13)]);
+    }
+
+    /// A natural xref shows its target as an xref to the ID it resolves to
+    /// does: the title of the section carrying the ID, else the anchor.
+    /// Asciidoctor (`natural_xrefs/main.adoc`): `<<Command line>>` renders
+    /// `href="#cli"`, `<<Free text>>` `href="#free"`, `<<Shared text>>`
+    /// `href="#first-owner"`.
+    #[test]
+    fn test_hover_natural_xref_shows_the_id_it_resolves_to() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/natural_xrefs")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        let path = root.join("main.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let hover = |line, character| {
+            resolve_hover(&content, Position { line, character }, &path, Some(&ws)).unwrap()
+        };
+
+        assert_eq!(hover(19, 13), "\u{2192} Installation\n\nmain.adoc:9");
+        assert_eq!(hover(19, 42), "\u{2192} CLI usage\n\nmain.adoc:13");
+        assert_eq!(hover(25, 26), "[[free]]\n\nmain.adoc:26");
+        assert_eq!(hover(40, 38), "[[first-owner]]\n\nmain.adoc:35");
     }
 
     /// Asciidoctor (`xref_path_in_include/index.adoc`) reads the file part of
