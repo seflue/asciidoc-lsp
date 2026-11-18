@@ -1,0 +1,16 @@
+== Chapter
+
+// Asciidoctor resolves an image against the docdir and imagesdir of the
+// master and an include against this file's folder with the master's
+// attributes. Read alone, as the preview does, this file has no imagesdir
+// and its own folder as docdir.
+
+image::found.png[]
+
+image::preview.png[]
+
+Inline image:preview.png[] too.
+
+include::{docdir}/shared/found.adoc[]
+
+include::{docdir}/parts/preview.adoc[]

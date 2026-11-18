@@ -1,0 +1,7 @@
+= Solo
+
+// No document includes this file: it is its own top-level document.
+
+image::preview.png[]
+
+include::{docdir}/parts/preview.adoc[]

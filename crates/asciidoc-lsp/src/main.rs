@@ -3065,7 +3065,11 @@ mod tests {
     /// In a symlinked folder, `..` pops the link's name, as Asciidoctor's
     /// `PathResolver#system_path` does, instead of going to the target's
     /// parent. `real/project/guide` links to `real/outside/guide`; both
-    /// parents hold a `part-up.adoc` and an `up.svg`.
+    /// parents hold a `part-up.adoc` and an `up.svg`. The image resolves
+    /// against the docdir of `diamond.adoc`, which reads the file:
+    /// Asciidoctor renders `../up.svg` there, a file next to `real/project`
+    /// that does not exist, so goto has no target; the completion of the
+    /// preview still lists the link-side parent.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_parent_of_symlinked_folder_is_the_link_side_parent() {
@@ -3084,10 +3088,7 @@ mod tests {
             include_target.map(|l| l.uri),
             Some(file_uri(&real.join("part-up.adoc")))
         );
-        assert_eq!(
-            image_target.map(|l| l.uri),
-            Some(file_uri(&real.join("up.svg")))
-        );
+        assert_eq!(image_target.map(|l| l.uri), None);
         assert!(labels.contains(&"docs/".to_string()), "{labels:?}");
         assert!(!labels.contains(&"shared/".to_string()), "{labels:?}");
     }

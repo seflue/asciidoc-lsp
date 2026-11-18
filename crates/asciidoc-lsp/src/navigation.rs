@@ -135,7 +135,7 @@ fn classify_in_range(
 /// Resolve a go-to-definition request to target files and lines
 /// (1-indexed). An attribute reference yields every definition, the one
 /// Asciidoctor uses first; an include, xref or image yields each scope's
-/// existing target once (ADR-4).
+/// existing target once, the preview of an included file none (ADR-4).
 ///
 /// Extracted from the `LanguageServer` handler for testability (V-8).
 pub fn resolve_goto_definitions(
@@ -160,17 +160,29 @@ pub fn resolve_goto_definitions(
         NodeKind::Image { ref path, .. } => {
             // Each scope's file, each once.
             unique_in_order(
-                resolve_image_targets(path, doc_path, workspace, node_info.line)
-                    .into_iter()
-                    .filter_map(|(_, target)| match target {
-                        ImageTarget::Local { path: target, .. } => target.canonicalize().ok(),
-                        ImageTarget::Remote { .. } => None,
-                    })
-                    .map(|canonical| (canonical, 1)),
+                resolve_image_targets(
+                    path,
+                    doc_path,
+                    workspace,
+                    node_info.line,
+                    Readings::Documents,
+                )
+                .into_iter()
+                .filter_map(|(_, target)| match target {
+                    ImageTarget::Local { path: target, .. } => target.canonicalize().ok(),
+                    ImageTarget::Remote { .. } => None,
+                })
+                .map(|canonical| (canonical, 1)),
             )
         }
         NodeKind::Include { ref path } => {
-            let targets = resolve_doc_targets(path, doc_path, workspace, node_info.line);
+            let targets = resolve_doc_targets(
+                path,
+                doc_path,
+                workspace,
+                node_info.line,
+                Readings::Documents,
+            );
             existing_targets(&targets)
                 .into_iter()
                 .map(|file| (file, 1))
@@ -188,7 +200,7 @@ pub fn resolve_goto_definitions(
                     doc_path,
                     target,
                     node_info.line,
-                    XrefReadings::Documents,
+                    Readings::Documents,
                 )
                 .into_iter()
                 .filter_map(|(_, resolved)| resolved.ok())
@@ -228,7 +240,13 @@ pub fn resolve_references(
             r
         }
         NodeKind::Include { path } => {
-            let targets = resolve_doc_targets(path, doc_path, Some(ws), node_info.line);
+            let targets = resolve_doc_targets(
+                path,
+                doc_path,
+                Some(ws),
+                node_info.line,
+                Readings::Documents,
+            );
             let mut r = Vec::new();
             for target in existing_targets(&targets) {
                 let filename = target.file_name().and_then(|f| f.to_str()).unwrap_or("");
@@ -488,7 +506,7 @@ pub fn resolve_hover(
                 doc_path,
                 target,
                 node_info.line,
-                XrefReadings::WithPreview,
+                Readings::WithPreview,
             );
             if resolved.is_empty() {
                 return None;
@@ -506,7 +524,13 @@ pub fn resolve_hover(
             Some(per_document_hover(texts))
         }
         NodeKind::Include { path } => {
-            let mut targets = resolve_doc_targets(path, doc_path, workspace, node_info.line);
+            let mut targets = resolve_doc_targets(
+                path,
+                doc_path,
+                workspace,
+                node_info.line,
+                Readings::WithPreview,
+            );
             // Scopes that reach the same file agree, however they spell it.
             collapse_if_agree(&mut targets, |a, b| a.path == b.path);
             let texts: Vec<(String, String)> = targets
@@ -534,7 +558,13 @@ pub fn resolve_hover(
             attrlist,
         } => {
             let macro_form = if *inline { "image:" } else { "image::" };
-            let mut targets = resolve_image_targets(path, doc_path, workspace, node_info.line);
+            let mut targets = resolve_image_targets(
+                path,
+                doc_path,
+                workspace,
+                node_info.line,
+                Readings::WithPreview,
+            );
             // Scopes that reach the same file agree, however they spell it.
             collapse_if_agree(&mut targets, |a, b| a.1.same_place(&b.1));
             let texts: Vec<(String, String)> = targets
@@ -568,7 +598,7 @@ pub fn resolve_hover(
                 doc_path,
                 id,
                 node_info.line,
-                XrefReadings::WithPreview,
+                Readings::WithPreview,
             )
             .into_iter()
             .filter_map(|(label, resolved)| Some((label, xref_hover(ws, &resolved.ok()?))))
@@ -741,15 +771,16 @@ fn is_remote_url(target: &str) -> bool {
 }
 
 /// Where an image macro on `line` points, per top-level document and, for
-/// a file others include, in the editor's preview of it (ADR-4): target,
-/// `imagesdir` and `docdir` take the values in effect there. Each target
-/// comes with its scope's label; without a workspace, one target with the
-/// label of `doc_path`.
+/// a file others include and when `readings` asks for it, in the editor's
+/// preview of it (ADR-4): target, `imagesdir` and `docdir` take the values
+/// in effect there. Each target comes with its scope's label; without a
+/// workspace, one target with the label of `doc_path`.
 fn resolve_image_targets(
     image_path: &str,
     doc_path: &Path,
     workspace: Option<&Workspace>,
     line: usize,
+    readings: Readings,
 ) -> Vec<(String, ImageTarget)> {
     let file_dir = document_dir(doc_path, workspace);
     let Some(ws) = workspace else {
@@ -757,6 +788,7 @@ fn resolve_image_targets(
         return vec![(file_display_name(doc_path), target)];
     };
     path_scopes(ws, doc_path, line)
+        .filter(|scope| readings == Readings::WithPreview || !scope.is_preview())
         .map(|scope| {
             let (base, imagesdir) = scope_image_base(&scope, file_dir);
             let doc_dir = scope_docdir(&scope, file_dir);
@@ -790,15 +822,17 @@ fn image_target(resolved_path: &str, base: &Path, doc_dir: &Path, imagesdir: &st
 }
 
 /// Where an include or xref file path on `line` points, per top-level
-/// document and, for a file others include, in the editor's preview of it
-/// (ADR-4), without checking that it exists. Each target comes with its
-/// scope's label and the path as substituted there; canonical when it
-/// exists. Without a workspace, one target with the label of `doc_path`.
+/// document and, for a file others include and when `readings` asks for
+/// it, in the editor's preview of it (ADR-4), without checking that it
+/// exists. Each target comes with its scope's label and the path as
+/// substituted there; canonical when it exists. Without a workspace, one
+/// target with the label of `doc_path`.
 fn resolve_doc_targets(
     target_path: &str,
     doc_path: &Path,
     workspace: Option<&Workspace>,
     line: usize,
+    readings: Readings,
 ) -> Vec<DocTarget> {
     let dir = document_dir(doc_path, workspace);
     let Some(ws) = workspace else {
@@ -809,6 +843,7 @@ fn resolve_doc_targets(
         )];
     };
     path_scopes(ws, doc_path, line)
+        .filter(|scope| readings == Readings::WithPreview || !scope.is_preview())
         .map(|scope| DocTarget::new(scope_label(&scope), &scope.substitute(target_path), dir))
         .collect()
 }
@@ -914,14 +949,9 @@ fn xref_definitions(
     line: usize,
 ) -> Vec<AnchorLocation> {
     let mut definitions = Vec::new();
-    for (_, resolved) in resolve_xref_targets(
-        ws,
-        catalogs,
-        doc_path,
-        target,
-        line,
-        XrefReadings::Documents,
-    ) {
+    for (_, resolved) in
+        resolve_xref_targets(ws, catalogs, doc_path, target, line, Readings::Documents)
+    {
         if let Ok(ResolvedXref {
             file,
             line,
@@ -1030,7 +1060,7 @@ fn resolve_xref_targets(
     doc_path: &Path,
     target: &str,
     line: usize,
-    readings: XrefReadings,
+    readings: Readings,
 ) -> Vec<(String, Result<ResolvedXref, DiagnosticKind>)> {
     let xref = asciidoc_core::types::Xref {
         target: target.to_string(),
@@ -1059,7 +1089,7 @@ fn resolve_xref_targets(
         // An attribute reference in the file part reads differently in each
         // scope, so each scope is read for its own attributes.
         return path_scopes(ws, doc_path, line)
-            .filter(|scope| readings == XrefReadings::WithPreview || !scope.is_preview())
+            .filter(|scope| readings == Readings::WithPreview || !scope.is_preview())
             .filter_map(|scope| {
                 let catalog = catalogs.get(scope.document());
                 let dir = document_dir(scope.document(), Some(ws));
@@ -1075,7 +1105,7 @@ fn resolve_xref_targets(
     }
     // The same scopes as `path_scopes`: one per top-level document and, for a
     // file others include, its preview, which reads the file alone.
-    let preview = (readings == XrefReadings::WithPreview && catalogs.is_included(doc_path))
+    let preview = (readings == Readings::WithPreview && catalogs.is_included(doc_path))
         .then(|| catalogs.get(doc_path));
     catalogs
         .scopes_at(doc_path)
@@ -1095,13 +1125,13 @@ fn resolve_xref_targets(
         .collect()
 }
 
-/// Which readings of a file an xref resolves in.
+/// Which readings of a file an xref, include or image resolves in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum XrefReadings {
+enum Readings {
     /// The top-level documents that read the file: the targets goto,
     /// find-references and rename follow. A target only the preview finds
     /// is broken where the file is converted, and following it would
-    /// contradict the diagnostic there.
+    /// contradict what Asciidoctor uses there.
     Documents,
     /// Those and, for a file others include, the editor's preview of it:
     /// what hover shows.
@@ -1237,36 +1267,38 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
             json!({ "scopes": scopes })
         }),
         NodeKind::Include { path } => {
-            let scopes: Vec<Value> = resolve_doc_targets(path, doc_path, workspace, info.line)
-                .into_iter()
-                .map(|target| {
-                    if is_uri(&target.substituted) {
-                        return json!({
+            let scopes: Vec<Value> =
+                resolve_doc_targets(path, doc_path, workspace, info.line, Readings::WithPreview)
+                    .into_iter()
+                    .map(|target| {
+                        if is_uri(&target.substituted) {
+                            return json!({
+                                "scope": target.label,
+                                "remote": true,
+                                "target": null,
+                                "canonical_target": null,
+                                "display": target.substituted,
+                                "exists": null,
+                            });
+                        }
+                        // Same existence gate as go-to-definition: the path gd returns.
+                        let exists = target.path.exists();
+                        json!({
                             "scope": target.label,
-                            "remote": true,
-                            "target": null,
-                            "canonical_target": null,
-                            "display": target.substituted,
-                            "exists": null,
-                        });
-                    }
-                    // Same existence gate as go-to-definition: the path gd returns.
-                    let exists = target.path.exists();
-                    json!({
-                        "scope": target.label,
-                        "target": path_string(&target.joined),
-                        "canonical_target": exists.then(|| path_string(&target.path)),
-                        "exists": exists,
+                            "target": path_string(&target.joined),
+                            "canonical_target": exists.then(|| path_string(&target.path)),
+                            "exists": exists,
+                        })
                     })
-                })
-                .collect();
+                    .collect();
             json!({ "scopes": scopes })
         }
         NodeKind::Image { path, .. } => {
-            let scopes: Vec<Value> = resolve_image_targets(path, doc_path, workspace, info.line)
-                .into_iter()
-                .map(|(label, target)| explain_image(&label, target))
-                .collect();
+            let scopes: Vec<Value> =
+                resolve_image_targets(path, doc_path, workspace, info.line, Readings::WithPreview)
+                    .into_iter()
+                    .map(|(label, target)| explain_image(&label, target))
+                    .collect();
             json!({ "scopes": scopes })
         }
     }
@@ -1328,24 +1360,18 @@ fn definition_json(definition: &AttributeDefinition) -> Value {
 
 fn explain_xref(ws: &Workspace, doc_path: &Path, target: &str, line: usize) -> Value {
     let catalogs = CatalogCache::new(ws);
-    let scopes: Vec<Value> = resolve_xref_targets(
-        ws,
-        &catalogs,
-        doc_path,
-        target,
-        line,
-        XrefReadings::WithPreview,
-    )
-    .into_iter()
-    .map(|(label, resolved)| match resolved {
-        Ok(resolved) => json!({
-            "scope": label,
-            "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
-            "error": null,
-        }),
-        Err(e) => json!({ "scope": label, "resolved": null, "error": e.to_string() }),
-    })
-    .collect();
+    let scopes: Vec<Value> =
+        resolve_xref_targets(ws, &catalogs, doc_path, target, line, Readings::WithPreview)
+            .into_iter()
+            .map(|(label, resolved)| match resolved {
+                Ok(resolved) => json!({
+                    "scope": label,
+                    "resolved": { "file": path_string(&resolved.file), "line": resolved.line },
+                    "error": null,
+                }),
+                Err(e) => json!({ "scope": label, "resolved": null, "error": e.to_string() }),
+            })
+            .collect();
     json!({ "scopes": scopes })
 }
 
@@ -2343,6 +2369,107 @@ mod tests {
     fn test_goto_def_file_xref_in_standalone_file_keeps_its_target() {
         let (root, targets) = goto_in_fixture("solo/foreign.adoc", 2, 20);
         assert_eq!(targets, vec![(root.join("chapters/setup.adoc"), 4)]);
+    }
+
+    fn paths_in_include_preview() -> (PathBuf, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/paths_in_include_preview")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
+    }
+
+    /// Goto follows an image only to the file the documents that read it
+    /// find, not to the one only the preview finds; hover still shows the
+    /// preview. Asciidoctor (`paths_in_include_preview/index.adoc`) renders
+    /// `images/found.png` and `images/preview.png`, and only the first exists.
+    #[test]
+    fn test_image_found_only_by_the_preview_has_no_goto() {
+        let (root, ws) = paths_in_include_preview();
+        let path = root.join("chapters/chapter.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let at = |line, character| Position { line, character };
+
+        assert_eq!(
+            resolve_goto_definitions(&content, at(9, 8), &path, Some(&ws)),
+            vec![]
+        );
+        assert_eq!(
+            resolve_goto_definitions(&content, at(11, 12), &path, Some(&ws)),
+            vec![]
+        );
+        assert_eq!(
+            resolve_hover(&content, at(9, 8), &path, Some(&ws)).unwrap(),
+            "In index.adoc:\nimage::images/preview.png[]\n\n\u{2717} File not found\n\n\
+             In chapter.adoc (preview):\nimage::preview.png[]\n\n\u{2713} File exists"
+        );
+
+        assert_eq!(
+            resolve_goto_definitions(&content, at(7, 8), &path, Some(&ws)),
+            vec![(root.join("images/found.png"), 1)]
+        );
+    }
+
+    /// Goto and find-references follow an include only to the file the
+    /// documents that read it find, as the diagnostic does; hover still
+    /// shows the preview. Asciidoctor (`paths_in_include_preview/index.adoc`):
+    /// `include file not found: .../parts/preview.adoc` for line 16;
+    /// `shared/found.adoc` is included.
+    #[test]
+    fn test_include_found_only_by_the_preview_has_no_goto() {
+        let (root, ws) = paths_in_include_preview();
+        let path = root.join("chapters/chapter.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let at = |line, character| Position { line, character };
+        let none = HashMap::new();
+
+        assert!(ws
+            .diagnostics_for(&path)
+            .iter()
+            .any(|d| d.line == 16 && matches!(&d.kind, DiagnosticKind::BrokenInclude { .. })));
+        assert_eq!(
+            resolve_goto_definitions(&content, at(15, 25), &path, Some(&ws)),
+            vec![]
+        );
+        let references = resolve_references(&content, at(15, 25), &path, Some(&ws), true, &none);
+        assert!(references.unwrap_or_default().is_empty());
+        let hover = resolve_hover(&content, at(15, 25), &path, Some(&ws)).unwrap();
+        assert!(
+            hover.ends_with(&format!(
+                "In chapter.adoc (preview):\ninclude::{}/parts/preview.adoc[]\n\n\
+                 \u{2713} File exists | 0 sections",
+                root.join("chapters").display()
+            )),
+            "{hover}"
+        );
+
+        assert_eq!(
+            resolve_goto_definitions(&content, at(13, 25), &path, Some(&ws)),
+            vec![(root.join("shared/found.adoc"), 1)]
+        );
+    }
+
+    /// A file no document includes is its own document: its image and
+    /// include keep their goto. Asciidoctor (`chapters/solo.adoc`) renders
+    /// `preview.png` next to it and includes `parts/preview.adoc`.
+    #[test]
+    fn test_image_and_include_in_standalone_file_keep_their_goto() {
+        let (root, ws) = paths_in_include_preview();
+        let path = root.join("chapters/solo.adoc");
+        let content = fs::read_to_string(&path).unwrap();
+        let at = |line, character| Position { line, character };
+
+        assert_eq!(
+            resolve_goto_definitions(&content, at(4, 8), &path, Some(&ws)),
+            vec![(root.join("chapters/preview.png"), 1)]
+        );
+        assert_eq!(
+            resolve_goto_definitions(&content, at(6, 25), &path, Some(&ws)),
+            vec![(root.join("chapters/parts/preview.adoc"), 1)]
+        );
     }
 
     /// Asciidoctor resolves `<<_second>>` in the document it converts: each
