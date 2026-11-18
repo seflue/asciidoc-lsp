@@ -152,7 +152,12 @@ impl Highlighting {
             "",
         )?;
         block.configure(&names);
-        inline.configure(&names);
+        // Inline highlights are numbered after the block ones, so an event
+        // tells which tree its capture comes from. No capture matches "".
+        let inline_names: Vec<&str> = std::iter::repeat_n("", STYLES.len())
+            .chain(names.iter().copied())
+            .collect();
+        inline.configure(&inline_names);
 
         let styles = STYLES
             .iter()
@@ -217,19 +222,38 @@ pub fn semantic_tokens(content: &str) -> anyhow::Result<Vec<SemanticToken>> {
     )?;
 
     // The events nest: the innermost enclosing highlight styles a run of
-    // text, so tokens come out flat.
+    // text, so tokens come out flat. Where a block capture starts at the
+    // same byte as an inline capture in the text it injects (the title line
+    // of `= {product} Manual`), `tree-sitter-highlight` starts the inline
+    // one first, though the block capture encloses it. A run of starts at
+    // one byte is therefore stacked block before inline, so each end closes
+    // the highlight it belongs to.
+    let from_inline = |index: usize| index >= STYLES.len();
     let mut open: Vec<usize> = Vec::new();
+    let mut run_start = 0;
     let mut tokens = TokenEncoder::new(content);
     for event in events {
         match event? {
-            HighlightEvent::HighlightStart(Highlight(index)) => open.push(index),
+            HighlightEvent::HighlightStart(Highlight(index)) => {
+                let at = if from_inline(index) {
+                    open.len()
+                } else {
+                    open[run_start..]
+                        .iter()
+                        .position(|&other| from_inline(other))
+                        .map_or(open.len(), |offset| run_start + offset)
+                };
+                open.insert(at, index);
+            }
             HighlightEvent::HighlightEnd => {
                 open.pop();
+                run_start = open.len();
             }
             HighlightEvent::Source { start, end } => {
+                run_start = open.len();
                 if let Some(&(token_type, modifiers)) = open
                     .last()
-                    .and_then(|index| highlighting.styles.get(*index))
+                    .and_then(|index| highlighting.styles.get(index % STYLES.len()))
                 {
                     tokens.push(start, end, token_type, modifiers);
                 }
@@ -424,6 +448,28 @@ mod tests {
             let on = on_line(&tokens, line);
             assert!(on.iter().all(|t| t.ty != "heading"), "{on:#?}");
         }
+    }
+
+    /// A title that opens with an attribute reference keeps its heading:
+    /// the reference is styled inside it and the rest of the title stays a
+    /// heading. Asciidoctor resolves the reference in the title: `skipping
+    /// reference to missing attribute: product`.
+    #[test]
+    fn title_opening_with_attribute_reference_stays_heading() {
+        let tokens = decoded(include_str!(
+            "../../../tests/fixtures/adversarial_project/index.adoc"
+        ));
+
+        assert_eq!(
+            texts_on_line(&tokens, 0),
+            [
+                ("heading", "="),
+                ("punctuation", "{"),
+                ("variable", "product"),
+                ("punctuation", "}"),
+                ("heading", " User Manual"),
+            ]
+        );
     }
 
     #[test]
