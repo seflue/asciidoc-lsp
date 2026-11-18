@@ -628,6 +628,45 @@ mod tests {
         }
     }
 
+    /// Type and text of the tokens on one line.
+    fn texts_on_line(tokens: &[Decoded], line: u32) -> Vec<(&str, &str)> {
+        on_line(tokens, line)
+            .iter()
+            .map(|t| (t.ty, t.text.as_str()))
+            .collect()
+    }
+
+    /// The role list of `[.term]#widget#` closes at its own `]`, not at the
+    /// bracket of a later macro on the line. Asciidoctor: `Role text <span
+    /// class="term">widget</span> comes before a later btn:[OK] macro.`
+    #[test]
+    fn role_list_closes_at_its_own_bracket() {
+        let tokens = decoded(FIXTURE);
+
+        let line = texts_on_line(&tokens, 35);
+        assert_eq!(
+            line[..4],
+            [
+                ("punctuation", "["),
+                ("parameter", "term"),
+                ("punctuation", "]"),
+                ("emphasis", "#widget#"),
+            ],
+            "{line:#?}"
+        );
+    }
+
+    /// A line that starts with `[` and ends with `]` is a block attribute
+    /// list, role span or not, so it holds no styled text. Asciidoctor reads
+    /// the whole line as the style of the next block: `unknown style for
+    /// paragraph: .role]#styled# and later pass:q[x`.
+    #[test]
+    fn bracketed_line_is_an_attribute_list_not_role_text() {
+        let tokens = decoded("[.role]#styled# and later pass:q[x]\n");
+
+        assert!(tokens.iter().all(|t| t.ty != "emphasis"), "{tokens:#?}");
+    }
+
     #[test]
     fn empty_document_has_no_tokens() {
         assert!(semantic_tokens("").unwrap().is_empty());
