@@ -2204,6 +2204,7 @@ mod tests {
                     includes: vec![],
                     xrefs: vec![],
                     anchors: vec![],
+                    block_titles: vec![],
                     attributes: vec![],
                     attribute_refs: vec![],
                     conditionals: vec![],

@@ -1,6 +1,6 @@
 use crate::types::{
-    Anchor, AttributeDef, AttributeRef, ConditionalDirective, ConditionalKind, ConditionalOperator,
-    IncludeMacro, Placement, Section, Span, UnterminatedBlock, Xref,
+    Anchor, AttributeDef, AttributeRef, BlockTitle, ConditionalDirective, ConditionalKind,
+    ConditionalOperator, IncludeMacro, Placement, Section, Span, UnterminatedBlock, Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -33,8 +33,18 @@ pub fn extract_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<Attribu
 #[must_use]
 pub fn extract_anchors(node: tree_sitter::Node, source: &[u8]) -> Vec<Anchor> {
     let mut results = Vec::new();
-    walk_for_anchors(node, source, &mut results);
+    walk_for_anchors(node, source, &mut results, &mut Vec::new());
     results
+}
+
+/// Extract the `.Title` of each block that a block anchor (`[[id]]`,
+/// `[#id]`) names, from the block tree. A title above a section heading is
+/// none: Asciidoctor matches a section by its heading only.
+#[must_use]
+pub fn extract_block_titles(node: tree_sitter::Node, source: &[u8]) -> Vec<BlockTitle> {
+    let mut titles = Vec::new();
+    walk_for_anchors(node, source, &mut Vec::new(), &mut titles);
+    titles
 }
 
 // --- Inline-level extractors (work on inline parse tree) ---
@@ -777,7 +787,12 @@ fn walk_for_attributes(node: tree_sitter::Node, source: &[u8], results: &mut Vec
     }
 }
 
-fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<Anchor>) {
+fn walk_for_anchors(
+    node: tree_sitter::Node,
+    source: &[u8],
+    results: &mut Vec<Anchor>,
+    titles: &mut Vec<BlockTitle>,
+) {
     // Skip backtick code spans — no anchors inside monospace
     if node.kind() == "monospace" {
         return;
@@ -820,8 +835,10 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
 
     // Consecutive `[[id]]` / `[#id]` lines above one block form a run;
     // Asciidoctor registers only the last ID of it (title lines and
-    // comments in between do not break the run).
+    // comments in between do not break the run). The last title line of
+    // the run is the title of the block the ID names.
     let mut run_last: Option<Anchor> = None;
+    let mut run_title: Option<String> = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if let Some((id, reftext)) = block_line_id(child, source) {
@@ -832,13 +849,30 @@ fn walk_for_anchors(node: tree_sitter::Node, source: &[u8], results: &mut Vec<An
             });
             continue;
         }
+        if child.kind() == "block_title" {
+            run_title = find_child_text(child, "line", source).map(|t| t.trim().to_string());
+            continue;
+        }
         let in_run = matches!(
             child.kind(),
-            "block_anchor" | "element_attr" | "block_title" | "line_comment" | "block_comment"
+            "block_anchor" | "element_attr" | "line_comment" | "block_comment"
         );
         if !in_run {
+            let title = run_title.take();
+            if let (Some(anchor), Some(title)) = (&run_last, title) {
+                let heading = matches!(
+                    child.kind(),
+                    "document_title" | "title1" | "title2" | "title3" | "title4" | "title5"
+                );
+                if !heading {
+                    titles.push(BlockTitle {
+                        line: anchor.line,
+                        title,
+                    });
+                }
+            }
             results.extend(run_last.take());
-            walk_for_anchors(child, source, results);
+            walk_for_anchors(child, source, results, titles);
         }
     }
     results.extend(run_last);
@@ -1526,6 +1560,26 @@ mod tests {
             .iter()
             .map(|a| (a.id.as_str(), a.reftext.as_deref(), a.line))
             .collect();
+        assert_eq!(got, expected, "{source:?}");
+    }
+
+    /// Block titles a natural xref matches, as Asciidoctor 2.0.26 reads them
+    /// (oracle: `tests/fixtures/natural_xrefs/main.adoc`): the `.Title` of a
+    /// block with an ID, above or below the ID line; the last ID of a run
+    /// names the block. A block without ID and a title above a section
+    /// heading give none. Each case lists `(line of the ID, title)`.
+    #[rstest::rstest]
+    #[case::table("intro\n\n.Table title\n[#t]\n|===\n|a\n|===\n", &[(4, "Table title")])]
+    #[case::title_below_id("[[l]]\n.Listing\n----\nx\n----\n", &[(1, "Listing")])]
+    #[case::last_id_of_run(".Run\n[[a]]\n[[b]]\n----\nx\n----\n", &[(3, "Run")])]
+    #[case::no_id(".Untitled\n|===\n|a\n|===\n", &[])]
+    #[case::no_title("[#t]\n|===\n|a\n|===\n", &[])]
+    #[case::above_section(".Block title\n[[s]]\n== Section\n", &[])]
+    fn test_extract_block_titles(#[case] source: &str, #[case] expected: &[(usize, &str)]) {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        let titles = extract_block_titles(tree.root_node(), source.as_bytes());
+        let got: Vec<(usize, &str)> = titles.iter().map(|t| (t.line, t.title.as_str())).collect();
         assert_eq!(got, expected, "{source:?}");
     }
 

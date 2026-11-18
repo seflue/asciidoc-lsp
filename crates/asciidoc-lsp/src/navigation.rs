@@ -2248,7 +2248,11 @@ mod tests {
 
     /// Asciidoctor (`natural_xrefs/main.adoc`): `<<Installation>>` renders as
     /// `#_installation` (section title), `<<Command line>>` as `#cli`
-    /// (reftext of the anchor above `== CLI usage`).
+    /// (reftext of the anchor above `== CLI usage`). On blocks with an ID:
+    /// `<<Table title>>` renders as `#tbl` (block title), `<<Listing text>>`
+    /// as `#lst` (block reftext), `<<Usage>>` as `#_usage` (the section
+    /// comes before the block of that title), `<<Shared block title>>` as
+    /// `#first-block` (first of two blocks).
     #[test]
     fn test_goto_def_natural_xref_lands_on_title_or_reftext_owner() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2259,20 +2263,16 @@ mod tests {
         ws.scan_workspace();
         let path = root.join("main.adoc");
         let content = fs::read_to_string(&path).unwrap();
-        let goto = |character| {
-            resolve_goto_definitions(
-                &content,
-                Position {
-                    line: 19,
-                    character,
-                },
-                &path,
-                Some(&ws),
-            )
+        let goto = |line, character| {
+            resolve_goto_definitions(&content, Position { line, character }, &path, Some(&ws))
         };
 
-        assert_eq!(goto(13), vec![(path.clone(), 9)]);
-        assert_eq!(goto(42), vec![(path.clone(), 13)]);
+        assert_eq!(goto(19, 13), vec![(path.clone(), 9)]);
+        assert_eq!(goto(19, 42), vec![(path.clone(), 13)]);
+        assert_eq!(goto(49, 16), vec![(path.clone(), 56)]);
+        assert_eq!(goto(49, 48), vec![(path.clone(), 67)]);
+        assert_eq!(goto(52, 25), vec![(path.clone(), 18)]);
+        assert_eq!(goto(52, 37), vec![(path.clone(), 79)]);
     }
 
     /// A natural xref shows its target as an xref to the ID it resolves to

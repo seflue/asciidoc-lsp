@@ -325,6 +325,7 @@ pub fn parse_single_file(
     anchors.extend(inline_anchors);
     // Document order: the first definition of an id is the one that counts.
     anchors.sort_by_key(|anchor| anchor.line);
+    let block_titles = crate::extractors::extract_block_titles(root_node, source.as_bytes());
 
     // Extract attribute references ({name} patterns) via byte-scanning
     let attribute_refs = crate::extractors::extract_attribute_refs(&source);
@@ -357,6 +358,7 @@ pub fn parse_single_file(
         includes: includes_raw,
         xrefs,
         anchors,
+        block_titles,
         attributes: file_attrs,
         attribute_refs,
         conditionals,

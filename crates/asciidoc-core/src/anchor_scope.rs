@@ -39,8 +39,8 @@ pub struct AnchorScope {
     whole: HashSet<PathBuf>,
     ids: HashMap<String, AnchorLocation>,
     /// The text a natural xref (`<<Section title>>`) matches, mapped to its
-    /// ID: the reftext of an anchor, or the title of a section without one.
-    /// The first definition of a text wins.
+    /// ID: the reftext of an anchor, or the title of a section or of a block
+    /// with an ID, without reftext. The first definition of a text wins.
     xreftexts: HashMap<String, String>,
     duplicates: Vec<DuplicateId>,
 }
@@ -60,7 +60,8 @@ impl AnchorScope {
 
     /// The ID that a natural xref names, with its first definition.
     /// Asciidoctor matches a target that is no ID, has no `#` and contains a
-    /// space or an uppercase letter against the reftexts and section titles.
+    /// space or an uppercase letter against the reftexts and the titles of
+    /// sections and of blocks with an ID.
     fn lookup_natural(&self, target: &str) -> Option<(&str, &AnchorLocation)> {
         let natural = !target.contains('#')
             && (target.contains(' ') || target.chars().any(char::is_uppercase));
@@ -502,7 +503,8 @@ fn definition_id<'b>(location: &AnchorLocation, id: &'b str) -> Option<&'b str> 
 
 /// A line of a file that defines an ID.
 enum Definition<'a> {
-    Anchor(&'a Anchor),
+    /// An anchor, with the title of the block it names.
+    Anchor(&'a Anchor, Option<&'a str>),
     Section(&'a Section),
 }
 
@@ -523,7 +525,7 @@ struct AnchorWalk<'a> {
     /// line are two readings.
     plain_read: Definitions,
     /// The IDs that carry a reftext, even one an earlier ID already holds: a
-    /// section among them is not matched by its title.
+    /// section or block among them is not matched by its title.
     reftext_ids: HashSet<String>,
     scope: AnchorScope,
 }
@@ -534,7 +536,14 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
     fn items(&self, _file: &Path, doc: &'a DocumentModel) -> Vec<(usize, Definition<'a>)> {
         doc.anchors
             .iter()
-            .map(|anchor| (anchor.line, Definition::Anchor(anchor)))
+            .map(|anchor| {
+                let title = doc
+                    .block_titles
+                    .iter()
+                    .find(|block| block.line == anchor.line)
+                    .map(|block| block.title.as_str());
+                (anchor.line, Definition::Anchor(anchor, title))
+            })
             .chain(
                 doc.sections
                     .iter()
@@ -545,12 +554,15 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
 
     fn item(&mut self, stack: &[PathBuf], file: &Path, item: Definition<'a>) {
         match item {
-            Definition::Anchor(anchor) => {
+            Definition::Anchor(anchor, title) => {
                 let plain_reread = self.note_plain_reading(file, anchor.line, Some(&anchor.id));
                 self.define_explicit(file, anchor, plain_reread);
                 if let Some(reftext) = &anchor.reftext {
                     self.reftext_ids.insert(anchor.id.clone());
                     self.define_xreftext(reftext, &anchor.id);
+                }
+                if let Some(title) = title {
+                    self.define_title(title, &anchor.id);
                 }
             }
             Definition::Section(section) => {
@@ -560,7 +572,7 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
                 // own) still gets one here: a false negative, accepted.
                 let is_document_header = section.is_header && stack.len() == 1;
                 if let Some(id) = &section.id {
-                    self.define_section_title(&section.title, id);
+                    self.define_title(&section.title, id);
                 } else if !is_document_header {
                     let plain_reread = self.note_plain_reading(file, section.line, None);
                     self.define_section(file, section, plain_reread);
@@ -644,8 +656,8 @@ impl AnchorWalk<'_> {
             .or_insert_with(|| id.to_string());
     }
 
-    /// A section with a reftext is matched by the reftext only.
-    fn define_section_title(&mut self, title: &str, id: &str) {
+    /// A section or block with a reftext is matched by the reftext only.
+    fn define_title(&mut self, title: &str, id: &str) {
         if !self.reftext_ids.contains(id) {
             self.define_xreftext(title, id);
         }
@@ -701,7 +713,7 @@ impl AnchorWalk<'_> {
             id = format!("{base}{separator}{suffix}");
             suffix += 1;
         }
-        self.define_section_title(&section.title, &id);
+        self.define_title(&section.title, &id);
         self.register(id, location);
     }
 }

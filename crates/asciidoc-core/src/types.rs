@@ -95,6 +95,15 @@ pub struct Anchor {
     pub line: usize,
 }
 
+/// The `.Title` line of a block with an ID. `line` is the line of the ID
+/// (`[[id]]`, `[#id]`) that names the block; a natural xref (`<<Title>>`)
+/// matches the title as it matches a section title.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockTitle {
+    pub line: usize,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeRef {
     pub name: String,
@@ -157,6 +166,8 @@ pub struct DocumentModel {
     pub includes: Vec<IncludeMacro>,
     pub xrefs: Vec<Xref>,
     pub anchors: Vec<Anchor>,
+    /// The titles of blocks with an ID, by the line of the ID.
+    pub block_titles: Vec<BlockTitle>,
     pub attributes: Vec<AttributeDef>,
     pub attribute_refs: Vec<AttributeRef>,
     pub conditionals: Vec<ConditionalDirective>,
@@ -472,6 +483,7 @@ impl DocumentModel {
             includes: vec![],
             xrefs: vec![],
             anchors: vec![],
+            block_titles: vec![],
             attributes: vec![],
             attribute_refs: vec![],
             conditionals: vec![],

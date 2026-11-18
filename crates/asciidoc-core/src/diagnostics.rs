@@ -1243,7 +1243,10 @@ mod tests {
     /// reference` for `No Such Title`, `CLI usage` (the reftext hides the
     /// title), `installation` (lowercase without space is an ID only),
     /// `#Installation` (no title lookup after `#`) and `Second owner` (its
-    /// reftext hides the title even though an earlier anchor holds it).
+    /// reftext hides the title even though an earlier anchor holds it). On
+    /// blocks: `Untitled table` (a block without ID is not matched) and
+    /// `Listing title` (the block's reftext hides its title); `Table title`,
+    /// `Listing text` and `Shared block title` resolve.
     #[test]
     fn test_natural_xrefs_resolve_by_title_or_reftext() {
         let (root, ws) = fixture_workspace("natural_xrefs");
@@ -1260,7 +1263,9 @@ mod tests {
                 "CLI usage",
                 "installation",
                 "#Installation",
-                "Second owner"
+                "Second owner",
+                "Untitled table",
+                "Listing title"
             ]
         );
     }

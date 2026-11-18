@@ -2,9 +2,9 @@
 
 // Asciidoctor resolves an xref target that is no ID, has no `#` and
 // contains a space or an uppercase letter by matching it against the
-// reftext, or the title of a section without reftext.
+// reftext, or the title of a section or of a block with ID, without reftext.
 // Asciidoctor -v: possible invalid reference for No Such Title, CLI usage,
-// installation, #Installation and Second owner; all others resolve.
+// installation, #Installation, Second owner (and below, in Blocks).
 
 == Installation
 
@@ -39,3 +39,50 @@ Text.
 
 A taken reftext still hides the title: <<Second owner>>.
 The reftext names its first owner: <<Shared text>>.
+
+== Blocks
+
+// Asciidoctor -v: possible invalid reference for Untitled table (no ID)
+// and Listing title (the reftext hides it). Table title renders as #tbl,
+// Listing text as #lst, Usage as #_usage (the section comes first) and
+// Shared block title as #first-block.
+
+Block title: <<Table title>>. Block reftext: <<Listing text>>.
+A block without ID: <<Untitled table>>.
+Reftext hides the block title: <<Listing title>>.
+The first owner wins: <<Usage>>, <<Shared block title>>.
+
+.Table title
+[#tbl]
+|===
+|Cell
+|===
+
+.Untitled table
+|===
+|Cell
+|===
+
+.Listing title
+[[lst,Listing text]]
+----
+code
+----
+
+.Usage
+[#usage-example]
+====
+Example.
+====
+
+.Shared block title
+[#first-block]
+====
+One.
+====
+
+.Shared block title
+[#second-block]
+====
+Two.
+====
