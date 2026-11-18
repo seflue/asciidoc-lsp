@@ -90,7 +90,7 @@ Tree-sitter parses syntax only. It knows nothing about attribute values, include
 * A top-level document is a document that no other document includes.
 * `{docdir}` is the folder of the top-level document, as in Asciidoctor. A document without an includer is its own top-level document. A `:docdir:` entry in a document or in `.asciidoctorconfig` is ignored.
 * Each top-level document is read as the editor previews it: its own `.asciidoctorconfig` chain first, then the document.
-* For paths, a file that other documents include is also resolved as its own preview: its config chain and its own folder as base, without the attributes of the including document. Attribute values (hover, go to definition on `{name}`) show only the top-level documents.
+* For paths, a file that other documents include is also resolved as its own preview: its config chain and its own folder as base, without the attributes of the including document. Hover shows this preview as information. Go to definition and find references on an xref, image, or include, and rename on an xref, follow only the top-level documents that read the file, as Asciidoctor does when it converts them. Attribute values (hover, go to definition on `{name}`) show only the top-level documents.
 * Each feature decides how to present the results. If all agree, it shows one result. If they differ, it shows each result with the document name.
 
 *Consequences:*
