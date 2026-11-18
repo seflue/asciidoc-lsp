@@ -48,4 +48,4 @@ It parses with tree-sitter grammars and provides document symbols, go to definit
 | The server stays operational when documents contain syntax errors. Partial results are preferred over crashes.
 |===
 
-For details on specific technology choices, see xref:09_architecture_decisions.adoc#adr-treesitter[Tree-sitter Decision].
+For details on specific technology choices, see xref:chapters/09_architecture_decisions.adoc#adr-treesitter[Tree-sitter Decision].

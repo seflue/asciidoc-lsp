@@ -3565,7 +3565,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         ))
         .unwrap();
 
-        // Line 46 (1-indexed): "...see xref:05_building_block_view.adoc#building-blocks[...]."
+        // Line 46 (1-indexed): "...see xref:chapters/05_building_block_view.adoc#building-blocks[...]."
         let pos = Position {
             line: 45,
             character: 50,
@@ -3575,7 +3575,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {
-                target: "05_building_block_view.adoc#building-blocks".into()
+                target: "chapters/05_building_block_view.adoc#building-blocks".into()
             }
         );
     }
@@ -3589,7 +3589,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         ))
         .unwrap();
 
-        // Line 68 (1-indexed): "...documented in xref:01_introduction_and_goals.adoc[...]..."
+        // Line 68 (1-indexed): "...documented in xref:chapters/01_introduction_and_goals.adoc[...]..."
         // "xref:" starts at character 91, target at 96
         let pos = Position {
             line: 67,
@@ -3600,7 +3600,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {
-                target: "01_introduction_and_goals.adoc".into()
+                target: "chapters/01_introduction_and_goals.adoc".into()
             }
         );
     }

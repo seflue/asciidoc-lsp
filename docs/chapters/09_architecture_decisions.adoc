@@ -19,7 +19,7 @@ The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing
 * Positive: Error recovery and syntax highlighting queries are provided by the Tree-sitter framework with minimal custom code.
 * Positive: Grammar fixes are made in the fork and take effect through the submodule pin.
 * Negative: The grammar may not cover all AsciiDoc constructs. Gaps are fixed in the fork.
-* Negative: The dual-grammar approach adds complexity to the parser integration; for details, see xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
+* Negative: The dual-grammar approach adds complexity to the parser integration; for details, see xref:chapters/08_concepts.adoc#parsing-concepts[Parsing Concepts].
 
 [[adr-rust]]
 === ADR-2: Implement in Rust
@@ -43,12 +43,12 @@ Tree-sitter's Rust bindings are first-class, and Rust's ownership model prevents
 * Negative: Higher learning curve compared to TypeScript. Contributors need Rust experience or must be willing to learn.
 * Negative: Longer compile times compared to TypeScript or Go.
 
-For the building block structure, see xref:05_building_block_view.adoc#building-blocks[Building Block View].
+For the building block structure, see xref:chapters/05_building_block_view.adoc#building-blocks[Building Block View].
 
 [[adr-dual-parser]]
 === ADR-3: Tree-sitter-Only-First, Dual-Parser Later
 
-*Status:* Superseded by xref:09_architecture_decisions.adoc#adr-semantics[ADR-4]
+*Status:* Superseded by xref:chapters/09_architecture_decisions.adoc#adr-semantics[ADR-4]
 
 *Context:*
 The `acdc-parser` crate (PEG-based) provides semantic-level parsing of AsciiDoc, including attribute substitution, conditional processing, and include resolution.
@@ -65,7 +65,7 @@ The `acdc-parser` is introduced only if specific semantic features (full attribu
 * Negative: Some advanced AsciiDoc features (conditional directives, complex attribute substitution) may have limited support in the initial release.
 * Negative: If `acdc-parser` is needed later, integrating it into an existing codebase is harder than designing for it from the start.
 
-The quality goals and stakeholder expectations that drove this trade-off are documented in xref:01_introduction_and_goals.adoc[Introduction and Goals] and xref:08_concepts.adoc#parsing-concepts[Parsing Concepts].
+The quality goals and stakeholder expectations that drove this trade-off are documented in xref:chapters/01_introduction_and_goals.adoc[Introduction and Goals] and xref:chapters/08_concepts.adoc#parsing-concepts[Parsing Concepts].
 
 [[adr-semantics]]
 === ADR-4: Resolve AsciiDoc Semantics in asciidoc-core

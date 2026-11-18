@@ -4,7 +4,7 @@
 The Semantic Layer builds on top of the parsed syntax trees and workspace state to provide the intelligence behind LSP features.
 It is responsible for cross-reference resolution, anchor indexing, attribute substitution tracking, and diagnostic generation.
 
-For the overall system context, see xref:05_building_block_view.adoc#building-blocks[Building Block View].
+For the overall system context, see xref:chapters/05_building_block_view.adoc#building-blocks[Building Block View].
 
 ==== Cross-Reference Resolution
 
@@ -13,8 +13,8 @@ This involves several steps: parsing the xref macro to extract the target docume
 
 The resolver handles three types of cross-references:
 
-* *Intra-document xrefs* — References to anchors within the same file (e.g., `<<section-id>>`).
-* *Inter-document xrefs* — References to anchors in other files (e.g., `xref:other.adoc#anchor[Label]`).
+* *Intra-document xrefs* — References to anchors within the same file (e.g., `+<<section-id>>+`).
+* *Inter-document xrefs* — References to anchors in other files (e.g., `+xref:other.adoc#anchor[Label]+`).
 * *Implicit section IDs* — AsciiDoc automatically generates IDs from section titles. The resolver must replicate this ID generation algorithm to resolve references to sections that lack explicit anchor definitions.
 
 ==== Parser Integration
