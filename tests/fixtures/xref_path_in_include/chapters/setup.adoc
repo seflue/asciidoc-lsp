@@ -9,3 +9,10 @@
 Good: xref:chapters/reference.adoc#ref-options[options].
 
 Dead in the converted master: xref:reference.adoc#ref-options[options].
+
+// Asciidoctor renders the xref below as the dead link
+// setup.html#setup-notes: no setup.adoc lies next to index.adoc, only this
+// file has the name. It reports none of the three xrefs.
+
+[[setup-notes]]
+Dead, no file at this path: xref:setup.adoc#setup-notes[notes].

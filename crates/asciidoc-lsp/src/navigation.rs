@@ -2336,6 +2336,9 @@ mod tests {
     /// dead link `reference.html#ref-options`, which the preview alone would
     /// find in `chapters/reference.adoc`;
     /// `xref:chapters/reference.adoc#ref-options[]` is `#ref-options`.
+    /// `xref:setup.adoc#setup-notes[]` is the dead link
+    /// `setup.html#setup-notes`: no `setup.adoc` lies next to `index.adoc`,
+    /// and goto does not fall back to `chapters/setup.adoc` by its name.
     #[test]
     fn test_xref_broken_in_the_master_is_not_followed_through_the_preview() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2356,6 +2359,10 @@ mod tests {
         let references = resolve_references(&content, at(10, 55), &path, Some(&ws), true, &none);
         assert!(references.unwrap_or_default().is_empty());
         assert_eq!(prepare_rename(&content, at(10, 55), &path, Some(&ws)), None);
+        assert_eq!(
+            resolve_goto_definitions(&content, at(17, 40), &path, Some(&ws)),
+            vec![]
+        );
 
         assert_eq!(
             resolve_goto_definitions(&content, at(8, 40), &path, Some(&ws)),

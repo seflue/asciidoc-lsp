@@ -12,9 +12,7 @@ use std::sync::atomic::Ordering;
 
 use crate::paths::{canonicalize_if_exists, join_doc_path, resolve_doc_target};
 use crate::reading::{read_in_order, ReadingVisitor};
-use crate::references::{
-    effective_id_separator, find_target_file, generate_section_id, parse_xref_target,
-};
+use crate::references::{effective_id_separator, generate_section_id, parse_xref_target};
 use crate::types::{
     Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, FileLocation, IncludeEdge,
     ResolvedXref, Section, Xref,
@@ -208,12 +206,14 @@ impl<'ws> CatalogCache<'ws> {
                 .map(|(id, location)| located(id, location))
                 .ok_or_else(broken);
         };
-        let file = find_target_file(
-            &self.workspace.documents,
-            resolve_file(file_ref).as_ref(),
-            file_ref,
-        )
-        .ok_or_else(broken)?;
+        // Only the path Asciidoctor reads names the file (ADR-009): a file
+        // of the same name in another folder is no target.
+        let resolved = resolve_file(file_ref).ok_or_else(broken)?;
+        let (file, _) = self
+            .workspace
+            .documents
+            .get_key_value(&resolved)
+            .ok_or_else(broken)?;
         let Some(id) = anchor_part else {
             return Ok(ResolvedXref {
                 file: file.clone(),

@@ -1222,14 +1222,20 @@ mod tests {
     /// `index.adoc`: `xref:chapters/reference.adoc#ref-options[]` renders as
     /// `#ref-options`, `xref:reference.adoc#ref-options[]` as the dead link
     /// `reference.html#ref-options` to the top-level `reference.adoc`, whose
-    /// page has only `top-options`. Asciidoctor does not check that link.
+    /// page has only `top-options`. `xref:setup.adoc#setup-notes[]` renders
+    /// as the dead link `setup.html#setup-notes`: no `setup.adoc` lies next
+    /// to `index.adoc`, and a file of that name in another folder is no
+    /// target. Asciidoctor does not check these links.
     #[test]
     fn test_xref_path_in_included_file_resolves_from_the_top_level_document() {
         let (root, ws) = fixture_workspace("xref_path_in_include");
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("chapters/setup.adoc")),
-            vec![("reference.adoc#ref-options", vec![])]
+            vec![
+                ("reference.adoc#ref-options", vec![]),
+                ("setup.adoc#setup-notes", vec![])
+            ]
         );
     }
 
