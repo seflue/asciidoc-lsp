@@ -667,6 +667,24 @@ mod tests {
         assert!(tokens.iter().all(|t| t.ty != "emphasis"), "{tokens:#?}");
     }
 
+    /// The angle brackets of `<https://example.org>` are markup around the
+    /// URL, not part of it. Asciidoctor drops them: `The page <a
+    /// href="https://example.org" class="bare">https://example.org</a> sits
+    /// in angle brackets.`
+    #[test]
+    fn angle_brackets_are_not_part_of_the_link() {
+        let tokens = decoded(FIXTURE);
+
+        assert_eq!(
+            texts_on_line(&tokens, 37),
+            [
+                ("punctuation", "<"),
+                ("link", "https://example.org"),
+                ("punctuation", ">"),
+            ]
+        );
+    }
+
     #[test]
     fn empty_document_has_no_tokens() {
         assert!(semantic_tokens("").unwrap().is_empty());
