@@ -3068,8 +3068,9 @@ mod tests {
     /// parents hold a `part-up.adoc` and an `up.svg`. The image resolves
     /// against the docdir of `diamond.adoc`, which reads the file:
     /// Asciidoctor renders `../up.svg` there, a file next to `real/project`
-    /// that does not exist, so goto has no target; the completion of the
-    /// preview still lists the link-side parent.
+    /// that does not exist, so goto has no target. The completion lists the
+    /// same folder, the parent of the document's `real/project`, not the
+    /// parents the preview reads (ADR-010).
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fixture_parent_of_symlinked_folder_is_the_link_side_parent() {
@@ -3089,7 +3090,8 @@ mod tests {
             Some(file_uri(&real.join("part-up.adoc")))
         );
         assert_eq!(image_target.map(|l| l.uri), None);
-        assert!(labels.contains(&"docs/".to_string()), "{labels:?}");
+        assert!(labels.contains(&"project/".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"docs/".to_string()), "{labels:?}");
         assert!(!labels.contains(&"shared/".to_string()), "{labels:?}");
     }
 

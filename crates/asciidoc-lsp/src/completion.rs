@@ -13,9 +13,7 @@ use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 use crate::positions;
-use crate::scopes::{
-    collapse_if_agree, document_dir, path_scopes, scope_docdir, scope_image_base, scope_label,
-};
+use crate::scopes::{collapse_if_agree, document_dir, scope_docdir, scope_image_base, scope_label};
 
 // ---------------------------------------------------------------------------
 // Syntax Completion Catalog
@@ -1096,10 +1094,13 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         );
     }
 
-    // The file as each scope reads it (ADR-4), from the scope's folder, as
-    // Asciidoctor reads it; anchors of any of them.
+    // The file as each top-level document reads it (ADR-4), from the
+    // document's folder, as Asciidoctor reads it; anchors of any of them. The
+    // preview takes no part, as for goto (ADR-010).
     let base = document_dir(doc_path, Some(ws));
-    let resolved: Vec<(PathBuf, String)> = path_scopes(ws, doc_path, line)
+    let resolved: Vec<(PathBuf, String)> = ws
+        .scopes_at(doc_path, line)
+        .into_iter()
         .map(|scope| (scope_docdir(&scope, base), scope.substitute(file)))
         .filter(|(_, resolved)| !resolved.contains('{'))
         .collect();
@@ -1131,8 +1132,8 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
 }
 
 /// Resolve xref path completions: `.adoc` files relative to each scope's
-/// `docdir` (the top-level document's folder, an included file's own folder
-/// for its preview), as Asciidoctor resolves xref paths.
+/// `docdir` (the folder of each top-level document that reads the file, not
+/// that of its preview), as Asciidoctor resolves xref paths.
 /// Reuses `resolve_path_completions` (which appends `[]` to file entries).
 pub(crate) fn resolve_xref_path_completions(
     prefix: &str,
@@ -1299,7 +1300,9 @@ struct PathListing {
 
 /// One [`PathListing`] per scope of `doc_path` on `line` (ADR-4), each
 /// starting from `base_dir(scope)`; without a workspace one from
-/// `fallback_base` with `prefix` as typed.
+/// `fallback_base` with `prefix` as typed. The preview scope takes no part:
+/// paths complete only where goto follows them, in the top-level documents
+/// (ADR-010).
 fn path_listings(
     prefix: &str,
     doc_path: &Path,
@@ -1314,7 +1317,8 @@ fn path_listings(
             resolved_prefix: prefix.to_string(),
         }];
     };
-    path_scopes(ws, doc_path, line)
+    ws.scopes_at(doc_path, line)
+        .into_iter()
         .map(|scope| PathListing {
             base_dir: base_dir(&scope),
             resolved_prefix: scope.substitute(prefix),
@@ -2827,18 +2831,23 @@ mod tests {
 
     /// Asciidoctor resolves xref paths in a book relative to the `docdir`
     /// of the top-level document, also in an included chapter: from
-    /// `chapters/setup.adoc`, `xref:` lists the folder of `index.adoc`
-    /// (book scope) and the chapter's own folder (preview scope).
+    /// `chapters/setup.adoc`, `xref:` lists the folder of `index.adoc`, not
+    /// the chapter's own folder that only its preview reads (ADR-010), so
+    /// no `reference.adoc` (it lies in `chapters/`).
     #[test]
-    fn test_xref_path_in_included_file_lists_the_top_level_document_folder() {
+    fn test_xref_path_in_included_file_lists_only_the_top_level_document_folder() {
         let labels = labels_in(
             fixture("adversarial_project"),
             "chapters/setup.adoc",
             "xref:",
         );
-        for expected in ["chapters/", "index.adoc", "reference.adoc", "ref-options"] {
+        for expected in ["chapters/", "index.adoc", "ref-options"] {
             assert!(labels.contains(&expected.to_string()), "{labels:?}");
         }
+        assert!(
+            !labels.contains(&"reference.adoc".to_string()),
+            "{labels:?}"
+        );
     }
 
     /// Asciidoctor resolves `xref:chapters/reference.adoc` from the `docdir`
@@ -2910,18 +2919,17 @@ mod tests {
     /// `xref:reference.adoc#ref-options[]` in the included
     /// `chapters/setup.adoc` as `reference.html#ref-options`: from the folder
     /// of `index.adoc` the path names the top-level `reference.adoc`, which
-    /// defines `top-options`. The preview reads it from the chapter's folder,
-    /// where it names `chapters/reference.adoc` with `ref-options`.
+    /// defines `top-options`. The preview would read it from the chapter's
+    /// folder, where it names `chapters/reference.adoc` with `ref-options`;
+    /// completion offers only what goto follows (ADR-010), so not that.
     #[test]
-    fn test_xref_cross_completions_in_included_file_read_each_scope_from_its_folder() {
+    fn test_xref_cross_completions_in_included_file_read_the_top_level_folder() {
         let labels = labels_in(
             fixture("xref_path_in_include"),
             "chapters/setup.adoc",
             "xref:reference.adoc#",
         );
-        for expected in ["top-options", "ref-options"] {
-            assert!(labels.contains(&expected.to_string()), "{labels:?}");
-        }
+        assert_eq!(labels, vec!["top-options"]);
     }
 
     #[test]
@@ -3431,10 +3439,11 @@ mod tests {
         assert_eq!(looks_like_text(head), expected);
     }
 
-    /// An image folder set by one top-level document and another by the
-    /// chapter's own preview: both are listed.
+    /// An image folder set by the top-level document is listed, the folder of
+    /// the chapter's own preview is not: completion offers what goto follows
+    /// (ADR-010).
     #[test]
-    fn test_image_completions_offer_union_with_preview() {
+    fn test_image_completions_offer_only_the_folders_of_the_documents() {
         let (_dir, ws, paths) = scanned(&[
             ("book.adoc", "= B\n:imagesdir: img\ninclude::ch.adoc[]\n"),
             ("ch.adoc", "== C\n\nimage::\n"),
@@ -3444,7 +3453,56 @@ mod tests {
         let items = resolve_image_completions("", &paths[1], 3, Some(&ws), AT_LINE_START);
         let labels = labels(&items);
         assert!(labels.contains(&"book.png"), "{labels:?}");
-        assert!(labels.contains(&"own.png"), "{labels:?}");
+        assert!(!labels.contains(&"own.png"), "{labels:?}");
+    }
+
+    /// Image and include paths complete only where the documents that read
+    /// the file resolve them, as goto follows them (ADR-010). Asciidoctor
+    /// (`paths_in_include_preview/index.adoc`) renders `images/found.png`
+    /// and `images/preview.png` (missing) for `chapters/chapter.adoc` and
+    /// reports `include file not found: .../parts/preview.adoc`; the preview
+    /// alone would find `chapters/preview.png` and `chapters/parts/`.
+    #[test]
+    fn test_path_completions_in_included_file_skip_the_preview() {
+        let images = labels_in(
+            fixture("paths_in_include_preview"),
+            "chapters/chapter.adoc",
+            "image::",
+        );
+        assert!(images.contains(&"found.png".to_string()), "{images:?}");
+        assert!(!images.contains(&"preview.png".to_string()), "{images:?}");
+        let inline = labels_in(
+            fixture("paths_in_include_preview"),
+            "chapters/chapter.adoc",
+            "image:",
+        );
+        assert!(!inline.contains(&"preview.png".to_string()), "{inline:?}");
+        let includes = labels_in(
+            fixture("paths_in_include_preview"),
+            "chapters/chapter.adoc",
+            "include::{docdir}/",
+        );
+        assert!(includes.contains(&"shared/".to_string()), "{includes:?}");
+        assert!(!includes.contains(&"parts/".to_string()), "{includes:?}");
+    }
+
+    /// A file no document includes is its own document and completes from
+    /// its own folder. Asciidoctor (`paths_in_include_preview/chapters/solo.adoc`)
+    /// renders `preview.png` next to it and includes `parts/preview.adoc`.
+    #[test]
+    fn test_path_completions_in_standalone_file_list_its_own_folder() {
+        let images = labels_in(
+            fixture("paths_in_include_preview"),
+            "chapters/solo.adoc",
+            "image::",
+        );
+        assert!(images.contains(&"preview.png".to_string()), "{images:?}");
+        let includes = labels_in(
+            fixture("paths_in_include_preview"),
+            "chapters/solo.adoc",
+            "include::{docdir}/",
+        );
+        assert!(includes.contains(&"parts/".to_string()), "{includes:?}");
     }
 
     /// Attribute names come from every top-level document; the value is
