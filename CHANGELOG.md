@@ -10,6 +10,33 @@ Before 1.0, a minor version may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Error for a level 0 section in a document that is not a book.
+- Hover on an anchor declaration shows the same as hover on an xref to it.
+
+### Changed
+
+- Xref paths in included files resolve from the top-level document, as in
+  Asciidoctor.
+- Go to definition and completion offer only targets the document actually
+  finds.
+- A missing include marked `opts=optional` is reported as information, not
+  as an error.
+
+### Fixed
+
+- Xrefs to a section title or reftext (`<<Section title>>`), including block
+  titles, resolve instead of being reported as broken.
+- Bibliography anchors (`[[[id]]]`) are valid xref targets.
+- Xrefs to a file that exists only elsewhere in the workspace are reported
+  as broken.
+- Rename refuses names that would break the document.
+- Highlighting: prose words, literal blocks, author lines, autolinks in
+  angle brackets and titles starting with an attribute reference.
+- An attribute entry directly below a paragraph line is treated as text.
+- Errors for section levels are reported where Asciidoctor reports them.
+
 ## [0.8.0] - 2026-11-17
 
 ### Added
