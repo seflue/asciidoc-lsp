@@ -41,7 +41,8 @@ pub fn quick_fixes(
         DiagnosticKind::BrokenXref { target, .. } => {
             xref_fixes(workspace, path, diagnostic, target)
         }
-        DiagnosticKind::BrokenInclude { path: written } => {
+        DiagnosticKind::BrokenInclude { path: written }
+        | DiagnosticKind::OptionalIncludeNotFound { path: written } => {
             include_fixes(workspace, path, diagnostic, written)
         }
         _ => Vec::new(),
@@ -491,6 +492,30 @@ mod tests {
                 "chapter.adoc".to_string(),
                 true,
                 range_of(&main, "include::chaptr.adoc[]", "chaptr.adoc")
+            )]
+        );
+    }
+
+    /// Asciidoctor (`main.adoc`): `INFO: optional include dropped because
+    /// include file not found: chaptre.adoc`. A typo stays one when the
+    /// include is optional.
+    #[test]
+    fn test_optional_include_suggests_nearest_file_name() {
+        let (root, ws) = fixture_workspace();
+        let main = root.join("main.adoc");
+
+        let fixes = fixes_at(&ws, &main, "include::chaptre.adoc[opts=optional]");
+
+        assert_eq!(
+            fixes,
+            vec![(
+                "chapter.adoc".to_string(),
+                true,
+                range_of(
+                    &main,
+                    "include::chaptre.adoc[opts=optional]",
+                    "chaptre.adoc"
+                )
             )]
         );
     }

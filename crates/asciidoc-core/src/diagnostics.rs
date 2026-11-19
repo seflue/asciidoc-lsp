@@ -83,6 +83,51 @@ fn required_tags(
     names
 }
 
+/// Whether an include is marked optional, as Asciidoctor reads it: an
+/// `optional-option` attribute, or `optional` in any `opts` list after
+/// substitution. The grammar splits a quoted list at its commas
+/// (`opts="step,optional"` yields `opts="step` and a key `optional"`), so a
+/// quoted value that does not close takes the following keys along up to
+/// the one that does.
+fn is_optional(attributes: &[(String, String)], substitute: impl Fn(&str) -> String) -> bool {
+    let mut rest = attributes.iter();
+    while let Some((name, value)) = rest.next() {
+        if name == "optional-option" {
+            return true;
+        }
+        if name != "opts" {
+            continue;
+        }
+        let value = substitute(value);
+        let value = value.trim();
+        let mut entries: Vec<String> = Vec::new();
+        match QUOTES.iter().find(|quote| value.starts_with(**quote)) {
+            Some(quote) if value.len() > 1 && value.ends_with(*quote) => {
+                entries.push(value[1..value.len() - 1].to_string());
+            }
+            Some(quote) => {
+                entries.push(value[1..].to_string());
+                for (key, _) in rest.by_ref() {
+                    if let Some(last) = key.strip_suffix(*quote) {
+                        entries.push(last.to_string());
+                        break;
+                    }
+                    entries.push(key.clone());
+                }
+            }
+            None => entries.push(value.to_string()),
+        }
+        if entries
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .any(|option| option.trim() == "optional")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// The tag names the file at `target` opens, `None` when it cannot be read.
 ///
 /// A `.adoc`/`.asciidoc` target in `documents` is answered from its model:
@@ -228,13 +273,18 @@ pub fn collect_diagnostics(
                 continue;
             };
             if !documents.contains_key(&target_path) && !target_path.exists() {
+                let written = inc.path.clone();
+                let kind = if is_optional(&inc.attributes, |value| registry.substitute(path, value))
+                {
+                    DiagnosticKind::OptionalIncludeNotFound { path: written }
+                } else {
+                    DiagnosticKind::BrokenInclude { path: written }
+                };
                 diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
                     line: inc.line,
                     span: None,
-                    kind: DiagnosticKind::BrokenInclude {
-                        path: inc.path.clone(),
-                    },
+                    kind,
                 });
                 continue;
             }
@@ -2816,5 +2866,44 @@ mod tests {
                 "part.adoc"
             ))
         );
+    }
+
+    /// Asciidoctor 2.0.26, `asciidoctor -v -o - tests/fixtures/optional_include/main.adoc`:
+    /// INFO "optional include dropped" on lines 10-16, ERROR "include file
+    /// not found" on lines 18-21; the present optional file reports nothing.
+    #[test]
+    fn test_optional_include_not_found_matches_asciidoctor() {
+        let (root, ws) = fixture_workspace("optional_include");
+
+        let mut found: Vec<_> = ws
+            .diagnostics_for(&root.join("main.adoc"))
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::OptionalIncludeNotFound { path } => {
+                    Some((d.line, "info", path.clone()))
+                }
+                DiagnosticKind::BrokenInclude { path } => Some((d.line, "error", path.clone())),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+
+        let expected: Vec<_> = [
+            (10, "info", "missing.adoc"),
+            (11, "info", "list-first.adoc"),
+            (12, "info", "list-last.adoc"),
+            (13, "info", "from-attribute.adoc"),
+            (14, "info", "repeated.adoc"),
+            (15, "info", "option-attribute.adoc"),
+            (16, "info", "quoted.adoc"),
+            (18, "error", "plain.adoc"),
+            (19, "error", "other-option.adoc"),
+            (20, "error", "shorthand.adoc"),
+            (21, "error", "uppercase.adoc"),
+        ]
+        .into_iter()
+        .map(|(line, level, path)| (line, level, path.to_string()))
+        .collect();
+        assert_eq!(found, expected);
     }
 }

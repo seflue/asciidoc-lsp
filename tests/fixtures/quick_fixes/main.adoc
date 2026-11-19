@@ -43,3 +43,5 @@ include::snipets/config.yml[]
 include::snippets/notes.yml[]
 
 include::man.adoc[]
+
+include::chaptre.adoc[opts=optional]

@@ -206,6 +206,11 @@ pub enum DiagnosticKind {
     BrokenInclude {
         path: String,
     },
+    /// A missing include marked `opts=optional`: Asciidoctor drops it and
+    /// logs an INFO, not an error. `path` is the include path as written.
+    OptionalIncludeNotFound {
+        path: String,
+    },
     /// Tags named by an include's `tag`/`tags` that its file does not open
     /// (`tag::name[]`). `path` is the include path as written.
     IncludeTagNotFound {
@@ -308,6 +313,9 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::BrokenInclude { path } => {
                 write!(f, "Broken include: {path}")
+            }
+            DiagnosticKind::OptionalIncludeNotFound { path } => {
+                write!(f, "Optional include not found: {path}")
             }
             DiagnosticKind::IncludeTagNotFound { tags, path } => {
                 let noun = if tags.len() == 1 { "tag" } else { "tags" };

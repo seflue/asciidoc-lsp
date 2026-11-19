@@ -39,6 +39,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
         | DiagnosticKind::SectionOutOfSequence { .. }
         | DiagnosticKind::UnterminatedBlock { .. }
         | DiagnosticKind::UnanchoredPdfPath { .. } => ls_types::DiagnosticSeverity::WARNING,
+        DiagnosticKind::OptionalIncludeNotFound { .. } => ls_types::DiagnosticSeverity::INFORMATION,
         DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::HINT,
     };
 
@@ -100,6 +101,31 @@ mod tests {
         assert_eq!(
             result[0].severity,
             Some(ls_types::DiagnosticSeverity::ERROR)
+        );
+    }
+
+    #[test]
+    fn test_convert_optional_include_not_found_is_information() {
+        let content = "= Title\n\ninclude::missing.adoc[opts=optional]\n";
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 3,
+            span: None,
+            kind: DiagnosticKind::OptionalIncludeNotFound {
+                path: "missing.adoc".into(),
+            },
+        }];
+
+        let result = convert_diagnostics(&diags, content);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::INFORMATION)
+        );
+        assert_eq!(
+            result[0].message,
+            "Optional include not found: missing.adoc"
         );
     }
 

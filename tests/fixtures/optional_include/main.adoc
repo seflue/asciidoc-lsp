@@ -1,0 +1,21 @@
+= Optional includes
+:o: optional
+
+// Asciidoctor 2.0.26 -v: "optional include dropped because include file
+// not found" (INFO) for every missing file below up to and including
+// opts="optional"; "include file not found" (ERROR) for the rest.
+
+include::present.adoc[opts=optional]
+
+include::missing.adoc[opts=optional]
+include::list-first.adoc[opts="optional,step"]
+include::list-last.adoc[opts="step,optional"]
+include::from-attribute.adoc[opts={o}]
+include::repeated.adoc[opts=optional,opts=step]
+include::option-attribute.adoc[optional-option=]
+include::quoted.adoc[opts="optional"]
+
+include::plain.adoc[]
+include::other-option.adoc[opts=step]
+include::shorthand.adoc[%optional]
+include::uppercase.adoc[opts=Optional]
