@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Bump the version from the last v* tag, rewrite CHANGELOG.md, commit, tag,
-# push, and create the GitHub release. Versioning is tag-only: nothing in
-# the repository is stamped with a version string.
+# Bump the version from the last v* tag, rewrite CHANGELOG.md, stamp the new
+# version into the workspace manifest (Cargo.toml, with Cargo.lock following),
+# commit both, tag, push, and create the GitHub release. The tag is still the
+# source of the next version; the manifest is stamped to match it, and
+# check-version.sh verifies that. The VS Code extension is not stamped here:
+# the release workflow sets its version from the tag at packaging time.
 #
 # Every function takes its inputs as arguments and keeps everything else
 # `local`. A function that produces a value echoes exactly that value to
@@ -97,9 +100,27 @@ update_changelog() {
   replace_exactly_one "<!-- next-url -->" "<!-- next-url -->\n[Unreleased]: ${repository}/compare/${tag}...HEAD"
 }
 
+# Writes the version into [workspace.package] and refreshes the workspace
+# members' entries in Cargo.lock (no dependency is touched). Any failure
+# restores CHANGELOG.md too, so nothing is left half-done before the commit.
+stamp_manifest_version() {
+  local version="$1" tag="$2"
+  local count
+  count="$(grep -c '^version = "' Cargo.toml || true)"
+  if [ "$count" != 1 ]; then
+    git checkout -- CHANGELOG.md
+    die "Expected exactly 1 top-level version line in Cargo.toml, found $count. Nothing was committed."
+  fi
+  sed -i '/^\[workspace\.package\]/,/^\[/s|^version = ".*"$|version = "'"${version}"'"|' Cargo.toml
+  if ! cargo update --workspace --offline || ! "$(dirname "${BASH_SOURCE[0]}")/check-version.sh" "$tag"; then
+    git checkout -- CHANGELOG.md Cargo.toml Cargo.lock
+    die "Could not stamp ${version} into Cargo.toml and Cargo.lock. Nothing was committed."
+  fi
+}
+
 commit_and_tag() {
   local version="$1" tag="$2"
-  git add CHANGELOG.md
+  git add CHANGELOG.md Cargo.toml Cargo.lock
   git commit -m "Release ${version}"
   # Annotated: `git push --follow-tags` only pushes annotated tags.
   git tag -a "${tag}" -m "Release ${version}"
@@ -110,8 +131,8 @@ commit_and_tag() {
 confirm_and_push() {
   local tag="$1"
   echo
-  echo "--- CHANGELOG.md changes for ${tag} ---"
-  git --no-pager diff HEAD~1 -- CHANGELOG.md
+  echo "--- CHANGELOG.md and Cargo.toml changes for ${tag} ---"
+  git --no-pager diff HEAD~1 -- CHANGELOG.md Cargo.toml
   echo
   local reply
   read -rp "Push ${tag} to origin and publish the GitHub release? [y/N] " reply
@@ -153,6 +174,7 @@ main() {
   repository="$(gh repo view --json url -q .url)"
 
   update_changelog "$version" "$tag" "$date" "$repository"
+  stamp_manifest_version "$version" "$tag"
   commit_and_tag "$version" "$tag"
   confirm_and_push "$tag"
   publish_release "$tag" "$version"

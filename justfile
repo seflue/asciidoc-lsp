@@ -36,8 +36,16 @@ fix:
     cargo fmt
     cargo clippy --fix --allow-dirty -- -D warnings
 
+# Test the release scripts in scratch repos
+test-release:
+    scripts/release_test.sh
+
+# Fail when HEAD carries a v* tag that differs from the Cargo version
+check-version:
+    scripts/check-version.sh
+
 # All quality checks (CI / pre-commit)
-ci: fmt-check lint test
+ci: fmt-check lint test test-release check-version
 
 # All checks + release build
 all: ci build-release

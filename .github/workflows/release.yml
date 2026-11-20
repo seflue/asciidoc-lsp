@@ -11,8 +11,16 @@ permissions:
   contents: write
 
 jobs:
+  verify-version:
+    name: Cargo version matches tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-version.sh "${{ github.event.release.tag_name }}"
+
   binaries:
     name: ${{ matrix.target }}
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -87,8 +95,8 @@ jobs:
 
   vsix:
     name: VSIX ${{ matrix.code_target }}
-    needs: binaries
-    if: ${{ !cancelled() }}
+    needs: [verify-version, binaries]
+    if: ${{ !cancelled() && needs.verify-version.result == 'success' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -135,6 +143,7 @@ jobs:
 
   vsix-universal:
     name: VSIX universal
+    needs: verify-version
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.release.tag_name }}
