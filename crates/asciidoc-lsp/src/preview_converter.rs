@@ -26,6 +26,10 @@ const EXTENSION: &str = include_str!("../assets/sourceline.rb");
 /// Environment variable that names the overlay file for the Ruby extension.
 const OVERLAY_ENV: &str = "ASCIIDOC_LSP_OVERLAY";
 
+/// Environment variable that names the workspace root for the Ruby extension:
+/// image URLs below it become `files/<path>`.
+const ROOT_ENV: &str = "ASCIIDOC_LSP_ROOT";
+
 /// How long the worker waits for further requests before it converts.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -296,6 +300,7 @@ impl Drop for OverlayFile {
 pub struct AsciidoctorConverter {
     program: String,
     extension: ExtensionFile,
+    root: Option<PathBuf>,
 }
 
 impl AsciidoctorConverter {
@@ -315,7 +320,16 @@ impl AsciidoctorConverter {
         Ok(Self {
             program: program.to_owned(),
             extension: ExtensionFile::write()?,
+            root: None,
         })
+    }
+
+    /// Point local image URLs of the output at `files/<path below root>`,
+    /// which the preview server serves from `root`.
+    #[must_use]
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
     }
 
     /// Asciidoctor's default stylesheet, taken from the standalone page of an
@@ -380,6 +394,9 @@ impl AsciidoctorConverter {
         }
         if let Some(overlay) = overlay {
             command.env(OVERLAY_ENV, overlay);
+        }
+        if let Some(root) = &self.root {
+            command.env(ROOT_ENV, root);
         }
         command
             .args(["-o", "-", "-"])
@@ -663,6 +680,100 @@ mod tests {
         assert!(html.contains("data-src-0"), "{html}");
         assert!(html.contains(r#"id="adoc-source-files""#), "{html}");
         assert!(html.contains("mid.adoc"), "{html}");
+    }
+
+    /// Convert `text` as `file` with `root` as the workspace root.
+    async fn convert_with_root(root: &Path, file: PathBuf, text: &str) -> String {
+        AsciidoctorConverter::new()
+            .unwrap()
+            .with_root(root.to_owned())
+            .convert(&ConvertRequest {
+                file,
+                text: text.to_owned(),
+                attributes: Vec::new(),
+                overlay: Vec::new(),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_local_images_point_at_the_files_route() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("chapters")).unwrap();
+        let chapter = root.join("chapters/ch1.adoc");
+        let text = "image::../images/block.png[Block]\n\n\
+                    image::../images/my pic.png[Spaced]\n\n\
+                    Inline image:../images/inline.png[Inline] here.\n\n\
+                    image::https://example.org/remote.png[Remote]\n\n\
+                    image::data:image/png;base64,AAAA[Data]\n\n\
+                    image:://cdn.example.org/proto.png[Proto]\n\n\
+                    image::../../outside.png[Outside]\n";
+        let html = convert_with_root(&root, chapter, text).await;
+        assert!(html.contains(r#"src="files/images/block.png""#), "{html}");
+        assert!(html.contains(r#"src="files/images/inline.png""#), "{html}");
+        assert!(
+            html.contains(r#"src="files/images/my%20pic.png""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"src="https://example.org/remote.png""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"src="data:image/png;base64,AAAA""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"src="//cdn.example.org/proto.png""#),
+            "{html}"
+        );
+        // Outside the root: left alone, it will not be found.
+        assert!(html.contains(r#"src="../../outside.png""#), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_images_follow_imagesdir_relative_and_absolute() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let book = root.join("book/book.adoc");
+        std::fs::create_dir_all(root.join("book")).unwrap();
+        let relative = ":imagesdir: ../pics\n\nimage::a.png[]\n";
+        let html = convert_with_root(&root, book.clone(), relative).await;
+        assert!(html.contains(r#"src="files/pics/a.png""#), "{html}");
+        let absolute = format!(":imagesdir: {}/abs\n\nimage::b.png[]\n", root.display());
+        let html = convert_with_root(&root, book, &absolute).await;
+        assert!(html.contains(r#"src="files/abs/b.png""#), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_without_a_root_image_urls_stay_as_they_are() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("doc.adoc");
+        let html = AsciidoctorConverter::new()
+            .unwrap()
+            .convert(&ConvertRequest {
+                file,
+                text: "image::images/a.png[]\n".to_owned(),
+                attributes: Vec::new(),
+                overlay: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(html.contains(r#"src="images/a.png""#), "{html}");
     }
 
     /// A chapter tree where the overlay replaces what is on disk.

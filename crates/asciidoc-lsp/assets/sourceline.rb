@@ -5,6 +5,9 @@
 # - `data-src-K` is added for blocks from an included file; K indexes the
 #   file table in the page's `<script id="adoc-source-files">`.
 #
+# - Local image URLs become `files/<path below the workspace root>`, which the
+#   preview server serves; the root comes in ASCIIDOC_LSP_ROOT.
+#
 # Loaded with `asciidoctor -r <this file>`.
 require 'asciidoctor/extensions'
 require 'json'
@@ -96,8 +99,57 @@ class SourceFilesPostprocessor < Asciidoctor::Extensions::Postprocessor
   end
 end
 
+# Rewrites the `src` of every `<img>` that names a local file below the
+# workspace root. The page lives at `/<token>/`, so `images/a.png` would
+# resolve there and `../images/a.png` would drop the token; `files/...` is
+# relative to the page and goes through the server's file route.
+class ImageSrcPostprocessor < Asciidoctor::Extensions::Postprocessor
+  IMG_SRC = /(<img\b[^>]*?\ssrc=")([^"]*)(")/
+  SCHEME = /\A[a-zA-Z][a-zA-Z0-9+.\-]*:/
+
+  def process(doc, output)
+    root = ENV['ASCIIDOC_LSP_ROOT']
+    return output if root.nil? || root.empty?
+    roots = [File.expand_path(root), AdocBufferOverlay.canonical(root)].uniq
+    base = File.expand_path(doc.base_dir)
+    output.gsub(IMG_SRC) do
+      head, src, tail = $1, $2, $3
+      rel = relative_to_root(src, base, roots)
+      rel ? "#{head}files/#{encode(rel)}#{tail}" : "#{head}#{src}#{tail}"
+    end
+  end
+
+  private
+
+  # The path of `src` below a root, or nil for URLs with a scheme, `//` URLs,
+  # and files outside every root.
+  def relative_to_root(src, base, roots)
+    return nil if src.empty? || src.start_with?('//') || src.match?(SCHEME)
+    # The converter escapes `&` in the attribute value.
+    path = decode(src.gsub('&amp;', '&'))
+    full = File.expand_path(path, base)
+    candidates = [full, AdocBufferOverlay.canonical(full)].uniq
+    roots.each do |root|
+      candidates.each do |candidate|
+        prefix = root.end_with?('/') ? root : "#{root}/"
+        return candidate[prefix.size..] if candidate.start_with?(prefix)
+      end
+    end
+    nil
+  end
+
+  def decode(text)
+    text.gsub(/%([0-9A-Fa-f]{2})/) { $1.hex.chr }.force_encoding(Encoding::UTF_8)
+  end
+
+  def encode(path)
+    path.b.gsub(%r{[^A-Za-z0-9\-._~/]}n) { |char| format('%%%02X', char.ord) }
+  end
+end
+
 Asciidoctor::Extensions.register do
   preprocessor SourceLinePreprocessor
   treeprocessor SourceLineTreeprocessor
   postprocessor SourceFilesPostprocessor
+  postprocessor ImageSrcPostprocessor
 end

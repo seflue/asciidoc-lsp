@@ -11,7 +11,9 @@
 //! replaces hyper, hyper-util and http-body-util.
 //!
 //! Routes below `/<token>/`: the page itself, `style.css`, `page.js`,
-//! `scroll-map.js`, `morphdom.js` and `events` (SSE).
+//! `scroll-map.js`, `morphdom.js` and `events` (SSE), and `files/<path>`: a
+//! regular file below the workspace root (the page's local images), checked
+//! on its canonical path so `..` and symlinks cannot leave the root.
 //!
 //! Events, each with one line of JSON as data:
 //! - `html`: `{file, lineCount, html}`, a finished conversion of `file`: the
@@ -109,6 +111,8 @@ struct Shared {
     token: String,
     port: u16,
     stylesheet: String,
+    /// Workspace root that `files/` serves from.
+    root: Option<PathBuf>,
     events: broadcast::Sender<Event>,
     snapshot: Mutex<Snapshot>,
     /// Lines of the last text requested per file, for the page's end sentinel.
@@ -185,7 +189,9 @@ pub struct Preview {
 impl Preview {
     /// Start the server on a random local port, with `converter` behind it.
     ///
-    /// `stylesheet` is served as `style.css`.
+    /// `stylesheet` is served as `style.css`. Local images of the document
+    /// are served from below `root` as `files/<path>`; without a root there
+    /// are none.
     ///
     /// # Errors
     /// [`PreviewError`] if no token can be made or the socket cannot be bound.
@@ -193,6 +199,7 @@ impl Preview {
         converter: C,
         debounce: Duration,
         stylesheet: String,
+        root: Option<PathBuf>,
     ) -> Result<Self, PreviewError> {
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).map_err(PreviewError::Random)?;
@@ -209,6 +216,7 @@ impl Preview {
             token,
             port,
             stylesheet,
+            root,
             events,
             snapshot: Mutex::new(Snapshot::default()),
             line_counts: Mutex::new(HashMap::new()),
@@ -349,6 +357,8 @@ enum Routed<'a> {
     },
     Redirect(String),
     Events,
+    /// A workspace file by its still percent-encoded path below the root.
+    File(String),
     Status(u16),
 }
 
@@ -382,7 +392,10 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         "scroll-map.js" => body("text/javascript; charset=utf-8", SCROLL_MAP_JS),
         "morphdom.js" => body("text/javascript; charset=utf-8", MORPHDOM_JS),
         "events" => Routed::Events,
-        _ => Routed::Status(404),
+        _ => match rest.strip_prefix("files/") {
+            Some(file) => Routed::File(file.to_owned()),
+            None => Routed::Status(404),
+        },
     }
 }
 
@@ -421,7 +434,7 @@ fn reason(status: u16) -> &'static str {
 const COMMON_HEADERS: &str = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
                               Referrer-Policy: no-referrer\r\n\
                               Content-Security-Policy: default-src 'none'; script-src 'self'; \
-                              style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+                              style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; \
                               connect-src 'self'; base-uri 'none'; form-action 'none'; \
                               frame-ancestors 'none'\r\n";
 
@@ -430,7 +443,7 @@ async fn write_response(
     status: u16,
     content_type: &str,
     extra_headers: &str,
-    body: &str,
+    body: &[u8],
 ) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
@@ -439,7 +452,7 @@ async fn write_response(
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body.as_bytes()).await?;
+    stream.write_all(body).await?;
     stream.shutdown().await
 }
 
@@ -449,24 +462,110 @@ async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<
         Err(_) => None,
     };
     let Some(head) = head else {
-        return write_response(&mut stream, 400, "text/plain", "", "bad request").await;
+        return write_response(&mut stream, 400, "text/plain", "", b"bad request").await;
     };
     let Some(request) = parse_request(&head) else {
-        return write_response(&mut stream, 400, "text/plain", "", "bad request").await;
+        return write_response(&mut stream, 400, "text/plain", "", b"bad request").await;
     };
     match route(shared, &request) {
         Routed::Body { content_type, body } => {
-            write_response(&mut stream, 200, content_type, "", body).await
+            write_response(&mut stream, 200, content_type, "", body.as_bytes()).await
         }
         Routed::Redirect(location) => {
             let extra = format!("Location: {location}\r\n");
-            write_response(&mut stream, 301, "text/plain", &extra, "").await
+            write_response(&mut stream, 301, "text/plain", &extra, b"").await
         }
         Routed::Status(status) => {
-            write_response(&mut stream, status, "text/plain", "", reason(status)).await
+            write_response(
+                &mut stream,
+                status,
+                "text/plain",
+                "",
+                reason(status).as_bytes(),
+            )
+            .await
         }
+        Routed::File(path) => match read_workspace_file(shared.root.as_deref(), &path).await {
+            Some((content_type, body)) => {
+                write_response(&mut stream, 200, content_type, "", &body).await
+            }
+            None => {
+                write_response(&mut stream, 404, "text/plain", "", reason(404).as_bytes()).await
+            }
+        },
         Routed::Events => serve_events(stream, shared).await,
     }
+}
+
+/// Decode `%XX` escapes. `None` for a bad escape or bytes that are no UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%' {
+            let hex = text.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// The content type for a file name, by extension; images the browser shows
+/// get theirs, anything else is a plain download.
+fn content_type_of(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The file at `encoded` (a percent-encoded path below `root`) and its
+/// content type, or `None` if it is not a regular file inside the root.
+///
+/// The path is checked twice: only plain names are accepted (no `..`, no
+/// absolute path), and the canonical path, with symlinks resolved, must lie
+/// inside the canonical root.
+async fn read_workspace_file(
+    root: Option<&Path>,
+    encoded: &str,
+) -> Option<(&'static str, Vec<u8>)> {
+    let root = root?.to_owned();
+    let relative = PathBuf::from(percent_decode(encoded)?);
+    tokio::task::spawn_blocking(move || read_inside(&root, &relative))
+        .await
+        .ok()?
+}
+
+fn read_inside(root: &Path, relative: &Path) -> Option<(&'static str, Vec<u8>)> {
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let path = root.join(relative).canonicalize().ok()?;
+    if !path.starts_with(&root) || !path.metadata().ok()?.is_file() {
+        return None;
+    }
+    let body = std::fs::read(&path).ok()?;
+    Some((content_type_of(&path), body))
 }
 
 async fn write_events(stream: &mut TcpStream, events: &[Event]) -> io::Result<()> {
@@ -522,10 +621,16 @@ pub(crate) mod testing {
     }
 
     pub(crate) async fn start() -> Preview {
+        start_with_root(None).await
+    }
+
+    /// Like [`start`], serving workspace files from below `root`.
+    pub(crate) async fn start_with_root(root: Option<PathBuf>) -> Preview {
         Preview::start(
             EchoConverter,
             Duration::from_millis(10),
             "body{}".to_owned(),
+            root,
         )
         .await
         .unwrap()
@@ -597,7 +702,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{address, get, request, start, Stream};
+    use super::testing::{address, get, request, start, start_with_root, Stream};
     use super::*;
 
     fn status_line(response: &str) -> &str {
@@ -633,10 +738,107 @@ mod tests {
             );
             assert!(response.contains("frame-ancestors 'none'"), "{target}");
             assert!(
+                response.contains("img-src 'self' data: https:; connect-src 'self';"),
+                "{target}: {response}"
+            );
+            assert!(
                 response.contains("X-Content-Type-Options: nosniff"),
                 "{target}"
             );
         }
+    }
+
+    /// A workspace with `images/pic.png` and a file outside it.
+    fn image_workspace() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().canonicalize().unwrap();
+        let root = outer.join("ws");
+        std::fs::create_dir_all(root.join("images")).unwrap();
+        std::fs::write(root.join("images/pic.png"), b"PNG-bytes").unwrap();
+        std::fs::write(root.join("images/my pic.SVG"), "<svg/>").unwrap();
+        std::fs::write(root.join("images/data.bin"), "x").unwrap();
+        std::fs::write(outer.join("secret.png"), "secret").unwrap();
+        std::os::unix::fs::symlink(outer.join("secret.png"), root.join("images/link.png")).unwrap();
+        (tmp, root)
+    }
+
+    #[tokio::test]
+    async fn workspace_images_are_served_with_their_type() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_root(Some(root)).await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        for (path, content_type) in [
+            ("images/pic.png", "image/png"),
+            ("images/my%20pic.SVG", "image/svg+xml"),
+            ("images/data.bin", "application/octet-stream"),
+        ] {
+            let response = get(port, &format!("/{token}/files/{path}"), &host).await;
+            assert!(status_line(&response).contains("200"), "{path}: {response}");
+            assert!(
+                response.contains(&format!("Content-Type: {content_type}\r\n")),
+                "{path}: {response}"
+            );
+            assert!(
+                response.contains("Content-Security-Policy: default-src 'none';"),
+                "{path}"
+            );
+            assert!(
+                response.contains("X-Content-Type-Options: nosniff"),
+                "{path}"
+            );
+        }
+        let response = get(port, &format!("/{token}/files/images/pic.png"), &host).await;
+        assert!(response.ends_with("PNG-bytes"), "{response}");
+        assert!(response.contains("Content-Length: 9\r\n"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn workspace_files_outside_the_root_or_missing_are_not_found() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_root(Some(root)).await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        for path in [
+            "../secret.png",
+            "%2e%2e/secret.png",
+            "images/../../secret.png",
+            "images/link.png",
+            "images/missing.png",
+            "images",
+            "images/",
+            "",
+            "/etc/passwd",
+            "%2Fetc/passwd",
+        ] {
+            let response = get(port, &format!("/{token}/files/{path}"), &host).await;
+            assert!(status_line(&response).contains("404"), "{path}: {response}");
+            assert!(!response.contains("secret"), "{path}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_files_keep_host_token_and_method_checks() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_root(Some(root)).await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        let target = format!("/{token}/files/images/pic.png");
+        let response = get(port, &target, "evil.example").await;
+        assert!(status_line(&response).contains("403"), "{response}");
+        let response = get(port, "/wrong/files/images/pic.png", &host).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+        let response = request(port, "POST", &target, &host).await;
+        assert!(status_line(&response).contains("405"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn without_a_root_no_files_are_served() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        let response = get(port, &format!("/{token}/files/images/pic.png"), &host).await;
+        assert!(status_line(&response).contains("404"), "{response}");
     }
 
     #[tokio::test]

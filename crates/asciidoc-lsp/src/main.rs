@@ -119,14 +119,20 @@ impl AsciiDocLsp {
         if let Some(preview) = running {
             return Ok(preview);
         }
-        let converter = preview_converter::AsciidoctorConverter::new().map_err(preview_error)?;
+        let root = self.root.lock().clone();
+        let mut converter =
+            preview_converter::AsciidoctorConverter::new().map_err(preview_error)?;
+        if let Some(root) = &root {
+            converter = converter.with_root(root.clone());
+        }
         let stylesheet = converter
             .default_stylesheet()
             .await
             .map_err(preview_error)?;
-        let preview = preview::Preview::start(converter, preview_converter::DEBOUNCE, stylesheet)
-            .await
-            .map_err(preview_error)?;
+        let preview =
+            preview::Preview::start(converter, preview_converter::DEBOUNCE, stylesheet, root)
+                .await
+                .map_err(preview_error)?;
         let preview = Arc::new(preview);
         *self.preview.lock() = Some(Arc::clone(&preview));
         Ok(preview)
@@ -5168,6 +5174,7 @@ mod tests {
             preview_converter::AsciidoctorConverter::new().unwrap(),
             std::time::Duration::from_millis(10),
             String::new(),
+            None,
         )
         .await
         .unwrap();
