@@ -5,6 +5,8 @@ mod diagnostics_convert;
 mod navigation;
 mod positions;
 mod present;
+#[allow(dead_code, reason = "the preview server consumes the converter")]
+mod preview_converter;
 mod semantic_tokens;
 mod symbols;
 #[cfg(test)]
