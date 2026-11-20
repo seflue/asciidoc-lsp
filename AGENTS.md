@@ -15,6 +15,7 @@ Run every build, test, lint and format step through a `just` target (`justfile` 
 - Call `just`, never `cargo` directly. When no target covers what you need (for example, `just test` takes no filter argument), stop and tell the user what you need instead of working around it.
 - `just lint` runs clippy with workspace-wide `pedantic` lints and `-D warnings`: every pedantic warning fails the build.
 - Run `just ci` before declaring a change done.
+- `just arch-check` (part of `ci`) needs cargo-arc 0.6.2 installed. Regenerate `arc-baseline.toml` only with `just arch-baseline`, and only from a green state.
 
 ## Grammar: two trees per document
 

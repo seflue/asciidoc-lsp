@@ -7,10 +7,15 @@
 //! The corpus is every directory in `tests/fixtures/` and `docs/`, each
 //! scanned as a workspace of its own.
 //!
+//! Where several documents read a file, the diagnostic names exactly the
+//! documents whose reading of the target fails, as `resolve_target` resolves
+//! it per reading. Optional includes are compared with their own
+//! diagnostic.
+//!
 //! Left out, as the diagnostics leave them out:
-//! - xrefs and images no whole reader judges: a document that reads the file
-//!   only in part is no judge of what is missing there;
-//! - includes with a URI target and optional includes.
+//! - xrefs, images and includes no whole reader judges: a document that
+//!   reads the file only in part is no judge of what is missing there;
+//! - includes with a URI target.
 //!
 //! Any deviation fails the test.
 
@@ -20,8 +25,7 @@ use std::path::{Path, PathBuf};
 
 use asciidoc_core::anchor_scope::CatalogCache;
 use asciidoc_core::diagnostics::collect_diagnostics;
-use asciidoc_core::paths::is_uri;
-use asciidoc_core::targets::{ImageOutcome, Readings, Target};
+use asciidoc_core::targets::{ImageOutcome, IncludeResult, Readings, Target, TargetResult};
 use asciidoc_core::types::{Diagnostic, DiagnosticKind};
 use asciidoc_core::workspace::Workspace;
 
@@ -57,6 +61,41 @@ fn corpus_roots() -> Vec<PathBuf> {
         .into_iter()
         .map(|root| root.canonicalize().unwrap())
         .collect()
+}
+
+/// The documents a diagnostic names for the readings in `missing`: none when
+/// nothing is missing (`None`), none named when one document reads the file
+/// alone, else those that miss the target, relative to `root`.
+fn expected_names(root: &Path, missing: &[&Path], readers: usize) -> Option<Vec<PathBuf>> {
+    if missing.is_empty() {
+        return None;
+    }
+    Some(if readers > 1 {
+        missing
+            .iter()
+            .map(|document| {
+                document
+                    .strip_prefix(root)
+                    .unwrap_or(document)
+                    .to_path_buf()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    })
+}
+
+/// Whether an include is marked optional, read from its attributes: an
+/// `optional-option`, or `optional` in the `opts` list, quotes removed.
+fn is_optional(attributes: &[(String, String)], substitute: impl Fn(&str) -> String) -> bool {
+    attributes.iter().any(|(name, value)| {
+        name == "optional-option"
+            || (name == "opts"
+                && substitute(value)
+                    .trim_matches(['"', '\''])
+                    .split(',')
+                    .any(|option| option.trim() == "optional"))
+    })
 }
 
 fn diagnostics_at<'a>(
@@ -102,7 +141,6 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
                 .map(|info| info.kind)
         };
         let readers = catalogs.scopes_at(path);
-        let judged = readers.iter().any(|scope| scope.reads_whole(path));
 
         for xref in &doc.xrefs {
             counts.xrefs += 1;
@@ -113,20 +151,45 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
                 Some(NodeKind::Xref { target } | NodeKind::ShorthandXref { target })
                     if target == xref.target
             );
-            // The number of documents the diagnostic names; none when one
-            // reading judges alone.
-            let broken = diagnostics_at(&diags, path, xref.line).find_map(|kind| match kind {
+            // What the build readings say: goto follows those that find the
+            // target, the diagnostic names those that miss it (all documents
+            // that read the file, when several do).
+            let resolved = catalogs.resolve_target(
+                path,
+                xref.line,
+                &Target::Xref(&xref.target),
+                Readings::Build,
+            );
+            let missing: Vec<&Path> = resolved
+                .iter()
+                .filter(|resolved| matches!(&resolved.result, TargetResult::Xref(Err(_))))
+                .map(|resolved| resolved.reading.document.as_path())
+                .collect();
+            let found_by_a_build = resolved
+                .iter()
+                .any(|resolved| matches!(&resolved.result, TargetResult::Xref(Ok(_))));
+            let named = diagnostics_at(&diags, path, xref.line).find_map(|kind| match kind {
                 DiagnosticKind::BrokenXref { target, documents } if *target == xref.target => {
-                    Some(documents.len())
+                    Some(documents.clone())
                 }
                 _ => None,
             });
+            let expected = expected_names(root, &missing, readers.len());
             let problem = if !located {
                 Some("goto does not recognise the xref at its span".to_string())
-            } else if !found_here.is_empty() && broken == Some(0) {
-                Some(format!("goto finds {found_here:?}, diagnostic says broken"))
-            } else if found_here.is_empty() && broken.is_none() && judged {
-                Some("goto finds nothing, no diagnostic".to_string())
+            } else if found_here.is_empty() == found_by_a_build {
+                Some(format!(
+                    "goto finds {found_here:?}, a build reading {} it",
+                    if found_by_a_build {
+                        "finds"
+                    } else {
+                        "does not find"
+                    }
+                ))
+            } else if named != expected {
+                Some(format!(
+                    "diagnostic names {named:?}, the readings that miss it are {expected:?}"
+                ))
             } else {
                 None
             };
@@ -196,15 +259,20 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
         }
 
         for inc in &doc.includes {
-            let kinds: Vec<&DiagnosticKind> = diagnostics_at(&diags, path, inc.line).collect();
-            let optional = kinds.iter().any(|kind| {
-                matches!(kind, DiagnosticKind::OptionalIncludeNotFound { path } if *path == inc.path)
-            });
-            let uri = ws
-                .scopes_at(path, inc.line)
+            let resolved = catalogs.resolve_target(
+                path,
+                inc.line,
+                &Target::Include(&inc.path),
+                Readings::Build,
+            );
+            let includes: Vec<(&Path, IncludeResult)> = resolved
                 .iter()
-                .any(|scope| is_uri(&scope.substitute(&inc.path)));
-            if optional || uri {
+                .filter_map(|resolved| {
+                    let include = resolved.result.clone().into_include()?;
+                    Some((resolved.reading.document.as_path(), include))
+                })
+                .collect();
+            if includes.iter().any(|(_, include)| include.is_remote()) {
                 continue;
             }
             counts.includes += 1;
@@ -213,20 +281,56 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
                 node_at(inc.line, 0),
                 Some(NodeKind::Include { path }) if path == inc.path
             );
-            // The number of documents the diagnostic names; none when one
-            // reading judges alone.
+            let scopes = ws.scopes_at(path, inc.line);
+            let optional = is_optional(&inc.attributes, |value| {
+                scopes
+                    .first()
+                    .map_or_else(|| value.to_string(), |scope| scope.substitute(value))
+            });
+            // What the build readings say: goto follows those that find the
+            // file, the diagnostic names those that miss it.
+            let missing: Vec<&Path> = includes
+                .iter()
+                .filter(|(_, include)| !include.exists)
+                .map(|(document, _)| *document)
+                .collect();
+            let found_by_a_build = includes.iter().any(|(_, include)| include.exists);
+            let kinds: Vec<&DiagnosticKind> = diagnostics_at(&diags, path, inc.line).collect();
             let broken = kinds.iter().find_map(|kind| match kind {
                 DiagnosticKind::BrokenInclude { path, documents } if *path == inc.path => {
-                    Some(documents.len())
+                    Some(documents.clone())
                 }
                 _ => None,
             });
+            let reported_optional = kinds.iter().any(|kind| {
+                matches!(kind, DiagnosticKind::OptionalIncludeNotFound { path } if *path == inc.path)
+            });
+            let expected = expected_names(root, &missing, readers.len());
+            // A missing optional include has its own diagnostic, without
+            // the documents.
+            let (expected_broken, expected_optional) = match (optional, expected) {
+                (true, expected) => (None, expected.is_some()),
+                (false, expected) => (expected, false),
+            };
             let problem = if !located {
                 Some("goto does not recognise the include".to_string())
-            } else if !found_here.is_empty() && broken == Some(0) {
-                Some(format!("goto finds {found_here:?}, diagnostic says broken"))
-            } else if found_here.is_empty() && broken.is_none() {
-                Some("goto finds nothing, no diagnostic".to_string())
+            } else if found_here.is_empty() == found_by_a_build {
+                Some(format!(
+                    "goto finds {found_here:?}, a build reading {} it",
+                    if found_by_a_build {
+                        "finds"
+                    } else {
+                        "does not find"
+                    }
+                ))
+            } else if reported_optional != expected_optional {
+                Some(format!(
+                    "optional include: diagnostic says missing: {reported_optional}, readings that miss it: {missing:?}"
+                ))
+            } else if broken != expected_broken {
+                Some(format!(
+                    "diagnostic names {broken:?}, the readings that miss it are {expected_broken:?}"
+                ))
             } else {
                 None
             };
