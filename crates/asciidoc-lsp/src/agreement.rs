@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use asciidoc_core::anchor_scope::CatalogCache;
 use asciidoc_core::diagnostics::collect_diagnostics;
 use asciidoc_core::paths::is_uri;
+use asciidoc_core::targets::{ImageOutcome, Readings, Target, TargetResult};
 use asciidoc_core::types::{Diagnostic, DiagnosticKind};
 use asciidoc_core::workspace::Workspace;
 
@@ -192,33 +193,41 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
             let missing = diagnostics_at(&diags, path, image.line).any(|kind| {
                 matches!(kind, DiagnosticKind::ImageNotFound { path, .. } if *path == image.path)
             });
-            let builds = ws.scopes_at(path, image.line);
-            let preview = ws.preview_scope_at(path, image.line);
-            let several = builds.len() + usize::from(preview.is_some()) > 1;
-            // The readings the diagnostics judge, whole readers and preview,
-            // and whether any of them can say a file is missing: not for a
-            // URI or a reference the reading leaves unresolved.
-            let can_judge = builds
+            // What the readings say, as `targets` resolves the image: goto
+            // follows the build readings that find the file, the diagnostic
+            // names the readings, preview included, that miss it.
+            let target = Target::Image(&image.path);
+            let outcomes = |readings| -> Vec<ImageOutcome> {
+                catalogs
+                    .resolve_target(path, image.line, &target, readings)
+                    .into_iter()
+                    .map(|resolved| {
+                        let TargetResult::Image(result) = resolved.result;
+                        result.outcome
+                    })
+                    .collect()
+            };
+            let found_by_a_build = outcomes(Readings::Build)
                 .iter()
-                .filter(|scope| {
-                    readers
-                        .iter()
-                        .any(|r| r.document() == scope.document() && r.reads_whole(path))
-                })
-                .chain(preview.iter())
-                .any(|scope| {
-                    let target = scope.substitute(&image.path);
-                    let imagesdir = scope.value("imagesdir").unwrap_or_default();
-                    !(target.contains('{') || is_uri(&target) || is_uri(&imagesdir))
-                });
+                .any(|outcome| matches!(outcome, ImageOutcome::Found { .. }));
+            let missed_by_a_reading = outcomes(Readings::WithPreview)
+                .iter()
+                .any(|outcome| matches!(outcome, ImageOutcome::Missing { .. }));
             let problem = if !located {
                 Some("goto does not recognise the image at its span".to_string())
-            } else if !found_here.is_empty() && missing && !several {
+            } else if found_here.is_empty() == found_by_a_build {
                 Some(format!(
-                    "goto finds {found_here:?}, diagnostic says missing"
+                    "goto finds {found_here:?}, a build reading {} it",
+                    if found_by_a_build {
+                        "finds"
+                    } else {
+                        "does not find"
+                    }
                 ))
-            } else if found_here.is_empty() && !missing && can_judge {
-                Some("goto finds nothing, no diagnostic".to_string())
+            } else if missing != missed_by_a_reading {
+                Some(format!(
+                    "diagnostic says missing: {missing}, a reading misses it: {missed_by_a_reading}"
+                ))
             } else {
                 None
             };

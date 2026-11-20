@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use asciidoc_core::attributes::DOCDIR;
-use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
+use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path};
+use asciidoc_core::targets::Reading;
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 /// The scopes a path on `line` of `doc_path` resolves in: one per
@@ -39,37 +40,6 @@ pub(crate) fn unique_in_order<T: PartialEq>(items: impl IntoIterator<Item = T>) 
     unique
 }
 
-/// The folder image paths resolve against in `scope` and the `imagesdir`
-/// shown in front of them: `docdir` (else `file_dir`) joined with
-/// `imagesdir`.
-pub(crate) fn scope_image_base(scope: &AttributeScope<'_>, file_dir: &Path) -> (PathBuf, String) {
-    let imagesdir = scope.value("imagesdir").unwrap_or_default();
-    let base = image_base_dir(&scope_docdir(scope, file_dir), &imagesdir);
-    (base, imagesdir)
-}
-
-/// Where the `imagesdir` of `scope` comes from, for a missing image:
-/// "imagesdir from part.adoc:3" or "imagesdir not set in this build".
-pub(crate) fn scope_imagesdir_note(scope: &AttributeScope<'_>) -> String {
-    scope
-        .value("imagesdir")
-        .filter(|value| !value.is_empty())
-        .and_then(|_| scope.definition("imagesdir")?.source)
-        .map_or_else(
-            || IMAGESDIR_NOT_SET.to_string(),
-            |source| {
-                format!(
-                    "imagesdir from {}:{}",
-                    file_display_name(&source.file),
-                    source.line
-                )
-            },
-        )
-}
-
-/// The note for a build without `imagesdir`.
-pub(crate) const IMAGESDIR_NOT_SET: &str = "imagesdir not set in this build";
-
 /// The folder paths resolve against in `scope`: its `docdir`, else `file_dir`.
 pub(crate) fn scope_docdir(scope: &AttributeScope<'_>, file_dir: &Path) -> PathBuf {
     scope
@@ -87,19 +57,19 @@ pub(crate) fn document_dir<'a>(doc_path: &'a Path, workspace: Option<&'a Workspa
         .unwrap_or(doc_path)
 }
 
-/// `doc_dir / imagesdir`, or `doc_dir` alone when `imagesdir` is empty.
-fn image_base_dir(doc_dir: &Path, imagesdir: &str) -> PathBuf {
-    if imagesdir.is_empty() {
-        doc_dir.to_path_buf()
-    } else {
-        normalize_lexically(&doc_dir.join(imagesdir))
-    }
-}
-
 /// How a hover names a scope: its document, marked when it is a preview.
 pub(crate) fn scope_label(scope: &AttributeScope<'_>) -> String {
-    let name = file_display_name(scope.document());
-    if scope.is_preview() {
+    label(scope.document(), scope.is_preview())
+}
+
+/// How a hover names a reading, see [`scope_label`].
+pub(crate) fn reading_label(reading: &Reading) -> String {
+    label(&reading.document, reading.preview)
+}
+
+fn label(document: &Path, preview: bool) -> String {
+    let name = file_display_name(document);
+    if preview {
         format!("{name} (preview)")
     } else {
         name

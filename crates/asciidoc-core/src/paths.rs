@@ -137,6 +137,40 @@ pub fn relative_path(from_dir: &Path, path: &Path) -> PathBuf {
     relative
 }
 
+/// Most `..` steps a displayed relative path may need: covers a sibling
+/// folder (`../shared/x.adoc`) but not an unrecognisable long chain.
+const MAX_PARENT_STEPS: usize = 2;
+
+/// A file the scan reached (`DuplicateAnchor`, `CircularInclude`) as shown in
+/// a message. A relative path stays as it is. An absolute path is
+/// normalized lexically and shown relative to the folder `root` when it is
+/// under `root` or shares a folder with it and needs at most
+/// `MAX_PARENT_STEPS` `..` steps. Otherwise (outside `root`, like
+/// `/opt/themes`) it stays absolute, independent of how long the shared
+/// ancestor is.
+#[must_use]
+pub fn display_path(root: &Path, path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let path = normalize_lexically(path);
+    let rel = relative_path(root, &path);
+    let parent_steps = rel
+        .components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count();
+    let shares_a_folder = root
+        .components()
+        .zip(path.components())
+        .take_while(|(a, b)| a == b)
+        .any(|(a, _)| matches!(a, std::path::Component::Normal(_)));
+    if shares_a_folder && parent_steps <= MAX_PARENT_STEPS {
+        rel
+    } else {
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

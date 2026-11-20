@@ -16,6 +16,7 @@ pub mod references;
 mod section_levels;
 pub mod source_text;
 pub mod substituted_refs;
+pub mod targets;
 pub mod types;
 pub mod ventilate;
 pub mod workspace;

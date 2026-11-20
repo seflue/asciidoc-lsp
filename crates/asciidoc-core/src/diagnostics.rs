@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::anchor_scope::{AnchorScope, CatalogCache};
-use crate::attributes::DOCDIR;
-use crate::paths::{is_uri, join_doc_path, resolve_doc_target};
-use crate::types::{Diagnostic, DiagnosticKind, DocumentModel, MissingImage, Span};
+pub use crate::paths::display_path;
+use crate::paths::{is_uri, resolve_doc_target};
+use crate::targets::{ImageOutcome, Readings, Target, TargetResult};
+use crate::types::{
+    Diagnostic, DiagnosticKind, DocumentModel, ImagesdirOrigin, MissingImage, Span,
+};
 use crate::workspace::Workspace;
 
 /// A duplicate: the second definition (file, line), the ID, and the first.
@@ -131,30 +134,6 @@ fn declared_tags<'a>(
         .as_deref()
 }
 
-/// Whether the image `target` of a macro in `file` is a file in `scope`, or
-/// cannot be judged: a URI, or a reference the scope leaves unresolved.
-/// Resolved as Asciidoctor does: against `imagesdir` below `docdir`.
-fn image_exists(
-    scope: &crate::workspace::AttributeScope<'_>,
-    file: &Path,
-    target: &str,
-    registry: &crate::attributes::AttributeRegistry,
-) -> bool {
-    let target = scope.substitute(target);
-    let imagesdir = scope.value("imagesdir").unwrap_or_default();
-    if target.contains('{') || is_uri(&target) || is_uri(&imagesdir) {
-        return true;
-    }
-    let docdir = scope
-        .value(DOCDIR)
-        .map(PathBuf::from)
-        .or_else(|| registry.doc_dir(file).map(Path::to_path_buf));
-    let Some(docdir) = docdir else {
-        return true;
-    };
-    join_doc_path(&join_doc_path(&docdir, &imagesdir), &target).exists()
-}
-
 /// Collect all diagnostics across the workspace, grouped by file.
 ///
 /// Paths named inside messages are display paths, see `display_path`:
@@ -268,55 +247,25 @@ pub fn collect_diagnostics(
         // include, in the editor's preview of it: one diagnostic per macro,
         // naming the builds that miss the file and where their `imagesdir`
         // comes from.
-        // A document that reads the file only in part is no judge of which
-        // images are rendered, so it is left out like for the xrefs.
-        let whole_readers: HashSet<PathBuf> = if doc.images.is_empty() {
-            HashSet::new()
-        } else {
-            catalogs
-                .scopes_at(path)
-                .iter()
-                .filter(|scope| scope.reads_whole(path))
-                .map(|scope| scope.document().to_path_buf())
-                .collect()
-        };
-        // The scopes of this file, walked once per state of its own
-        // attribute entries and includes: the scope on a line only changes
-        // with the entries and includes before it.
-        let mut image_scopes: HashMap<(usize, usize), Vec<crate::workspace::AttributeScope<'_>>> =
-            HashMap::new();
         for image in &doc.images {
-            let entries_before = doc
-                .attributes
-                .iter()
-                .filter(|attr| attr.line < image.line)
-                .count();
-            let includes_before = doc
-                .includes
-                .iter()
-                .filter(|inc| inc.line < image.line)
-                .count();
-            let scopes = image_scopes
-                .entry((entries_before, includes_before))
-                .or_insert_with(|| {
-                    workspace
-                        .scopes_at(path, image.line)
-                        .into_iter()
-                        .filter(|scope| whole_readers.contains(scope.document()))
-                        .chain(workspace.preview_scope_at(path, image.line))
-                        .collect()
-                });
-            let missing: Vec<MissingImage> = scopes
-                .iter()
-                .filter(|scope| !image_exists(scope, path, &image.path, registry))
-                .map(|scope| MissingImage {
-                    document: display_path(root, scope.document()),
-                    preview: scope.is_preview(),
-                    imagesdir_from: scope
-                        .value("imagesdir")
-                        .filter(|value| !value.is_empty())
-                        .and_then(|_| scope.definition("imagesdir")?.source)
-                        .map(|source| (display_path(root, &source.file), source.line)),
+            let missing: Vec<MissingImage> = catalogs
+                .resolve_target(
+                    path,
+                    image.line,
+                    &Target::Image(&image.path),
+                    Readings::WithPreview,
+                )
+                .into_iter()
+                .filter_map(|resolved| {
+                    let TargetResult::Image(result) = resolved.result;
+                    matches!(result.outcome, ImageOutcome::Missing { .. }).then(|| MissingImage {
+                        document: display_path(root, &resolved.reading.document),
+                        preview: resolved.reading.preview,
+                        imagesdir_from: result.imagesdir_from.map(|origin| ImagesdirOrigin {
+                            file: display_path(root, &origin.file),
+                            line: origin.line,
+                        }),
+                    })
                 })
                 .collect();
             if !missing.is_empty() {
@@ -577,40 +526,6 @@ pub fn collect_diagnostics(
     }
 
     diags
-}
-
-/// Most `..` steps a displayed relative path may need: covers a sibling
-/// folder (`../shared/x.adoc`) but not an unrecognisable long chain.
-const MAX_PARENT_STEPS: usize = 2;
-
-/// A file the scan reached (`DuplicateAnchor`, `CircularInclude`) as shown in
-/// a message. A relative path stays as it is. An absolute path is
-/// normalized lexically and shown relative to the folder `root` when it is
-/// under `root` or shares a folder with it and needs at most
-/// `MAX_PARENT_STEPS` `..` steps. Otherwise (outside `root`, like
-/// `/opt/themes`) it stays absolute, independent of how long the shared
-/// ancestor is.
-#[must_use]
-pub fn display_path(root: &Path, path: &Path) -> PathBuf {
-    if !path.is_absolute() {
-        return path.to_path_buf();
-    }
-    let path = crate::paths::normalize_lexically(path);
-    let rel = crate::paths::relative_path(root, &path);
-    let parent_steps = rel
-        .components()
-        .take_while(|c| matches!(c, std::path::Component::ParentDir))
-        .count();
-    let shares_a_folder = root
-        .components()
-        .zip(path.components())
-        .take_while(|(a, b)| a == b)
-        .any(|(a, _)| matches!(a, std::path::Component::Normal(_)));
-    if shares_a_folder && parent_steps <= MAX_PARENT_STEPS {
-        rel
-    } else {
-        path
-    }
 }
 
 /// A PDF value as shown in a message: root-relative only when it lies under

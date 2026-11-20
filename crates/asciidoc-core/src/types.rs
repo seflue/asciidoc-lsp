@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where a title or an include stands in the block tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,9 +409,30 @@ pub struct MissingImage {
     /// The top-level document, or the previewed file.
     pub document: PathBuf,
     pub preview: bool,
-    /// Display path and line of the `imagesdir` entry in effect there;
-    /// `None` when `imagesdir` is not set.
-    pub imagesdir_from: Option<(PathBuf, usize)>,
+    /// The `imagesdir` entry in effect there, its file as shown in the
+    /// message; `None` when `imagesdir` is not set.
+    pub imagesdir_from: Option<ImagesdirOrigin>,
+}
+
+/// The `imagesdir` entry a build resolves images with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagesdirOrigin {
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+/// Where the `imagesdir` of a build comes from, for a missing image:
+/// "imagesdir from part.adoc:3" or "imagesdir not set in this build".
+/// `file_name` turns the file of the entry into the name to show: a hover
+/// names the file, a diagnostic its path relative to the root.
+pub fn imagesdir_note(
+    origin: Option<&ImagesdirOrigin>,
+    file_name: impl FnOnce(&Path) -> String,
+) -> String {
+    match origin {
+        Some(origin) => format!("imagesdir from {}:{}", file_name(&origin.file), origin.line),
+        None => "imagesdir not set in this build".to_string(),
+    }
 }
 
 impl fmt::Display for DiagnosticKind {
@@ -434,12 +455,9 @@ impl fmt::Display for DiagnosticKind {
                     .iter()
                     .map(|build| {
                         let preview = if build.preview { " (preview)" } else { "" };
-                        let imagesdir = match &build.imagesdir_from {
-                            Some((file, line)) => {
-                                format!("imagesdir from {}:{line}", file.display())
-                            }
-                            None => "imagesdir not set in this build".to_string(),
-                        };
+                        let imagesdir = imagesdir_note(build.imagesdir_from.as_ref(), |file| {
+                            file.display().to_string()
+                        });
                         format!("{}{preview}: {imagesdir}", build.document.display())
                     })
                     .collect();

@@ -7,13 +7,16 @@ use tower_lsp_server::ls_types::Position;
 
 use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
-use asciidoc_core::diagnostics::display_path;
 use asciidoc_core::extractors::{element_attr_id, find_child_text, is_valid_anchor_id};
 use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{
     is_builtin_theme, is_pdf_path_attribute, resolve_pdf_attribute, PdfPath, PDF_THEME,
 };
 use asciidoc_core::references::{parse_xref_target, xref_names_file};
+use asciidoc_core::targets::{
+    imagesdir_note, resolve_image_in_folder, ImageOutcome, ImageResult, Readings, Target,
+    TargetResult,
+};
 use asciidoc_core::types::{
     AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref,
 };
@@ -23,9 +26,8 @@ use asciidoc_core::workspace::{
 
 use crate::positions;
 use crate::scopes::{
-    collapse_if_agree, document_dir, file_display_name, path_scopes, scope_docdir,
-    scope_image_base, scope_imagesdir_note, scope_label, unique_in_order, DocTarget,
-    IMAGESDIR_NOT_SET,
+    collapse_if_agree, document_dir, file_display_name, path_scopes, reading_label, scope_label,
+    unique_in_order, DocTarget,
 };
 
 /// Classification of a node found at a cursor position.
@@ -163,29 +165,18 @@ pub fn resolve_goto_definitions(
         NodeKind::Image { ref path, .. } => {
             // Each scope's file, each once.
             unique_in_order(
-                resolve_image_targets(
-                    path,
-                    doc_path,
-                    workspace,
-                    node_info.line,
-                    Readings::Documents,
-                )
-                .into_iter()
-                .filter_map(|(_, target)| match target {
-                    ImageTarget::Local { path: target, .. } => target.canonicalize().ok(),
-                    ImageTarget::Remote { .. } => None,
-                })
-                .map(|canonical| (canonical, 1)),
+                resolve_image_targets(path, doc_path, workspace, node_info.line, Readings::Build)
+                    .into_iter()
+                    .filter_map(|(_, result)| match result.outcome {
+                        ImageOutcome::Found { path, .. } => path.canonicalize().ok(),
+                        _ => None,
+                    })
+                    .map(|canonical| (canonical, 1)),
             )
         }
         NodeKind::Include { ref path } => {
-            let targets = resolve_doc_targets(
-                path,
-                doc_path,
-                workspace,
-                node_info.line,
-                Readings::Documents,
-            );
+            let targets =
+                resolve_doc_targets(path, doc_path, workspace, node_info.line, Readings::Build);
             existing_targets(&targets)
                 .into_iter()
                 .map(|file| (file, 1))
@@ -203,7 +194,7 @@ pub fn resolve_goto_definitions(
                     doc_path,
                     target,
                     node_info.line,
-                    Readings::Documents,
+                    Readings::Build,
                 )
                 .into_iter()
                 .filter_map(|(_, resolved)| resolved.ok())
@@ -243,13 +234,8 @@ pub fn resolve_references(
             r
         }
         NodeKind::Include { path } => {
-            let targets = resolve_doc_targets(
-                path,
-                doc_path,
-                Some(ws),
-                node_info.line,
-                Readings::Documents,
-            );
+            let targets =
+                resolve_doc_targets(path, doc_path, Some(ws), node_info.line, Readings::Build);
             let mut r = Vec::new();
             for target in existing_targets(&targets) {
                 let filename = target.file_name().and_then(|f| f.to_str()).unwrap_or("");
@@ -577,29 +563,31 @@ pub fn resolve_hover(
                 Readings::WithPreview,
             );
             // Scopes that reach the same file agree, however they spell it.
-            collapse_if_agree(&mut targets, |a, b| a.1.same_place(&b.1));
+            collapse_if_agree(&mut targets, |a, b| {
+                image_place(&a.1.outcome) == image_place(&b.1.outcome)
+            });
             let texts: Vec<(String, String)> = targets
                 .into_iter()
-                .map(|(label, target)| {
-                    let text = match target {
-                        ImageTarget::Remote { url } => format!("{macro_form}{url}[{attrlist}]"),
-                        ImageTarget::Local {
-                            path: target,
-                            display,
-                            imagesdir_note,
-                        } => {
-                            let status = if target.exists() {
-                                "\u{2713} File exists".to_string()
-                            } else {
-                                format!("\u{2717} File not found ({imagesdir_note})")
-                            };
-                            format!("{macro_form}{display}[{attrlist}]\n\n{status}")
+                .map(|(label, result)| {
+                    let text = match result.outcome {
+                        ImageOutcome::Remote { url } => format!("{macro_form}{url}[{attrlist}]"),
+                        ImageOutcome::Found { display, .. } => {
+                            format!("{macro_form}{display}[{attrlist}]\n\n\u{2713} File exists")
+                        }
+                        ImageOutcome::Missing { display, .. }
+                        | ImageOutcome::Unjudged { display, .. } => {
+                            let note = imagesdir_note(result.imagesdir_from.as_ref(), |file| {
+                                file_display_name(file)
+                            });
+                            format!(
+                                "{macro_form}{display}[{attrlist}]\n\n\u{2717} File not found ({note})"
+                            )
                         }
                     };
                     (label, text)
                 })
                 .collect();
-            Some(per_document_hover(texts))
+            (!texts.is_empty()).then(|| per_document_hover(texts))
         }
         NodeKind::Anchor { id } => {
             let ws = workspace?;
@@ -763,100 +751,38 @@ fn config_relative_path(ws: &Workspace, doc_path: &Path, value: &str) -> Option<
     ))
 }
 
-/// Where an image macro points after attribute substitution and `imagesdir`.
-enum ImageTarget {
-    /// A file: `path` is absolute, `display` is the human-readable path
-    /// including imagesdir.
-    Local {
-        path: PathBuf,
-        display: String,
-        /// Where `imagesdir` comes from in that build, see
-        /// `scope_imagesdir_note`.
-        imagesdir_note: String,
-    },
-    /// A URI (Asciidoctor's `uriish?`: `https:`, `data:`, ...), from the macro target or from `imagesdir`.
-    Remote { url: String },
-}
-
-impl ImageTarget {
-    /// Whether both point to the same file or URL.
-    fn same_place(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Local { path: a, .. }, Self::Local { path: b, .. }) => a == b,
-            (Self::Remote { url: a }, Self::Remote { url: b }) => a == b,
-            _ => false,
-        }
+/// Where an image resolves, for comparing readings: the file, or the URL.
+fn image_place(outcome: &ImageOutcome) -> Result<&Path, &str> {
+    match outcome {
+        ImageOutcome::Found { path, .. }
+        | ImageOutcome::Missing { path, .. }
+        | ImageOutcome::Unjudged { path, .. } => Ok(path),
+        ImageOutcome::Remote { url } => Err(url),
     }
 }
 
-/// Whether an image target is a URI (`http:`, `HTTPS:`, `ftp:`, `data:`),
-/// which Asciidoctor never resolves against the file system.
-fn is_remote_url(target: &str) -> bool {
-    is_uri(target)
-}
-
-/// Where an image macro on `line` points, per top-level document and, for
-/// a file others include and when `readings` asks for it, in the editor's
-/// preview of it (ADR-4): target, `imagesdir` and `docdir` take the values
-/// in effect there. Each target comes with its scope's label; without a
-/// workspace, one target with the label of `doc_path`.
+/// Where an image macro on `line` points, per reading (`readings` says
+/// whether the preview takes part). Each result comes with its reading's
+/// label; without a workspace, one result with the label of `doc_path`.
 fn resolve_image_targets(
     image_path: &str,
     doc_path: &Path,
     workspace: Option<&Workspace>,
     line: usize,
     readings: Readings,
-) -> Vec<(String, ImageTarget)> {
-    let file_dir = document_dir(doc_path, workspace);
+) -> Vec<(String, ImageResult)> {
     let Some(ws) = workspace else {
-        let target = image_target(image_path, file_dir, file_dir, "", IMAGESDIR_NOT_SET.into());
-        return vec![(file_display_name(doc_path), target)];
+        let result = resolve_image_in_folder(image_path, document_dir(doc_path, None));
+        return vec![(file_display_name(doc_path), result)];
     };
-    path_scopes(ws, doc_path, line)
-        .filter(|scope| readings == Readings::WithPreview || !scope.is_preview())
-        .map(|scope| {
-            let (base, imagesdir) = scope_image_base(&scope, file_dir);
-            let doc_dir = scope_docdir(&scope, file_dir);
-            let target = image_target(
-                &scope.substitute(image_path),
-                &base,
-                &doc_dir,
-                &imagesdir,
-                scope_imagesdir_note(&scope),
-            );
-            (scope_label(&scope), target)
+    CatalogCache::new(ws)
+        .resolve_target(doc_path, line, &Target::Image(image_path), readings)
+        .into_iter()
+        .map(|resolved| {
+            let TargetResult::Image(result) = resolved.result;
+            (reading_label(&resolved.reading), result)
         })
         .collect()
-}
-
-/// An image target from its substituted path, the folder it resolves
-/// against and the `imagesdir` shown in front of it. An absolute path shown
-/// is shown relative to `doc_dir` as far as `display_path` allows.
-fn image_target(
-    resolved_path: &str,
-    base: &Path,
-    doc_dir: &Path,
-    imagesdir: &str,
-    imagesdir_note: String,
-) -> ImageTarget {
-    let mut display = if imagesdir.is_empty() || is_remote_url(resolved_path) {
-        resolved_path.to_string()
-    } else {
-        format!("{}/{resolved_path}", imagesdir.trim_end_matches('/'))
-    };
-    if Path::new(&display).is_absolute() {
-        display = display_path(doc_dir, Path::new(&display))
-            .display()
-            .to_string();
-    }
-    if is_remote_url(&display) {
-        return ImageTarget::Remote { url: display };
-    }
-    ImageTarget::Local {
-        path: join_doc_path(base, resolved_path),
-        display,
-        imagesdir_note,
-    }
 }
 
 /// Where an include or xref file path on `line` points, per top-level
@@ -987,8 +913,7 @@ fn xref_definitions(
     line: usize,
 ) -> Vec<AnchorLocation> {
     let mut definitions = Vec::new();
-    for (_, resolved) in
-        resolve_xref_targets(ws, catalogs, doc_path, target, line, Readings::Documents)
+    for (_, resolved) in resolve_xref_targets(ws, catalogs, doc_path, target, line, Readings::Build)
     {
         if let Ok(ResolvedXref {
             file,
@@ -1169,19 +1094,6 @@ fn resolve_xref_targets(
         .collect()
 }
 
-/// Which readings of a file an xref, include or image resolves in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Readings {
-    /// The top-level documents that read the file: the targets goto,
-    /// find-references and rename follow. A target only the preview finds
-    /// is broken where the file is converted, and following it would
-    /// contradict what Asciidoctor uses there.
-    Documents,
-    /// Those and, for a file others include, the editor's preview of it:
-    /// what hover shows.
-    WithPreview,
-}
-
 /// Build a debug report of what go-to-definition and hover see at `pos`.
 ///
 /// `lookup_path` is the path the handlers resolve with; pass it exactly as
@@ -1341,16 +1253,16 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
             let scopes: Vec<Value> =
                 resolve_image_targets(path, doc_path, workspace, info.line, Readings::WithPreview)
                     .into_iter()
-                    .map(|(label, target)| explain_image(&label, target))
+                    .map(|(label, result)| explain_image(&label, result))
                     .collect();
             json!({ "scopes": scopes })
         }
     }
 }
 
-fn explain_image(label: &str, target: ImageTarget) -> Value {
-    match target {
-        ImageTarget::Remote { url } => json!({
+fn explain_image(label: &str, result: ImageResult) -> Value {
+    match result.outcome {
+        ImageOutcome::Remote { url } => json!({
             "scope": label,
             "remote": true,
             "target": null,
@@ -1358,20 +1270,18 @@ fn explain_image(label: &str, target: ImageTarget) -> Value {
             "display": url,
             "exists": null,
         }),
-        ImageTarget::Local {
-            path: target,
-            display,
-            ..
-        } => {
+        ImageOutcome::Found { path, display }
+        | ImageOutcome::Missing { path, display }
+        | ImageOutcome::Unjudged { path, display } => {
             // Same existence gate as go-to-definition: the path gd returns.
-            let canonical_target = target.canonicalize().ok();
+            let canonical_target = path.canonicalize().ok();
             json!({
                 "scope": label,
                 "remote": false,
-                "target": path_string(&target),
+                "target": path_string(&path),
                 "canonical_target": canonical_target.as_deref().map(path_string),
                 "display": display,
-                "exists": target.exists(),
+                "exists": path.exists(),
             })
         }
     }

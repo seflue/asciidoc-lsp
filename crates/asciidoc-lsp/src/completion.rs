@@ -7,16 +7,17 @@ use tower_lsp_server::ls_types::{
     TextEdit,
 };
 
-use asciidoc_core::anchor_scope::AnchorScope;
+use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::builtin_attributes::{
     builtin_attribute, BuiltinAttribute, BuiltinValues, BUILTIN_ATTRIBUTES,
 };
 use asciidoc_core::paths::canonicalize_if_exists;
+use asciidoc_core::targets::Target;
 use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
 use crate::positions;
-use crate::scopes::{collapse_if_agree, document_dir, scope_docdir, scope_image_base, scope_label};
+use crate::scopes::{collapse_if_agree, document_dir, scope_docdir, scope_label};
 
 // ---------------------------------------------------------------------------
 // Syntax Completion Catalog
@@ -1394,15 +1395,20 @@ pub(crate) fn resolve_image_completions(
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let file_dir = document_dir(doc_path, ws);
-    let listings = path_listings(
-        prefix,
-        doc_path,
-        line,
-        ws,
-        file_dir.to_path_buf(),
-        |scope| scope_image_base(scope, file_dir).0,
-    );
+    let listings = match ws {
+        Some(ws) => CatalogCache::new(ws)
+            .base_dirs(doc_path, line, &Target::Image(prefix))
+            .into_iter()
+            .map(|base| PathListing {
+                base_dir: base.dir,
+                resolved_prefix: base.prefix,
+            })
+            .collect(),
+        None => vec![PathListing {
+            base_dir: document_dir(doc_path, None).to_path_buf(),
+            resolved_prefix: prefix.to_string(),
+        }],
+    };
     // Cursor lands inside `[]` on the `alt` placeholder for image alt text.
     resolve_path_completions(
         prefix,

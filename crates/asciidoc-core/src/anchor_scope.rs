@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use crate::paths::{canonicalize_if_exists, join_doc_path, resolve_doc_target};
 use crate::reading::{read_in_order, ReadingVisitor};
 use crate::references::{effective_id_separator, generate_section_id, parse_xref_target};
+use crate::targets::ReadingScopeCache;
 use crate::types::{
     Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, FileLocation, IncludeEdge,
     ResolvedXref, Section, Xref,
@@ -112,6 +113,9 @@ pub struct CatalogCache<'ws> {
     workspace: &'ws Workspace,
     catalogs: RefCell<HashMap<PathBuf, Rc<AnchorScope>>>,
     roots: OnceCell<HashMap<PathBuf, Vec<PathBuf>>>,
+    /// The attribute scopes of the targets resolved so far, see
+    /// [`crate::targets`].
+    pub(crate) reading_scopes: RefCell<ReadingScopeCache<'ws>>,
 }
 
 impl<'ws> CatalogCache<'ws> {
@@ -122,7 +126,13 @@ impl<'ws> CatalogCache<'ws> {
             workspace,
             catalogs: RefCell::new(HashMap::new()),
             roots: OnceCell::new(),
+            reading_scopes: RefCell::default(),
         }
+    }
+
+    /// The workspace the cache reads.
+    pub(crate) fn workspace(&self) -> &'ws Workspace {
+        self.workspace
     }
 
     /// `IncludeGraph::doc_roots` of the workspace.
