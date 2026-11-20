@@ -228,9 +228,25 @@ impl AsciiDocLsp {
         }
     }
 
-    /// Files changed on disk: convert again if the document on show reads
-    /// one of them.
-    fn preview_files_changed(&self, changed: &[PathBuf]) {
+    /// Whether the document on show reads one of the `changed` files. Ask
+    /// before the watcher events reach the workspace: a deleted file leaves
+    /// the index and with it the read set.
+    fn preview_reads_any(&self, changed: &[PathBuf]) -> bool {
+        if self.preview.lock().is_none() || self.preview_active.lock().is_none() {
+            return false;
+        }
+        let Some(shown) = self.preview_shown.lock().clone() else {
+            return false;
+        };
+        self.workspace.lock().as_ref().is_some_and(|ws| {
+            let read = ws.documents_read_by(&shown);
+            changed.iter().any(|path| read.contains(path))
+        })
+    }
+
+    /// Files changed on disk and the document on show reads one of them
+    /// ([`Self::preview_reads_any`]): convert again.
+    fn preview_files_changed(&self) {
         let running = self.preview.lock().clone();
         let Some(preview) = running else {
             return;
@@ -238,17 +254,8 @@ impl AsciiDocLsp {
         let Some(active) = self.preview_active.lock().clone() else {
             return;
         };
-        let Some(shown) = self.preview_shown.lock().clone() else {
-            return;
-        };
-        let affects = self.workspace.lock().as_ref().is_some_and(|ws| {
-            let read = ws.documents_read_by(&shown);
-            changed.iter().any(|path| read.contains(path))
-        });
-        if affects {
-            if let Some(request) = self.preview_request(&active) {
-                self.send_preview_request(&preview, request);
-            }
+        if let Some(request) = self.preview_request(&active) {
+            self.send_preview_request(&preview, request);
         }
     }
 
@@ -665,10 +672,13 @@ impl LanguageServer for AsciiDocLsp {
             .iter()
             .filter_map(|event| document_path(&event.uri))
             .collect();
+        let affects_preview = self.preview_reads_any(&changed);
         if let Some(diagnostics) = self.compute_watched_files_update(params) {
             self.publish_workspace_diagnostics(&diagnostics).await;
         }
-        self.preview_files_changed(&changed);
+        if affects_preview {
+            self.preview_files_changed();
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -5303,6 +5313,38 @@ mod tests {
             })
             .await;
         stream.until("changed on disk").await;
+    }
+
+    #[tokio::test]
+    async fn test_deleting_an_included_chapter_converts_the_book() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((book_uri, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&chapter_uri),
+            })
+            .await;
+        server
+            .preview_open(vec![serde_json::json!(book_uri)])
+            .await
+            .unwrap();
+        stream.until("disk text").await;
+        fs::remove_file(root.join("ch1.adoc")).unwrap();
+        server
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: chapter_uri,
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        stream.until("Unresolved directive").await;
     }
 
     #[tokio::test]
