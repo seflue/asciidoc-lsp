@@ -8,7 +8,6 @@
 //! nowhere else; features ask [`CatalogCache::resolve_target`] and present.
 //! Whether results that agree are shown once is the feature's decision.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -17,11 +16,10 @@ use crate::anchor_scope::CatalogCache;
 use crate::attributes::DOCDIR;
 use crate::paths::{
     canonicalize_if_exists, display_path, is_uri, join_doc_path, normalize_lexically,
-    resolve_doc_target,
 };
 use crate::references::parse_xref_target;
 pub use crate::types::{imagesdir_note, ImagesdirOrigin};
-use crate::types::{DiagnosticKind, ResolvedXref, Xref};
+use crate::types::{AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref, Xref};
 use crate::workspace::{AttributeScope, Workspace};
 
 /// A target as written in the file.
@@ -128,11 +126,6 @@ pub struct BaseDir {
     pub dir: PathBuf,
     pub prefix: String,
 }
-
-/// The scopes of one position and kind of reading, see
-/// [`CatalogCache::resolve_target`].
-pub(crate) type ReadingScopeCache<'ws> =
-    HashMap<(PathBuf, usize, usize, bool), Rc<Vec<AttributeScope<'ws>>>>;
 
 impl<'ws> CatalogCache<'ws> {
     /// Where `target` on `line` of `file` points, one result per reading in
@@ -281,6 +274,89 @@ impl<'ws> CatalogCache<'ws> {
             .collect()
     }
 
+    /// The xrefs of `id` that point at one of the `definitions`: those that
+    /// resolve to it in at least one top-level document that reads them, so
+    /// an xref to the same ID in another document is no reference. Each
+    /// location carries the column of its xref, so two xrefs on one line are
+    /// told apart.
+    #[must_use]
+    pub fn anchor_references(&self, id: &str, definitions: &[AnchorLocation]) -> Vec<FileLocation> {
+        self.references_of(id, definitions, false)
+    }
+
+    /// [`Self::anchor_references`] plus the natural xrefs (`<<Section Title>>`,
+    /// `<<reftext>>`) that resolve to one of the `definitions`. Such an xref
+    /// names no ID, so it is a reference but never part of a rename.
+    #[must_use]
+    pub fn anchor_and_natural_references(
+        &self,
+        id: &str,
+        definitions: &[AnchorLocation],
+    ) -> Vec<FileLocation> {
+        self.references_of(id, definitions, true)
+    }
+
+    fn references_of(
+        &self,
+        id: &str,
+        definitions: &[AnchorLocation],
+        include_natural: bool,
+    ) -> Vec<FileLocation> {
+        let workspace = self.workspace();
+        // A definition is matched by file and line only, so an xref to
+        // another ID on that line must be told apart by the ID it resolves to.
+        let mut definition_ids = vec![id.to_string()];
+        for path in workspace.documents.keys() {
+            for scope in self.scopes_at(path) {
+                let named = scope
+                    .lookup(id)
+                    .map(|location| (id, location))
+                    .or_else(|| scope.lookup_natural(id));
+                if let Some((real, location)) = named {
+                    if definitions
+                        .iter()
+                        .any(|d| d.file == location.file && d.line == location.line)
+                        && !definition_ids.iter().any(|known| known == real)
+                    {
+                        definition_ids.push(real.to_string());
+                    }
+                }
+            }
+        }
+        let mut references = Vec::new();
+        for (path, doc) in &workspace.documents {
+            let named = doc.xrefs.iter().filter(|xref| {
+                let (file, anchor) = parse_xref_target(&xref.target);
+                anchor == Some(id) || (include_natural && file.is_none())
+            });
+            for xref in named {
+                let reaches_definition = self
+                    .resolve_target(
+                        path,
+                        xref.line,
+                        &Target::Xref(&xref.target),
+                        Readings::Build,
+                    )
+                    .into_iter()
+                    .filter_map(|resolved| resolved.result.into_xref()?.ok())
+                    .any(|resolved| {
+                        resolved
+                            .id
+                            .as_ref()
+                            .is_none_or(|rid| definition_ids.contains(rid))
+                            && definitions.iter().any(|definition| {
+                                resolved.file == definition.file && resolved.line == definition.line
+                            })
+                    });
+                if reaches_definition {
+                    let (col, end_col) = xref.id_span().map_or((0, 0), |(_, c, e)| (c, e));
+                    references.push(FileLocation::new(path.clone(), xref.line, col, end_col));
+                }
+            }
+        }
+        references
+    }
+
     /// The scopes on `line` of `file`: those of the top-level documents, or
     /// with `preview` the preview alone. The scope on a line only changes
     /// with the attribute entries and includes before it, so a file's lines
@@ -416,26 +492,6 @@ fn document_folder(workspace: &Workspace, file: &Path) -> PathBuf {
         .or_else(|| file.parent())
         .unwrap_or(file)
         .to_path_buf()
-}
-
-/// The file part `file` of an xref read in the top-level document
-/// `document`, as a path. Asciidoctor resolves it from the folder of
-/// `document`, also when the xref stands in an included file (ADR-009).
-/// `attributes`, the scope of `document` on the line of the xref, fills in
-/// attribute references in it, else the registry does.
-pub(crate) fn xref_file(
-    workspace: &Workspace,
-    document: &Path,
-    attributes: Option<&AttributeScope<'_>>,
-    file: &str,
-) -> Option<PathBuf> {
-    match (attributes, workspace.attributes.doc_dir(document)) {
-        (Some(attributes), Some(dir)) => Some(canonicalize_if_exists(join_doc_path(
-            dir,
-            &attributes.substitute(file),
-        ))),
-        _ => resolve_doc_target(document, file, &workspace.attributes),
-    }
 }
 
 /// The include `substituted` from the folder `dir`.

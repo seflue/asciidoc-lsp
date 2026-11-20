@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
+use crate::paths::{canonicalize_if_exists, join_doc_path, resolve_doc_target};
 use crate::reading::{read_in_order, ReadingVisitor};
 use crate::references::{effective_id_separator, generate_section_id, parse_xref_target};
-use crate::targets::{xref_file, ReadingScopeCache, Readings, Target};
 use crate::types::{
-    Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, FileLocation, IncludeEdge,
-    ResolvedXref, Section, Xref,
+    Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, IncludeEdge, ResolvedXref,
+    Section, Xref,
 };
 use crate::workspace::{is_own_top_level, top_level_documents_in, AttributeScope, Workspace};
 
@@ -62,7 +62,7 @@ impl AnchorScope {
     /// Asciidoctor matches a target that is no ID, has no `#` and contains a
     /// space or an uppercase letter against the reftexts and the titles of
     /// sections and of blocks with an ID.
-    fn lookup_natural(&self, target: &str) -> Option<(&str, &AnchorLocation)> {
+    pub(crate) fn lookup_natural(&self, target: &str) -> Option<(&str, &AnchorLocation)> {
         let natural = !target.contains('#')
             && (target.contains(' ') || target.chars().any(char::is_uppercase));
         if !natural {
@@ -103,6 +103,11 @@ impl AnchorScope {
         self.whole.contains(file)
     }
 }
+
+/// The scopes of one position and kind of reading, see
+/// [`CatalogCache::resolve_target`].
+pub(crate) type ReadingScopeCache<'ws> =
+    HashMap<(PathBuf, usize, usize, bool), Rc<Vec<AttributeScope<'ws>>>>;
 
 /// The ID catalogs of one request or pass over the workspace, each read once,
 /// with the top-level documents of every file computed once. The cache
@@ -246,89 +251,6 @@ impl<'ws> CatalogCache<'ws> {
         location.ok_or_else(broken)
     }
 
-    /// The xrefs of `id` that point at one of the `definitions`: those that
-    /// resolve to it in at least one top-level document that reads them, so
-    /// an xref to the same ID in another document is no reference. Each
-    /// location carries the column of its xref, so two xrefs on one line are
-    /// told apart.
-    #[must_use]
-    pub fn anchor_references(&self, id: &str, definitions: &[AnchorLocation]) -> Vec<FileLocation> {
-        self.references_of(id, definitions, false)
-    }
-
-    /// [`Self::anchor_references`] plus the natural xrefs (`<<Section Title>>`,
-    /// `<<reftext>>`) that resolve to one of the `definitions`. Such an xref
-    /// names no ID, so it is a reference but never part of a rename.
-    #[must_use]
-    pub fn anchor_and_natural_references(
-        &self,
-        id: &str,
-        definitions: &[AnchorLocation],
-    ) -> Vec<FileLocation> {
-        self.references_of(id, definitions, true)
-    }
-
-    fn references_of(
-        &self,
-        id: &str,
-        definitions: &[AnchorLocation],
-        include_natural: bool,
-    ) -> Vec<FileLocation> {
-        let workspace = self.workspace;
-        // A definition is matched by file and line only, so an xref to
-        // another ID on that line must be told apart by the ID it resolves to.
-        let mut definition_ids = vec![id.to_string()];
-        for path in workspace.documents.keys() {
-            for scope in self.scopes_at(path) {
-                let named = scope
-                    .lookup(id)
-                    .map(|location| (id, location))
-                    .or_else(|| scope.lookup_natural(id));
-                if let Some((real, location)) = named {
-                    if definitions
-                        .iter()
-                        .any(|d| d.file == location.file && d.line == location.line)
-                        && !definition_ids.iter().any(|known| known == real)
-                    {
-                        definition_ids.push(real.to_string());
-                    }
-                }
-            }
-        }
-        let mut references = Vec::new();
-        for (path, doc) in &workspace.documents {
-            let named = doc.xrefs.iter().filter(|xref| {
-                let (file, anchor) = parse_xref_target(&xref.target);
-                anchor == Some(id) || (include_natural && file.is_none())
-            });
-            for xref in named {
-                let reaches_definition = self
-                    .resolve_target(
-                        path,
-                        xref.line,
-                        &Target::Xref(&xref.target),
-                        Readings::Build,
-                    )
-                    .into_iter()
-                    .filter_map(|resolved| resolved.result.into_xref()?.ok())
-                    .any(|resolved| {
-                        resolved
-                            .id
-                            .as_ref()
-                            .is_none_or(|rid| definition_ids.contains(rid))
-                            && definitions.iter().any(|definition| {
-                                resolved.file == definition.file && resolved.line == definition.line
-                            })
-                    });
-                if reaches_definition {
-                    let (col, end_col) = xref.id_span().map_or((0, 0), |(_, c, e)| (c, e));
-                    references.push(FileLocation::new(path.clone(), xref.line, col, end_col));
-                }
-            }
-        }
-        references
-    }
-
     /// The catalog of every top-level document of the workspace, in path
     /// order.
     pub(crate) fn all(&self) -> Vec<Rc<AnchorScope>> {
@@ -344,6 +266,26 @@ impl<'ws> CatalogCache<'ws> {
             .into_iter()
             .map(|document| self.get(document))
             .collect()
+    }
+}
+
+/// The file part `file` of an xref read in the top-level document
+/// `document`, as a path. Asciidoctor resolves it from the folder of
+/// `document`, also when the xref stands in an included file (ADR-009).
+/// `attributes`, the scope of `document` on the line of the xref, fills in
+/// attribute references in it, else the registry does.
+pub(crate) fn xref_file(
+    workspace: &Workspace,
+    document: &Path,
+    attributes: Option<&AttributeScope<'_>>,
+    file: &str,
+) -> Option<PathBuf> {
+    match (attributes, workspace.attributes.doc_dir(document)) {
+        (Some(attributes), Some(dir)) => Some(canonicalize_if_exists(join_doc_path(
+            dir,
+            &attributes.substitute(file),
+        ))),
+        _ => resolve_doc_target(document, file, &workspace.attributes),
     }
 }
 

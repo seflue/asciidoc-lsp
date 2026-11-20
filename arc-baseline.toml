@@ -16,17 +16,6 @@ symbols = [
 [[violations]]
 rule = "no-cycles"
 from = "asciidoc-core::anchor_scope"
-to = "asciidoc-core::targets"
-symbols = [
-    "ReadingScopeCache",
-    "Readings",
-    "Target",
-    "xref_file",
-]
-
-[[violations]]
-rule = "no-cycles"
-from = "asciidoc-core::anchor_scope"
 to = "asciidoc-core::workspace"
 symbols = [
     "AttributeScope",
