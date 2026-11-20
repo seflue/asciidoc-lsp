@@ -392,7 +392,7 @@ impl LanguageServer for AsciiDocLsp {
 
     async fn initialized(&self, _: InitializedParams) {
         // Register file watchers if the client supports dynamic registration.
-        // Without this, external edits to `.asciidoctorconfig*` and `.adoc` files
+        // Without this, external edits to `.asciidoctorconfig*`, `.adoc` and theme `.yml` files
         // outside open buffers leave caches stale.
         if *self.can_request_file_watcher.lock() {
             let registration = watched_files_registration();
@@ -1030,6 +1030,8 @@ enum WatchedKind {
     Config,
     AsciiDoc,
     Image,
+    /// A YAML file that may be a PDF theme.
+    Theme,
 }
 
 /// Extensions of the image files whose appearance or removal changes the
@@ -1045,7 +1047,7 @@ fn image_watchers() -> impl Iterator<Item = FileSystemWatcher> {
 }
 
 /// The `workspace/didChangeWatchedFiles` registration sent from `initialized`:
-/// config files, `.adoc` sources and image files.
+/// config files, `.adoc` sources, theme `.yml` files and image files.
 fn watched_files_registration() -> Registration {
     let watchers = vec![
         FileSystemWatcher {
@@ -1062,6 +1064,10 @@ fn watched_files_registration() -> Registration {
         },
         FileSystemWatcher {
             glob_pattern: GlobPattern::String("**/*.asciidoc".into()),
+            kind: None,
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.yml".into()),
             kind: None,
         },
     ];
@@ -1087,6 +1093,7 @@ struct ClassifiedEvents {
     /// An image file appeared, vanished or changed: the diagnostics need a
     /// recalculation, no document is parsed again.
     images_changed: bool,
+    theme_changed: bool,
     adoc_events: Vec<(PathBuf, FileChangeType)>,
 }
 
@@ -1107,6 +1114,8 @@ fn classify_events(
         match classify_watched_path(&path) {
             // Config chains are read from disk, open in the editor or not.
             Some(WatchedKind::Config) => out.config_changed = true,
+            // Theme files are read from disk on every recalculation.
+            Some(WatchedKind::Theme) => out.theme_changed = true,
             Some(WatchedKind::AsciiDoc) if !is_path_open(&path, open_buffers) => {
                 out.adoc_events.push((path, change.typ));
             }
@@ -1114,7 +1123,11 @@ fn classify_events(
             Some(WatchedKind::AsciiDoc) | None => {}
         }
     }
-    if !out.config_changed && !out.images_changed && out.adoc_events.is_empty() {
+    if !out.config_changed
+        && !out.images_changed
+        && !out.theme_changed
+        && out.adoc_events.is_empty()
+    {
         None
     } else {
         Some(out)
@@ -1181,14 +1194,15 @@ fn resolve_deleted_doc_key(path: &Path) -> PathBuf {
 }
 
 /// Classify a watched-file path. The watcher globs may match unrelated files
-/// (`**/*` is permissive); the handler routes only `.asciidoctorconfig*` and
-/// `.adoc` / `.asciidoc` files and image files, and ignores everything else.
+/// (`**/*` is permissive); the handler routes only `.asciidoctorconfig*`,
+/// `.adoc` / `.asciidoc`, `.yml` and image files, and ignores everything else.
 fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
     let name = path.file_name()?.to_str()?;
     let ext = path.extension().and_then(|e| e.to_str());
     match (name, ext) {
         (".asciidoctorconfig" | ".asciidoctorconfig.adoc", _) => Some(WatchedKind::Config),
         (_, Some("adoc" | "asciidoc")) => Some(WatchedKind::AsciiDoc),
+        (_, Some("yml")) => Some(WatchedKind::Theme),
         (_, Some(ext)) if IMAGE_EXTENSIONS.iter().any(|i| i.eq_ignore_ascii_case(ext)) => {
             Some(WatchedKind::Image)
         }
@@ -1959,6 +1973,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_classify_watched_path_theme_yaml() {
+        assert_eq!(
+            classify_watched_path(Path::new("/ws/themes/custom-theme.yml")),
+            Some(WatchedKind::Theme)
+        );
+        assert!(classify_watched_path(Path::new("/ws/other.yaml")).is_none());
+    }
+
     // --- open-buffer filter + deleted-key resolution ---
 
     #[test]
@@ -2063,6 +2086,20 @@ mod tests {
         let kinds: Vec<_> = classified.adoc_events.iter().map(|(_, t)| *t).collect();
         assert!(kinds.contains(&FileChangeType::CREATED));
         assert!(kinds.contains(&FileChangeType::DELETED));
+    }
+
+    /// A theme file is read from disk, open in the editor or not.
+    #[test]
+    fn test_classify_events_flags_theme_yaml_even_when_open() {
+        let open: HashSet<PathBuf> = HashSet::from([PathBuf::from("/ws/t-theme.yml")]);
+        let changes = vec![make_event(
+            "file:///ws/t-theme.yml",
+            FileChangeType::CHANGED,
+        )];
+        let classified = classify_events(changes, &open).expect("theme event remains");
+        assert!(classified.theme_changed);
+        assert!(!classified.config_changed);
+        assert!(classified.adoc_events.is_empty());
     }
 
     #[test]
@@ -3848,6 +3885,49 @@ mod tests {
                 None => assert_eq!(hover, None, "{typ:?}"),
             }
         }
+    }
+
+    /// A theme file edited on disk updates the missing-path findings of the
+    /// document that names it, without any edit to the document.
+    #[tokio::test]
+    async fn test_theme_yaml_watch_event_updates_pdf_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let theme = root.join("t-theme.yml");
+        let text = "= A\n:pdf-theme: {docdir}/t-theme.yml\n";
+        fs::write(
+            &theme,
+            "title-page:\n  logo:\n    image: image:gone.png[]\n",
+        )
+        .unwrap();
+        fs::write(root.join("a.adoc"), text).unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        open_document(server, &file_uri(&root.join("a.adoc")), text).await;
+        let findings = |server: &AsciiDocLsp| {
+            let ws = server.workspace.lock();
+            ws.as_ref()
+                .unwrap()
+                .diagnostics_for(&root.join("a.adoc"))
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.kind,
+                        asciidoc_core::types::DiagnosticKind::PdfThemeEntryNotFound { .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(findings(server), 1);
+
+        fs::write(
+            &theme,
+            "title-page:\n  logo:\n    image: image:https://e.org/x.png[]\n",
+        )
+        .unwrap();
+        notify_watched(server, &theme, FileChangeType::CHANGED).await;
+
+        assert_eq!(findings(server), 0);
     }
 
     /// A config event re-reads open documents from the editor, not from disk.
