@@ -3,9 +3,11 @@
 //!
 //! A reading is one way the file is read: by a top-level document that
 //! includes it, or, for a file others include, by the editor previewing it
-//! on its own. The path rule of each kind of target, the choice of readings
-//! and the handling of readers that read the file only in part live here and
-//! nowhere else; features ask [`CatalogCache::resolve_target`] and present.
+//! on its own. The path rule of image and include targets, the choice of
+//! readings and the handling of readers that read the file only in part live
+//! here; the file part of an xref is resolved by
+//! [`crate::anchor_scope`]'s `xref_file`. Features ask
+//! [`CatalogCache::resolve_target`] and present.
 //! Whether results that agree are shown once is the feature's decision.
 //!
 //! Without a workspace there are no readings: a file stands alone, and the
@@ -88,7 +90,8 @@ pub struct IncludeResult {
     pub joined: PathBuf,
     /// `joined`, canonical when it exists.
     pub path: PathBuf,
-    /// A file exists at `path`. Never true for a URI.
+    /// A file exists at `path`, or an indexed document not saved yet. Never
+    /// true for a URI.
     pub exists: bool,
 }
 
@@ -1738,6 +1741,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_same_file_follows_symlinks_of_files_that_exist() {
         let (_tmp, root, _ws) = scanned(&[("a.adoc", "A\n"), ("b.adoc", "B\n")]);

@@ -182,7 +182,7 @@ impl<'ws> CatalogCache<'ws> {
 
     /// Where `xref` points when read in `scope`, one top-level document.
     /// The file part of the target is resolved from the folder of that
-    /// document ([`crate::targets`] holds the rule); `attributes`, the scope
+    /// document (`xref_file` holds the rule); `attributes`, the scope
     /// of the document on the line of the xref, fills in attribute
     /// references in it, else the registry does.
     ///
@@ -274,7 +274,7 @@ impl<'ws> CatalogCache<'ws> {
 /// `document`, also when the xref stands in an included file (ADR-009).
 /// `attributes`, the scope of `document` on the line of the xref, fills in
 /// attribute references in it, else the registry does.
-pub(crate) fn xref_file(
+fn xref_file(
     workspace: &Workspace,
     document: &Path,
     attributes: Option<&AttributeScope<'_>>,

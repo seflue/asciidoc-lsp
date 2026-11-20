@@ -1,8 +1,8 @@
 //! Goto and the diagnostics agree on every target of the project's own
 //! documents: where go-to-definition finds an xref, image or include, the
 //! diagnostics report it as missing nowhere, and where it finds nothing they
-//! report it. Both resolve the same macro per reading (ADR-008), but the
-//! rule lives in two places and is kept equal by hand; this test pins it.
+//! report it. Both ask `resolve_target` per reading (ADR-008); this test pins
+//! that they present its answer alike.
 //!
 //! The corpus is every directory in `tests/fixtures/` and `docs/`, each
 //! scanned as a workspace of its own.
@@ -12,10 +12,11 @@
 //! it per reading. Optional includes are compared with their own
 //! diagnostic.
 //!
-//! Left out, as the diagnostics leave them out:
-//! - xrefs, images and includes no whole reader judges: a document that
-//!   reads the file only in part is no judge of what is missing there;
-//! - includes with a URI target.
+//! A reading that reads the file only in part counts neither as missing nor
+//! as found; where only such readings exist, neither goto nor the
+//! diagnostics report anything.
+//!
+//! Left out, as the diagnostics leave them out: includes with a URI target.
 //!
 //! Any deviation fails the test.
 
@@ -87,6 +88,8 @@ fn expected_names(root: &Path, missing: &[&Path], readers: usize) -> Option<Vec<
 
 /// Whether an include is marked optional, read from its attributes: an
 /// `optional-option`, or `optional` in the `opts` list, quotes removed.
+/// Deliberately written apart from the rule in `diagnostics`, so that this
+/// test does not share a mistake with the code it checks.
 fn is_optional(attributes: &[(String, String)], substitute: impl Fn(&str) -> String) -> bool {
     attributes.iter().any(|(name, value)| {
         name == "optional-option"

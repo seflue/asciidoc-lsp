@@ -1057,7 +1057,7 @@ pub(crate) fn resolve_xref_path_completions(
     closing: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let listings = path_listings(doc_path, line, ws, &Target::Xref(prefix), prefix);
+    let listings = path_listings(doc_path, line, ws, &Target::Xref(prefix));
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
     // When a `[` follows later in the same target (`closing == ""`): drop the bracket
@@ -1210,15 +1210,15 @@ fn path_listings(
     line: usize,
     ws: Option<&Workspace>,
     target: &Target<'_>,
-    prefix: &str,
 ) -> Vec<BaseDir> {
-    match ws {
-        Some(ws) => CatalogCache::new(ws).base_dirs(doc_path, line, target),
-        None => vec![BaseDir {
-            dir: document_dir(doc_path, None).to_path_buf(),
-            prefix: prefix.to_string(),
-        }],
+    if let Some(ws) = ws {
+        return CatalogCache::new(ws).base_dirs(doc_path, line, target);
     }
+    let (Target::Xref(prefix) | Target::Include(prefix) | Target::Image(prefix)) = *target;
+    vec![BaseDir {
+        dir: document_dir(doc_path, None).to_path_buf(),
+        prefix: prefix.to_string(),
+    }]
 }
 
 /// The candidates of one [`BaseDir`] for the typed `prefix`.
@@ -1338,7 +1338,7 @@ pub(crate) fn resolve_include_completions(
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let listings = path_listings(doc_path, line, ws, &Target::Include(prefix), prefix);
+    let listings = path_listings(doc_path, line, ws, &Target::Include(prefix));
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(
         prefix,
@@ -1358,7 +1358,7 @@ pub(crate) fn resolve_image_completions(
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let listings = path_listings(doc_path, line, ws, &Target::Image(prefix), prefix);
+    let listings = path_listings(doc_path, line, ws, &Target::Image(prefix));
     // Cursor lands inside `[]` on the `alt` placeholder for image alt text.
     resolve_path_completions(
         prefix,
