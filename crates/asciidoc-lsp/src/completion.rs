@@ -1371,10 +1371,20 @@ pub(crate) fn resolve_include_completions(
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let base = document_dir(doc_path, ws);
-    let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |_| {
-        base.to_path_buf()
-    });
+    let listings = match ws {
+        Some(ws) => CatalogCache::new(ws)
+            .base_dirs(doc_path, line, &Target::Include(prefix))
+            .into_iter()
+            .map(|base| PathListing {
+                base_dir: base.dir,
+                resolved_prefix: base.prefix,
+            })
+            .collect(),
+        None => vec![PathListing {
+            base_dir: document_dir(doc_path, None).to_path_buf(),
+            resolved_prefix: prefix.to_string(),
+        }],
+    };
     let current = canonicalize_if_exists(doc_path.to_path_buf());
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(

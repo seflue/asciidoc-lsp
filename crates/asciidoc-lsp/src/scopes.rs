@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use asciidoc_core::attributes::DOCDIR;
-use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path};
 use asciidoc_core::targets::Reading;
 use asciidoc_core::workspace::{AttributeScope, Workspace};
 
@@ -73,29 +72,6 @@ fn label(document: &Path, preview: bool) -> String {
         format!("{name} (preview)")
     } else {
         name
-    }
-}
-
-/// One scope's view of an include or xref file path.
-pub(crate) struct DocTarget {
-    pub(crate) label: String,
-    /// The path as written, attribute references substituted.
-    pub(crate) substituted: String,
-    /// Joined onto the document directory, symlinks kept.
-    pub(crate) joined: PathBuf,
-    /// `joined`, canonical when it exists.
-    pub(crate) path: PathBuf,
-}
-
-impl DocTarget {
-    pub(crate) fn new(label: String, substituted: &str, dir: &Path) -> Self {
-        let joined = join_doc_path(dir, substituted);
-        Self {
-            label,
-            substituted: substituted.to_string(),
-            path: canonicalize_if_exists(joined.clone()),
-            joined,
-        }
     }
 }
 

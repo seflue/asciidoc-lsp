@@ -14,7 +14,9 @@ use std::rc::Rc;
 
 use crate::anchor_scope::CatalogCache;
 use crate::attributes::DOCDIR;
-use crate::paths::{display_path, is_uri, join_doc_path, normalize_lexically};
+use crate::paths::{
+    canonicalize_if_exists, display_path, is_uri, join_doc_path, normalize_lexically,
+};
 pub use crate::types::{imagesdir_note, ImagesdirOrigin};
 use crate::workspace::AttributeScope;
 
@@ -23,6 +25,8 @@ use crate::workspace::AttributeScope;
 pub enum Target<'t> {
     /// The path of `image::path[]` or `image:path[]`.
     Image(&'t str),
+    /// The path of `include::path[]`.
+    Include(&'t str),
 }
 
 /// Which readings of a file a target resolves in.
@@ -56,6 +60,30 @@ pub struct Resolved {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetResult {
     Image(ImageResult),
+    Include(IncludeResult),
+}
+
+/// Where an include points in one reading, resolved from the folder of the
+/// including file with the attributes of that reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeResult {
+    /// The path as written, attribute references substituted.
+    pub substituted: String,
+    /// Joined onto the folder of the including file, symlinks kept.
+    pub joined: PathBuf,
+    /// `joined`, canonical when it exists.
+    pub path: PathBuf,
+    /// A file exists at `path`. Never true for a URI.
+    pub exists: bool,
+}
+
+impl IncludeResult {
+    /// The target is a URI: Asciidoctor fetches it or not, it is never a
+    /// file here.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        is_uri(&self.substituted)
+    }
 }
 
 /// Where an image points in one reading.
@@ -114,6 +142,7 @@ impl<'ws> CatalogCache<'ws> {
         let workspace = self.workspace();
         let file = workspace.indexed_path(file);
         let file_dir = workspace.attributes.doc_dir(&file).unwrap_or(&file);
+        let include_dir = include_dir_of(workspace, &file);
         let builds = self.reading_scopes(&file, line, false);
         let previews = if readings == Readings::WithPreview {
             self.reading_scopes(&file, line, true)
@@ -128,6 +157,10 @@ impl<'ws> CatalogCache<'ws> {
                     Target::Image(written) => {
                         TargetResult::Image(resolve_image(scope, file_dir, written))
                     }
+                    Target::Include(written) => TargetResult::Include(resolve_include(
+                        &scope.substitute(written),
+                        &include_dir,
+                    )),
                 };
                 let judge = scope.is_preview() || self.get(scope.document()).reads_whole(&file);
                 (judge || !result.is_failure()).then(|| Resolved {
@@ -155,6 +188,10 @@ impl<'ws> CatalogCache<'ws> {
             .map(|scope| match *target {
                 Target::Image(typed) => BaseDir {
                     dir: image_base_dir(&docdir_of(scope, file_dir), &imagesdir_of(scope)),
+                    prefix: scope.substitute(typed),
+                },
+                Target::Include(typed) => BaseDir {
+                    dir: include_dir_of(workspace, &file),
                     prefix: scope.substitute(typed),
                 },
             })
@@ -203,11 +240,30 @@ impl<'ws> CatalogCache<'ws> {
 }
 
 impl TargetResult {
+    /// The result of a [`Target::Image`].
+    #[must_use]
+    pub fn into_image(self) -> Option<ImageResult> {
+        match self {
+            Self::Image(image) => Some(image),
+            Self::Include(_) => None,
+        }
+    }
+
+    /// The result of a [`Target::Include`].
+    #[must_use]
+    pub fn into_include(self) -> Option<IncludeResult> {
+        match self {
+            Self::Include(include) => Some(include),
+            Self::Image(_) => None,
+        }
+    }
+
     /// The target is missing: the one result a reader of only part of the
     /// file may not give.
     fn is_failure(&self) -> bool {
         match self {
             Self::Image(image) => matches!(image.outcome, ImageOutcome::Missing { .. }),
+            Self::Include(include) => !include.exists && !include.is_remote(),
         }
     }
 }
@@ -217,6 +273,35 @@ impl TargetResult {
 #[must_use]
 pub fn resolve_image_in_folder(written: &str, folder: &Path) -> ImageResult {
     image_result(written, folder, "", None)
+}
+
+/// An include target resolved without a workspace, from `folder`.
+#[must_use]
+pub fn resolve_include_in_folder(written: &str, folder: &Path) -> IncludeResult {
+    resolve_include(written, folder)
+}
+
+/// The folder includes in `file` resolve from: its document folder (a
+/// symlink's own folder for a symlinked file), else its parent.
+fn include_dir_of(workspace: &crate::workspace::Workspace, file: &Path) -> PathBuf {
+    workspace
+        .attributes
+        .doc_dir(file)
+        .or_else(|| file.parent())
+        .unwrap_or(file)
+        .to_path_buf()
+}
+
+/// The include `substituted` from the folder `dir`.
+fn resolve_include(substituted: &str, dir: &Path) -> IncludeResult {
+    let joined = join_doc_path(dir, substituted);
+    let path = canonicalize_if_exists(joined.clone());
+    IncludeResult {
+        substituted: substituted.to_string(),
+        exists: !is_uri(substituted) && path.exists(),
+        joined,
+        path,
+    }
 }
 
 /// The folder paths resolve against in `scope`: its `docdir`, else `file_dir`.
@@ -338,7 +423,7 @@ mod tests {
             .resolve_target(&root.join(file), line, &Target::Image(written), readings)
             .into_iter()
             .map(|resolved| {
-                let TargetResult::Image(result) = resolved.result;
+                let result = resolved.result.into_image().unwrap();
                 let outcome = match result.outcome {
                     ImageOutcome::Found { path, display } => {
                         format!("found {} as {display}", relative(&path))
@@ -374,7 +459,7 @@ mod tests {
             )
             .into_iter()
             .map(|resolved| {
-                let TargetResult::Image(result) = resolved.result;
+                let result = resolved.result.into_image().unwrap();
                 result.imagesdir_from.map(|origin| {
                     (
                         origin
@@ -773,5 +858,281 @@ mod tests {
             .collect();
 
         assert_eq!(dirs, vec![root.join("img"), root.join("pics")]);
+    }
+
+    /// One include's results as (document relative to `root`, preview,
+    /// outcome with paths relative to `root`).
+    fn include(
+        root: &Path,
+        ws: &Workspace,
+        file: &str,
+        line: usize,
+        written: &str,
+        readings: Readings,
+    ) -> Vec<(String, bool, String)> {
+        let relative = |path: &Path| path.strip_prefix(root).unwrap().display().to_string();
+        CatalogCache::new(ws)
+            .resolve_target(&root.join(file), line, &Target::Include(written), readings)
+            .into_iter()
+            .map(|resolved| {
+                let result = resolved.result.into_include().unwrap();
+                let outcome = if result.is_remote() {
+                    format!("remote {}", result.substituted)
+                } else if result.exists {
+                    format!("found {}", relative(&result.path))
+                } else {
+                    format!("missing {}", relative(&result.joined))
+                };
+                (
+                    relative(&resolved.reading.document),
+                    resolved.reading.preview,
+                    outcome,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_include_resolves_from_the_including_folder_with_the_attributes_of_the_reading() {
+        let (root, ws) = fixture("paths_in_include_preview");
+
+        // `{docdir}` is the folder of the master in the build reading, the
+        // folder of the chapter in the preview, where `shared/` is missing.
+        assert_eq!(
+            include(
+                &root,
+                &ws,
+                "chapters/chapter.adoc",
+                14,
+                "{docdir}/shared/found.adoc",
+                Readings::WithPreview
+            ),
+            vec![
+                reading("index.adoc", false, "found shared/found.adoc"),
+                reading(
+                    "chapters/chapter.adoc",
+                    true,
+                    "missing chapters/shared/found.adoc"
+                ),
+            ]
+        );
+        // The path as written is joined onto the including folder, not the
+        // docdir of the reading.
+        assert_eq!(
+            include(
+                &root,
+                &ws,
+                "chapters/chapter.adoc",
+                16,
+                "parts/preview.adoc",
+                Readings::Build
+            ),
+            vec![reading(
+                "index.adoc",
+                false,
+                "found chapters/parts/preview.adoc"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_include_build_leaves_out_the_preview_and_with_preview_adds_it_last() {
+        let (root, ws) = fixture("paths_in_include_preview");
+
+        // Only the preview finds the file the docdir of the master lacks.
+        assert_eq!(
+            include(
+                &root,
+                &ws,
+                "chapters/chapter.adoc",
+                16,
+                "{docdir}/parts/preview.adoc",
+                Readings::Build
+            ),
+            vec![reading("index.adoc", false, "missing parts/preview.adoc")]
+        );
+        assert_eq!(
+            include(
+                &root,
+                &ws,
+                "chapters/chapter.adoc",
+                16,
+                "{docdir}/parts/preview.adoc",
+                Readings::WithPreview
+            ),
+            vec![
+                reading("index.adoc", false, "missing parts/preview.adoc"),
+                reading(
+                    "chapters/chapter.adoc",
+                    true,
+                    "found chapters/parts/preview.adoc"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_of_a_reader_of_only_part_of_the_file_drops_its_failure_keeps_its_hit() {
+        let part = "// tag::a[]\ninclude::{inc}[]\n// end::a[]\n";
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "book.adoc",
+                "= Book\n:inc: a.adoc\n\ninclude::part.adoc[]\n",
+            ),
+            (
+                "web.adoc",
+                "= Web\n:inc: b.adoc\n\ninclude::part.adoc[tag=a]\n",
+            ),
+            ("part.adoc", part),
+            ("a.adoc", "A\n"),
+        ]);
+
+        // `b.adoc` is missing in the partial reader: dropped, not judged.
+        assert_eq!(
+            include(&root, &ws, "part.adoc", 2, "{inc}", Readings::Build),
+            vec![reading("book.adoc", false, "found a.adoc")]
+        );
+
+        // Where the partial reader hits, it is kept.
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "book.adoc",
+                "= Book\n:inc: a.adoc\n\ninclude::part.adoc[]\n",
+            ),
+            (
+                "web.adoc",
+                "= Web\n:inc: a.adoc\n\ninclude::part.adoc[tag=a]\n",
+            ),
+            ("part.adoc", part),
+            ("a.adoc", "A\n"),
+        ]);
+        assert_eq!(
+            include(&root, &ws, "part.adoc", 2, "{inc}", Readings::Build),
+            vec![
+                reading("book.adoc", false, "found a.adoc"),
+                reading("web.adoc", false, "found a.adoc"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_with_a_uri_target_is_remote_never_missing() {
+        let (_tmp, root, ws) = scanned(&[(
+            "book.adoc",
+            "= Book\n:remote: https://example.com/a.adoc\n\ninclude::{remote}[]\n\ninclude::https://example.com/b.adoc[]\n",
+        )]);
+
+        assert_eq!(
+            include(&root, &ws, "book.adoc", 4, "{remote}", Readings::Build),
+            vec![reading(
+                "book.adoc",
+                false,
+                "remote https://example.com/a.adoc"
+            )]
+        );
+        let results = CatalogCache::new(&ws).resolve_target(
+            &root.join("book.adoc"),
+            6,
+            &Target::Include("https://example.com/b.adoc"),
+            Readings::Build,
+        );
+        let [only] = results.as_slice() else {
+            panic!("one reading expected");
+        };
+        assert!(!only.result.is_failure());
+    }
+
+    #[test]
+    fn test_include_missing_in_one_build_reading_is_reported_for_that_reading_only() {
+        let (_tmp, root, ws) = scanned(&[
+            ("book.adoc", "= Book\n:dir: a\n\ninclude::part.adoc[]\n"),
+            ("web.adoc", "= Web\n:dir: b\n\ninclude::part.adoc[]\n"),
+            ("part.adoc", "include::{dir}.adoc[]\n"),
+            ("a.adoc", "A\n"),
+        ]);
+
+        assert_eq!(
+            include(&root, &ws, "part.adoc", 1, "{dir}.adoc", Readings::Build),
+            vec![
+                reading("book.adoc", false, "found a.adoc"),
+                reading("web.adoc", false, "missing b.adoc"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_in_a_file_reached_through_a_folder_link_resolves_from_the_link_folder() {
+        let (root, _) = fixture("symlinks");
+        let project = root.join("real/project");
+        let ws = Workspace::build(&project, &project.join("diamond.adoc"));
+
+        // `up.adoc` is first met as `guide/up.adoc`, so `../part-up.adoc` is
+        // the one next to `guide`, not next to the file's real folder.
+        assert_eq!(
+            include(
+                &root,
+                &ws,
+                "real/outside/guide/up.adoc",
+                3,
+                "../part-up.adoc",
+                Readings::Build
+            ),
+            vec![reading(
+                "real/project/diamond.adoc",
+                false,
+                "found real/project/part-up.adoc"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_include_found_through_a_folder_link_has_a_canonical_path_and_a_link_path() {
+        let (root, ws) = fixture("symlinks");
+
+        let results = CatalogCache::new(&ws).resolve_target(
+            &root.join("real/project/via-link.adoc"),
+            3,
+            &Target::Include("config/book-link/twice.adoc"),
+            Readings::Build,
+        );
+        let include = results[0].result.clone().into_include().unwrap();
+        assert_eq!(
+            include.joined,
+            root.join("real/project/config/book-link/twice.adoc")
+        );
+        assert_eq!(include.path, root.join("real/project/book/twice.adoc"));
+        assert!(include.exists);
+    }
+
+    #[test]
+    fn test_include_base_dirs_start_from_the_including_folder_with_the_reading_prefix() {
+        let (root, ws) = fixture("paths_in_include_preview");
+        let bases = CatalogCache::new(&ws).base_dirs(
+            &root.join("chapters/chapter.adoc"),
+            14,
+            &Target::Include("{docdir}/sh"),
+        );
+
+        assert_eq!(
+            bases,
+            vec![BaseDir {
+                dir: root.join("chapters"),
+                prefix: format!("{}/sh", root.display()),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_include_in_folder_resolves_without_a_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.adoc"), "A\n").unwrap();
+
+        let found = resolve_include_in_folder("a.adoc", &root);
+        assert!(found.exists);
+        assert_eq!(found.path, root.join("a.adoc"));
+        let missing = resolve_include_in_folder("b.adoc", &root);
+        assert!(!missing.exists);
+        assert!(resolve_include_in_folder("https://example.com/x.adoc", &root).is_remote());
     }
 }

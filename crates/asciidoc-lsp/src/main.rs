@@ -4300,7 +4300,8 @@ mod tests {
             assert_eq!(
                 broken,
                 [asciidoc_core::types::DiagnosticKind::BrokenInclude {
-                    path: "missing.adoc".into()
+                    path: "missing.adoc".into(),
+                    documents: Vec::new(),
                 }
                 .to_string()],
                 "{name}"

@@ -4,12 +4,12 @@
 //! attributes or brackets.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::anchor_scope::{AnchorScope, CatalogCache};
-use crate::paths::resolve_doc_target;
 use crate::references::parse_xref_target;
+use crate::targets::{Readings, Target};
 use crate::types::{Diagnostic, DiagnosticKind, Xref};
 use crate::workspace::{AttributeScope, Workspace};
 
@@ -41,7 +41,7 @@ pub fn quick_fixes(
         DiagnosticKind::BrokenXref { target, .. } => {
             xref_fixes(workspace, path, diagnostic, target)
         }
-        DiagnosticKind::BrokenInclude { path: written }
+        DiagnosticKind::BrokenInclude { path: written, .. }
         | DiagnosticKind::OptionalIncludeNotFound { path: written } => {
             include_fixes(workspace, path, diagnostic, written)
         }
@@ -197,26 +197,38 @@ fn include_fixes(
     else {
         return Vec::new();
     };
-    let Some(resolved) = resolve_doc_target(path, &include.path, workspace.attributes()) else {
-        return Vec::new();
-    };
+    // The folder the target is looked for in, per top-level document that
+    // reads the file, as go-to-definition resolves it.
+    let readings = CatalogCache::new(workspace).resolve_target(
+        path,
+        include.line,
+        &Target::Include(&include.path),
+        Readings::Build,
+    );
+    let resolved: Vec<PathBuf> = readings
+        .into_iter()
+        .filter_map(|reading| reading.result.into_include())
+        .map(|include| include.joined)
+        .collect();
     // Only the last segment is replaced, and only when it is the file name
     // as written: an attribute in it would be overwritten.
     let segment_start = include.path.rfind('/').map_or(0, |slash| slash + 1);
-    let (Some(name), Some(parent)) = (
-        resolved.file_name().and_then(|name| name.to_str()),
-        resolved.parent(),
-    ) else {
-        return Vec::new();
-    };
-    if include.path[segment_start..] != *name {
+    let name = &include.path[segment_start..];
+    let folders: Vec<&Path> = resolved
+        .iter()
+        .filter_map(|joined| {
+            let file = joined.file_name()?.to_str()?;
+            (file == name).then(|| joined.parent()).flatten()
+        })
+        .collect();
+    if resolved.is_empty() || folders.len() != resolved.len() {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return Vec::new();
-    };
     let including = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let files: Vec<String> = entries
+    let files: BTreeSet<String> = folders
+        .iter()
+        .filter_map(|folder| std::fs::read_dir(folder).ok())
+        .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|entry| {
@@ -225,7 +237,16 @@ fn include_fixes(
         .filter_map(|entry| entry.file_name()?.to_str().map(str::to_string))
         .filter(|file| !file.starts_with('.'))
         .collect();
-    let nearby = near(name, files.iter().map(String::as_str));
+    // A fix that leaves the diagnostic in another document is none.
+    let nearby: Vec<(&str, usize)> = near(name, files.iter().map(String::as_str))
+        .into_iter()
+        .filter(|(candidate, _)| {
+            folders.iter().all(|folder| {
+                let file = folder.join(candidate);
+                file.is_file() && file.canonicalize().map_or(true, |real| real != including)
+            })
+        })
+        .collect();
     replacements(
         &nearby,
         include.line,

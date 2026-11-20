@@ -114,6 +114,7 @@ mod tests {
             span: None,
             kind: DiagnosticKind::BrokenInclude {
                 path: "missing.adoc".into(),
+                documents: vec![],
             },
         }];
 

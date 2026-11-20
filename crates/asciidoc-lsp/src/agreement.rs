@@ -12,17 +12,16 @@
 //!   only in part is no judge of what is missing there;
 //! - includes with a URI target and optional includes.
 //!
-//! A deviation that is not listed in [`KNOWN_DEVIATIONS`] fails the test,
-//! and so does a listed one that no longer occurs.
+//! Any deviation fails the test.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use asciidoc_core::anchor_scope::CatalogCache;
 use asciidoc_core::diagnostics::collect_diagnostics;
 use asciidoc_core::paths::is_uri;
-use asciidoc_core::targets::{ImageOutcome, Readings, Target, TargetResult};
+use asciidoc_core::targets::{ImageOutcome, Readings, Target};
 use asciidoc_core::types::{Diagnostic, DiagnosticKind};
 use asciidoc_core::workspace::Workspace;
 
@@ -36,48 +35,6 @@ enum Kind {
     Image,
     Include,
 }
-
-/// A known deviation: corpus directory (relative to the repository root),
-/// file (relative to that directory), 1-based line, kind, and the cause.
-struct Known {
-    corpus: &'static str,
-    file: &'static str,
-    line: usize,
-    kind: Kind,
-    cause: &'static str,
-}
-
-/// Deviations the test accepts, each with its cause. The includes shrink to
-/// nothing when the include diagnostic judges per reading like goto.
-const KNOWN_DEVIATIONS: &[Known] = &[
-    Known {
-        corpus: "tests/fixtures/docdir_top_level",
-        file: "docs/shared/chapters.adoc",
-        line: 1,
-        kind: Kind::Include,
-        cause: "the registry substitutes {docdir} with the folder of the including \
-                file and misses the target; the build reading takes the docdir of \
-                its top-level document and finds it (registry against reading)",
-    },
-    Known {
-        corpus: "tests/fixtures/paths_in_include_preview",
-        file: "chapters/chapter.adoc",
-        line: 14,
-        kind: Kind::Include,
-        cause: "the registry substitutes {docdir} with the folder of the including \
-                file and misses the target; the build reading takes the docdir of \
-                its top-level document and finds it (registry against reading)",
-    },
-    Known {
-        corpus: "tests/fixtures/paths_in_include_preview",
-        file: "chapters/chapter.adoc",
-        line: 16,
-        kind: Kind::Include,
-        cause: "the registry substitutes {docdir} with the folder of the including \
-                file and finds the target; no build reading does, only the \
-                preview (registry against reading)",
-    },
-];
 
 #[derive(Default)]
 struct Counts {
@@ -201,10 +158,7 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
                 catalogs
                     .resolve_target(path, image.line, &target, readings)
                     .into_iter()
-                    .map(|resolved| {
-                        let TargetResult::Image(result) = resolved.result;
-                        result.outcome
-                    })
+                    .map(|resolved| resolved.result.into_image().unwrap().outcome)
                     .collect()
             };
             let found_by_a_build = outcomes(Readings::Build)
@@ -259,14 +213,19 @@ fn deviations_in(root: &Path, counts: &mut Counts) -> Vec<(String, usize, Kind, 
                 node_at(inc.line, 0),
                 Some(NodeKind::Include { path }) if path == inc.path
             );
-            let broken = kinds.iter().any(
-                |kind| matches!(kind, DiagnosticKind::BrokenInclude { path } if *path == inc.path),
-            );
+            // The number of documents the diagnostic names; none when one
+            // reading judges alone.
+            let broken = kinds.iter().find_map(|kind| match kind {
+                DiagnosticKind::BrokenInclude { path, documents } if *path == inc.path => {
+                    Some(documents.len())
+                }
+                _ => None,
+            });
             let problem = if !located {
                 Some("goto does not recognise the include".to_string())
-            } else if !found_here.is_empty() && broken {
+            } else if !found_here.is_empty() && broken == Some(0) {
                 Some(format!("goto finds {found_here:?}, diagnostic says broken"))
-            } else if found_here.is_empty() && !broken {
+            } else if found_here.is_empty() && broken.is_none() {
                 Some("goto finds nothing, no diagnostic".to_string())
             } else {
                 None
@@ -291,51 +250,20 @@ fn test_goto_and_diagnostics_agree_on_every_target() {
         .canonicalize()
         .unwrap();
     let mut counts = Counts::default();
-    let mut actual: BTreeSet<(String, String, usize, Kind)> = BTreeSet::new();
-    let mut described = Vec::new();
+    let mut deviations = Vec::new();
     for root in corpus_roots() {
         let corpus = root.strip_prefix(&repo).unwrap().display().to_string();
         for (file, line, kind, text) in deviations_in(&root, &mut counts) {
-            actual.insert((corpus.clone(), file.clone(), line, kind));
-            described.push(format!("{corpus}/{file}:{line} {kind:?} {text}"));
+            deviations.push(format!("{corpus}/{file}:{line} {kind:?} {text}"));
         }
     }
     eprintln!(
         "checked {} xrefs, {} images, {} includes",
         counts.xrefs, counts.images, counts.includes
     );
-    let expected: BTreeSet<(String, String, usize, Kind)> = KNOWN_DEVIATIONS
-        .iter()
-        .map(|known| {
-            (
-                known.corpus.to_string(),
-                known.file.to_string(),
-                known.line,
-                known.kind,
-            )
-        })
-        .collect();
-    let unexpected: Vec<String> = described
-        .iter()
-        .filter(|text| {
-            !KNOWN_DEVIATIONS.iter().any(|known| {
-                text.starts_with(&format!(
-                    "{}/{}:{} {:?} ",
-                    known.corpus, known.file, known.line, known.kind
-                ))
-            })
-        })
-        .cloned()
-        .collect();
     assert!(
-        unexpected.is_empty(),
-        "unexpected deviations:\n{}",
-        unexpected.join("\n")
+        deviations.is_empty(),
+        "deviations:\n{}",
+        deviations.join("\n")
     );
-    let stale: Vec<_> = expected.difference(&actual).collect();
-    assert!(
-        stale.is_empty(),
-        "known deviations that no longer occur: {stale:?}"
-    );
-    assert!(KNOWN_DEVIATIONS.iter().all(|known| !known.cause.is_empty()));
 }

@@ -257,7 +257,7 @@ pub fn collect_diagnostics(
                 )
                 .into_iter()
                 .filter_map(|resolved| {
-                    let TargetResult::Image(result) = resolved.result;
+                    let result = resolved.result.into_image()?;
                     matches!(result.outcome, ImageOutcome::Missing { .. }).then(|| MissingImage {
                         document: display_path(root, &resolved.reading.document),
                         preview: resolved.reading.preview,
@@ -281,21 +281,43 @@ pub fn collect_diagnostics(
             }
         }
 
-        // 2. Broken includes and missing include tags
+        // 2. Broken includes and missing include tags. A broken include is
+        // judged in each top-level document that reads the file, with that
+        // document's attributes, as go-to-definition does: one diagnostic,
+        // naming the documents where the target is missing when several
+        // read it.
         for inc in &doc.includes {
             if is_uri(&registry.substitute(path, &inc.path)) {
                 continue;
             }
-            let Some(target_path) = resolve_doc_target(path, &inc.path, registry) else {
-                continue;
-            };
-            if !documents.contains_key(&target_path) && !target_path.exists() {
+            let readings = catalogs.resolve_target(
+                path,
+                inc.line,
+                &Target::Include(&inc.path),
+                Readings::Build,
+            );
+            let missing: Vec<PathBuf> = readings
+                .iter()
+                .filter(|resolved| {
+                    matches!(&resolved.result, TargetResult::Include(include)
+                        if !include.exists && !include.is_remote())
+                })
+                .map(|resolved| display_path(root, &resolved.reading.document))
+                .collect();
+            if !missing.is_empty() {
                 let written = inc.path.clone();
                 let kind = if is_optional(&inc.attributes, |value| registry.substitute(path, value))
                 {
                     DiagnosticKind::OptionalIncludeNotFound { path: written }
                 } else {
-                    DiagnosticKind::BrokenInclude { path: written }
+                    DiagnosticKind::BrokenInclude {
+                        path: written,
+                        documents: if readings.len() > 1 {
+                            missing
+                        } else {
+                            Vec::new()
+                        },
+                    }
                 };
                 diags.entry(path.clone()).or_default().push(Diagnostic {
                     file: path.clone(),
@@ -305,6 +327,9 @@ pub fn collect_diagnostics(
                 });
                 continue;
             }
+            let Some(target_path) = resolve_doc_target(path, &inc.path, registry) else {
+                continue;
+            };
             let required = required_tags(&inc.attributes, |value| registry.substitute(path, value));
             if required.is_empty() {
                 continue;
@@ -3259,7 +3284,7 @@ mod tests {
                 DiagnosticKind::OptionalIncludeNotFound { path } => {
                     Some((d.line, "info", path.clone()))
                 }
-                DiagnosticKind::BrokenInclude { path } => Some((d.line, "error", path.clone())),
+                DiagnosticKind::BrokenInclude { path, .. } => Some((d.line, "error", path.clone())),
                 _ => None,
             })
             .collect();

@@ -2784,7 +2784,7 @@ mod tests {
 
     /// `include::{docdir}/...` in an included file follows the top-level
     /// document's folder. The target is missing for the second including
-    /// document only, so the include is not broken.
+    /// document only, so the diagnostic names that document alone.
     #[test]
     fn test_fixture_docdir_include_from_included_file() {
         let root = docdir_fixture();
@@ -2801,7 +2801,7 @@ mod tests {
             .map(|edge| edge.target.as_path())
             .collect();
         assert_eq!(targets, vec![intro.as_path()]);
-        assert_eq!(broken_includes(&ws, &chapters), 0);
+        assert_eq!(broken_includes(&ws, &chapters), 1);
 
         // A graph walk from the entry gets there too.
         let ws = Workspace::build(&root, &root.join("docs/handbook/handbook.adoc"));

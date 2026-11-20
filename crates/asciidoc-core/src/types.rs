@@ -287,18 +287,15 @@ pub enum DiagnosticKind {
     },
     BrokenInclude {
         path: String,
+        /// As in `BrokenXref`.
+        documents: Vec<PathBuf>,
     },
     /// A missing include marked `opts=optional`: Asciidoctor drops it and
     /// logs an INFO, not an error. `path` is the include path as written.
-    OptionalIncludeNotFound {
-        path: String,
-    },
+    OptionalIncludeNotFound { path: String },
     /// Tags named by an include's `tag`/`tags` that its file does not open
     /// (`tag::name[]`). `path` is the include path as written.
-    IncludeTagNotFound {
-        tags: Vec<String>,
-        path: String,
-    },
+    IncludeTagNotFound { tags: Vec<String>, path: String },
     /// `documents` names the top-level documents where the attribute is not
     /// set when several read the file; empty when the file belongs to one
     /// document only.
@@ -372,14 +369,9 @@ pub enum DiagnosticKind {
         searched: Vec<String>,
     },
     /// `pdf-theme` name without `pdf-themesdir` that no bundled theme has.
-    UnknownPdfTheme {
-        name: String,
-    },
+    UnknownPdfTheme { name: String },
     /// Relative PDF path: resolves against the build's working directory.
-    UnanchoredPdfPath {
-        attribute: String,
-        value: String,
-    },
+    UnanchoredPdfPath { attribute: String, value: String },
     /// An image no top-level document (or the editor's preview of the file)
     /// finds at `path`, resolved with the `imagesdir` of that build.
     ImageNotFound {
@@ -390,17 +382,11 @@ pub enum DiagnosticKind {
     /// Currently unused: ifdef/ifndef attributes are build-time-dependent,
     /// so the LSP cannot verify them.
     #[allow(dead_code)]
-    UndefinedConditionalAttr {
-        name: String,
-        directive: String,
-    },
+    UndefinedConditionalAttr { name: String, directive: String },
     /// A delimited block that is never closed; `context` is Asciidoctor's
     /// name for the block kind, `delimiter` the delimiter that closes the block,
     /// e.g. `----`.
-    UnterminatedBlock {
-        context: String,
-        delimiter: String,
-    },
+    UnterminatedBlock { context: String, delimiter: String },
 }
 
 /// A build in which an image is missing, see [`DiagnosticKind::ImageNotFound`].
@@ -446,8 +432,13 @@ impl fmt::Display for DiagnosticKind {
                 let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
                 write!(f, " (not found in {})", documents.join(", "))
             }
-            DiagnosticKind::BrokenInclude { path } => {
-                write!(f, "Broken include: {path}")
+            DiagnosticKind::BrokenInclude { path, documents } => {
+                write!(f, "Broken include: {path}")?;
+                if documents.is_empty() {
+                    return Ok(());
+                }
+                let documents: Vec<_> = documents.iter().map(|d| d.display().to_string()).collect();
+                write!(f, " (not found in {})", documents.join(", "))
             }
             DiagnosticKind::ImageNotFound { path, missing } => {
                 write!(f, "Image not found: {path}")?;
@@ -750,6 +741,7 @@ mod tests {
 
         let d2 = DiagnosticKind::BrokenInclude {
             path: "missing.adoc".into(),
+            documents: vec![],
         };
         assert_eq!(d2.to_string(), "Broken include: missing.adoc");
 

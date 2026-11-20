@@ -8,14 +8,14 @@ use tower_lsp_server::ls_types::Position;
 use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::extractors::{element_attr_id, find_child_text, is_valid_anchor_id};
-use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
+use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
 use asciidoc_core::pdf_theme::{
     is_builtin_theme, is_pdf_path_attribute, resolve_pdf_attribute, PdfPath, PDF_THEME,
 };
 use asciidoc_core::references::{parse_xref_target, xref_names_file};
 use asciidoc_core::targets::{
-    imagesdir_note, resolve_image_in_folder, ImageOutcome, ImageResult, Readings, Target,
-    TargetResult,
+    imagesdir_note, resolve_image_in_folder, resolve_include_in_folder, ImageOutcome, ImageResult,
+    IncludeResult, Readings, Target,
 };
 use asciidoc_core::types::{
     AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref,
@@ -27,7 +27,7 @@ use asciidoc_core::workspace::{
 use crate::positions;
 use crate::scopes::{
     collapse_if_agree, document_dir, file_display_name, path_scopes, reading_label, scope_label,
-    unique_in_order, DocTarget,
+    unique_in_order,
 };
 
 /// Classification of a node found at a cursor position.
@@ -176,7 +176,7 @@ pub fn resolve_goto_definitions(
         }
         NodeKind::Include { ref path } => {
             let targets =
-                resolve_doc_targets(path, doc_path, workspace, node_info.line, Readings::Build);
+                resolve_include_targets(path, doc_path, workspace, node_info.line, Readings::Build);
             existing_targets(&targets)
                 .into_iter()
                 .map(|file| (file, 1))
@@ -235,7 +235,7 @@ pub fn resolve_references(
         }
         NodeKind::Include { path } => {
             let targets =
-                resolve_doc_targets(path, doc_path, Some(ws), node_info.line, Readings::Build);
+                resolve_include_targets(path, doc_path, Some(ws), node_info.line, Readings::Build);
             let mut r = Vec::new();
             for target in existing_targets(&targets) {
                 let filename = target.file_name().and_then(|f| f.to_str()).unwrap_or("");
@@ -521,7 +521,7 @@ pub fn resolve_hover(
             Some(per_document_hover(texts))
         }
         NodeKind::Include { path } => {
-            let mut targets = resolve_doc_targets(
+            let mut targets = resolve_include_targets(
                 path,
                 doc_path,
                 workspace,
@@ -529,14 +529,14 @@ pub fn resolve_hover(
                 Readings::WithPreview,
             );
             // Scopes that reach the same file agree, however they spell it.
-            collapse_if_agree(&mut targets, |a, b| a.path == b.path);
+            collapse_if_agree(&mut targets, |a, b| a.1.path == b.1.path);
             let texts: Vec<(String, String)> = targets
                 .into_iter()
-                .map(|target| {
+                .map(|(label, target)| {
                     let mut text = format!("include::{}[]", target.substituted);
-                    if is_uri(&target.substituted) {
+                    if target.is_remote() {
                         text.push_str("\n\n\u{2197} Remote include, not fetched");
-                    } else if target.path.exists() {
+                    } else if target.exists {
                         let section_count = workspace
                             .and_then(|ws| ws.documents().get(&target.path))
                             .map_or(0, |doc| doc.sections.len());
@@ -544,7 +544,7 @@ pub fn resolve_hover(
                     } else {
                         text.push_str("\n\n\u{2717} File not found");
                     }
-                    (target.label, text)
+                    (label, text)
                 })
                 .collect();
             (!texts.is_empty()).then(|| per_document_hover(texts))
@@ -778,47 +778,44 @@ fn resolve_image_targets(
     CatalogCache::new(ws)
         .resolve_target(doc_path, line, &Target::Image(image_path), readings)
         .into_iter()
-        .map(|resolved| {
-            let TargetResult::Image(result) = resolved.result;
-            (reading_label(&resolved.reading), result)
+        .filter_map(|resolved| {
+            let result = resolved.result.into_image()?;
+            Some((reading_label(&resolved.reading), result))
         })
         .collect()
 }
 
-/// Where an include or xref file path on `line` points, per top-level
-/// document and, for a file others include and when `readings` asks for
-/// it, in the editor's preview of it (ADR-4), without checking that it
-/// exists. Each target comes with its scope's label and the path as
-/// substituted there; canonical when it exists. Without a workspace, one
-/// target with the label of `doc_path`.
-fn resolve_doc_targets(
-    target_path: &str,
+/// Where an include on `line` points, per reading (`readings` says whether
+/// the preview takes part). Each result comes with its reading's label;
+/// without a workspace, one result with the label of `doc_path`.
+fn resolve_include_targets(
+    include_path: &str,
     doc_path: &Path,
     workspace: Option<&Workspace>,
     line: usize,
     readings: Readings,
-) -> Vec<DocTarget> {
-    let dir = document_dir(doc_path, workspace);
+) -> Vec<(String, IncludeResult)> {
     let Some(ws) = workspace else {
-        return vec![DocTarget::new(
-            file_display_name(doc_path),
-            target_path,
-            dir,
-        )];
+        let result = resolve_include_in_folder(include_path, document_dir(doc_path, None));
+        return vec![(file_display_name(doc_path), result)];
     };
-    path_scopes(ws, doc_path, line)
-        .filter(|scope| readings == Readings::WithPreview || !scope.is_preview())
-        .map(|scope| DocTarget::new(scope_label(&scope), &scope.substitute(target_path), dir))
+    CatalogCache::new(ws)
+        .resolve_target(doc_path, line, &Target::Include(include_path), readings)
+        .into_iter()
+        .filter_map(|resolved| {
+            let result = resolved.result.into_include()?;
+            Some((reading_label(&resolved.reading), result))
+        })
         .collect()
 }
 
 /// The distinct existing files among `targets`, in order.
-fn existing_targets(targets: &[DocTarget]) -> Vec<PathBuf> {
+fn existing_targets(targets: &[(String, IncludeResult)]) -> Vec<PathBuf> {
     unique_in_order(
         targets
             .iter()
-            .filter(|target| target.path.exists())
-            .map(|target| target.path.clone()),
+            .filter(|(_, target)| target.exists)
+            .map(|(_, target)| target.path.clone()),
     )
 }
 
@@ -1223,30 +1220,35 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
             json!({ "scopes": scopes })
         }),
         NodeKind::Include { path } => {
-            let scopes: Vec<Value> =
-                resolve_doc_targets(path, doc_path, workspace, info.line, Readings::WithPreview)
-                    .into_iter()
-                    .map(|target| {
-                        if is_uri(&target.substituted) {
-                            return json!({
-                                "scope": target.label,
-                                "remote": true,
-                                "target": null,
-                                "canonical_target": null,
-                                "display": target.substituted,
-                                "exists": null,
-                            });
-                        }
-                        // Same existence gate as go-to-definition: the path gd returns.
-                        let exists = target.path.exists();
-                        json!({
-                            "scope": target.label,
-                            "target": path_string(&target.joined),
-                            "canonical_target": exists.then(|| path_string(&target.path)),
-                            "exists": exists,
-                        })
-                    })
-                    .collect();
+            let scopes: Vec<Value> = resolve_include_targets(
+                path,
+                doc_path,
+                workspace,
+                info.line,
+                Readings::WithPreview,
+            )
+            .into_iter()
+            .map(|(label, target)| {
+                if target.is_remote() {
+                    return json!({
+                        "scope": label,
+                        "remote": true,
+                        "target": null,
+                        "canonical_target": null,
+                        "display": target.substituted,
+                        "exists": null,
+                    });
+                }
+                // Same existence gate as go-to-definition: the path gd returns.
+                let exists = target.exists;
+                json!({
+                    "scope": label,
+                    "target": path_string(&target.joined),
+                    "canonical_target": exists.then(|| path_string(&target.path)),
+                    "exists": exists,
+                })
+            })
+            .collect();
             json!({ "scopes": scopes })
         }
         NodeKind::Image { path, .. } => {
