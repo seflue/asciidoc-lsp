@@ -1,0 +1,3 @@
+= Theme in another folder, fonts without fontsdir
+:pdf-themesdir: {docdir}/themes
+:pdf-theme: {docdir}/other/fontshift-theme.yml

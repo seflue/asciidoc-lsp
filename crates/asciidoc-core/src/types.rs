@@ -287,6 +287,21 @@ pub enum DiagnosticKind {
         /// under the root, absolute otherwise; not an addressable location.
         value: String,
     },
+    /// A path inside the `pdf-theme` YAML file that does not exist: an
+    /// `extends` entry, an `image:` value or a `font.catalog` file.
+    PdfThemeEntryNotFound {
+        /// Display path of the theme file (`pdf_display_path` in diagnostics.rs).
+        theme: PathBuf,
+        /// 1-based line of the entry in the theme file.
+        line: usize,
+        /// Dotted key path of the entry, e.g. `font.catalog.Custom.bold`.
+        key: String,
+        /// Display path for a file the theme names absolutely or relative to
+        /// its themes directory; a font file as written.
+        path: PathBuf,
+        /// Font directories looked in, as displayed; empty for other entries.
+        searched: Vec<String>,
+    },
     /// `pdf-theme` name without `pdf-themesdir` that no bundled theme has.
     UnknownPdfTheme {
         name: String,
@@ -435,6 +450,24 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::PdfPathNotFound { attribute, path } => {
                 write!(f, "{attribute}: not found: {}", path.display())
+            }
+            DiagnosticKind::PdfThemeEntryNotFound {
+                theme,
+                line,
+                key,
+                path,
+                searched,
+            } => {
+                write!(
+                    f,
+                    "pdf-theme: {}:{line}: {key}: not found: {}",
+                    theme.display(),
+                    path.display()
+                )?;
+                if searched.is_empty() {
+                    return Ok(());
+                }
+                write!(f, " (searched: {})", searched.join(", "))
             }
             DiagnosticKind::PdfThemeYamlExtension { value } => {
                 write!(

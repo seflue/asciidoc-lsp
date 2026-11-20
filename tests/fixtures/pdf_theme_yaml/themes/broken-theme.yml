@@ -1,0 +1,21 @@
+extends:
+  - default
+  - missing-parent
+  - ./also-missing.yml
+title-page:
+  background-image: image:missing-background.png[]
+  logo:
+    image: image:logo.svg[]
+header:
+  recto:
+    center:
+      content: image:data:image/png;base64,AAAA[]
+font:
+  catalog:
+    Custom:
+      normal: custom-regular.ttf
+      bold: custom-bold.ttf
+    Absolute:
+      normal: /nonexistent-yaml/absolute.ttf
+    Bundled:
+      normal: GEM_FONTS_DIR/nope.ttf

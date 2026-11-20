@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::attributes::{substitute_attributes, AttributeRegistry, AttributeSource, DOCDIR};
 use crate::graph::IncludeGraph;
 use crate::paths::normalize_lexically;
+use crate::pdf_theme_yaml::{check_theme, ThemeDirs};
 use crate::types::{AttributeDef, Diagnostic, DiagnosticKind, DocumentModel};
 use crate::workspace::entry_name;
 
@@ -38,7 +39,7 @@ const BUILTIN_THEMES: &[&str] = &[
 ];
 
 /// `pdf-fontsdir` entry for the fonts bundled with Asciidoctor PDF.
-const GEM_FONTS_DIR: &str = "GEM_FONTS_DIR";
+pub(crate) const GEM_FONTS_DIR: &str = "GEM_FONTS_DIR";
 
 /// Whether `name` is one of the PDF path attributes this module resolves.
 #[must_use]
@@ -221,6 +222,20 @@ impl<'a> Scope<'a> {
         Some(resolve_dir(&value))
     }
 
+    /// The `pdf-fontsdir` entries Asciidoctor PDF uses: the last entry, else
+    /// the registry value; `None` when neither sets it.
+    fn fontsdirs(&self, registry: &AttributeRegistry) -> Option<Vec<PdfPath>> {
+        let value = self.last(PDF_FONTSDIR).map_or_else(
+            || {
+                registry
+                    .resolve(self.root, PDF_FONTSDIR)
+                    .map(|v| registry.substitute(self.root, v))
+            },
+            |entry| Some(entry.value.clone()),
+        )?;
+        Some(resolve_fontsdir(&value))
+    }
+
     fn last(&self, name: &str) -> Option<&Entry<'a>> {
         self.entries.iter().rev().find(|entry| entry.name == name)
     }
@@ -312,7 +327,14 @@ fn resolve_entry(name: &str, value: &str, themesdir: Option<&PdfPath>) -> Vec<Pd
     }
 }
 
-fn check_entry(entry: &Entry<'_>, themesdir: Option<&PdfPath>) -> Vec<DiagnosticKind> {
+/// The directories a theme's own paths resolve against.
+struct Dirs {
+    themesdir: Option<PdfPath>,
+    fontsdirs: Option<Vec<PdfPath>>,
+}
+
+fn check_entry(entry: &Entry<'_>, dirs: &Dirs) -> Vec<DiagnosticKind> {
+    let themesdir = dirs.themesdir.as_ref();
     if entry.name == PDF_THEME && has_extension(&entry.value, ".yaml") {
         return vec![DiagnosticKind::PdfThemeYamlExtension {
             value: entry.value.clone(),
@@ -320,26 +342,58 @@ fn check_entry(entry: &Entry<'_>, themesdir: Option<&PdfPath>) -> Vec<Diagnostic
     }
     resolve_entry(entry.name, &entry.value, themesdir)
         .into_iter()
-        .filter_map(|path| match path {
+        .flat_map(|path| match path {
+            PdfPath::Absolute(path) if entry.name == PDF_THEME && path.is_file() => {
+                theme_findings(&path, dirs)
+            }
             PdfPath::Absolute(path) => {
                 let exists = if entry.name == PDF_THEME {
-                    path.is_file()
+                    false
                 } else {
                     path.is_dir()
                 };
-                (!exists).then(|| DiagnosticKind::PdfPathNotFound {
-                    attribute: entry.name.to_string(),
-                    path,
-                })
+                (!exists)
+                    .then(|| DiagnosticKind::PdfPathNotFound {
+                        attribute: entry.name.to_string(),
+                        path,
+                    })
+                    .into_iter()
+                    .collect()
             }
-            PdfPath::Relative(value) => Some(DiagnosticKind::UnanchoredPdfPath {
+            PdfPath::Relative(value) => vec![DiagnosticKind::UnanchoredPdfPath {
                 attribute: entry.name.to_string(),
                 value,
-            }),
+            }],
             PdfPath::Builtin(name) if entry.name == PDF_THEME && !is_builtin_theme(&name) => {
-                Some(DiagnosticKind::UnknownPdfTheme { name })
+                vec![DiagnosticKind::UnknownPdfTheme { name }]
             }
-            PdfPath::Builtin(_) | PdfPath::Unknown(_) => None,
+            PdfPath::Builtin(_) | PdfPath::Unknown(_) => Vec::new(),
+        })
+        .collect()
+}
+
+/// Missing paths inside the theme file `theme`, which exists.
+fn theme_findings(theme: &Path, dirs: &Dirs) -> Vec<DiagnosticKind> {
+    let themes = match &dirs.themesdir {
+        Some(PdfPath::Absolute(dir)) => Some(dir.as_path()),
+        Some(_) => None,
+        None => theme.parent(),
+    };
+    let found = check_theme(
+        theme,
+        &ThemeDirs {
+            themes,
+            fonts: dirs.fontsdirs.as_deref(),
+        },
+    );
+    found
+        .into_iter()
+        .map(|f| DiagnosticKind::PdfThemeEntryNotFound {
+            theme: theme.to_path_buf(),
+            line: f.line,
+            key: f.key,
+            path: f.path,
+            searched: f.searched,
         })
         .collect()
 }
@@ -358,9 +412,12 @@ pub fn collect_pdf_diagnostics(
     let mut clean: HashSet<(PathBuf, usize)> = HashSet::new();
     for root in top_level_documents(documents, graph) {
         let scope = Scope::collect(&root, documents, graph, registry);
-        let themesdir = scope.themesdir(registry);
+        let dirs = Dirs {
+            themesdir: scope.themesdir(registry),
+            fontsdirs: scope.fontsdirs(registry),
+        };
         for entry in &scope.entries {
-            let kinds = check_entry(entry, themesdir.as_ref());
+            let kinds = check_entry(entry, &dirs);
             if kinds.is_empty() {
                 clean.insert((entry.file.to_path_buf(), entry.line));
             }
@@ -463,6 +520,7 @@ mod tests {
                 matches!(
                     d.kind,
                     DiagnosticKind::PdfPathNotFound { .. }
+                        | DiagnosticKind::PdfThemeEntryNotFound { .. }
                         | DiagnosticKind::PdfThemeYamlExtension { .. }
                         | DiagnosticKind::UnknownPdfTheme { .. }
                         | DiagnosticKind::UnanchoredPdfPath { .. }
@@ -472,6 +530,19 @@ mod tests {
             .collect();
         diags.sort();
         diags
+    }
+
+    /// Committed fixture `tests/fixtures/pdf_theme_yaml`: themes whose YAML
+    /// names files, scanned with itself as workspace root.
+    fn yaml_fixture() -> (PathBuf, Workspace) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_theme_yaml")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (root, ws)
     }
 
     fn resolve(ws: &Workspace, file: &Path, name: &str, line: Option<usize>) -> Vec<PdfPath> {
@@ -730,6 +801,97 @@ mod tests {
     #[test]
     fn conditional_entry_in_top_level_document_is_not_certain() {
         assert_eq!(shared_diags("pdf_top_level_conditional"), vec![]);
+    }
+
+    #[test]
+    fn theme_yaml_with_existing_paths_has_no_findings() {
+        let (root, ws) = yaml_fixture();
+        assert_eq!(pdf_diags(&ws, &root.join("ok.adoc")), vec![]);
+    }
+
+    /// Findings sit on the `:pdf-theme:` line of the document, one per
+    /// missing path, naming the theme file and the line in it. `extends`
+    /// and relative images resolve against the themes directory, a font
+    /// against `pdf-fontsdir` where `GEM_FONTS_DIR` stands for the bundled
+    /// fonts. Remote and `data:` images are not files.
+    #[test]
+    fn theme_yaml_reports_missing_paths_on_the_pdf_theme_line() {
+        let (root, ws) = yaml_fixture();
+        let mut expected: Vec<(usize, String)> = [
+            "3: extends: not found: themes/missing-parent-theme.yml",
+            "4: extends: not found: themes/also-missing.yml",
+            "6: title-page.background-image: not found: themes/missing-background.png",
+            "17: font.catalog.Custom.bold: not found: custom-bold.ttf (searched: fonts, GEM_FONTS_DIR)",
+            "19: font.catalog.Absolute.normal: not found: /nonexistent-yaml/absolute.ttf",
+            "21: font.catalog.Bundled.normal: not found: GEM_FONTS_DIR/nope.ttf (searched: GEM_FONTS_DIR)",
+        ]
+        .iter()
+        .map(|m| (4, format!("pdf-theme: themes/broken-theme.yml:{m}")))
+        .collect();
+        expected.sort();
+        assert_eq!(pdf_diags(&ws, &root.join("broken.adoc")), expected);
+    }
+
+    /// `./` in `extends` is relative to the theme file's folder, any other
+    /// `extends` and images to the themes directory, here a different one.
+    #[test]
+    fn theme_yaml_separates_themes_directory_from_theme_folder() {
+        let (root, ws) = yaml_fixture();
+        assert_eq!(
+            pdf_diags(&ws, &root.join("shifted.adoc")),
+            vec![(
+                3,
+                "pdf-theme: other/shifted-theme.yml:9: header.recto.left.content: not found: themes/other-only.png"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// Without `pdf-themesdir` a theme in another folder resolves against
+    /// that folder.
+    #[test]
+    fn theme_yaml_without_themesdir_resolves_against_its_own_folder() {
+        let (root, ws) = yaml_fixture();
+        assert_eq!(
+            pdf_diags(&ws, &root.join("ownfolder.adoc")),
+            vec![(
+                2,
+                "pdf-theme: other/own-theme.yml:5: title-page.background-image: not found: other/missing-own.png"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// Without `pdf-themesdir` the theme file's folder is the themes
+    /// directory; without `pdf-fontsdir` fonts are looked up there, then
+    /// among the bundled ones.
+    #[test]
+    fn theme_yaml_without_directories_uses_theme_folder_and_bundled_fonts() {
+        let (root, ws) = yaml_fixture();
+        assert_eq!(
+            pdf_diags(&ws, &root.join("nodirs.adoc")),
+            vec![(
+                2,
+                "pdf-theme: themes/nodirs-theme.yml:8: font.catalog.Custom.normal: not found: custom-regular.ttf (searched: themes, GEM_FONTS_DIR)"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// Without `pdf-fontsdir` fonts are looked up in the themes directory
+    /// (`theme.__dir__`), which is not the theme file's folder when
+    /// `pdf-themesdir` is set.
+    #[test]
+    fn theme_yaml_fonts_without_fontsdir_use_the_themes_directory() {
+        let (root, ws) = yaml_fixture();
+        assert_eq!(
+            pdf_diags(&ws, &root.join("fontshift.adoc")),
+            vec![(
+                3,
+                "pdf-theme: other/fontshift-theme.yml:6: font.catalog.Own.normal: not found: other-font.ttf (searched: themes, GEM_FONTS_DIR)"
+                    .to_string()
+            )]
+        );
     }
 
     #[test]

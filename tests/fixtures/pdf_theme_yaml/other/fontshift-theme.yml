@@ -1,0 +1,6 @@
+font:
+  catalog:
+    Shifted:
+      normal: shifted-font.ttf
+    Own:
+      normal: other-font.ttf

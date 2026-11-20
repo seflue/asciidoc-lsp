@@ -12,6 +12,7 @@ strsim = "0.11"
 thiserror = "2"
 tracing = "0.1"
 unicode-segmentation = "1"
+saphyr = "0.3"
 
 [lints]
 workspace = true

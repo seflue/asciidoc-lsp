@@ -1,0 +1,10 @@
+extends: ./parent-theme.yml
+title-page:
+  logo:
+    image: image:logo.svg[]
+font:
+  catalog:
+    Custom:
+      normal: custom-regular.ttf
+    Noto Serif:
+      normal: notoserif-regular-subset.ttf

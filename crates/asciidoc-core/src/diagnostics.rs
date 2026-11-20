@@ -490,6 +490,20 @@ pub fn collect_diagnostics(
     for mut diag in crate::pdf_theme::collect_pdf_diagnostics(documents, graph, registry) {
         match &mut diag.kind {
             DiagnosticKind::PdfPathNotFound { path, .. } => *path = pdf_display_path(root, path),
+            DiagnosticKind::PdfThemeEntryNotFound {
+                theme,
+                path,
+                searched,
+                ..
+            } => {
+                *theme = pdf_display_path(root, theme);
+                *path = pdf_display_path(root, path);
+                for dir in searched {
+                    *dir = pdf_display_path(root, Path::new(dir.as_str()))
+                        .display()
+                        .to_string();
+                }
+            }
             DiagnosticKind::PdfThemeYamlExtension { value } => {
                 *value = pdf_display_path(root, Path::new(value.as_str()))
                     .display()

@@ -1,0 +1,3 @@
+= Theme in another folder
+:pdf-themesdir: {docdir}/themes
+:pdf-theme: {docdir}/other/shifted-theme.yml

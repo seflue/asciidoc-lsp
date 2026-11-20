@@ -1,0 +1,9 @@
+extends:
+  - ./sibling.yml
+  - parent
+header:
+  recto:
+    center:
+      content: image:logo.svg[]
+    left:
+      content: image:other-only.png[]

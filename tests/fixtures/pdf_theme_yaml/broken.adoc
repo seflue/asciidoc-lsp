@@ -1,0 +1,4 @@
+= Broken theme
+:pdf-themesdir: {docdir}/themes
+:pdf-fontsdir: {docdir}/fonts;GEM_FONTS_DIR
+:pdf-theme: broken

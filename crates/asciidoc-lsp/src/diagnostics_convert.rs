@@ -28,6 +28,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
     let severity = match &diag.kind {
         DiagnosticKind::BrokenInclude { .. }
         | DiagnosticKind::PdfPathNotFound { .. }
+        | DiagnosticKind::PdfThemeEntryNotFound { .. }
         | DiagnosticKind::PdfThemeYamlExtension { .. }
         | DiagnosticKind::UnknownPdfTheme { .. }
         | DiagnosticKind::LevelZeroSectionOutsideBook { .. } => ls_types::DiagnosticSeverity::ERROR,
@@ -342,6 +343,16 @@ mod tests {
                 DiagnosticKind::PdfPathNotFound {
                     attribute: attribute(),
                     path: PathBuf::from("/themes/custom-theme.yml"),
+                },
+                ls_types::DiagnosticSeverity::ERROR,
+            ),
+            (
+                DiagnosticKind::PdfThemeEntryNotFound {
+                    theme: PathBuf::from("themes/custom-theme.yml"),
+                    line: 3,
+                    key: "extends".into(),
+                    path: PathBuf::from("themes/base-theme.yml"),
+                    searched: Vec::new(),
                 },
                 ls_types::DiagnosticSeverity::ERROR,
             ),

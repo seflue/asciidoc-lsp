@@ -1,0 +1,20 @@
+extends:
+  - default
+  - parent
+  - ./parent-theme.yml
+  - ./parent-theme.yml !important
+title-page:
+  background-image: image:https://example.org/background.png[]
+  logo:
+    image: image:{themesdir}/logo.svg[pdfwidth=30%]
+header:
+  recto:
+    center:
+      content: image:logo.svg[]
+font:
+  catalog:
+    Custom:
+      normal: custom-regular.ttf
+    Noto Serif:
+      normal: notoserif-regular-subset.ttf
+      bold: GEM_FONTS_DIR/notoserif-bold-subset.ttf

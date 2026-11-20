@@ -1,0 +1,5 @@
+extends: own-parent
+title-page:
+  logo:
+    image: image:own.png[]
+  background-image: image:missing-own.png[]
