@@ -1,0 +1,10 @@
+[[rules]]
+name = "lsp-no-core-paths"
+type = "forbidden-dependency"
+from = "asciidoc-lsp"
+to = "asciidoc-core::paths"
+
+[[rules]]
+name = "no-cycles"
+type = "no-cycles"
+scope = "**"

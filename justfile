@@ -44,8 +44,16 @@ test-release:
 check-version:
     scripts/check-version.sh
 
+# Check the architecture rules in arc-rules.toml (frozen: arc-baseline.toml)
+arch-check:
+    cargo arc check
+
+# Rewrite arc-baseline.toml from the current violations (review the diff!)
+arch-baseline:
+    cargo arc check --generate-baseline
+
 # All quality checks (CI / pre-commit)
-ci: fmt-check lint test test-release check-version
+ci: fmt-check lint test test-release check-version arch-check
 
 # All checks + release build
 all: ci build-release
