@@ -751,7 +751,7 @@ enum ImageTarget {
     /// A file: `path` is absolute, `display` is the human-readable path
     /// including imagesdir.
     Local { path: PathBuf, display: String },
-    /// An `http(s)` URL, from the macro target or from `imagesdir`.
+    /// A URI (Asciidoctor's `uriish?`: `https:`, `data:`, ...), from the macro target or from `imagesdir`.
     Remote { url: String },
 }
 
@@ -766,8 +766,10 @@ impl ImageTarget {
     }
 }
 
+/// Whether an image target is a URI (`http:`, `HTTPS:`, `ftp:`, `data:`),
+/// which Asciidoctor never resolves against the file system.
 fn is_remote_url(target: &str) -> bool {
-    target.starts_with("http://") || target.starts_with("https://")
+    is_uri(target)
 }
 
 /// Where an image macro on `line` points, per top-level document and, for
@@ -805,7 +807,7 @@ fn image_target(resolved_path: &str, base: &Path, doc_dir: &Path, imagesdir: &st
     let mut display = if imagesdir.is_empty() || is_remote_url(resolved_path) {
         resolved_path.to_string()
     } else {
-        format!("{imagesdir}/{resolved_path}")
+        format!("{}/{resolved_path}", imagesdir.trim_end_matches('/'))
     };
     if Path::new(&display).is_absolute() {
         display = display_path(doc_dir, Path::new(&display))
@@ -5890,6 +5892,33 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         );
     }
 
+    #[test]
+    fn test_hover_image_with_local_imagesdir_trailing_slash_has_no_double_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = tmp.path().join("images");
+        fs::create_dir_all(&images).unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(&a, "= Doc A\n:imagesdir: images/\n\nimage::r.svg[]\n").unwrap();
+        fs::write(images.join("r.svg"), "<svg/>").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 3,
+            character: 10,
+        };
+
+        let hover = resolve_hover(&content, pos, &a, Some(&ws)).unwrap();
+        assert!(
+            hover.contains("image::images/r.svg[]"),
+            "Should show images/r.svg, got: {hover}"
+        );
+        assert!(
+            !hover.contains("images//r.svg"),
+            "Must not contain a double slash, got: {hover}"
+        );
+    }
+
     #[rstest]
     #[case::mid_line("= Doc A\n:imagesdir: img\n\nText image:logo.png[Alt] here.\n", 8)]
     #[case::line_start("= Doc A\n:imagesdir: img\n\nimage:logo.png[Alt] here.\n", 8)]
@@ -5974,6 +6003,26 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         "= Doc\n:imagesdir: https://example.com/img\n\nimage::r.svg[]\n",
         "image::",
         "https://example.com/img/r.svg"
+    )]
+    #[case::url_imagesdir_trailing_slash(
+        "= Doc\n:imagesdir: https://example.com/img/\n\nimage::r.svg[]\n",
+        "image::",
+        "https://example.com/img/r.svg"
+    )]
+    #[case::data_uri(
+        "= Doc\n\nimage::data:image/png;base64,iVBOR[]\n",
+        "image::",
+        "data:image/png;base64,iVBOR"
+    )]
+    #[case::ftp(
+        "= Doc\n\nimage::ftp://example.com/r.svg[]\n",
+        "image::",
+        "ftp://example.com/r.svg"
+    )]
+    #[case::uppercase_scheme(
+        "= Doc\n\nimage::HTTPS://example.com/r.svg[]\n",
+        "image::",
+        "HTTPS://example.com/r.svg"
     )]
     fn test_remote_image_is_not_a_local_file(
         #[case] doc: &str,
