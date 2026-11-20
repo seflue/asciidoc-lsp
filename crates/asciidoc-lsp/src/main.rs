@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod agreement;
 mod completion;
 mod diagnostics_convert;
 mod navigation;
