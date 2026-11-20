@@ -517,6 +517,13 @@ mod tests {
         (fake, started, finished)
     }
 
+    /// Lets the worker task run until it waits again; time stays put.
+    async fn settle() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     async fn next_html(outcomes: &mut mpsc::UnboundedReceiver<ConvertOutcome>) -> String {
         let outcome = tokio::time::timeout(Duration::from_secs(5), outcomes.recv())
             .await
@@ -525,32 +532,48 @@ mod tests {
         outcome.result.unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_burst_within_debounce_converts_only_the_last() {
         let (fake, started, _) = fake(Duration::from_millis(1));
         let (handle, mut outcomes) = spawn(fake, Duration::from_millis(60));
         handle.request(request("a"));
         handle.request(request("b"));
         handle.request(request("c"));
+        settle().await;
+        tokio::time::advance(Duration::from_millis(59)).await;
+        settle().await;
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
         assert_eq!(next_html(&mut outcomes).await, "c");
         assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_requests_spread_over_time_reset_the_debounce() {
         let (fake, started, _) = fake(Duration::from_millis(1));
         let (handle, mut outcomes) = spawn(fake, Duration::from_millis(150));
         // Each gap is shorter than the debounce, the whole burst is longer.
         for text in ["a", "b", "c", "d"] {
             handle.request(request(text));
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            settle().await;
+            tokio::time::advance(Duration::from_millis(80)).await;
+            settle().await;
         }
         assert_eq!(started.load(Ordering::SeqCst), 0);
+        // 80 ms after the last request: 70 ms are still missing.
+        tokio::time::advance(Duration::from_millis(69)).await;
+        settle().await;
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
         assert_eq!(next_html(&mut outcomes).await, "d");
         assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_outcome_generation_marks_stale_results() {
         let (fake, _, _) = fake(Duration::from_millis(1));
         let (handle, mut outcomes) = spawn(fake, Duration::from_millis(10));
@@ -602,14 +625,18 @@ mod tests {
         assert!(html.contains("header guide"), "{html}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_newer_request_aborts_the_running_conversion() {
         let (fake, started, finished) = fake(Duration::from_millis(400));
         let (handle, mut outcomes) = spawn(fake, Duration::from_millis(10));
         handle.request(request("old"));
-        while started.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        settle().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        settle().await;
+        // The old run started; 100 ms into its 400 ms a newer request comes.
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
         handle.request(request("new"));
         assert_eq!(next_html(&mut outcomes).await, "new");
         assert_eq!(started.load(Ordering::SeqCst), 2);
@@ -617,7 +644,7 @@ mod tests {
         assert!(outcomes.try_recv().is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_worker_ends_when_handle_is_dropped() {
         let (fake, _, _) = fake(Duration::from_millis(1));
         let (handle, mut outcomes) = spawn(fake, Duration::from_millis(10));
