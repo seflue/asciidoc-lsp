@@ -485,6 +485,14 @@ mod tests {
     }
 
     #[test]
+    fn inline_markup_in_a_quote_block_paragraph_is_highlighted() {
+        let tokens = decoded("____\nSome *bold* text and <<_target>>.\n____\n");
+
+        find(&tokens, "strong", "*bold*");
+        find(&tokens, "link", "_target");
+    }
+
+    #[test]
     fn checklist_markers_carry_their_state() {
         let tokens = decoded("* [x] done\n* [ ] open\n* plain\n");
 
