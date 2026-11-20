@@ -62,8 +62,9 @@
    * strictly ascending and interpolation and binary search hold.
    *
    * A file included more than once counts with its first occurrence: the
-   * anchors stop where an included file's lines fall back, which is where
-   * its next occurrence starts. (A main file has one occurrence.) Pixel
+   * anchors stop where an included file's lines fall back (below the last
+   * line, not equal to it: a list and its first item share a line), which is
+   * where its next occurrence starts. (A main file has one occurrence.) Pixel
    * space of other files' blocks is not lost: it lies between the file's own
    * neighbours, and the interpolation spans it.
    */
@@ -75,10 +76,8 @@
       var entry = entries[i]
       var from = entry.src === undefined ? null : entry.src
       if (from !== wanted) continue
-      if (entry.line <= last) {
-        if (wanted !== null && result.length) break
-        continue
-      }
+      if (entry.line < last && wanted !== null && result.length) break
+      if (entry.line <= last) continue
       result.push({ line: entry.line, top: entry.top })
       last = entry.line
     }
