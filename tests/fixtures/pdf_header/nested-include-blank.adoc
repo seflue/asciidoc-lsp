@@ -1,0 +1,4 @@
+= T
+include::nested-include-blank-included.adoc[]
+
+Body.

@@ -1,0 +1,4 @@
+= Themesdir after the header
+:pdf-theme: default-sans
+include::blank.adoc[]
+:pdf-themesdir: /nonexistent

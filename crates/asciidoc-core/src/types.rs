@@ -193,8 +193,77 @@ pub struct DocumentModel {
     pub tags: Vec<String>,
     /// Delimited blocks without a closing delimiter.
     pub unterminated_blocks: Vec<UnterminatedBlock>,
+    /// What each line is to the reader of a document header, one per source
+    /// line, see [`HeaderLine`].
+    pub header_lines: Vec<HeaderLine>,
     /// How many lines the file has; a last line without a line break counts.
     pub line_count: usize,
+}
+
+/// One source line as the reader of a document header takes it. Asciidoctor
+/// reads the header from the lines of the top-level document and of the files
+/// it includes as one stream, so a line is classified on its own, without the
+/// conditionals around it: they are evaluated where the files are read
+/// together (`pdf_header`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderLine {
+    /// Empty or whitespace only.
+    Blank,
+    /// `// text`.
+    Comment,
+    /// `////`: a comment block that ends on `end` (1-based), `None` when it
+    /// never closes. The lines in between are `Covered`.
+    BlockComment { end: Option<usize> },
+    /// An attribute entry, `:name: value` or `:name!:`. The lines that carry
+    /// its value on (` \` at the end) are `Covered`.
+    Entry(HeaderEntry),
+    /// `ifdef`, `ifndef`, `ifeval` and `endif` at the start of a line.
+    Directive(Directive),
+    /// A line with an `include::` macro; the include graph has its edge.
+    Include,
+    /// A line above the title that belongs to the next block: `[[id]]` or
+    /// `[attributes]`. A `.Title` line is a [`HeaderLine::TitleBlocker`].
+    Metadata,
+    /// A `.Title` line or a `discrete` or `float` attrlist above the title:
+    /// block metadata that also keeps the next level-0 line from being the
+    /// document title.
+    TitleBlocker,
+    /// The level-0 title.
+    Title,
+    /// Anything else.
+    Text,
+    /// Text the revision line pattern (`RevisionInfoLineRx`) rejects: it
+    /// starts with a colon and no comma is followed by anything but a colon.
+    NotRevision,
+    /// A line inside a comment block or the continuation of an entry.
+    Covered,
+}
+
+/// An attribute entry line, name and value as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderEntry {
+    /// Lower case, without the `!` of an unset.
+    pub name: String,
+    pub unset: bool,
+    /// The value with its continuation lines joined; empty for an unset.
+    pub value: String,
+}
+
+/// A preprocessor conditional line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Directive {
+    /// `ifdef::a,b[]` and `ifndef::a+b[]`; `content` is the text in the
+    /// brackets of the single-line form, `ifdef::a[:x: y]`.
+    Condition {
+        kind: ConditionalKind,
+        names: Vec<String>,
+        operator: ConditionalOperator,
+        content: Option<String>,
+    },
+    /// `ifeval::[expression]`, not evaluated.
+    Ifeval,
+    /// `endif::[]`.
+    Endif,
 }
 
 /// An attribute that may be defined at `line` without the LSP being able to
@@ -579,6 +648,7 @@ impl DocumentModel {
             substituted_refs: vec![],
             possible_definitions: vec![],
             tags: vec![],
+            header_lines: vec![],
             unterminated_blocks: vec![],
             line_count: 0,
         }

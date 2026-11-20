@@ -1,0 +1,5 @@
+= T
+include::include-trailing-blank-included.adoc[]
+:pdf-theme: nosuch
+
+Body.

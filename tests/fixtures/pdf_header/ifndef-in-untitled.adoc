@@ -1,0 +1,5 @@
+ifndef::foo[]
+:pdf-theme: nosuch
+endif::[]
+
+Body.

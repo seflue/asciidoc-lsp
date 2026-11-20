@@ -1,0 +1,1 @@
+:pdf-theme: default

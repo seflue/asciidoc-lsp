@@ -1,0 +1,6 @@
+= T
+:pdf-theme: nosuch
+[[sec]]
+== S
+
+Body.

@@ -3,23 +3,27 @@
 //!
 //! Asciidoctor PDF reads these from the top-level document it converts, so an
 //! entry in an included file (a shared `pdf-settings.adoc`) counts for every
-//! document that includes it. A value is taken after attribute substitution
-//! with the attributes the top-level document knows at that line (its own
-//! entries and those of earlier includes), else with what that document
-//! starts with (`.asciidoctorconfig`, built-ins), and `{docdir}` of the
-//! top-level document. It is checked once per such document. A relative
-//! value resolves against the working directory of the build, which the
-//! server cannot know.
+//! document that includes it. Only the last entry in the header of each
+//! attribute counts: Asciidoctor PDF loads the theme after the attributes are
+//! reset to the end of the header, which `pdf_header` reads. A value is taken
+//! after attribute substitution with what the header defined before it, else
+//! with what the document starts with (`.asciidoctorconfig`, built-ins), and
+//! `{docdir}` of the top-level document. It is checked once per such
+//! document. A relative value resolves against the working directory of the
+//! build, which the server cannot know.
+//!
+//! Hover reads the whole document instead: the last entry anywhere.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::attributes::{substitute_attributes, AttributeRegistry, AttributeSource, DOCDIR};
+use crate::attributes::{AttributeLayer, AttributeRegistry, AttributeSource};
 use crate::graph::IncludeGraph;
 use crate::paths::normalize_lexically;
+use crate::pdf_header::{HeaderValue, PdfHeader};
 use crate::pdf_theme_yaml::{check_theme, ThemeDirs};
-use crate::types::{AttributeDef, Diagnostic, DiagnosticKind, DocumentModel};
-use crate::workspace::entry_name;
+use crate::types::{Diagnostic, DiagnosticKind, DocumentModel};
+use crate::workspace::Workspace;
 
 pub const PDF_THEME: &str = "pdf-theme";
 pub const PDF_THEMESDIR: &str = "pdf-themesdir";
@@ -78,166 +82,55 @@ pub struct PdfResolution {
     pub paths: Vec<PdfPath>,
 }
 
-/// An attribute entry for a PDF path attribute, value substituted.
-struct Entry<'a> {
-    file: &'a Path,
-    line: usize,
-    name: &'a str,
-    value: String,
-}
-
-/// The PDF path entries one top-level document sees, in document order.
-struct Scope<'a> {
-    root: &'a Path,
-    /// `{docdir}` of `root`, which every file it includes sees.
-    docdir: String,
-    entries: Vec<Entry<'a>>,
-    files: HashSet<&'a Path>,
-    /// What the entries so far say, in line order across the document and
-    /// its includes, by name.
-    defined: HashMap<&'a str, Known>,
-}
-
-/// What the entries so far say about one attribute.
-enum Known {
-    /// Set, value substituted when defined.
-    Set(String),
-    /// Unset: a reference stays as written, the start state does not apply.
+/// What a PDF path attribute is at the end of the header.
+enum InEffect {
+    Value(String),
     Unset,
-    /// Possibly set, an entry in a block conditional: not certain, a
-    /// reference stays as written.
-    Possible,
+    /// The header may or may not set it: nothing is checked against it.
+    Uncertain,
 }
 
-/// One step of a document in line order: an attribute entry or an include.
-enum Step<'a> {
-    Attribute(&'a AttributeDef),
-    Include(&'a Path),
+/// The last header entry for `name`, else the value from the
+/// `.asciidoctorconfig` chain. Entries of the file itself outside the header
+/// do not count.
+fn in_effect(
+    header: &PdfHeader,
+    registry: &AttributeRegistry,
+    root: &Path,
+    name: &str,
+) -> InEffect {
+    match header.value(name) {
+        Some(HeaderValue::Set(entry)) => InEffect::Value(entry.value.clone()),
+        Some(HeaderValue::Unset) => InEffect::Unset,
+        Some(HeaderValue::Uncertain) => InEffect::Uncertain,
+        None => match registry.preset(root, name) {
+            Some((AttributeLayer::Config, hit)) => {
+                InEffect::Value(registry.substitute(root, &hit.value))
+            }
+            Some((AttributeLayer::Builtin, _)) | None => InEffect::Unset,
+        },
+    }
 }
 
-impl<'a> Scope<'a> {
-    fn collect(
-        root: &'a Path,
-        documents: &'a HashMap<PathBuf, DocumentModel>,
-        graph: &'a IncludeGraph,
-        registry: &AttributeRegistry,
-    ) -> Self {
-        let mut scope = Scope {
-            root,
-            docdir: registry
-                .resolve(root, DOCDIR)
-                .unwrap_or_default()
-                .to_string(),
-            entries: Vec::new(),
-            files: HashSet::new(),
-            defined: HashMap::new(),
-        };
-        scope.visit(root, documents, graph, registry);
-        scope
+/// The `pdf-themesdir` Asciidoctor PDF uses; `None` when unset.
+fn themesdir(header: &PdfHeader, registry: &AttributeRegistry, root: &Path) -> Option<PdfPath> {
+    match in_effect(header, registry, root, PDF_THEMESDIR) {
+        InEffect::Value(value) => Some(resolve_dir(&value)),
+        InEffect::Unset => None,
+        InEffect::Uncertain => Some(PdfPath::Unknown(String::new())),
     }
+}
 
-    fn visit(
-        &mut self,
-        file: &'a Path,
-        documents: &'a HashMap<PathBuf, DocumentModel>,
-        graph: &'a IncludeGraph,
-        registry: &AttributeRegistry,
-    ) {
-        let Some(doc) = documents.get(file) else {
-            return;
-        };
-        if !self.files.insert(doc.path.as_path()) {
-            return;
-        }
-        let mut steps: Vec<(usize, Step<'a>)> = doc
-            .attributes
-            .iter()
-            .map(|attr| (attr.line, Step::Attribute(attr)))
-            .chain(
-                graph
-                    .includes_of(&doc.path)
-                    .iter()
-                    .map(|edge| (edge.line, Step::Include(edge.target.as_path()))),
-            )
-            .collect();
-        steps.sort_by_key(|(line, _)| *line);
-        for (_, step) in steps {
-            match step {
-                Step::Attribute(attr) => {
-                    let (name, unset) = entry_name(&attr.name);
-                    let possible = doc.possible_definitions.iter().any(|possible| {
-                        possible.line == attr.line && possible.name.eq_ignore_ascii_case(name)
-                    });
-                    let value = self.substitute(registry, &attr.value);
-                    if is_pdf_path_attribute(&attr.name) {
-                        self.entries.push(Entry {
-                            file: doc.path.as_path(),
-                            line: attr.line,
-                            name: attr.name.as_str(),
-                            value: value.clone(),
-                        });
-                    }
-                    let known = if unset {
-                        Known::Unset
-                    } else if possible {
-                        Known::Possible
-                    } else {
-                        Known::Set(value)
-                    };
-                    self.defined.insert(name, known);
-                }
-                Step::Include(target) => self.visit(target, documents, graph, registry),
-            }
-        }
-    }
-
-    /// Substitute `{name}` as the top-level document sees it at this point:
-    /// an attribute defined above in it or an include, else what the
-    /// top-level document starts with (`.asciidoctorconfig`, built-ins).
-    fn substitute(&self, registry: &AttributeRegistry, input: &str) -> String {
-        substitute_attributes(input, |name| {
-            if name == DOCDIR {
-                Some(self.docdir.clone())
-            } else {
-                match self.defined.get(name) {
-                    Some(Known::Set(value)) => Some(value.clone()),
-                    Some(Known::Unset | Known::Possible) => None,
-                    None => registry.preset(self.root, name).map(|(_, hit)| hit.value),
-                }
-            }
-        })
-    }
-
-    /// The `pdf-themesdir` Asciidoctor PDF uses: the last entry, else the
-    /// value from the attribute registry (`.asciidoctorconfig`).
-    fn themesdir(&self, registry: &AttributeRegistry) -> Option<PdfPath> {
-        let value = self.last(PDF_THEMESDIR).map_or_else(
-            || {
-                registry
-                    .resolve(self.root, PDF_THEMESDIR)
-                    .map(|v| registry.substitute(self.root, v))
-            },
-            |entry| Some(entry.value.clone()),
-        )?;
-        Some(resolve_dir(&value))
-    }
-
-    /// The `pdf-fontsdir` entries Asciidoctor PDF uses: the last entry, else
-    /// the registry value; `None` when neither sets it.
-    fn fontsdirs(&self, registry: &AttributeRegistry) -> Option<Vec<PdfPath>> {
-        let value = self.last(PDF_FONTSDIR).map_or_else(
-            || {
-                registry
-                    .resolve(self.root, PDF_FONTSDIR)
-                    .map(|v| registry.substitute(self.root, v))
-            },
-            |entry| Some(entry.value.clone()),
-        )?;
-        Some(resolve_fontsdir(&value))
-    }
-
-    fn last(&self, name: &str) -> Option<&Entry<'a>> {
-        self.entries.iter().rev().find(|entry| entry.name == name)
+/// The `pdf-fontsdir` entries Asciidoctor PDF uses; `None` when unset.
+fn fontsdirs(
+    header: &PdfHeader,
+    registry: &AttributeRegistry,
+    root: &Path,
+) -> Option<Vec<PdfPath>> {
+    match in_effect(header, registry, root, PDF_FONTSDIR) {
+        InEffect::Value(value) => Some(resolve_fontsdir(&value)),
+        InEffect::Unset => None,
+        InEffect::Uncertain => Some(vec![PdfPath::Unknown(String::new())]),
     }
 }
 
@@ -333,39 +226,39 @@ struct Dirs {
     fontsdirs: Option<Vec<PdfPath>>,
 }
 
-fn check_entry(entry: &Entry<'_>, dirs: &Dirs) -> Vec<DiagnosticKind> {
+fn check_entry(name: &str, value: &str, dirs: &Dirs) -> Vec<DiagnosticKind> {
     let themesdir = dirs.themesdir.as_ref();
-    if entry.name == PDF_THEME && has_extension(&entry.value, ".yaml") {
+    if name == PDF_THEME && has_extension(value, ".yaml") {
         return vec![DiagnosticKind::PdfThemeYamlExtension {
-            value: entry.value.clone(),
+            value: value.to_string(),
         }];
     }
-    resolve_entry(entry.name, &entry.value, themesdir)
+    resolve_entry(name, value, themesdir)
         .into_iter()
         .flat_map(|path| match path {
-            PdfPath::Absolute(path) if entry.name == PDF_THEME && path.is_file() => {
+            PdfPath::Absolute(path) if name == PDF_THEME && path.is_file() => {
                 theme_findings(&path, dirs)
             }
             PdfPath::Absolute(path) => {
-                let exists = if entry.name == PDF_THEME {
+                let exists = if name == PDF_THEME {
                     false
                 } else {
                     path.is_dir()
                 };
                 (!exists)
                     .then(|| DiagnosticKind::PdfPathNotFound {
-                        attribute: entry.name.to_string(),
+                        attribute: name.to_string(),
                         path,
                     })
                     .into_iter()
                     .collect()
             }
             PdfPath::Relative(value) => vec![DiagnosticKind::UnanchoredPdfPath {
-                attribute: entry.name.to_string(),
+                attribute: name.to_string(),
                 value,
             }],
-            PdfPath::Builtin(name) if entry.name == PDF_THEME && !is_builtin_theme(&name) => {
-                vec![DiagnosticKind::UnknownPdfTheme { name }]
+            PdfPath::Builtin(theme) if name == PDF_THEME && !is_builtin_theme(&theme) => {
+                vec![DiagnosticKind::UnknownPdfTheme { name: theme }]
             }
             PdfPath::Builtin(_) | PdfPath::Unknown(_) => Vec::new(),
         })
@@ -398,28 +291,29 @@ fn theme_findings(theme: &Path, dirs: &Dirs) -> Vec<DiagnosticKind> {
         .collect()
 }
 
-/// Diagnostics for every `pdf-theme`, `pdf-themesdir` and `pdf-fontsdir`
-/// entry, checked once per top-level document that reaches it. An entry
-/// reached from several documents reports each distinct finding once, and
-/// nothing when it checks clean for at least one of them.
+/// Diagnostics for the `pdf-theme`, `pdf-themesdir` and `pdf-fontsdir`
+/// entries Asciidoctor PDF reads (the last header entry of each, unless it
+/// unsets, see [`PdfHeader`]), checked once per top-level document that
+/// reaches it. An entry reached from several documents reports each distinct
+/// finding once, and nothing when it checks clean for at least one of them.
 #[must_use]
-pub fn collect_pdf_diagnostics(
-    documents: &HashMap<PathBuf, DocumentModel>,
-    graph: &IncludeGraph,
-    registry: &AttributeRegistry,
-) -> Vec<Diagnostic> {
+pub fn collect_pdf_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
+    let registry = workspace.attributes();
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut clean: HashSet<(PathBuf, usize)> = HashSet::new();
-    for root in top_level_documents(documents, graph) {
-        let scope = Scope::collect(&root, documents, graph, registry);
+    for root in top_level_documents(&workspace.documents, &workspace.include_graph) {
+        let header = PdfHeader::read(workspace, &root);
         let dirs = Dirs {
-            themesdir: scope.themesdir(registry),
-            fontsdirs: scope.fontsdirs(registry),
+            themesdir: themesdir(&header, registry, &root),
+            fontsdirs: fontsdirs(&header, registry, &root),
         };
-        for entry in &scope.entries {
-            let kinds = check_entry(entry, &dirs);
+        for name in [PDF_THEMESDIR, PDF_THEME, PDF_FONTSDIR] {
+            let Some(HeaderValue::Set(entry)) = header.value(name) else {
+                continue;
+            };
+            let kinds = check_entry(name, &entry.value, &dirs);
             if kinds.is_empty() {
-                clean.insert((entry.file.to_path_buf(), entry.line));
+                clean.insert((entry.file.clone(), entry.line));
             }
             for kind in kinds {
                 let seen = diags
@@ -427,7 +321,7 @@ pub fn collect_pdf_diagnostics(
                     .any(|d| d.file == entry.file && d.line == entry.line && d.kind == kind);
                 if !seen {
                     diags.push(Diagnostic {
-                        file: entry.file.to_path_buf(),
+                        file: entry.file.clone(),
                         line: entry.line,
                         span: None,
                         kind,
@@ -443,12 +337,11 @@ pub fn collect_pdf_diagnostics(
 /// Resolve a PDF path attribute as seen from `file`: the entry on `line`
 /// when given (an attribute entry), else the last entry for `name` in the
 /// first top-level document that reaches `file` (an attribute reference),
-/// else the registry value (`.asciidoctorconfig`).
+/// else the registry value (`.asciidoctorconfig`). Unlike the diagnostics,
+/// hover reads the whole document, not only its header.
 #[must_use]
 pub fn resolve_pdf_attribute(
-    documents: &HashMap<PathBuf, DocumentModel>,
-    graph: &IncludeGraph,
-    registry: &AttributeRegistry,
+    workspace: &Workspace,
     file: &Path,
     name: &str,
     line: Option<usize>,
@@ -456,32 +349,34 @@ pub fn resolve_pdf_attribute(
     if !is_pdf_path_attribute(name) {
         return None;
     }
-    let roots = top_level_documents(documents, graph);
-    let scope = roots
-        .iter()
-        .map(|root| Scope::collect(root, documents, graph, registry))
-        .find(|scope| scope.files.contains(file))
-        .unwrap_or_else(|| Scope::collect(file, documents, graph, registry));
-    let themesdir = scope.themesdir(registry);
+    let registry = workspace.attributes();
+    let file = workspace.indexed_path(file);
+    let scopes = workspace.scopes_at(&file, line.unwrap_or(0));
+    let scope = scopes.first()?;
+    let root = scope.document();
+    let themesdir = themesdir(&PdfHeader::read(workspace, root), registry, root);
 
+    let set = scope
+        .definitions(name)
+        .filter(|definition| definition.value.is_some());
     let entry = match line {
-        Some(line) => scope
-            .entries
-            .iter()
-            .find(|e| e.file == file && e.line == line && e.name == name),
-        None => scope.last(name),
+        Some(line) => set
+            .filter(|definition| {
+                definition
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.file == file && source.line == line)
+            })
+            .last(),
+        None => set.last(),
     };
     let (value, source) = if let Some(entry) = entry {
-        let source = AttributeSource {
-            file: entry.file.to_path_buf(),
-            line: entry.line,
-        };
-        (entry.value.clone(), Some(source))
+        (entry.value.clone()?, entry.source.clone())
     } else {
-        let value = registry.resolve(scope.root, name)?;
+        let value = registry.resolve(root, name)?;
         (
-            registry.substitute(scope.root, value),
-            registry.resolve_source(scope.root, name),
+            registry.substitute(root, value),
+            registry.resolve_source(root, name),
         )
     };
     Some(PdfResolution {
@@ -547,6 +442,171 @@ mod tests {
 
     fn resolve(ws: &Workspace, file: &Path, name: &str, line: Option<usize>) -> Vec<PdfPath> {
         ws.resolve_pdf_attribute(file, name, line).unwrap().paths
+    }
+
+    /// Asciidoctor PDF loads the theme when conversion starts, after the
+    /// attributes are restored to their state at the end of the header
+    /// (`Document#restore_attributes`; `converter.rb` `convert_document` →
+    /// `load_theme`). Only the last header value of each attribute counts:
+    /// an overwritten entry, one in the body or in a file included from the
+    /// body, and one an unset (`:name!:`) cancels are never read.
+    #[test]
+    fn only_the_last_header_value_of_each_pdf_attribute_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let files = [
+            ("override.adoc", "= O\n:pdf-theme: nosuch-a\n:pdf-theme: default\n\nBody.\n"),
+            (
+                "unset.adoc",
+                "= U\n:pdf-themesdir: {docdir}/nothemes\n:pdf-theme: default\n:pdf-themesdir!:\n\nBody.\n",
+            ),
+            ("body.adoc", "= B\n\nBody.\n\n:pdf-theme: nosuch-b\n"),
+            ("last.adoc", "= L\n:pdf-theme: default\n:pdf-theme: nosuch-c\n\nBody.\n"),
+            ("untitled.adoc", ":pdf-theme: nosuch-d\n\n:pdf-theme: nosuch-e\n\nBody.\n"),
+            ("header-include.adoc", "= H\ninclude::in-header.adoc[]\n\nBody.\n"),
+            ("in-header.adoc", ":pdf-theme: nosuch-f\n"),
+            ("body-include.adoc", "= BI\n\ninclude::in-body.adoc[]\n"),
+            ("in-body.adoc", ":pdf-theme: nosuch-g\n"),
+            (
+                "shared-override.adoc",
+                "= S\n:pdf-themesdir: {docdir}/other\ninclude::settings.adoc[]\n:pdf-theme: default\n:pdf-themesdir!:\n\nBody.\n",
+            ),
+            ("settings.adoc", ":pdf-themesdir: {docdir}/themes\n:pdf-theme: corp\n"),
+        ];
+        for (name, text) in files {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        let found: Vec<(&str, Vec<usize>)> = files
+            .iter()
+            .map(|(name, _)| {
+                let lines = pdf_diags(&ws, &root.join(name)).into_iter().map(|d| d.0);
+                (*name, lines.collect())
+            })
+            .filter(|(_, lines): &(&str, Vec<usize>)| !lines.is_empty())
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("last.adoc", vec![3]),
+                ("untitled.adoc", vec![3]),
+                ("in-header.adoc", vec![1]),
+            ]
+        );
+    }
+
+    /// Files of the fixture directory with the lines of their PDF diagnostics,
+    /// those without any left out.
+    fn fixture_pdf_lines() -> Vec<(String, Vec<usize>)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_header")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".adoc") {
+                continue;
+            }
+            let lines: Vec<usize> = pdf_diags(&ws, &path).into_iter().map(|d| d.0).collect();
+            if !lines.is_empty() {
+                found.push((name, lines));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn expected(entries: &[(&str, &[usize])]) -> Vec<(String, Vec<usize>)> {
+        let mut list: Vec<_> = entries
+            .iter()
+            .map(|(name, lines)| ((*name).to_string(), lines.to_vec()))
+            .collect();
+        list.sort();
+        list
+    }
+
+    /// Fixtures in `tests/fixtures/pdf_header`: where the header ends decides
+    /// which `pdf-theme` entry Asciidoctor PDF reads. Each fixture is checked
+    /// against the oracle, Asciidoctor with the attributes restored after the
+    /// header: `nosuch` reports at its entry, `nil` stays quiet. Only the
+    /// fixtures with a report are listed; the known limitations are listed
+    /// apart.
+    #[test]
+    fn pdf_header_fixtures_match_asciidoctor() {
+        let oracle: &[(&str, &[usize])] = &[
+            ("include-before-title.adoc", &[3]),
+            ("anchor-before-title.adoc", &[3]),
+            ("attrlist-before-title.adoc", &[3]),
+            ("ifdef-in-header.adoc", &[3]),
+            ("author-email-revision.adoc", &[4]),
+            ("author-only.adoc", &[3]),
+            ("author-as-entries.adoc", &[4]),
+            ("author-email.adoc", &[3]),
+            ("author-revision.adoc", &[4]),
+            ("author-revnumber-only.adoc", &[4]),
+            ("comments-in-header.adoc", &[6]),
+            ("include-then-entry.adoc", &[3]),
+            ("untitled-comment-include.adoc", &[3]),
+            ("entry-before-title.adoc", &[1]),
+            ("untitled-blank-between.adoc", &[3]),
+            ("unset-then-set.adoc", &[3]),
+            ("title-then-attrlist-section.adoc", &[2]),
+            ("ifdef-before-title.adoc", &[2]),
+            ("include-blockcomment-blank-included.adoc", &[6]),
+            ("revision-continued-entry.adoc", &[6]),
+            ("untitled-leading-blanks.adoc", &[3]),
+            ("revision-oneline-ifdef.adoc", &[4]),
+            ("oneline-ifdef-no-revision.adoc", &[2]),
+            ("revision-include-in-header-included.adoc", &[1]),
+            ("revision-blockcomment.adoc", &[7]),
+            ("blockcomment-no-revision.adoc", &[5]),
+            ("revision-invalid-entry.adoc", &[5]),
+            ("title-paragraph-as-author.adoc", &[3]),
+            ("continued-entry-no-revision.adoc", &[4]),
+        ];
+        // Known limitations, missed errors (oracle `nosuch`, the LSP is quiet):
+        // - `ifndef::foo[]` holds unless the build sets `foo`; nothing says
+        //   `foo` is unset and a build may pass `-a foo`, so the branch is
+        //   unknown;
+        // - nothing in an `ifeval` branch is checked.
+        let missed: &[&str] = &["ifndef-in-untitled.adoc", "revision-ifeval.adoc"];
+        let found = fixture_pdf_lines();
+        assert_eq!(found, expected(oracle));
+        for name in missed {
+            assert!(found.iter().all(|(file, _)| file != name), "{name}");
+        }
+    }
+
+    /// One settings file included from two top-level documents: the blank
+    /// line in it ends the header of the titled document, so its first entry
+    /// counts there, while the untitled document reads on to the last entry.
+    /// The finding stays on the shared file.
+    #[test]
+    fn shared_header_include_is_read_per_top_level_document() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_header_shared_include")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let lines = |name: &str| -> Vec<usize> {
+            pdf_diags(&ws, &root.join(name))
+                .into_iter()
+                .map(|d| d.0)
+                .collect()
+        };
+        assert_eq!(lines("settings.adoc"), vec![1]);
+        assert_eq!(lines("titled.adoc"), Vec::<usize>::new());
+        assert_eq!(lines("untitled.adoc"), Vec::<usize>::new());
     }
 
     #[test]
@@ -626,26 +686,58 @@ mod tests {
 
     #[test]
     fn theme_without_themesdir_is_builtin_name_or_anchored_yml_path() {
-        let (root, ws) = fixture();
+        // One document per value: only the last header entry is checked.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("theme")).unwrap();
+        std::fs::write(root.join("theme/custom-theme.yml"), "").unwrap();
+        let values = [
+            "default-sans",
+            "corporate",
+            "{docdir}/theme/custom-theme.yaml",
+            "theme/custom-theme.yml",
+            "{docdir}/theme/custom-theme.yml",
+            "{docdir}/theme/none-theme.yml",
+            "{undefined-dir}/custom-theme.yml",
+            "",
+        ];
+        for (i, value) in values.iter().enumerate() {
+            std::fs::write(
+                root.join(format!("d{i}.adoc")),
+                format!("= D\n:pdf-theme: {value}\n"),
+            )
+            .unwrap();
+        }
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        let found: Vec<(usize, String)> = (0..values.len())
+            .flat_map(|i| {
+                pdf_diags(&ws, &root.join(format!("d{i}.adoc")))
+                    .into_iter()
+                    .map(move |(_, message)| (i, message))
+            })
+            .collect();
         assert_eq!(
-            pdf_diags(&ws, &root.join("no-themesdir.adoc")),
+            found,
             vec![
                 (
-                    3,
+                    1,
                     "pdf-theme: 'corporate' is not a built-in theme; set pdf-themesdir for a custom theme"
                         .to_string()
                 ),
                 (
-                    4,
+                    2,
                     "pdf-theme: theme file must end in .yml, not .yaml: theme/custom-theme.yaml"
                         .to_string()
                 ),
                 (
-                    5,
+                    3,
                     "pdf-theme: relative path 'theme/custom-theme.yml' resolves against the build's working directory; anchor it with {docdir}"
                         .to_string()
                 ),
-                (7, "pdf-theme: not found: theme/none-theme.yml".to_string()),
+                (5, "pdf-theme: not found: theme/none-theme.yml".to_string()),
             ]
         );
     }
@@ -892,6 +984,28 @@ mod tests {
                     .to_string()
             )]
         );
+    }
+
+    /// Only the `.asciidoctorconfig` chain presets a name the header does
+    /// not touch. An entry after the header, or in a branch the header
+    /// skips, is not read by Asciidoctor PDF (oracle: no themesdir, the
+    /// built-in theme applies).
+    #[test]
+    fn entries_outside_the_header_do_not_preset_directories() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_theme_body_entries")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        for name in [
+            "body-themesdir.adoc",
+            "skipped-themesdir.adoc",
+            "body-fontsdir.adoc",
+        ] {
+            assert_eq!(pdf_diags(&ws, &root.join(name)), vec![], "{name}");
+        }
     }
 
     #[test]

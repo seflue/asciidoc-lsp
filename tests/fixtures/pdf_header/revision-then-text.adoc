@@ -1,0 +1,7 @@
+= T
+Jane Doe
+v1.0
+Some text
+:pdf-theme: nosuch
+
+Body.

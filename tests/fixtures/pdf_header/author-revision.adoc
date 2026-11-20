@@ -1,0 +1,6 @@
+= T
+Jane Doe
+v1.0, 2026-01-01
+:pdf-theme: nosuch
+
+Body.

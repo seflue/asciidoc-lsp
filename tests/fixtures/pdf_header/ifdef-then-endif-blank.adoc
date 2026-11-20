@@ -1,0 +1,10 @@
+= T
+Jane Doe
+v1.0
+ifdef::backend-pdf[]
+:a: b
+
+endif::[]
+:pdf-theme: nosuch
+
+Body.

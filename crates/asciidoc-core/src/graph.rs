@@ -366,6 +366,7 @@ pub fn parse_single_file(
     registry.register_file_attributes(canonical, &file_attrs);
 
     let edges = include_edges(canonical, &includes_raw, registry);
+    let header_lines = crate::extractors::extract_header_lines(root_node, &source, &includes_raw);
 
     let doc = DocumentModel {
         path: canonical.to_path_buf(),
@@ -382,6 +383,7 @@ pub fn parse_single_file(
         possible_definitions,
         tags,
         unterminated_blocks,
+        header_lines,
         line_count: source.lines().count(),
     };
 

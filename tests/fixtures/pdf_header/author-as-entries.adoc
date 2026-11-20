@@ -1,0 +1,6 @@
+= T
+:author: Jane Doe
+:revnumber: 1.0
+:pdf-theme: nosuch
+
+Body.

@@ -1,0 +1,4 @@
+= Fontsdir after the header
+:pdf-theme: {docdir}/fonts-theme.yml
+
+:pdf-fontsdir: /nonexistent

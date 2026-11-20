@@ -2217,6 +2217,7 @@ mod tests {
                     possible_definitions: vec![],
                     tags: vec![],
                     unterminated_blocks: vec![],
+                    header_lines: vec![],
                     line_count: 0,
                 });
             if loc.kind == AnchorKind::ImplicitSection {

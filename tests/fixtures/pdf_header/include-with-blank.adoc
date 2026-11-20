@@ -1,0 +1,4 @@
+= T
+include::include-with-blank-included.adoc[]
+
+Body.

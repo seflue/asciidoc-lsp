@@ -1,0 +1,6 @@
+= T
+Jane Doe <jd@example.org>
+v1.0, 2026-01-01
+:pdf-theme: nosuch
+
+Body.

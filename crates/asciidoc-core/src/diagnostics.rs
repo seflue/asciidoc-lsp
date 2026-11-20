@@ -487,7 +487,7 @@ pub fn collect_diagnostics(
     }
 
     // 6. PDF theme and font paths
-    for mut diag in crate::pdf_theme::collect_pdf_diagnostics(documents, graph, registry) {
+    for mut diag in crate::pdf_theme::collect_pdf_diagnostics(workspace) {
         match &mut diag.kind {
             DiagnosticKind::PdfPathNotFound { path, .. } => *path = pdf_display_path(root, path),
             DiagnosticKind::PdfThemeEntryNotFound {

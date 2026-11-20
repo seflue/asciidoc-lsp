@@ -2,7 +2,8 @@
 
 use tree_sitter::{Node, Parser, Range};
 
-use crate::types::{AttributeRef, PossibleDefinition};
+use crate::extractors::parse_directive;
+use crate::types::{AttributeRef, Directive, PossibleDefinition};
 use crate::workspace::entry_name;
 
 /// A byte range of the source in which Asciidoctor substitutes attributes.
@@ -531,54 +532,53 @@ struct Preprocessor {
     possible: Vec<PossibleDefinition>,
 }
 
-/// The reader's view of the conditionals, line by line: `ifdef`, `ifndef`
-/// and `ifeval` at the start of a line. Their block form opens, `endif`
-/// closes; the single-line form with content opens nothing. Conditionals are
+/// The reader's view of the conditionals, line by line: the directives
+/// [`parse_directive`] takes, a line it rejects is text. Their block form
+/// opens, `endif` closes; the single-line form with content opens nothing. Conditionals are
 /// not evaluated (the attributes they test depend on the build), so the
 /// lines they cover are not checked; an entry in a single-line conditional
 /// is only a possible definition.
 fn scan_preprocessor(source: &str) -> Preprocessor {
-    let mut depth = 0usize;
+    // How many block conditionals are open.
+    let mut open = 0usize;
     let mut locked = Vec::new();
     let mut possible = Vec::new();
     for (index, line) in source.lines().enumerate() {
-        let directive = line
-            .strip_prefix("ifdef::")
-            .or_else(|| line.strip_prefix("ifndef::"));
-        if let Some(rest) = directive {
-            locked.push(true);
-            let content = rest
-                .split_once('[')
-                .and_then(|(_, content)| content.trim_end().strip_suffix(']'));
-            match content {
-                Some("") => depth += 1,
-                Some(content) => {
-                    let entry = content
-                        .strip_prefix(':')
-                        .and_then(|entry| entry.split_once(':'));
-                    if let Some((name, _)) = entry {
+        match parse_directive(line.trim_end()) {
+            Some(Directive::Condition { content, .. }) => {
+                locked.push(true);
+                match content {
+                    None => open += 1,
+                    Some(content) => {
+                        let entry = content
+                            .strip_prefix(':')
+                            .and_then(|entry| entry.split_once(':'));
+                        if let Some((name, _)) = entry {
+                            possible.push(PossibleDefinition {
+                                name: entry_name(name).0.to_string(),
+                                line: index + 1,
+                            });
+                        }
+                    }
+                }
+            }
+            Some(Directive::Ifeval) => {
+                locked.push(true);
+                open += 1;
+            }
+            Some(Directive::Endif) => {
+                locked.push(true);
+                open = open.saturating_sub(1);
+            }
+            None => {
+                locked.push(open > 0);
+                if open > 0 {
+                    if let Some(name) = entry_line_name(line) {
                         possible.push(PossibleDefinition {
-                            name: entry_name(name).0.to_string(),
+                            name: name.to_string(),
                             line: index + 1,
                         });
                     }
-                }
-                None => {}
-            }
-        } else if line.starts_with("ifeval::[") {
-            locked.push(true);
-            depth += 1;
-        } else if line.starts_with("endif::") {
-            locked.push(true);
-            depth = depth.saturating_sub(1);
-        } else {
-            locked.push(depth > 0);
-            if depth > 0 {
-                if let Some(name) = entry_line_name(line) {
-                    possible.push(PossibleDefinition {
-                        name: name.to_string(),
-                        line: index + 1,
-                    });
                 }
             }
         }
@@ -1092,6 +1092,19 @@ mod tests {
         let source = "ifdef::g[]\n{a}\nifdef::h[]\n{b}\nendif::[]\n{c}\nendif::[]\n{d}\n\
                       ifdef::g[{e}]\nifeval::[\"{f}\" == \"y\"]\n{g}\nendif::[]\n{h}\n";
         assert_eq!(names(source), ["d", "h"]);
+    }
+
+    /// The reader takes a directive it rejects for a text line, or drops it
+    /// without opening a block: whitespace in the target, text in an `endif`,
+    /// no target.
+    #[test]
+    fn malformed_directives_open_and_close_nothing() {
+        assert_eq!(conditional_lines("ifdef::a b[]\nX\n"), [false, false]);
+        assert_eq!(conditional_lines("ifdef::[]\nX\n"), [false, false]);
+        assert_eq!(
+            conditional_lines("ifdef::g[]\nendif::x[text]\nY\nendif::[]\nZ\n"),
+            [true, true, true, true, false]
+        );
     }
 
     #[test]

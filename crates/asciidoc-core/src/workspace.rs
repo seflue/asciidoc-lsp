@@ -201,14 +201,7 @@ impl Workspace {
         name: &str,
         line: Option<usize>,
     ) -> Option<PdfResolution> {
-        crate::pdf_theme::resolve_pdf_attribute(
-            &self.documents,
-            &self.include_graph,
-            &self.attributes,
-            file,
-            name,
-            line,
-        )
+        crate::pdf_theme::resolve_pdf_attribute(self, file, name, line)
     }
 
     /// The attributes in effect on `line` of `file`, one scope per top-level

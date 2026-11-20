@@ -1,7 +1,7 @@
 use crate::types::{
     Anchor, AttributeDef, AttributeRef, BlockTitle, ConditionalDirective, ConditionalKind,
-    ConditionalOperator, ImageMacro, IncludeMacro, Placement, Section, Span, UnterminatedBlock,
-    Xref,
+    ConditionalOperator, Directive, HeaderEntry, HeaderLine, ImageMacro, IncludeMacro, Placement,
+    Section, Span, UnterminatedBlock, Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -33,6 +33,229 @@ pub fn extract_block_images(node: tree_sitter::Node, source: &[u8]) -> Vec<Image
         &mut results,
     );
     results
+}
+
+/// What each line of `source` is to the reader of a document header, one per
+/// line. Asciidoctor reads the header line by line from the top-level
+/// document and the files it includes as one stream, which no tree of one
+/// file shows; this is the one place that classifies lines by their text
+/// (see "Zeilenklassifikation" in `architecture.org`). Only the level-0 title
+/// comes from the tree, and the lines of include macros from `includes`.
+#[must_use]
+pub fn extract_header_lines(
+    root: tree_sitter::Node,
+    source: &str,
+    includes: &[IncludeMacro],
+) -> Vec<HeaderLine> {
+    let title = title_line(root);
+    let lines: Vec<&str> = source.lines().map(str::trim_end).collect();
+    let mut classes = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let number = index + 1;
+        let (class, taken) = if title == Some(number) {
+            (HeaderLine::Title, 1)
+        } else if includes.iter().any(|include| include.line == number) {
+            (HeaderLine::Include, 1)
+        } else {
+            classify_header_line(&lines, index)
+        };
+        classes.push(class);
+        classes.extend((1..taken).map(|_| HeaderLine::Covered));
+        index += taken;
+    }
+    classes
+}
+
+/// The class of the text of a single-line conditional, `ifdef::a[:x: y]`:
+/// the reader takes it as the line that stands in the stream.
+#[must_use]
+pub(crate) fn classify_single_line(text: &str) -> HeaderLine {
+    classify_header_line(&[text.trim_end()], 0).0
+}
+
+/// The line the first level-0 title of the tree stands on.
+fn title_line(root: tree_sitter::Node) -> Option<usize> {
+    let mut cursor = root.walk();
+    for element in root.children(&mut cursor) {
+        let mut inner = element.walk();
+        let title = element
+            .named_children(&mut inner)
+            .find(|child| child.kind() == "document_title");
+        if let Some(title) = title {
+            return Some(title.start_position().row + 1);
+        }
+    }
+    None
+}
+
+/// The class of `lines[index]` and how many lines it takes, itself included.
+fn classify_header_line(lines: &[&str], index: usize) -> (HeaderLine, usize) {
+    let line = lines[index];
+    if line.is_empty() {
+        return (HeaderLine::Blank, 1);
+    }
+    if line.starts_with("//") {
+        if line.len() >= 4 && line.bytes().all(|byte| byte == b'/') {
+            // Asciidoctor skips the whole block, blank lines inside included.
+            return match lines[index + 1..].iter().position(|inner| *inner == line) {
+                Some(close) => (
+                    HeaderLine::BlockComment {
+                        end: Some(index + close + 2),
+                    },
+                    close + 2,
+                ),
+                None => (HeaderLine::BlockComment { end: None }, lines.len() - index),
+            };
+        }
+        // `///` and longer lines of other text are no comment.
+        return if line.starts_with("///") {
+            (HeaderLine::Text, 1)
+        } else {
+            (HeaderLine::Comment, 1)
+        };
+    }
+    if let Some(directive) = parse_directive(line) {
+        return (HeaderLine::Directive(directive), 1);
+    }
+    if let Some((entry, taken)) = parse_entry(lines, index) {
+        return (HeaderLine::Entry(entry), taken);
+    }
+    if is_block_metadata(line) {
+        let class = if takes_title(line) {
+            HeaderLine::TitleBlocker
+        } else {
+            HeaderLine::Metadata
+        };
+        return (class, 1);
+    }
+    if is_not_revision(line) {
+        return (HeaderLine::NotRevision, 1);
+    }
+    (HeaderLine::Text, 1)
+}
+
+/// Whether block metadata keeps the next level-0 line from being the
+/// document title: a block title, or a `discrete` or `float` style.
+fn takes_title(metadata: &str) -> bool {
+    let Some(attrlist) = metadata.strip_prefix('[') else {
+        return true;
+    };
+    let first = attrlist.split([',', ']']).next().unwrap_or_default();
+    let style = first.split(['#', '.', '%']).next().unwrap_or_default();
+    matches!(style.trim(), "discrete" | "float")
+}
+
+/// Whether `RevisionInfoLineRx` rejects `line`: it starts with a colon and
+/// no comma is followed by anything but a colon.
+fn is_not_revision(line: &str) -> bool {
+    line.starts_with(':')
+        && line
+            .match_indices(',')
+            .all(|(at, _)| line[at + 1..].starts_with(':'))
+}
+
+/// `ifdef`, `ifndef`, `ifeval` and `endif` as Asciidoctor's preprocessor
+/// takes them: at the start of a line, the target without whitespace, the
+/// line ending in `]`. A directive it would reject is a text line.
+pub(crate) fn parse_directive(line: &str) -> Option<Directive> {
+    if !line.ends_with(']') || line.starts_with('[') {
+        return None;
+    }
+    let (name, rest) = ["ifdef", "ifndef", "ifeval", "endif"]
+        .into_iter()
+        .find_map(|name| Some((name, line.strip_prefix(name)?.strip_prefix("::")?)))?;
+    let (target, text) = rest.split_once('[')?;
+    if target.contains(char::is_whitespace) {
+        return None;
+    }
+    let text = text.strip_suffix(']').filter(|text| !text.is_empty());
+    match name {
+        "endif" => text.is_none().then_some(Directive::Endif),
+        "ifeval" => (target.is_empty() && text.is_some()).then_some(Directive::Ifeval),
+        _ if target.is_empty() => None,
+        _ => {
+            let (operator, delimiter) = match target.find([',', '+']) {
+                Some(at) if target.as_bytes()[at] == b',' => (ConditionalOperator::Or, ','),
+                Some(_) => (ConditionalOperator::And, '+'),
+                None => (ConditionalOperator::Single, ','),
+            };
+            Some(Directive::Condition {
+                kind: if name == "ifdef" {
+                    ConditionalKind::Ifdef
+                } else {
+                    ConditionalKind::Ifndef
+                },
+                names: target
+                    .to_lowercase()
+                    .split(delimiter)
+                    .map(str::to_string)
+                    .collect(),
+                operator,
+                content: text.map(str::to_string),
+            })
+        }
+    }
+}
+
+/// An attribute entry line, `:name: value`, `:name!:` or `:!name:`, and the
+/// number of lines it takes: a value ending in ` \` (or ` +`) goes on in the
+/// next line, as long as that ends in it too.
+fn parse_entry(lines: &[&str], index: usize) -> Option<(HeaderEntry, usize)> {
+    let (name, after) = lines[index].strip_prefix(':')?.split_once(':')?;
+    let bare = name.strip_prefix('!').unwrap_or(name);
+    if !bare.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let unset = name.starts_with('!') || name.ends_with('!');
+    let name: String = bare
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    let mut value = after.trim_start_matches([' ', '\t']).to_string();
+    let mut taken = 1;
+    if let Some(marker) = [" \\", " +"].into_iter().find(|m| value.ends_with(m)) {
+        value.truncate(value.len() - marker.len());
+        value.truncate(value.trim_end().len());
+        while let Some(next) = lines.get(index + taken).filter(|next| !next.is_empty()) {
+            taken += 1;
+            let next = next.trim_start();
+            let open = next.ends_with(marker);
+            let piece = if open {
+                next[..next.len() - marker.len()].trim_end()
+            } else {
+                next
+            };
+            value = format!("{value} {piece}");
+            if !open {
+                break;
+            }
+        }
+    }
+    Some((
+        HeaderEntry {
+            name,
+            unset,
+            value: if unset { String::new() } else { value },
+        },
+        taken,
+    ))
+}
+
+/// An ID, an attribute list or a block title: a line that belongs to the
+/// block after it.
+fn is_block_metadata(line: &str) -> bool {
+    if line.starts_with('[') {
+        return line.ends_with(']');
+    }
+    line.strip_prefix('.').is_some_and(|title| {
+        let title = title.strip_prefix('.').unwrap_or(title);
+        title.starts_with(|c: char| !c.is_whitespace() && c != '.')
+    })
 }
 
 /// Paragraph styles Asciidoctor renders as verbatim text.
@@ -1245,6 +1468,141 @@ fn extract_block_macro_attrs(node: tree_sitter::Node, source: &[u8]) -> Vec<(Str
 mod tests {
     use super::*;
     use crate::parser;
+
+    fn header_lines_of(source: &str) -> Vec<HeaderLine> {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        let includes = extract_includes(tree.root_node(), source.as_bytes());
+        extract_header_lines(tree.root_node(), source, &includes)
+    }
+
+    fn entry(name: &str, value: &str) -> HeaderLine {
+        HeaderLine::Entry(HeaderEntry {
+            name: name.to_string(),
+            unset: false,
+            value: value.to_string(),
+        })
+    }
+
+    #[test]
+    fn header_lines_classify_each_kind_of_line() {
+        let source = "[[top]]\n[.cover]\n= T\nJane Doe\n// c\n:x: y\ninclude::a.adoc[]\n  \n";
+        assert_eq!(
+            header_lines_of(source),
+            vec![
+                HeaderLine::Metadata,
+                HeaderLine::Metadata,
+                HeaderLine::Title,
+                HeaderLine::Text,
+                HeaderLine::Comment,
+                entry("x", "y"),
+                HeaderLine::Include,
+                HeaderLine::Blank,
+            ]
+        );
+    }
+
+    #[test]
+    fn header_lines_take_continued_entries_and_comment_blocks_whole() {
+        let source = ":d: long \\\n  more \\\n  last\n////\nnote\n\n////\n:x: y\n";
+        assert_eq!(
+            header_lines_of(source),
+            vec![
+                entry("d", "long more last"),
+                HeaderLine::Covered,
+                HeaderLine::Covered,
+                HeaderLine::BlockComment { end: Some(7) },
+                HeaderLine::Covered,
+                HeaderLine::Covered,
+                HeaderLine::Covered,
+                entry("x", "y"),
+            ]
+        );
+        assert_eq!(
+            header_lines_of("////\nnote\n"),
+            vec![HeaderLine::BlockComment { end: None }, HeaderLine::Covered]
+        );
+        // A backslash without the space is part of the value.
+        assert_eq!(
+            header_lines_of(":d: a\\\nText\n"),
+            vec![entry("d", "a\\"), HeaderLine::Text]
+        );
+    }
+
+    #[test]
+    fn header_lines_tell_the_metadata_that_takes_the_title() {
+        assert_eq!(
+            header_lines_of(".Foo\n[discrete]\n[float,role=x]\n[role=x]\n[[id]]\n"),
+            vec![
+                HeaderLine::TitleBlocker,
+                HeaderLine::TitleBlocker,
+                HeaderLine::TitleBlocker,
+                HeaderLine::Metadata,
+                HeaderLine::Metadata,
+            ]
+        );
+        assert_eq!(
+            header_lines_of(":e,:f\n:e:f, x\n"),
+            vec![HeaderLine::NotRevision, HeaderLine::Text]
+        );
+    }
+
+    #[test]
+    fn header_lines_read_entries_as_asciidoctor_does() {
+        let unset = |name: &str| {
+            HeaderLine::Entry(HeaderEntry {
+                name: name.to_string(),
+                unset: true,
+                value: String::new(),
+            })
+        };
+        assert_eq!(
+            header_lines_of(":Not An-Entry: x\n:a!:\n:!b:\n :c: d\n:e:f\n///x\n"),
+            vec![
+                entry("notan-entry", "x"),
+                unset("a"),
+                unset("b"),
+                HeaderLine::Text,
+                HeaderLine::NotRevision,
+                HeaderLine::Text,
+            ]
+        );
+    }
+
+    #[test]
+    fn header_lines_classify_preprocessor_directives() {
+        let condition = |kind, names: &[&str], operator, content: Option<&str>| {
+            HeaderLine::Directive(Directive::Condition {
+                kind,
+                names: names.iter().map(ToString::to_string).collect(),
+                operator,
+                content: content.map(ToString::to_string),
+            })
+        };
+        let source = "ifdef::A,b[]\nifndef::a+b[:x: y]\nifeval::[1 == 1]\nendif::[]\n\\ifdef::a[]\nifdef::a b[]\nendif::x[text]\n";
+        assert_eq!(
+            header_lines_of(source),
+            vec![
+                condition(
+                    ConditionalKind::Ifdef,
+                    &["a", "b"],
+                    ConditionalOperator::Or,
+                    None
+                ),
+                condition(
+                    ConditionalKind::Ifndef,
+                    &["a", "b"],
+                    ConditionalOperator::And,
+                    Some(":x: y")
+                ),
+                HeaderLine::Directive(Directive::Ifeval),
+                HeaderLine::Directive(Directive::Endif),
+                HeaderLine::Text,
+                HeaderLine::Text,
+                HeaderLine::Text,
+            ]
+        );
+    }
 
     #[test]
     fn test_extract_sections() {

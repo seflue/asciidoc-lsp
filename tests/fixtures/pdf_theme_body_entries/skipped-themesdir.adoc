@@ -1,0 +1,5 @@
+= Themesdir in a skipped branch
+:pdf-theme: default-sans
+ifndef::backend-pdf[]
+:pdf-themesdir: /nonexistent
+endif::[]

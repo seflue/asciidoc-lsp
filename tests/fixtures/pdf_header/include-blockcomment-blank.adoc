@@ -1,0 +1,4 @@
+= T
+include::include-blockcomment-blank-included.adoc[]
+
+Body.
