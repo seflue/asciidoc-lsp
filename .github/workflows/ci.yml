@@ -49,7 +49,12 @@ jobs:
           rustup toolchain install
           rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
+      - name: Install Asciidoctor
+        run: sudo gem install asciidoctor -v 2.0.26
       - run: cargo test
+        env:
+          # A missing Asciidoctor fails the tests that need it, not skips them.
+          ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR: "1"
 
   build:
     name: Build

@@ -5165,12 +5165,7 @@ mod tests {
         server: &AsciiDocLsp,
     ) -> Option<(Uri, Uri, preview::testing::Stream)> {
         use preview::testing::{address, Stream};
-        if !std::process::Command::new("asciidoctor")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
-            eprintln!("skipped: asciidoctor is not on the PATH");
+        if !preview_converter::asciidoctor_available() {
             return None;
         }
         let (book, chapter) = (root.join("book.adoc"), root.join("ch1.adoc"));

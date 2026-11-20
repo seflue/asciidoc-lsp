@@ -464,6 +464,26 @@ fn extract_stylesheet(page: &str) -> Option<String> {
     Some(page[start..start + length].trim().to_owned())
 }
 
+/// Whether a real Asciidoctor is installed, for tests that need one. A test
+/// that finds none skips itself, unless `ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR` is
+/// set: then the missing Asciidoctor fails the test, so CI cannot pass
+/// without having run it.
+#[cfg(test)]
+pub(crate) fn asciidoctor_available() -> bool {
+    let available = std::process::Command::new("asciidoctor")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            std::env::var_os("ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR").is_none(),
+            "asciidoctor is not on the PATH, but ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR is set"
+        );
+        eprintln!("skipped: asciidoctor is not on the PATH");
+    }
+    available
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,7 +634,6 @@ mod tests {
     #[tokio::test]
     async fn test_header_attribute_overrides_config_attribute() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let converter = AsciidoctorConverter::new().unwrap();
@@ -668,17 +687,9 @@ mod tests {
         assert!(matches!(error, ConvertError::Failed { .. }));
     }
 
-    fn asciidoctor_available() -> bool {
-        std::process::Command::new("asciidoctor")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    }
-
     #[tokio::test]
     async fn test_nested_include_html_carries_source_lines_and_file_table() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -727,7 +738,6 @@ mod tests {
     #[tokio::test]
     async fn test_local_images_point_at_the_files_route() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -767,7 +777,6 @@ mod tests {
     #[tokio::test]
     async fn test_images_follow_imagesdir_relative_and_absolute() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -785,7 +794,6 @@ mod tests {
     #[tokio::test]
     async fn test_without_a_root_image_urls_stay_as_they_are() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -839,7 +847,6 @@ mod tests {
     #[tokio::test]
     async fn test_overlay_replaces_included_files_and_keeps_include_semantics() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -891,7 +898,6 @@ mod tests {
     #[tokio::test]
     async fn test_overlay_file_that_is_not_on_disk_can_be_included() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -913,7 +919,6 @@ mod tests {
     #[tokio::test]
     async fn test_overlay_matches_an_include_through_a_symlinked_folder() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -943,7 +948,6 @@ mod tests {
     #[tokio::test]
     async fn test_without_overlay_includes_come_from_disk() {
         if !asciidoctor_available() {
-            eprintln!("skipped: asciidoctor is not on the PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
