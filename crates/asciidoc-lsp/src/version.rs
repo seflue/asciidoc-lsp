@@ -1,17 +1,26 @@
 //! `--version` output: the version is stamped at build time (see `build.rs`).
 
 /// Picks the version string: the release override, else `git describe` as
-/// semver build metadata, else `0.0.0+unknown`. Empty values count as unset;
-/// a leading `v` is dropped. Versions come from tags only, so no package
-/// version is involved.
+/// semver build metadata, else `<package_version>+unknown`. Empty values count
+/// as unset; a leading `v` is dropped. Tags win while one is reachable;
+/// `package_version` (the Cargo version, which `just release` keeps equal to
+/// the latest tag) is only the base when no tag is.
 ///
 /// A local build prints `X.Y.Z+<n>.<sha>[.dirty]` (`n` commits after the tag),
-/// `X.Y.Z[+dirty]` on a tag, and `0.0.0+<sha>[.dirty]` when no tag is reachable.
-pub fn select_version(override_env: Option<&str>, git_describe: Option<&str>) -> String {
+/// `X.Y.Z[+dirty]` on a tag, and `<package_version>+<sha>[.dirty]` when no tag
+/// is reachable.
+pub fn select_version(
+    override_env: Option<&str>,
+    git_describe: Option<&str>,
+    package_version: &str,
+) -> String {
     if let Some(v) = non_empty(override_env) {
         return strip_v(v).to_owned();
     }
-    non_empty(git_describe).map_or_else(|| "0.0.0+unknown".to_owned(), describe_to_semver)
+    non_empty(git_describe).map_or_else(
+        || format!("{package_version}+unknown"),
+        |d| describe_to_semver(d, package_version),
+    )
 }
 
 fn non_empty(v: Option<&str>) -> Option<&str> {
@@ -23,7 +32,7 @@ fn strip_v(v: &str) -> &str {
 }
 
 /// Rewrites `git describe --tags --always --dirty` output as semver build metadata.
-fn describe_to_semver(describe: &str) -> String {
+fn describe_to_semver(describe: &str, package_version: &str) -> String {
     let describe = strip_v(describe);
     let (rest, dirty) = describe
         .strip_suffix("-dirty")
@@ -39,7 +48,7 @@ fn describe_to_semver(describe: &str) -> String {
     } else if rest.contains('.') {
         rest.to_owned()
     } else {
-        format!("0.0.0+{rest}")
+        format!("{package_version}+{rest}")
     };
     if dirty {
         out.push(if out.contains('+') { '.' } else { '+' });
@@ -58,6 +67,7 @@ pub fn build_version() -> String {
     select_version(
         option_env!("ASCIIDOC_LSP_BUILD_VERSION"),
         option_env!("ASCIIDOC_LSP_BUILD_GIT_DESCRIBE"),
+        env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -71,68 +81,69 @@ pub fn wants_version<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> bool 
 mod tests {
     use super::*;
 
+    const PKG: &str = "0.9.0";
+
+    fn select(override_env: Option<&str>, git_describe: Option<&str>) -> String {
+        select_version(override_env, git_describe, PKG)
+    }
+
     #[test]
     fn test_env_var_wins_over_git_describe() {
-        assert_eq!(
-            select_version(Some("0.7.0"), Some("v0.6.0-12-gabc1234")),
-            "0.7.0"
-        );
+        assert_eq!(select(Some("0.7.0"), Some("v0.6.0-12-gabc1234")), "0.7.0");
     }
 
     #[test]
     fn test_leading_v_is_stripped_from_env_var() {
-        assert_eq!(select_version(Some("v0.7.0"), None), "0.7.0");
+        assert_eq!(select(Some("v0.7.0"), None), "0.7.0");
     }
 
     #[test]
     fn test_exact_tag_is_the_bare_version() {
-        assert_eq!(select_version(None, Some("v0.9.0")), "0.9.0");
+        assert_eq!(select(None, Some("v0.9.0")), "0.9.0");
     }
 
     #[test]
     fn test_commits_after_tag_become_build_metadata() {
+        assert_eq!(select(None, Some("v0.9.0-18-ge63ebcd")), "0.9.0+18.e63ebcd");
         assert_eq!(
-            select_version(None, Some("v0.9.0-18-ge63ebcd")),
-            "0.9.0+18.e63ebcd"
-        );
-        assert_eq!(
-            select_version(None, Some("v0.9.0-18-ge63ebcd-dirty")),
+            select(None, Some("v0.9.0-18-ge63ebcd-dirty")),
             "0.9.0+18.e63ebcd.dirty"
         );
     }
 
     #[test]
     fn test_dirty_on_exact_tag() {
-        assert_eq!(select_version(None, Some("v0.9.0-dirty")), "0.9.0+dirty");
+        assert_eq!(select(None, Some("v0.9.0-dirty")), "0.9.0+dirty");
     }
 
     #[test]
     fn test_prerelease_tag_keeps_its_prerelease_part() {
         assert_eq!(
-            select_version(None, Some("v0.10.0-rc.1-3-gabc1234")),
+            select(None, Some("v0.10.0-rc.1-3-gabc1234")),
             "0.10.0-rc.1+3.abc1234"
         );
-        assert_eq!(select_version(None, Some("v0.10.0-rc.1")), "0.10.0-rc.1");
+        assert_eq!(select(None, Some("v0.10.0-rc.1")), "0.10.0-rc.1");
     }
 
     #[test]
-    fn test_bare_hash_without_tag_uses_zero_version() {
-        assert_eq!(select_version(None, Some("e63ebcd")), "0.0.0+e63ebcd");
+    fn test_bare_hash_without_tag_uses_package_version() {
+        assert_eq!(select(None, Some("e63ebcd")), "0.9.0+e63ebcd");
+        assert_eq!(select(None, Some("e63ebcd-dirty")), "0.9.0+e63ebcd.dirty");
         assert_eq!(
-            select_version(None, Some("e63ebcd-dirty")),
-            "0.0.0+e63ebcd.dirty"
+            select_version(None, Some("e63ebcd"), "1.2.3"),
+            "1.2.3+e63ebcd"
         );
     }
 
     #[test]
     fn test_empty_values_fall_through() {
-        assert_eq!(select_version(Some(" "), Some("abc1234")), "0.0.0+abc1234");
-        assert_eq!(select_version(Some(""), Some("")), "0.0.0+unknown");
+        assert_eq!(select(Some(" "), Some("abc1234")), "0.9.0+abc1234");
+        assert_eq!(select(Some(""), Some("")), "0.9.0+unknown");
     }
 
     #[test]
-    fn test_fallback_is_zero_version_unknown() {
-        assert_eq!(select_version(None, None), "0.0.0+unknown");
+    fn test_fallback_is_package_version_unknown() {
+        assert_eq!(select(None, None), "0.9.0+unknown");
     }
 
     #[test]
