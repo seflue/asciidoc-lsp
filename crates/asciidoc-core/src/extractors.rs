@@ -319,9 +319,33 @@ fn walk_for_verbatim_paragraphs(
                     .map(|child| child.start_position().row + 1..=last_line(*child)),
             );
         }
+        // A verse quote block is no compound block: whatever the grammar
+        // reads as a block macro inside it is a verse line.
+        if style == Some(VERSE_STYLE) {
+            for quote in children
+                .iter()
+                .filter(|child| child.kind() == "quoted_block")
+            {
+                push_block_macro_rows(*quote, results);
+            }
+        }
     }
     for child in children {
         walk_for_verbatim_paragraphs(child, source, results);
+    }
+}
+
+fn push_block_macro_rows(
+    node: tree_sitter::Node,
+    results: &mut Vec<std::ops::RangeInclusive<usize>>,
+) {
+    if node.kind() == "block_macro" {
+        results.push(node.start_position().row + 1..=last_line(node));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        push_block_macro_rows(child, results);
     }
 }
 
@@ -1002,7 +1026,7 @@ fn is_block_anchor_syntax(line: &str) -> bool {
 }
 
 /// `(end marker kind, Asciidoctor context)` of a delimited block node kind.
-fn block_context(kind: &str) -> Option<(&'static str, &'static str)> {
+pub(crate) fn block_context(kind: &str) -> Option<(&'static str, &'static str)> {
     Some(match kind {
         "listing_block" => ("listing_block_end_marker", "listing"),
         "literal_block" => ("literal_block_marker", "literal"),
@@ -1317,13 +1341,12 @@ fn walk_for_inline_ranges(
             | "block_title"
             | "quoted_line"
             | "admonition"
-            | "quoted_block"
             | "quoted_md_block"
             | "description_list_item"
     );
 
     if is_inline_container {
-        let is_quote = matches!(parent_kind, "quoted_block" | "quoted_md_block");
+        let is_quote = parent_kind == "quoted_md_block";
         let mut raw_delimiter: Option<String> = None;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -1354,9 +1377,9 @@ fn walk_for_inline_ranges(
     }
 }
 
-/// Quote content is stored as raw `line` children, so nested raw blocks
-/// (listing, literal, passthrough, block comment) and line comments show up
-/// as prose. Returns true for lines that Asciidoctor does not read as text:
+/// Markdown quote content is stored as raw `line` children, so nested raw
+/// blocks (listing, literal, passthrough, block comment) and line comments
+/// show up as prose. Returns true for lines that Asciidoctor does not read as text:
 /// the delimiters themselves, everything between them, and `//` comments.
 /// `raw_delimiter` carries the open delimiter across calls.
 fn is_raw_quote_line(

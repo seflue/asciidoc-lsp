@@ -513,6 +513,13 @@ impl<'a> Layout<'a> {
         self.attributes_above(row)
             .is_none_or(|attributes| attributes.into_iter().any(rules_out_ventilation))
     }
+
+    /// Like [`Self::ruled_out_above`] for a `____` block, where the `quote`
+    /// style is the block's own.
+    fn ruled_out_above_quote(&self, row: usize) -> bool {
+        self.attributes_above(row)
+            .is_none_or(|attributes| attributes.into_iter().any(rules_out_quote_block))
+    }
 }
 
 fn layout<'a>(root: tree_sitter::Node, source: &'a str) -> Layout<'a> {
@@ -551,6 +558,11 @@ fn walk_for_layout<'a>(node: tree_sitter::Node, source: &'a str, layout: &mut La
             "sidebar_block" | "delimited_block" if !layout.ruled_out_above(row) => {
                 walk_for_layout(child, source, layout);
             }
+            // A quote block is compound; only `[verse]` makes it verbatim.
+            // `[quote]` over `--` makes the open block a quote block.
+            "quoted_block" | "open_block" if !layout.ruled_out_above_quote(row) => {
+                walk_for_layout(child, source, layout);
+            }
             _ => {}
         }
     }
@@ -579,8 +591,27 @@ fn has_error_near(root: tree_sitter::Node, group: &Range<usize>) -> bool {
         .any(|rows| rows.start < neighbourhood.end && neighbourhood.start < rows.end)
 }
 
-/// Rows covered by `ERROR` and `MISSING` nodes.
+/// Whether `node` is the end marker of an unclosed delimited block.
+/// Asciidoctor only warns and reads the rest as the block's content, so it
+/// leaves the paragraphs inside intact.
+fn is_missing_block_end(node: tree_sitter::Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    // A table is no block of `block_context`, but its end marker is named
+    // after it all the same, and Asciidoctor warns about it the same way.
+    let table_end = parent.kind().ends_with("table_block")
+        && node.kind().strip_suffix("_marker") == Some(parent.kind());
+    table_end
+        || crate::extractors::block_context(parent.kind())
+            .is_some_and(|(end_marker, _)| end_marker == node.kind())
+}
+
+/// Rows covered by `ERROR` and `MISSING` nodes, except unclosed block ends.
 fn walk_for_error_rows(node: tree_sitter::Node, rows: &mut Vec<Range<usize>>) {
+    if node.is_missing() && is_missing_block_end(node) {
+        return;
+    }
     if node.is_error() || node.is_missing() {
         let covered = rows_of(node);
         rows.push(covered.start..covered.end.max(covered.start + 1));
@@ -694,6 +725,17 @@ fn block_attribute_line(line: &str) -> Option<&str> {
 /// under which line breaks are significant, or an admonition or quote style
 /// the MVP leaves alone.
 fn rules_out_ventilation(attr: &str) -> bool {
+    rules_out_attributes(attr, None)
+}
+
+/// [`rules_out_ventilation`] for the attribute list of a `____` block.
+fn rules_out_quote_block(attr: &str) -> bool {
+    rules_out_attributes(attr, Some("quote"))
+}
+
+/// Whether the attribute list rules ventilation out, except for the style
+/// `own_style`.
+fn rules_out_attributes(attr: &str, own_style: Option<&str>) -> bool {
     let entries = split_attribute_list(attr);
     let positional_options = entries
         .first()
@@ -701,23 +743,27 @@ fn rules_out_ventilation(attr: &str) -> bool {
         .is_some_and(|first| {
             let style_end = first.find(['#', '.', '%']).unwrap_or(first.len());
             let (style, shorthands) = first.split_at(style_end);
-            matches!(
-                style.trim(),
-                "verse"
-                    | "source"
-                    | "literal"
-                    | "pass"
-                    | "listing"
-                    | "quote"
-                    | "NOTE"
-                    | "TIP"
-                    | "IMPORTANT"
-                    | "WARNING"
-                    | "CAUTION"
-            ) || shorthands
-                .split('%')
-                .skip(1)
-                .any(|option| option.split(['#', '.']).next() == Some("hardbreaks"))
+            let style = style.trim();
+            Some(style) != own_style
+                && matches!(
+                    style,
+                    "verse"
+                        | "source"
+                        | "literal"
+                        | "pass"
+                        | "listing"
+                        | "comment"
+                        | "quote"
+                        | "NOTE"
+                        | "TIP"
+                        | "IMPORTANT"
+                        | "WARNING"
+                        | "CAUTION"
+                )
+                || shorthands
+                    .split('%')
+                    .skip(1)
+                    .any(|option| option.split(['#', '.']).next() == Some("hardbreaks"))
         });
     let named_options = entries
         .iter()
@@ -1341,6 +1387,49 @@ mod tests {
         1,
         "Ende.\nAm 30. Oktober war es.\nDann.\n"
     )]
+    // A quote block is compound: its paragraphs are paragraphs
+    #[case::quote_block("____\nQuote. Two.\n____\n", 2, "____\nQuote.\nTwo.\n____\n")]
+    #[case::quote_block_with_style_and_attribution(
+        "[quote,Author,Source]\n____\nQuote. Two.\n____\n",
+        3,
+        "[quote,Author,Source]\n____\nQuote.\nTwo.\n____\n"
+    )]
+    #[case::second_paragraph_in_quote_block(
+        "____\nFirst. Para.\n\nSecond. Para.\n____\n",
+        4,
+        "____\nFirst. Para.\n\nSecond.\nPara.\n____\n"
+    )]
+    #[case::unclosed_quote_block("____\nQuote. Two.\n", 2, "____\nQuote.\nTwo.\n")]
+    #[case::unclosed_example_block("====\nOne. Two.\n", 2, "====\nOne.\nTwo.\n")]
+    #[case::unclosed_sidebar_block("****\nOne. Two.\n", 2, "****\nOne.\nTwo.\n")]
+    #[case::quote_styled_open_block(
+        "[quote,Author,Source]\n--\nOne. Two.\n--\n",
+        3,
+        "[quote,Author,Source]\n--\nOne.\nTwo.\n--\n"
+    )]
+    #[case::open_block("--\nOne. Two.\n--\n", 2, "--\nOne.\nTwo.\n--\n")]
+    #[case::unclosed_open_block("--\nOne. Two.\n", 2, "--\nOne.\nTwo.\n")]
+    #[case::abstract_open_block(
+        "[abstract]\n--\nOne. Two.\n--\n",
+        3,
+        "[abstract]\n--\nOne.\nTwo.\n--\n"
+    )]
+    #[case::partintro_open_block(
+        "[partintro]\n--\nOne. Two.\n--\n",
+        3,
+        "[partintro]\n--\nOne.\nTwo.\n--\n"
+    )]
+    #[case::unclosed_table_without_line_ending("One. Two.\n|===", 1, "One.\nTwo.\n|===")]
+    #[case::nested_quote_block(
+        "______\nOuter. Text.\n\n____\nInner. Text.\n____\n______\n",
+        5,
+        "______\nOuter. Text.\n\n____\nInner.\nText.\n____\n______\n"
+    )]
+    #[case::paragraph_after_list_in_quote_block(
+        "____\n* Item.\n\nAfter. List.\n____\n",
+        4,
+        "____\n* Item.\n\nAfter.\nList.\n____\n"
+    )]
     // A line holding only a formatted label ending in `:` stays on its own
     #[case::bold_label_line(
         "*Context:*\nThe server needs a parser. It must be fast.\n",
@@ -1435,7 +1524,25 @@ mod tests {
     #[case::attribute_entry(":attr: Val. Ue.\n", 1)]
     #[case::block_attribute_line("[source,rust]\nlet a = 1;\n", 1)]
     #[case::block_title_line(".Title. With dot\nFirst. Second.\n", 1)]
-    #[case::quote_block("____\nQuote. Two.\n____\n", 2)]
+    // A grammar error in or next to the paragraph is left alone
+    #[case::error_node_around_paragraph("____\nOne. Two.\n|===\n", 2)]
+    #[case::error_node_below_paragraph("One. Two.\n++++\nx\n", 1)]
+    // Admonition and comment styles over an open block
+    #[case::note_styled_open_block("[NOTE]\n--\nOne. Two.\n--\n", 3)]
+    #[case::comment_styled_open_block("[comment]\n--\nOne. Two.\n--\n", 3)]
+    #[case::comment_style("[comment]\nOne. Two.\n", 2)]
+    // Verbatim lines, not paragraphs
+    #[case::source_styled_open_block("[source]\n--\nOne. Two.\n--\n", 3)]
+    #[case::listing_styled_open_block("[listing]\n--\nOne. Two.\n--\n", 3)]
+    #[case::literal_styled_open_block("[literal]\n--\nOne. Two.\n--\n", 3)]
+    #[case::pass_styled_open_block("[pass]\n--\nOne. Two.\n--\n", 3)]
+    #[case::verse_styled_open_block("[verse]\n--\nOne. Two.\n--\n", 3)]
+    #[case::verse_styled_quote_block("[verse]\n____\nOne. Two.\n____\n", 3)]
+    #[case::verse_with_author_on_quote_block(
+        "[verse,Carl Sandburg,Fog]\n____\nOne. Two.\n____\n",
+        3
+    )]
+    #[case::hardbreaks_quote_block("[%hardbreaks]\n____\nOne. Two.\n____\n", 3)]
     #[case::description_list_with_lowercase_term("term:: Def. Two.\nmore. Yes.\n", 2)]
     #[case::hard_line_break("Hard. Break +\nnext. Line.\n", 1)]
     #[case::hard_line_break_on_later_line("First. Line.\nHard. Break +\nnext.\n", 1)]
