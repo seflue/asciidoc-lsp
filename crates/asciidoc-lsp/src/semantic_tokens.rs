@@ -654,6 +654,61 @@ mod tests {
         }
     }
 
+    fn has_admonition(tokens: &[Decoded], line: u32, text: &str) -> bool {
+        on_line(tokens, line)
+            .iter()
+            .any(|t| t.ty == "admonition" && t.text == text && t.mods == ["note"])
+    }
+
+    /// Every direct paragraph of a `[NOTE]` example block is marked, also
+    /// those after a list or a listing, not only the leading run.
+    #[test]
+    fn admonition_block_marks_paragraphs_after_a_list() {
+        let tokens =
+            decoded("[NOTE]\n====\nfirst\n\n* item\n\nafter\n\n----\ncode\n----\n\nlast\n====\n");
+
+        for (line, text) in [(2, "first"), (6, "after"), (12, "last")] {
+            assert!(
+                has_admonition(&tokens, line, text),
+                "line {line}: {tokens:#?}"
+            );
+        }
+    }
+
+    /// The body of a `[NOTE]` open block is marked like an example block's.
+    #[test]
+    fn admonition_open_block_body_is_marked() {
+        let tokens = decoded("[NOTE]\n--\nopen\n\n* item\n\nafter\n--\n");
+
+        for (line, text) in [(2, "open"), (6, "after")] {
+            assert!(
+                has_admonition(&tokens, line, text),
+                "line {line}: {tokens:#?}"
+            );
+        }
+    }
+
+    /// The style line is marked above a paragraph, and carries no admonition
+    /// token above a listing, a sidebar or a list: the block is no
+    /// admonition there, so neither its body.
+    #[test]
+    fn admonition_style_line_is_marked_only_above_admonition_blocks() {
+        let paragraph = decoded("[NOTE]\ntext\n");
+        assert!(has_admonition(&paragraph, 0, "NOTE"), "{paragraph:#?}");
+
+        for content in [
+            "[NOTE]\n----\ncode\n----\n",
+            "[NOTE]\n****\nside\n****\n",
+            "[NOTE]\n* item\n",
+        ] {
+            let tokens = decoded(content);
+            assert!(
+                tokens.iter().all(|t| t.ty != "admonition"),
+                "{content:?}: {tokens:#?}"
+            );
+        }
+    }
+
     /// A listing with named attributes only has no style: raw body.
     #[test]
     fn listing_with_named_attributes_only_is_raw() {
