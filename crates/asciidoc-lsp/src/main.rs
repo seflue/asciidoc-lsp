@@ -5023,8 +5023,7 @@ mod tests {
         change_document(server, &uri_a, 2, "beta").await;
         stream.until("<p>beta</p>").await;
 
-        // A buffer that is not shown does not convert; moving the cursor
-        // into it switches the page to it.
+        // Moving the cursor into another buffer switches the page to it.
         open_document(server, &uri_b, "gamma").await;
         server
             .cursor_moved(CursorMovedParams {

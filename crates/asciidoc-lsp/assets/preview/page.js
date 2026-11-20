@@ -83,8 +83,11 @@
   function onHtml(message) {
     // Without a cursor to follow, keep the line at the top of the page where
     // it is, even if the content above it changes height.
+    // The line of another document says nothing about the new one.
     var keepLine =
-      followOn() && cursorApplies() ? null : maps.sourceLineAtViewportTop(anchors(), 0)
+      (followOn() && cursorApplies()) || message.file !== shownFile
+        ? null
+        : maps.sourceLineAtViewportTop(anchors(), 0)
     patch(message.html)
     shownFile = message.file
     lineCount = message.lineCount

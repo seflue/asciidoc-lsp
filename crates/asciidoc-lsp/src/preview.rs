@@ -6,7 +6,7 @@
 //! random token (a wrong token is a 404), and the `Host` header must name that
 //! address and port (anything else is a 403, which stops DNS rebinding).
 //!
-//! HTTP is hand-written on `tokio::net`: the server answers `GET` for six
+//! HTTP is hand-written on `tokio::net`: the server answers `GET` for five
 //! fixed routes and one event stream, so a request parser of a few lines
 //! replaces hyper, hyper-util and http-body-util.
 //!
@@ -169,7 +169,8 @@ impl Shared {
 
 /// A running preview server and the converter feeding it.
 ///
-/// Dropping it stops the server and the converter worker.
+/// Dropping it stops accepting connections and ends the converter worker.
+/// Event streams that are already open end with their client.
 #[derive(Debug)]
 pub struct Preview {
     shared: Arc<Shared>,
@@ -415,7 +416,11 @@ fn reason(status: u16) -> &'static str {
 }
 
 const COMMON_HEADERS: &str = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
-                              Referrer-Policy: no-referrer\r\n";
+                              Referrer-Policy: no-referrer\r\n\
+                              Content-Security-Policy: default-src 'none'; script-src 'self'; \
+                              style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+                              connect-src 'self'; base-uri 'none'; form-action 'none'; \
+                              frame-ancestors 'none'\r\n";
 
 async fn write_response(
     stream: &mut TcpStream,
@@ -482,7 +487,10 @@ async fn serve_events(mut stream: TcpStream, shared: &Shared) -> io::Result<()> 
             next = events.recv() => match next {
                 Ok(event) => write_events(&mut stream, &[event]).await?,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let replay = shared.snapshot.lock().replay();
+                    // Resubscribing drops the stale events still buffered for
+                    // this receiver; the snapshot matches the new receiver.
+                    let replay;
+                    (events, replay) = shared.subscribe();
                     write_events(&mut stream, &replay).await?;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -601,6 +609,31 @@ mod tests {
         assert!(status_line(&response).contains("404"), "{response}");
         let response = get(port, "/", &format!("127.0.0.1:{port}")).await;
         assert!(status_line(&response).contains("404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_content_security_policy() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        for target in [
+            format!("/{token}/"),
+            format!("/{token}/page.js"),
+            format!("/{token}/style.css"),
+            "/wrong/".to_owned(),
+        ] {
+            let response = get(port, &target, &host).await;
+            assert!(
+                response
+                    .contains("Content-Security-Policy: default-src 'none'; script-src 'self';"),
+                "{target}: {response}"
+            );
+            assert!(response.contains("frame-ancestors 'none'"), "{target}");
+            assert!(
+                response.contains("X-Content-Type-Options: nosniff"),
+                "{target}"
+            );
+        }
     }
 
     #[tokio::test]
