@@ -24,6 +24,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -211,7 +212,11 @@ impl Preview {
         let url = format!("http://127.0.0.1:{port}/{}/", shared.token);
         let (convert, outcomes) = preview_converter::spawn(converter, debounce);
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&shared)));
-        let pump = tokio::spawn(pump_outcomes(outcomes, Arc::clone(&shared)));
+        let pump = tokio::spawn(pump_outcomes(
+            outcomes,
+            convert.latest_generation(),
+            Arc::clone(&shared),
+        ));
         Ok(Self {
             shared,
             url,
@@ -263,8 +268,16 @@ impl Drop for Preview {
     }
 }
 
-async fn pump_outcomes(mut outcomes: mpsc::UnboundedReceiver<ConvertOutcome>, shared: Arc<Shared>) {
+async fn pump_outcomes(
+    mut outcomes: mpsc::UnboundedReceiver<ConvertOutcome>,
+    latest: Arc<AtomicU64>,
+    shared: Arc<Shared>,
+) {
     while let Some(outcome) = outcomes.recv().await {
+        // A newer request exists: its own outcome is on the way.
+        if outcome.is_stale(&latest) {
+            continue;
+        }
         shared.publish_outcome(outcome);
     }
 }

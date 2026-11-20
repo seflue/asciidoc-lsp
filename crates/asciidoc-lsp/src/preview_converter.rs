@@ -3,13 +3,17 @@
 //!
 //! [`spawn`] starts the worker: send [`ConvertRequest`]s through the
 //! [`ConvertHandle`], read finished [`ConvertOutcome`]s from the receiver.
-//! A request that arrives while a run is under way kills that run, and an
-//! outcome is never sent once a newer request exists.
+//! A request that arrives while a run is under way kills that run. Each
+//! request gets a generation number, which its [`ConvertOutcome`] carries; an
+//! outcome can still be queued when a newer request arrives, so a consumer
+//! drops outcomes for which [`ConvertOutcome::is_stale`] holds.
 
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -57,11 +61,22 @@ pub struct ConvertRequest {
 /// The result for one request.
 #[derive(Debug)]
 pub struct ConvertOutcome {
+    /// The generation of the request, as counted by the [`ConvertHandle`].
+    pub generation: u64,
     /// The document the request named.
     pub file: PathBuf,
     /// The embedded HTML, with `data-line-N` / `data-src-K` classes and the
     /// file table in `<script id="adoc-source-files">`, or why not.
     pub result: Result<String, ConvertError>,
+}
+
+impl ConvertOutcome {
+    /// Whether a newer request than this outcome's has been made, given the
+    /// counter from [`ConvertHandle::latest_generation`].
+    #[must_use]
+    pub fn is_stale(&self, latest: &AtomicU64) -> bool {
+        self.generation < latest.load(Ordering::SeqCst)
+    }
 }
 
 /// Something that converts one request. Dropping the returned future must
@@ -77,14 +92,23 @@ pub trait Convert: Send + Sync + 'static {
 /// dropped.
 #[derive(Debug, Clone)]
 pub struct ConvertHandle {
-    requests: mpsc::UnboundedSender<ConvertRequest>,
+    requests: mpsc::UnboundedSender<(u64, ConvertRequest)>,
+    latest: Arc<AtomicU64>,
 }
 
 impl ConvertHandle {
     /// Queue `request`; it replaces any request not yet converted. Returns
     /// `false` if the worker has ended.
     pub fn request(&self, request: ConvertRequest) -> bool {
-        self.requests.send(request).is_ok()
+        let generation = self.latest.fetch_add(1, Ordering::SeqCst) + 1;
+        self.requests.send((generation, request)).is_ok()
+    }
+
+    /// The generation of the newest request made so far; outcomes with a
+    /// smaller generation are stale.
+    #[must_use]
+    pub fn latest_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.latest)
     }
 }
 
@@ -96,18 +120,24 @@ pub fn spawn<C: Convert>(
     let (requests, request_rx) = mpsc::unbounded_channel();
     let (outcome_tx, outcomes) = mpsc::unbounded_channel();
     tokio::spawn(run(converter, debounce, request_rx, outcome_tx));
-    (ConvertHandle { requests }, outcomes)
+    (
+        ConvertHandle {
+            requests,
+            latest: Arc::new(AtomicU64::new(0)),
+        },
+        outcomes,
+    )
 }
 
 async fn run<C: Convert>(
     converter: C,
     debounce: Duration,
-    mut requests: mpsc::UnboundedReceiver<ConvertRequest>,
+    mut requests: mpsc::UnboundedReceiver<(u64, ConvertRequest)>,
     outcomes: mpsc::UnboundedSender<ConvertOutcome>,
 ) {
     let mut carried = None;
     loop {
-        let mut request = match carried.take() {
+        let (mut generation, mut request) = match carried.take() {
             Some(request) => request,
             None => match requests.recv().await {
                 Some(request) => request,
@@ -118,7 +148,7 @@ async fn run<C: Convert>(
         loop {
             tokio::select! {
                 newer = requests.recv() => match newer {
-                    Some(newer) => request = newer,
+                    Some(newer) => (generation, request) = newer,
                     None => return,
                 },
                 () = tokio::time::sleep(debounce) => break,
@@ -146,6 +176,7 @@ async fn run<C: Convert>(
             continue;
         }
         let outcome = ConvertOutcome {
+            generation,
             file: request.file,
             result,
         };
@@ -272,8 +303,21 @@ impl AsciidoctorConverter {
             .arg(base_dir)
             .arg("-a")
             .arg(format!("docfile={}", request.file.display()));
+        // Stdin input leaves these unset, a file input derives them.
+        if let Some(stem) = request.file.file_stem() {
+            command
+                .arg("-a")
+                .arg(format!("docname={}", stem.to_string_lossy()));
+        }
+        if let Some(extension) = request.file.extension() {
+            command
+                .arg("-a")
+                .arg(format!("docfilesuffix=.{}", extension.to_string_lossy()));
+        }
+        // The trailing `@` makes each a soft set, so the document header can
+        // still override a config value; a plain `-a` locks the attribute.
         for (name, value) in &request.attributes {
-            command.arg("-a").arg(format!("{name}={value}"));
+            command.arg("-a").arg(format!("{name}={value}@"));
         }
         command
             .args(["-o", "-", "-"])
@@ -401,6 +445,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_requests_spread_over_time_reset_the_debounce() {
+        let (fake, started, _) = fake(Duration::from_millis(1));
+        let (handle, mut outcomes) = spawn(fake, Duration::from_millis(150));
+        // Each gap is shorter than the debounce, the whole burst is longer.
+        for text in ["a", "b", "c", "d"] {
+            handle.request(request(text));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        assert_eq!(next_html(&mut outcomes).await, "d");
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_outcome_generation_marks_stale_results() {
+        let (fake, _, _) = fake(Duration::from_millis(1));
+        let (handle, mut outcomes) = spawn(fake, Duration::from_millis(10));
+        let latest = handle.latest_generation();
+        handle.request(request("a"));
+        let outcome = outcomes.recv().await.unwrap();
+        assert_eq!(outcome.generation, 1);
+        assert!(!outcome.is_stale(&latest));
+        handle.request(request("b"));
+        assert!(outcome.is_stale(&latest));
+    }
+
+    #[test]
+    fn test_command_sets_config_attributes_softly_and_docname() {
+        let converter = AsciidoctorConverter::with_program("asciidoctor").unwrap();
+        let mut request = request("= T");
+        request.file = PathBuf::from("/work/guide.adoc");
+        request.attributes = vec![("toc".to_owned(), "left".to_owned())];
+        let command = converter.command(&request);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "toc=left@",
+            "docname=guide",
+            "docfilesuffix=.adoc",
+            "docfile=/work/guide.adoc",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "{expected}: {args:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_header_attribute_overrides_config_attribute() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let converter = AsciidoctorConverter::new().unwrap();
+        let mut request = request("= T\n:foo: header\n\n{foo} {docname}\n");
+        request.file = PathBuf::from("/work/guide.adoc");
+        request.attributes = vec![("foo".to_owned(), "config".to_owned())];
+        let html = converter.convert(&request).await.unwrap();
+        assert!(html.contains("header guide"), "{html}");
+    }
+
+    #[tokio::test]
     async fn test_newer_request_aborts_the_running_conversion() {
         let (fake, started, finished) = fake(Duration::from_millis(400));
         let (handle, mut outcomes) = spawn(fake, Duration::from_millis(10));
@@ -466,7 +576,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(html.contains("data-line-"), "{html}");
+        // A block of the main file has a line but no `data-src`.
+        assert!(html.contains(r#"class="paragraph data-line-5""#), "{html}");
+        // A block of inner.adoc (file 1) after two nested includes: its own
+        // line, not the line of the include that pulled it in.
+        assert!(
+            html.contains(r#"class="paragraph data-src-1 data-line-3""#),
+            "{html}"
+        );
         assert!(html.contains("data-src-0"), "{html}");
         assert!(html.contains(r#"id="adoc-source-files""#), "{html}");
         assert!(html.contains("mid.adoc"), "{html}");
