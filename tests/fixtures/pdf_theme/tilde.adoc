@@ -1,0 +1,3 @@
+= Tilde Paths
+:pdf-themesdir: ~/themes
+:pdf-fontsdir: ~/fonts;~

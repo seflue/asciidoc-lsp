@@ -59,8 +59,8 @@ pub enum PdfPath {
     /// working directory.
     Relative(String),
     /// Not checkable: an attribute reference left unresolved, an empty or
-    /// `.yaml` theme, or a theme inside a themes directory that is itself
-    /// not checkable.
+    /// `.yaml` theme, a leading `~` (the home directory of the build), or a
+    /// theme inside a themes directory that is itself not checkable.
     Unknown(String),
 }
 
@@ -202,7 +202,8 @@ fn is_unresolved(value: &str) -> bool {
 
 /// Resolve a directory value the way Asciidoctor PDF's `File.expand_path` does.
 fn resolve_dir(value: &str) -> PdfPath {
-    if is_unresolved(value) {
+    // `File.expand_path` also expands a leading `~` (or `~user`) to a home directory.
+    if is_unresolved(value) || value.starts_with('~') {
         PdfPath::Unknown(value.to_string())
     } else if Path::new(value).is_absolute() {
         PdfPath::Absolute(normalize_lexically(Path::new(value)))
@@ -485,6 +486,21 @@ mod tests {
         );
     }
 
+    /// Ruby's `File.expand_path` expands a leading `~` to the home directory,
+    /// so such a value is neither relative nor checkable.
+    #[test]
+    fn tilde_prefix_is_not_a_relative_path() {
+        let (root, ws) = fixture();
+        assert_eq!(pdf_diags(&ws, &root.join("tilde.adoc")), vec![]);
+        assert_eq!(resolve_dir("~/themes"), PdfPath::Unknown("~/themes".into()));
+        assert_eq!(resolve_dir("~"), PdfPath::Unknown("~".into()));
+        assert_eq!(
+            resolve_dir("~root/themes"),
+            PdfPath::Unknown("~root/themes".into())
+        );
+        assert_eq!(resolve_dir("a~b"), PdfPath::Relative("a~b".into()));
+    }
+
     #[test]
     fn theme_without_themesdir_is_builtin_name_or_anchored_yml_path() {
         let (root, ws) = fixture();
@@ -631,6 +647,18 @@ mod tests {
             ("custom", Some(&relative), PdfPath::Unknown("custom".into())),
             ("x.yml", Some(&relative), PdfPath::Unknown("x.yml".into())),
             ("x.yaml", None, PdfPath::Unknown("x.yaml".into())),
+            // Ruby expands a leading `~` only for a lone theme file, never
+            // inside a themes directory (`File.absolute_path`).
+            (
+                "~/custom.yml",
+                None,
+                PdfPath::Unknown("~/custom.yml".into()),
+            ),
+            (
+                "~/x.yml",
+                Some(&dir),
+                PdfPath::Absolute("/themes/~/x.yml".into()),
+            ),
             // Case-sensitive like Ruby's `end_with?`: a name, not a file.
             ("custom.YML", None, PdfPath::Builtin("custom.YML".into())),
             ("", None, PdfPath::Unknown(String::new())),
