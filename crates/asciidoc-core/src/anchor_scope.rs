@@ -264,13 +264,54 @@ impl<'ws> CatalogCache<'ws> {
     /// told apart.
     #[must_use]
     pub fn anchor_references(&self, id: &str, definitions: &[AnchorLocation]) -> Vec<FileLocation> {
+        self.references_of(id, definitions, false)
+    }
+
+    /// [`Self::anchor_references`] plus the natural xrefs (`<<Section Title>>`,
+    /// `<<reftext>>`) that resolve to one of the `definitions`. Such an xref
+    /// names no ID, so it is a reference but never part of a rename.
+    #[must_use]
+    pub fn anchor_and_natural_references(
+        &self,
+        id: &str,
+        definitions: &[AnchorLocation],
+    ) -> Vec<FileLocation> {
+        self.references_of(id, definitions, true)
+    }
+
+    fn references_of(
+        &self,
+        id: &str,
+        definitions: &[AnchorLocation],
+        include_natural: bool,
+    ) -> Vec<FileLocation> {
         let workspace = self.workspace;
+        // A definition is matched by file and line only, so an xref to
+        // another ID on that line must be told apart by the ID it resolves to.
+        let mut definition_ids = vec![id.to_string()];
+        for path in workspace.documents.keys() {
+            for scope in self.scopes_at(path) {
+                let named = scope
+                    .lookup(id)
+                    .map(|location| (id, location))
+                    .or_else(|| scope.lookup_natural(id));
+                if let Some((real, location)) = named {
+                    if definitions
+                        .iter()
+                        .any(|d| d.file == location.file && d.line == location.line)
+                        && !definition_ids.iter().any(|known| known == real)
+                    {
+                        definition_ids.push(real.to_string());
+                    }
+                }
+            }
+        }
         let mut references = Vec::new();
         for (path, doc) in &workspace.documents {
-            let named = doc
-                .xrefs
-                .iter()
-                .filter(|xref| parse_xref_target(&xref.target).1 == Some(id));
+            let named = doc.xrefs.iter().filter(|xref| {
+                let (file, anchor) = parse_xref_target(&xref.target);
+                anchor == Some(id) || (include_natural && file.is_none())
+            });
             for xref in named {
                 let attribute_scopes = if xref.target.contains('{') {
                     workspace.scopes_at(path, xref.line)
@@ -280,9 +321,14 @@ impl<'ws> CatalogCache<'ws> {
                 let reaches_definition = self.scopes_at(path).iter().any(|scope| {
                     self.resolve_read(scope, xref, &attribute_scopes)
                         .is_ok_and(|resolved| {
-                            definitions.iter().any(|definition| {
-                                resolved.file == definition.file && resolved.line == definition.line
-                            })
+                            resolved
+                                .id
+                                .as_ref()
+                                .is_none_or(|rid| definition_ids.contains(rid))
+                                && definitions.iter().any(|definition| {
+                                    resolved.file == definition.file
+                                        && resolved.line == definition.line
+                                })
                         })
                 });
                 if reaches_definition {

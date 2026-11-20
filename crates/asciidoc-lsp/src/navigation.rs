@@ -258,7 +258,14 @@ pub fn resolve_references(
         }
         NodeKind::Anchor { id } => {
             let definitions = anchor_definitions_of_anchor(ws, &catalogs, doc_path, id);
-            anchor_reference_locations(&catalogs, id, &definitions, include_declaration, overrides)
+            anchor_reference_locations(
+                &catalogs,
+                id,
+                &definitions,
+                include_declaration,
+                true,
+                overrides,
+            )
         }
         NodeKind::Xref { target } | NodeKind::ShorthandXref { target } => {
             // A file-only xref has no anchor to find references for.
@@ -276,6 +283,7 @@ pub fn resolve_references(
                 anchor_id,
                 &definitions,
                 include_declaration,
+                true,
                 overrides,
             )
         }
@@ -1025,7 +1033,8 @@ fn push_definition(definitions: &mut Vec<AnchorLocation>, location: AnchorLocati
 }
 
 /// The xrefs that reach any of `definitions` of `id`, and the definitions
-/// too when `include_declaration` is set, each at the span of the id on its
+/// too when `include_declaration` is set, and the natural xrefs (by title or
+/// reftext) when `include_natural` is set, each at the span of the id on its
 /// line (the spans rename edits). An xref carries its span from extraction;
 /// the declaration's is found in its line (`[[id]]` or `[[id,reftext]]`). A
 /// declaration whose line holds no such span, such as a section's implicit
@@ -1035,10 +1044,15 @@ fn anchor_reference_locations(
     id: &str,
     definitions: &[AnchorLocation],
     include_declaration: bool,
+    include_natural: bool,
     overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Vec<FileLocation> {
     let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
-    let mut locations = catalogs.anchor_references(id, definitions);
+    let mut locations = if include_natural {
+        catalogs.anchor_and_natural_references(id, definitions)
+    } else {
+        catalogs.anchor_references(id, definitions)
+    };
     if include_declaration {
         for definition in definitions {
             let text = read_file_cached(&mut file_cache, &definition.file, overrides);
@@ -1980,7 +1994,8 @@ fn resolve_rename_anchor(
     }
 
     // Anchor references (xrefs)
-    for loc in anchor_reference_locations(catalogs, anchor_id, definitions, false, overrides) {
+    for loc in anchor_reference_locations(catalogs, anchor_id, definitions, false, false, overrides)
+    {
         edits
             .entry(loc.path)
             .or_default()
@@ -4415,6 +4430,206 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         let files: Vec<_> = results.iter().map(|loc| loc.path.clone()).collect();
         assert!(files.contains(&b_canon), "b.adoc should be in results");
         assert!(files.contains(&c_canon), "c.adoc should be in results");
+    }
+
+    #[test]
+    fn test_references_on_anchor_find_natural_xref_by_reftext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\n[[cli,Command line]]\n== Tools\n\nSee <<Command line>> and <<cli>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
+        let cols: Vec<_> = results.iter().map(|loc| (loc.line, loc.col)).collect();
+        assert_eq!(results.len(), 2, "natural and id xref expected: {cols:?}");
+        assert!(results.iter().all(|loc| loc.line == 6));
+    }
+
+    /// Natural xrefs count in every written form and in included files.
+    #[test]
+    fn test_references_find_natural_xref_in_macro_form_and_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\n[[cli,Command line]]\n== Tools\n\nSee <<Command line>> and <<cli>>.\n\n\
+             Macro xref:Command line[] form.\n\ninclude::chapters/part.adoc[]\n",
+        )
+        .unwrap();
+        fs::create_dir(tmp.path().join("chapters")).unwrap();
+        let part = tmp.path().join("chapters/part.adoc");
+        fs::write(&part, "Back to <<Command line>> from the include.\n").unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
+        let mut found: Vec<_> = results
+            .iter()
+            .map(|loc| {
+                (
+                    loc.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    loc.line,
+                )
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("a.adoc".to_string(), 6),
+                ("a.adoc".to_string(), 6),
+                ("a.adoc".to_string(), 8),
+                ("part.adoc".to_string(), 1),
+            ]
+        );
+    }
+
+    /// The reftext of an inline anchor is a natural xref target too.
+    #[test]
+    fn test_references_on_inline_anchor_find_natural_xref_by_reftext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\nInline anchor [[inl,Inline Text]]here.\n\nSee <<Inline Text>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 17,
+        };
+
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert_eq!(results[0].line, 5);
+    }
+
+    #[test]
+    fn test_references_on_section_anchor_find_natural_xref_by_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\n[[sec]]\n== Section Title\n\nSee <<Section Title>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert_eq!(results[0].line, 6);
+    }
+
+    #[test]
+    fn test_references_two_anchors_on_one_line_do_not_share_xrefs() {
+        // Definitions are matched by line, so <<b>> on the line of [[b]]
+        // must not count as a reference of [[a]].
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\nSiehe [[a]]Alpha und [[b]]Beta.\n\nSee <<b>> and <<a>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only <<a>> is a reference of a: {results:?}"
+        );
+        assert_eq!(results[0].line, 5);
+    }
+
+    #[test]
+    fn test_references_on_xref_with_implicit_section_id_find_natural_xref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\n== Section Title\n\nSee <<_section_title>> and <<Section Title>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 4,
+            character: 8,
+        };
+
+        let results =
+            resolve_references(&content, pos, &a, Some(&ws), false, &HashMap::new()).unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "id and natural xref expected: {results:?}"
+        );
+        assert!(results.iter().all(|loc| loc.line == 5));
+    }
+
+    #[test]
+    fn test_rename_leaves_natural_xref_alone() {
+        // A natural xref names the reftext, not the ID: renaming the ID
+        // must not rewrite it.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.adoc");
+        fs::write(
+            &a,
+            "= Doc\n\n[[cli,Command line]]\n== Tools\n\nSee <<Command line>> and <<cli>>.\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::build(tmp.path(), &a);
+        let content = fs::read_to_string(&a).unwrap();
+        let pos = Position {
+            line: 2,
+            character: 4,
+        };
+
+        let edits = resolve_rename(&content, pos, &a, Some(&ws), &HashMap::new()).unwrap();
+        let on_xref_line: Vec<_> = edits
+            .values()
+            .flatten()
+            .filter(|(line, _, _)| *line == 6)
+            .collect();
+        assert_eq!(on_xref_line.len(), 1, "only <<cli>>: {on_xref_line:?}");
     }
 
     #[test]
