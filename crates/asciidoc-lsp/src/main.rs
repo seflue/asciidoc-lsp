@@ -5,7 +5,7 @@ mod diagnostics_convert;
 mod navigation;
 mod positions;
 mod present;
-#[allow(dead_code, reason = "the preview server consumes the converter")]
+mod preview;
 mod preview_converter;
 mod semantic_tokens;
 mod symbols;
@@ -72,6 +72,14 @@ struct AsciiDocLsp {
     /// `workspace/didChangeWatchedFiles`. Set in `initialize()`,
     /// consumed in `initialized()`.
     can_request_file_watcher: Mutex<bool>,
+    /// The preview server; `None` until the first
+    /// [`PREVIEW_OPEN_COMMAND`].
+    preview: Mutex<Option<Arc<preview::Preview>>>,
+    /// Serialises the start of the preview server, which awaits.
+    preview_start: tokio::sync::Mutex<()>,
+    /// The document the preview follows: the last one named by the open
+    /// command or by [`CURSOR_MOVED_METHOD`].
+    preview_active: Mutex<Option<Uri>>,
 }
 
 impl AsciiDocLsp {
@@ -84,7 +92,114 @@ impl AsciiDocLsp {
             diagnostics: Mutex::new(HashMap::new()),
             published_diagnostics: Mutex::new(HashSet::new()),
             can_request_file_watcher: Mutex::new(false),
+            preview: Mutex::new(None),
+            preview_start: tokio::sync::Mutex::new(()),
+            preview_active: Mutex::new(None),
         }
+    }
+
+    /// The running preview server, started on first use. Fails with a hint
+    /// if Asciidoctor is not installed.
+    async fn ensure_preview(&self) -> Result<Arc<preview::Preview>> {
+        let running = self.preview.lock().clone();
+        if let Some(preview) = running {
+            return Ok(preview);
+        }
+        let _starting = self.preview_start.lock().await;
+        let running = self.preview.lock().clone();
+        if let Some(preview) = running {
+            return Ok(preview);
+        }
+        let converter = preview_converter::AsciidoctorConverter::new().map_err(preview_error)?;
+        let stylesheet = converter
+            .default_stylesheet()
+            .await
+            .map_err(preview_error)?;
+        let preview = preview::Preview::start(converter, preview_converter::DEBOUNCE, stylesheet)
+            .await
+            .map_err(preview_error)?;
+        let preview = Arc::new(preview);
+        *self.preview.lock() = Some(Arc::clone(&preview));
+        Ok(preview)
+    }
+
+    /// Queue a conversion of `uri` from its editor buffer (or the file on
+    /// disk if it is not open), with the attributes of its config chain.
+    fn request_preview_convert(&self, preview: &preview::Preview, uri: &Uri) {
+        let (Some(file), Some(text)) = (document_path(uri), self.get_document_content(uri)) else {
+            return;
+        };
+        let attributes = self
+            .workspace
+            .lock()
+            .as_ref()
+            .map_or_default(|ws| ws.attributes().config_attributes(&file));
+        preview.request_convert(preview_converter::ConvertRequest {
+            file,
+            text: text.as_str().to_owned(),
+            attributes,
+        });
+    }
+
+    /// A buffer's text changed: convert it again if the preview shows it.
+    fn preview_buffer_changed(&self, uri: &Uri) {
+        let running = self.preview.lock().clone();
+        let Some(preview) = running else {
+            return;
+        };
+        if self.preview_active.lock().as_ref() == Some(uri) {
+            self.request_preview_convert(&preview, uri);
+        }
+    }
+
+    /// `workspace/executeCommand` [`PREVIEW_OPEN_COMMAND`]: start the preview
+    /// server if needed, make the document the shown one and answer with the
+    /// page URL as `{"url": ...}`.
+    async fn preview_open(
+        &self,
+        arguments: Vec<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        let [argument]: [serde_json::Value; 1] = arguments.try_into().map_err(|_| {
+            jsonrpc::Error::invalid_params(format!(
+                "{PREVIEW_OPEN_COMMAND} expects exactly one argument: the document URI"
+            ))
+        })?;
+        let uri: Uri = serde_json::from_value(argument).map_err(|err| {
+            jsonrpc::Error::invalid_params(format!("{PREVIEW_OPEN_COMMAND}: invalid URI: {err}"))
+        })?;
+        let preview = self.ensure_preview().await?;
+        *self.preview_active.lock() = Some(uri.clone());
+        self.request_preview_convert(&preview, &uri);
+        Ok(Some(serde_json::json!({ "url": preview.url() })))
+    }
+
+    /// Notification [`CURSOR_MOVED_METHOD`]: the editor's cursor is on
+    /// `params.line` (0-based) of `params.uri`. Ignored while no preview is
+    /// open. A different document becomes the shown one.
+    #[allow(
+        clippy::unused_async,
+        reason = "`LspServiceBuilder::custom_method` takes an async handler"
+    )]
+    async fn cursor_moved(&self, params: CursorMovedParams) {
+        let running = self.preview.lock().clone();
+        let Some(preview) = running else {
+            return;
+        };
+        let Some(file) = document_path(&params.uri) else {
+            return;
+        };
+        let switched = {
+            let mut active = self.preview_active.lock();
+            let switched = active.as_ref() != Some(&params.uri);
+            if switched {
+                *active = Some(params.uri.clone());
+            }
+            switched
+        };
+        if switched {
+            self.request_preview_convert(&preview, &params.uri);
+        }
+        preview.set_cursor(&file, params.line);
     }
 
     /// Quick-fixes for the diagnostics of `uri` that touch `range`, taken from
@@ -391,7 +506,10 @@ impl LanguageServer for AsciiDocLsp {
                     },
                 )),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![EXPLAIN_POSITION_COMMAND.to_string()],
+                    commands: vec![
+                        EXPLAIN_POSITION_COMMAND.to_string(),
+                        PREVIEW_OPEN_COMMAND.to_string(),
+                    ],
                     ..Default::default()
                 }),
                 completion_provider: Some(CompletionOptions {
@@ -496,6 +614,7 @@ impl LanguageServer for AsciiDocLsp {
                 }
             }
         }
+        self.preview_buffer_changed(&uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -550,6 +669,7 @@ impl LanguageServer for AsciiDocLsp {
                 }
             }
         }
+        self.preview_buffer_changed(&uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -989,6 +1109,9 @@ impl LanguageServer for AsciiDocLsp {
         &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
+        if params.command == PREVIEW_OPEN_COMMAND {
+            return self.preview_open(params.arguments).await;
+        }
         let args = parse_explain_position_command(&params.command, params.arguments)?;
         let uri = &args.text_document.uri;
 
@@ -1232,6 +1355,30 @@ fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
 /// Command name of the position debug report.
 const EXPLAIN_POSITION_COMMAND: &str = "asciidoc.explainPosition";
 
+/// Command that opens the preview: one argument, the URI of the document to
+/// show; answers `{"url": "<page URL>"}`.
+const PREVIEW_OPEN_COMMAND: &str = "asciidoc.preview.open";
+
+/// Notification from the editor: its cursor moved. Params
+/// [`CursorMovedParams`].
+const CURSOR_MOVED_METHOD: &str = "asciidoc/cursorMoved";
+
+/// Params of [`CURSOR_MOVED_METHOD`].
+#[derive(Debug, serde::Deserialize)]
+struct CursorMovedParams {
+    uri: Uri,
+    /// 0-based, like an LSP position. The preview server turns it into the
+    /// 1-based line of Asciidoctor's `data-line-N`.
+    line: u32,
+}
+
+/// A preview failure as a JSON-RPC error with the cause as message.
+fn preview_error(error: impl std::fmt::Display) -> jsonrpc::Error {
+    let mut err = jsonrpc::Error::internal_error();
+    err.message = format!("AsciiDoc preview: {error}").into();
+    err
+}
+
 /// Validate a `workspace/executeCommand` request for
 /// [`EXPLAIN_POSITION_COMMAND`]: the command must match and `arguments` must
 /// hold exactly one object shaped like `TextDocumentPositionParams`.
@@ -1342,7 +1489,9 @@ async fn main() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(AsciiDocLsp::new);
+    let (service, socket) = LspService::build(AsciiDocLsp::new)
+        .custom_method(CURSOR_MOVED_METHOD, AsciiDocLsp::cursor_moved)
+        .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())
@@ -4810,5 +4959,80 @@ mod tests {
             .await,
             Some(format!(":pdf-themesdir: {}", path("docs/theme")))
         );
+    }
+
+    #[tokio::test]
+    async fn test_preview_open_rejects_bad_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _socket) = initialized_server(tmp.path()).await;
+        let server = service.inner();
+
+        assert!(server.preview_open(Vec::new()).await.is_err());
+        assert!(server
+            .preview_open(vec![serde_json::json!(5)])
+            .await
+            .is_err());
+        assert!(
+            server.preview.lock().is_none(),
+            "nothing starts on bad input"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preview_follows_cursor_notifications_and_buffer_changes() {
+        use preview::testing::{address, start, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a.adoc"), root.join("b.adoc"));
+        fs::write(&a, "").unwrap();
+        fs::write(&b, "").unwrap();
+        let (uri_a, uri_b) = (file_uri(&a), file_uri(&b));
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+
+        // Without a preview the notification does nothing.
+        server
+            .cursor_moved(CursorMovedParams {
+                uri: uri_a.clone(),
+                line: 0,
+            })
+            .await;
+        assert!(server.preview_active.lock().is_none());
+
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        *server.preview.lock() = Some(Arc::new(preview));
+        let mut stream = Stream::open(port, &token).await;
+
+        open_document(server, &uri_a, "alpha").await;
+        server
+            .cursor_moved(CursorMovedParams {
+                uri: uri_a.clone(),
+                line: 2,
+            })
+            .await;
+        // LSP line 2 is source line 3.
+        let seen = stream.until(r#""line":3}"#).await;
+        assert!(
+            seen.contains(&format!(r#""file":"{}""#, a.display())),
+            "{seen}"
+        );
+        stream.until("<p>alpha</p>").await;
+
+        change_document(server, &uri_a, 2, "beta").await;
+        stream.until("<p>beta</p>").await;
+
+        // A buffer that is not shown does not convert; moving the cursor
+        // into it switches the page to it.
+        open_document(server, &uri_b, "gamma").await;
+        server
+            .cursor_moved(CursorMovedParams {
+                uri: uri_b.clone(),
+                line: 0,
+            })
+            .await;
+        stream.until("<p>gamma</p>").await;
+        assert_eq!(server.preview_active.lock().as_ref(), Some(&uri_b));
     }
 }

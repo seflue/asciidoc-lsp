@@ -1,0 +1,726 @@
+//! The preview server: a small HTTP server inside the LSP process that serves
+//! the preview page and pushes converted HTML and the cursor line to it as
+//! server-sent events.
+//!
+//! Safeguards: it binds `127.0.0.1` on a random port, every URL starts with a
+//! random token (a wrong token is a 404), and the `Host` header must name that
+//! address and port (anything else is a 403, which stops DNS rebinding).
+//!
+//! HTTP is hand-written on `tokio::net`: the server answers `GET` for six
+//! fixed routes and one event stream, so a request parser of a few lines
+//! replaces hyper, hyper-util and http-body-util.
+//!
+//! Routes below `/<token>/`: the page itself, `style.css`, `page.js`,
+//! `scroll-map.js`, `morphdom.js` and `events` (SSE).
+//!
+//! Events, each with one line of JSON as data:
+//! - `html`: `{file, lineCount, html}`, a finished conversion of `file`.
+//! - `cursor`: `{file, line}`; `line` is a 1-based source line, see
+//!   [`Preview::set_cursor`].
+//! - `convert-error`: `{message}`, the conversion failed.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io;
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+
+use crate::preview_converter::{self, Convert, ConvertOutcome, ConvertRequest};
+
+const PAGE: &str = include_str!("../assets/preview/index.html");
+const PAGE_JS: &str = include_str!("../assets/preview/page.js");
+const SCROLL_MAP_JS: &str = include_str!("../assets/preview/scroll-map.js");
+const MORPHDOM_JS: &str = include_str!("../assets/preview/morphdom.js");
+
+/// Longest request head (request line and headers) the server reads.
+const MAX_HEAD_BYTES: usize = 16 * 1024;
+/// How long a client may take to send its request head.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle time after which the event stream sends a comment line, which also
+/// notices a client that went away.
+const KEEPALIVE: Duration = Duration::from_secs(15);
+/// Buffered events per stream; a slower reader gets the current state again.
+const EVENT_BACKLOG: usize = 64;
+
+/// Why the server could not start.
+#[derive(Debug, thiserror::Error)]
+pub enum PreviewError {
+    /// The operating system gave no random bytes for the token.
+    #[error("no random bytes for the preview token: {0}")]
+    Random(getrandom::Error),
+    /// The listening socket could not be opened.
+    #[error("cannot open the preview server socket: {0}")]
+    Bind(io::Error),
+}
+
+/// One server-sent event.
+#[derive(Debug, Clone)]
+struct Event {
+    name: &'static str,
+    /// One line of JSON.
+    data: String,
+}
+
+impl Event {
+    fn new(name: &'static str, data: &serde_json::Value) -> Self {
+        Self {
+            name,
+            data: data.to_string(),
+        }
+    }
+
+    fn frame(&self) -> String {
+        format!("event: {}\ndata: {}\n\n", self.name, self.data)
+    }
+}
+
+/// The latest event of each kind, replayed to a stream that connects late.
+#[derive(Debug, Default)]
+struct Snapshot {
+    html: Option<Event>,
+    cursor: Option<Event>,
+    error: Option<Event>,
+}
+
+impl Snapshot {
+    fn replay(&self) -> Vec<Event> {
+        [&self.html, &self.cursor, &self.error]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct Shared {
+    token: String,
+    port: u16,
+    stylesheet: String,
+    events: broadcast::Sender<Event>,
+    snapshot: Mutex<Snapshot>,
+    /// Lines of the last text requested per file, for the page's end sentinel.
+    line_counts: Mutex<HashMap<PathBuf, usize>>,
+}
+
+impl Shared {
+    /// Remember `event` as the current one of its kind and send it to every
+    /// stream. Both happen under the snapshot lock, so a stream that
+    /// subscribes sees each event exactly once, in the replay or live.
+    fn publish(&self, event: Event) {
+        let mut snapshot = self.snapshot.lock();
+        match event.name {
+            "html" => {
+                snapshot.html = Some(event.clone());
+                snapshot.error = None;
+            }
+            "cursor" => snapshot.cursor = Some(event.clone()),
+            _ => snapshot.error = Some(event.clone()),
+        }
+        // No receiver is fine: nobody has the page open.
+        let _ = self.events.send(event);
+    }
+
+    fn subscribe(&self) -> (broadcast::Receiver<Event>, Vec<Event>) {
+        let snapshot = self.snapshot.lock();
+        (self.events.subscribe(), snapshot.replay())
+    }
+
+    fn publish_outcome(&self, outcome: ConvertOutcome) {
+        match outcome.result {
+            Ok(html) => {
+                let line_count = self
+                    .line_counts
+                    .lock()
+                    .get(&outcome.file)
+                    .copied()
+                    .unwrap_or(0);
+                self.publish(Event::new(
+                    "html",
+                    &serde_json::json!({
+                        "file": outcome.file.to_string_lossy(),
+                        "lineCount": line_count,
+                        "html": html,
+                    }),
+                ));
+            }
+            Err(error) => self.publish(Event::new(
+                "convert-error",
+                &serde_json::json!({ "message": error.to_string() }),
+            )),
+        }
+    }
+
+    fn allows_host(&self, host: &str) -> bool {
+        let port = self.port;
+        host == format!("127.0.0.1:{port}")
+            || host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+    }
+}
+
+/// A running preview server and the converter feeding it.
+///
+/// Dropping it stops the server and the converter worker.
+#[derive(Debug)]
+pub struct Preview {
+    shared: Arc<Shared>,
+    url: String,
+    convert: preview_converter::ConvertHandle,
+    tasks: [JoinHandle<()>; 2],
+}
+
+impl Preview {
+    /// Start the server on a random local port, with `converter` behind it.
+    ///
+    /// `stylesheet` is served as `style.css`.
+    ///
+    /// # Errors
+    /// [`PreviewError`] if no token can be made or the socket cannot be bound.
+    pub async fn start<C: Convert>(
+        converter: C,
+        debounce: Duration,
+        stylesheet: String,
+    ) -> Result<Self, PreviewError> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(PreviewError::Random)?;
+        let token = bytes.iter().fold(String::new(), |mut token, byte| {
+            let _ = write!(token, "{byte:02x}");
+            token
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .map_err(PreviewError::Bind)?;
+        let port = listener.local_addr().map_err(PreviewError::Bind)?.port();
+        let (events, _) = broadcast::channel(EVENT_BACKLOG);
+        let shared = Arc::new(Shared {
+            token,
+            port,
+            stylesheet,
+            events,
+            snapshot: Mutex::new(Snapshot::default()),
+            line_counts: Mutex::new(HashMap::new()),
+        });
+        let url = format!("http://127.0.0.1:{port}/{}/", shared.token);
+        let (convert, outcomes) = preview_converter::spawn(converter, debounce);
+        let accept = tokio::spawn(accept_loop(listener, Arc::clone(&shared)));
+        let pump = tokio::spawn(pump_outcomes(outcomes, Arc::clone(&shared)));
+        Ok(Self {
+            shared,
+            url,
+            convert,
+            tasks: [accept, pump],
+        })
+    }
+
+    /// The URL of the page, token included.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Queue a conversion; the result reaches the page as an `html` event.
+    /// A newer request replaces one that has not been converted yet.
+    pub fn request_convert(&self, request: ConvertRequest) {
+        let line_count = request.text.lines().count().max(1);
+        self.shared
+            .line_counts
+            .lock()
+            .insert(request.file.clone(), line_count);
+        if !self.convert.request(request) {
+            tracing::warn!("preview converter has stopped");
+        }
+    }
+
+    /// Tell the page the editor's cursor is on `lsp_line` of `file`.
+    ///
+    /// `lsp_line` is 0-based, as in every LSP position. Asciidoctor's
+    /// `data-line-N` classes count from 1, so the event carries
+    /// `lsp_line + 1`; the page compares it with the anchors as it is.
+    pub fn set_cursor(&self, file: &Path, lsp_line: u32) {
+        self.shared.publish(Event::new(
+            "cursor",
+            &serde_json::json!({
+                "file": file.to_string_lossy(),
+                "line": u64::from(lsp_line) + 1,
+            }),
+        ));
+    }
+}
+
+impl Drop for Preview {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+async fn pump_outcomes(mut outcomes: mpsc::UnboundedReceiver<ConvertOutcome>, shared: Arc<Shared>) {
+    while let Some(outcome) = outcomes.recv().await {
+        shared.publish_outcome(outcome);
+    }
+}
+
+async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let shared = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    if let Err(error) = serve_connection(stream, &shared).await {
+                        tracing::debug!(%error, "preview connection ended");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "preview accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// The parts of a request the server looks at.
+#[derive(Debug, PartialEq, Eq)]
+struct Request<'a> {
+    method: &'a str,
+    target: &'a str,
+    host: Option<&'a str>,
+}
+
+/// Parse a request head. `None` if it is malformed or has two `Host` headers.
+fn parse_request(head: &str) -> Option<Request<'_>> {
+    let mut lines = head.split("\r\n");
+    let mut parts = lines.next()?.split(' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    if !parts.next()?.starts_with("HTTP/") || parts.next().is_some() {
+        return None;
+    }
+    let mut host = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("host") {
+                if host.is_some() {
+                    return None;
+                }
+                host = Some(value.trim());
+            }
+        }
+    }
+    Some(Request {
+        method,
+        target,
+        host,
+    })
+}
+
+/// What to answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Routed<'a> {
+    Body {
+        content_type: &'static str,
+        body: &'a str,
+    },
+    Redirect(String),
+    Events,
+    Status(u16),
+}
+
+fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
+    if !request.host.is_some_and(|host| shared.allows_host(host)) {
+        return Routed::Status(403);
+    }
+    let path = request
+        .target
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .strip_prefix('/')
+        .unwrap_or_default();
+    let (token, rest) = path.split_once('/').unwrap_or((path, ""));
+    if token != shared.token {
+        return Routed::Status(404);
+    }
+    if request.method != "GET" {
+        return Routed::Status(405);
+    }
+    if !path.contains('/') {
+        // The page loads its assets by relative URL, so it needs the slash.
+        return Routed::Redirect(format!("/{token}/"));
+    }
+    let body = |content_type, body| Routed::Body { content_type, body };
+    match rest {
+        "" => body("text/html; charset=utf-8", PAGE),
+        "style.css" => body("text/css; charset=utf-8", &shared.stylesheet),
+        "page.js" => body("text/javascript; charset=utf-8", PAGE_JS),
+        "scroll-map.js" => body("text/javascript; charset=utf-8", SCROLL_MAP_JS),
+        "morphdom.js" => body("text/javascript; charset=utf-8", MORPHDOM_JS),
+        "events" => Routed::Events,
+        _ => Routed::Status(404),
+    }
+}
+
+/// Read up to the blank line that ends the request head. `None` if the
+/// client closed first or the head is too long.
+async fn read_head(stream: &mut TcpStream) -> io::Result<Option<String>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            buffer.truncate(end);
+            return Ok(Some(String::from_utf8_lossy(&buffer).into_owned()));
+        }
+        if buffer.len() > MAX_HEAD_BYTES {
+            return Ok(None);
+        }
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        301 => "Moved Permanently",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        405 => "Method Not Allowed",
+        _ => "Not Found",
+    }
+}
+
+const COMMON_HEADERS: &str = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
+                              Referrer-Policy: no-referrer\r\n";
+
+async fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: &str,
+) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         {COMMON_HEADERS}{extra_headers}Connection: close\r\n\r\n",
+        reason(status),
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
+    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await {
+        Ok(head) => head?,
+        Err(_) => None,
+    };
+    let Some(head) = head else {
+        return write_response(&mut stream, 400, "text/plain", "", "bad request").await;
+    };
+    let Some(request) = parse_request(&head) else {
+        return write_response(&mut stream, 400, "text/plain", "", "bad request").await;
+    };
+    match route(shared, &request) {
+        Routed::Body { content_type, body } => {
+            write_response(&mut stream, 200, content_type, "", body).await
+        }
+        Routed::Redirect(location) => {
+            let extra = format!("Location: {location}\r\n");
+            write_response(&mut stream, 301, "text/plain", &extra, "").await
+        }
+        Routed::Status(status) => {
+            write_response(&mut stream, status, "text/plain", "", reason(status)).await
+        }
+        Routed::Events => serve_events(stream, shared).await,
+    }
+}
+
+async fn write_events(stream: &mut TcpStream, events: &[Event]) -> io::Result<()> {
+    for event in events {
+        stream.write_all(event.frame().as_bytes()).await?;
+    }
+    stream.flush().await
+}
+
+/// The event stream: the current state first, then every new event.
+async fn serve_events(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{COMMON_HEADERS}\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await?;
+    let (mut events, replay) = shared.subscribe();
+    write_events(&mut stream, &replay).await?;
+    loop {
+        tokio::select! {
+            next = events.recv() => match next {
+                Ok(event) => write_events(&mut stream, &[event]).await?,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let replay = shared.snapshot.lock().replay();
+                    write_events(&mut stream, &replay).await?;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            () = tokio::time::sleep(KEEPALIVE) => {
+                stream.write_all(b": keepalive\n\n").await?;
+                stream.flush().await?;
+            }
+        }
+    }
+}
+
+/// Help for tests that talk to a running server.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use crate::preview_converter::ConvertError;
+
+    /// Converts to `<p>` plus the request text, without Ruby.
+    pub(crate) struct EchoConverter;
+
+    impl Convert for EchoConverter {
+        async fn convert(&self, request: &ConvertRequest) -> Result<String, ConvertError> {
+            Ok(format!("<p>{}</p>", request.text))
+        }
+    }
+
+    pub(crate) async fn start() -> Preview {
+        Preview::start(
+            EchoConverter,
+            Duration::from_millis(10),
+            "body{}".to_owned(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `(port, token)` of a running preview.
+    pub(crate) fn address(preview: &Preview) -> (u16, String) {
+        (preview.shared.port, preview.shared.token.clone())
+    }
+
+    /// One request, read to the end of the connection: the whole response.
+    pub(crate) async fn get(port: u16, target: &str, host: &str) -> String {
+        request(port, "GET", target, host).await
+    }
+
+    pub(crate) async fn request(port: u16, method: &str, target: &str, host: &str) -> String {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let text = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        stream.write_all(text.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    /// An open event stream.
+    pub(crate) struct Stream {
+        stream: TcpStream,
+        received: String,
+    }
+
+    impl Stream {
+        pub(crate) async fn open(port: u16, token: &str) -> Self {
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            let text = format!("GET /{token}/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+            stream.write_all(text.as_bytes()).await.unwrap();
+            Self {
+                stream,
+                received: String::new(),
+            }
+        }
+
+        /// Read until the received text contains `needle` (5 s at most) and
+        /// return everything received so far.
+        pub(crate) async fn until(&mut self, needle: &str) -> String {
+            let read = async {
+                let mut chunk = [0_u8; 4096];
+                while !self.received.contains(needle) {
+                    let count = self.stream.read(&mut chunk).await.unwrap();
+                    assert!(
+                        count > 0,
+                        "stream closed before {needle:?}: {}",
+                        self.received
+                    );
+                    self.received
+                        .push_str(&String::from_utf8_lossy(&chunk[..count]));
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap_or_else(|_| panic!("no {needle:?} in: {}", self.received));
+            self.received.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{address, get, request, start, Stream};
+    use super::*;
+
+    fn status_line(response: &str) -> &str {
+        response.lines().next().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_not_found() {
+        let preview = start().await;
+        let (port, _) = address(&preview);
+        let response = get(port, "/not-the-token/", &format!("127.0.0.1:{port}")).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+        let response = get(port, "/", &format!("127.0.0.1:{port}")).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn foreign_host_is_forbidden() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        for host in [
+            "evil.example",
+            "127.0.0.1",
+            "127.0.0.1:1",
+            "localhost.evil:80",
+        ] {
+            let response = get(port, &format!("/{token}/"), host).await;
+            assert!(status_line(&response).contains("403"), "{host}: {response}");
+        }
+        // The host check comes first: a wrong token is no oracle either.
+        let response = get(port, "/wrong/", "evil.example").await;
+        assert!(status_line(&response).contains("403"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn page_and_assets_are_served_for_both_host_names() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            let response = get(port, &format!("/{token}/"), &host).await;
+            assert!(status_line(&response).contains("200"), "{response}");
+            assert!(response.contains("Follow cursor"));
+        }
+        let host = format!("127.0.0.1:{port}");
+        for (path, marker) in [
+            ("style.css", "body{}"),
+            ("page.js", "EventSource"),
+            ("scroll-map.js", "AdocScrollMap"),
+            ("morphdom.js", "morphdom"),
+        ] {
+            let response = get(port, &format!("/{token}/{path}"), &host).await;
+            assert!(status_line(&response).contains("200"), "{path}: {response}");
+            assert!(response.contains(marker), "{path}");
+        }
+        let response = get(port, &format!("/{token}/nope"), &host).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn token_without_slash_redirects_and_post_is_refused() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        let response = get(port, &format!("/{token}"), &host).await;
+        assert!(status_line(&response).contains("301"), "{response}");
+        assert!(response.contains(&format!("Location: /{token}/")));
+        let response = request(port, "POST", &format!("/{token}/"), &host).await;
+        assert!(status_line(&response).contains("405"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn event_stream_needs_the_token_and_host() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let response = get(port, "/wrong/events", &format!("127.0.0.1:{port}")).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+        let response = get(port, &format!("/{token}/events"), "evil.example").await;
+        assert!(status_line(&response).contains("403"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn conversion_reaches_the_stream_as_html_event() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/doc.adoc"),
+            text: "one\ntwo\nthree\n".to_owned(),
+            attributes: Vec::new(),
+        });
+        let all = stream.until(r#""lineCount":3}"#).await;
+        assert!(all.contains("event: html"), "{all}");
+        assert!(all.contains("text/event-stream"));
+        assert!(all.contains(r#""file":"/doc.adoc""#), "{all}");
+        assert!(all.contains(r#""lineCount":3"#), "{all}");
+        assert!(
+            all.contains(r#""html":"<p>one\ntwo\nthree\n</p>""#),
+            "{all}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_line_is_sent_one_based() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        let all = stream.until(r#""line":1}"#).await;
+        assert!(all.contains("event: cursor"), "{all}");
+        assert!(
+            all.contains(r#"data: {"file":"/doc.adoc","line":1}"#),
+            "{all}"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_stream_gets_the_current_state() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let mut first = Stream::open(port, &token).await;
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/doc.adoc"),
+            text: "x".to_owned(),
+            attributes: Vec::new(),
+        });
+        first.until("</p>").await;
+        preview.set_cursor(Path::new("/doc.adoc"), 4);
+        first.until(r#""line":5}"#).await;
+        let mut late = Stream::open(port, &token).await;
+        let replay = late.until(r#""line":5}"#).await;
+        assert!(replay.contains("event: html"), "{replay}");
+        assert!(replay.contains("<p>x</p>"), "{replay}");
+    }
+
+    #[test]
+    fn parse_request_reads_method_target_and_host() {
+        let head = "GET /a/b?x=1 HTTP/1.1\r\nhOsT:  localhost:80 \r\nAccept: */*";
+        assert_eq!(
+            parse_request(head),
+            Some(Request {
+                method: "GET",
+                target: "/a/b?x=1",
+                host: Some("localhost:80"),
+            })
+        );
+        assert_eq!(parse_request("GET /"), None);
+        assert_eq!(parse_request("GET / HTTP/1.1\r\nHost: a\r\nHost: b"), None);
+        assert_eq!(parse_request("GET / HTTP/1.1 extra\r\nHost: a"), None);
+    }
+}

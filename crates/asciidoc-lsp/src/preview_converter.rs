@@ -37,6 +37,9 @@ pub enum ConvertError {
     /// The output was not UTF-8.
     #[error("Asciidoctor wrote output that is not UTF-8")]
     InvalidOutput,
+    /// A standalone page from Asciidoctor held no embedded stylesheet.
+    #[error("Asciidoctor's page has no embedded stylesheet")]
+    StylesheetMissing,
 }
 
 /// One document state to convert.
@@ -225,6 +228,40 @@ impl AsciidoctorConverter {
         })
     }
 
+    /// Asciidoctor's default stylesheet, taken from the standalone page of an
+    /// empty document (the CLI embeds it there), so no gem path is needed.
+    ///
+    /// # Errors
+    /// [`ConvertError::AsciidoctorMissing`] if the program is not found;
+    /// other [`ConvertError`]s if the run fails or the page has no stylesheet.
+    pub async fn default_stylesheet(&self) -> Result<String, ConvertError> {
+        let output = Command::new(&self.program)
+            .args(["-o", "-", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    ConvertError::AsciidoctorMissing {
+                        program: self.program.clone(),
+                    }
+                } else {
+                    ConvertError::Io(error)
+                }
+            })?;
+        if !output.status.success() {
+            return Err(ConvertError::Failed {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let page = String::from_utf8(output.stdout).map_err(|_| ConvertError::InvalidOutput)?;
+        extract_stylesheet(&page).ok_or(ConvertError::StylesheetMissing)
+    }
+
     fn command(&self, request: &ConvertRequest) -> Command {
         let base_dir = request.file.parent().unwrap_or(Path::new("."));
         let mut command = Command::new(&self.program);
@@ -285,6 +322,13 @@ impl Convert for AsciidoctorConverter {
     }
 }
 
+/// The content of the first `<style>` element of a standalone page.
+fn extract_stylesheet(page: &str) -> Option<String> {
+    let start = page.find("<style>")? + "<style>".len();
+    let length = page[start..].find("</style>")?;
+    Some(page[start..start + length].trim().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +350,16 @@ mod tests {
             self.finished.fetch_add(1, Ordering::SeqCst);
             Ok(request.text.clone())
         }
+    }
+
+    #[test]
+    fn extracts_the_first_style_element() {
+        let page = "<head><link rel=x>\n<style>\nbody { margin: 0 }\n</style>\n<style>b</style>";
+        assert_eq!(
+            extract_stylesheet(page).as_deref(),
+            Some("body { margin: 0 }")
+        );
+        assert_eq!(extract_stylesheet("<p>no style</p>"), None);
     }
 
     fn request(text: &str) -> ConvertRequest {
