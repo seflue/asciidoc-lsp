@@ -7,6 +7,7 @@ mod positions;
 mod present;
 mod preview;
 mod preview_converter;
+mod preview_target;
 mod semantic_tokens;
 mod symbols;
 #[cfg(test)]
@@ -80,6 +81,12 @@ struct AsciiDocLsp {
     /// The document the preview follows: the last one named by the open
     /// command or by [`CURSOR_MOVED_METHOD`].
     preview_active: Mutex<Option<Uri>>,
+    /// What the preview converts for the active document, as the last open
+    /// command set it.
+    preview_mode: Mutex<preview_target::PreviewMode>,
+    /// The document of the last conversion request: the top-level document
+    /// in whole-document mode, else the active one.
+    preview_shown: Mutex<Option<PathBuf>>,
 }
 
 impl AsciiDocLsp {
@@ -95,6 +102,8 @@ impl AsciiDocLsp {
             preview: Mutex::new(None),
             preview_start: tokio::sync::Mutex::new(()),
             preview_active: Mutex::new(None),
+            preview_mode: Mutex::new(preview_target::PreviewMode::default()),
+            preview_shown: Mutex::new(None),
         }
     }
 
@@ -123,53 +132,111 @@ impl AsciiDocLsp {
         Ok(preview)
     }
 
-    /// Queue a conversion of `uri` from its editor buffer (or the file on
-    /// disk if it is not open), with the attributes of its config chain.
-    fn request_preview_convert(&self, preview: &preview::Preview, uri: &Uri) {
-        let (Some(file), Some(text)) = (document_path(uri), self.get_document_content(uri)) else {
-            return;
-        };
-        let attributes = self
-            .workspace
+    /// The texts of the open buffers by canonical path.
+    fn open_buffers(&self) -> HashMap<PathBuf, Arc<String>> {
+        self.documents
             .lock()
-            .as_ref()
-            .map_or_default(|ws| ws.attributes().config_attributes(&file));
-        preview.request_convert(preview_converter::ConvertRequest {
-            file,
-            text: text.as_str().to_owned(),
-            attributes,
-        });
+            .iter()
+            .filter_map(|(uri, state)| Some((document_path(uri)?, Arc::clone(&state.content))))
+            .collect()
     }
 
-    /// A buffer's text changed: convert it again if the preview shows it.
+    /// The conversion that shows `uri` in the current mode.
+    ///
+    /// Whole-document mode converts the top-level document that includes the
+    /// file (the one on show if several do, else the first in path order; a
+    /// file that nothing includes is its own). Whichever document it is, its
+    /// text and the texts of the open buffers it includes come from the
+    /// editor, the rest from disk, and it gets the attributes of its own
+    /// config chain.
+    fn preview_request(&self, uri: &Uri) -> Option<preview_converter::ConvertRequest> {
+        let active = document_path(uri)?;
+        let buffers = self.open_buffers();
+        let shown = self.preview_shown.lock().clone();
+        let whole = *self.preview_mode.lock() == preview_target::PreviewMode::Document;
+        let guard = self.workspace.lock();
+        let workspace = guard.as_ref();
+        let file = if whole {
+            let tops = workspace.map_or_default(|ws| ws.including_top_level_documents(&active));
+            preview_target::choose_top_level(&tops, shown.as_deref()).unwrap_or(active)
+        } else {
+            active
+        };
+        let text = match buffers.get(&file) {
+            Some(text) => text.as_str().to_owned(),
+            None => asciidoc_core::source_text::read_adoc_file(&file).ok()?,
+        };
+        let read = workspace.map_or_default(|ws| ws.documents_read_by(&file));
+        let overlay = read
+            .into_iter()
+            .filter(|path| *path != file)
+            .filter_map(|path| {
+                let text = buffers.get(&path)?.as_str().to_owned();
+                Some((path, text))
+            })
+            .collect();
+        let attributes = workspace.map_or_default(|ws| ws.attributes().config_attributes(&file));
+        Some(preview_converter::ConvertRequest {
+            file,
+            text,
+            attributes,
+            overlay,
+        })
+    }
+
+    /// Queue `request` and remember its document as the one on show.
+    fn send_preview_request(
+        &self,
+        preview: &preview::Preview,
+        request: preview_converter::ConvertRequest,
+    ) {
+        *self.preview_shown.lock() = Some(request.file.clone());
+        preview.request_convert(request);
+    }
+
+    /// A buffer's text changed: convert again if it is the active one or part
+    /// of the document on show.
     fn preview_buffer_changed(&self, uri: &Uri) {
         let running = self.preview.lock().clone();
         let Some(preview) = running else {
             return;
         };
-        if self.preview_active.lock().as_ref() == Some(uri) {
-            self.request_preview_convert(&preview, uri);
+        let Some(active) = self.preview_active.lock().clone() else {
+            return;
+        };
+        let affects = active == *uri || {
+            let (Some(changed), Some(shown)) =
+                (document_path(uri), self.preview_shown.lock().clone())
+            else {
+                return;
+            };
+            self.workspace
+                .lock()
+                .as_ref()
+                .is_some_and(|ws| ws.documents_read_by(&shown).contains(&changed))
+        };
+        if affects {
+            if let Some(request) = self.preview_request(&active) {
+                self.send_preview_request(&preview, request);
+            }
         }
     }
 
     /// `workspace/executeCommand` [`PREVIEW_OPEN_COMMAND`]: start the preview
-    /// server if needed, make the document the shown one and answer with the
+    /// server if needed, make the document the active one and answer with the
     /// page URL as `{"url": ...}`.
     async fn preview_open(
         &self,
         arguments: Vec<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>> {
-        let [argument]: [serde_json::Value; 1] = arguments.try_into().map_err(|_| {
-            jsonrpc::Error::invalid_params(format!(
-                "{PREVIEW_OPEN_COMMAND} expects exactly one argument: the document URI"
-            ))
-        })?;
-        let uri: Uri = serde_json::from_value(argument).map_err(|err| {
-            jsonrpc::Error::invalid_params(format!("{PREVIEW_OPEN_COMMAND}: invalid URI: {err}"))
-        })?;
+        let (uri, mode) = preview_target::parse_open_arguments(arguments, PREVIEW_OPEN_COMMAND)
+            .map_err(jsonrpc::Error::invalid_params)?;
         let preview = self.ensure_preview().await?;
+        *self.preview_mode.lock() = mode;
         *self.preview_active.lock() = Some(uri.clone());
-        self.request_preview_convert(&preview, &uri);
+        if let Some(request) = self.preview_request(&uri) {
+            self.send_preview_request(&preview, request);
+        }
         Ok(Some(serde_json::json!({ "url": preview.url() })))
     }
 
@@ -197,7 +264,13 @@ impl AsciiDocLsp {
             switched
         };
         if switched {
-            self.request_preview_convert(&preview, &params.uri);
+            // The page already shows the document if the new active one is
+            // part of it.
+            if let Some(request) = self.preview_request(&params.uri) {
+                if self.preview_shown.lock().as_ref() != Some(&request.file) {
+                    self.send_preview_request(&preview, request);
+                }
+            }
         }
         preview.set_cursor(&file, params.line);
     }
@@ -1355,8 +1428,10 @@ fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
 /// Command name of the position debug report.
 const EXPLAIN_POSITION_COMMAND: &str = "asciidoc.explainPosition";
 
-/// Command that opens the preview: one argument, the URI of the document to
-/// show; answers `{"url": "<page URL>"}`.
+/// Command that opens the preview: the URI of the active document and
+/// optionally `{"mode": "document" | "part"}` (default `document`: the
+/// top-level document that includes it; `part`: the document alone). Answers
+/// `{"url": "<page URL>"}`.
 const PREVIEW_OPEN_COMMAND: &str = "asciidoc.preview.open";
 
 /// Notification from the editor: its cursor moved. Params
@@ -5033,5 +5108,159 @@ mod tests {
             .await;
         stream.until("<p>gamma</p>").await;
         assert_eq!(server.preview_active.lock().as_ref(), Some(&uri_b));
+    }
+
+    /// A book with one chapter whose buffer is open and unsaved, shown by a
+    /// real Asciidoctor. `None` if Asciidoctor is not installed.
+    async fn book_preview(
+        root: &Path,
+        server: &AsciiDocLsp,
+    ) -> Option<(Uri, Uri, preview::testing::Stream)> {
+        use preview::testing::{address, Stream};
+        if !std::process::Command::new("asciidoctor")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return None;
+        }
+        let (book, chapter) = (root.join("book.adoc"), root.join("ch1.adoc"));
+        let book_text = "= Book\n\nintro\n\ninclude::ch1.adoc[]\n";
+        fs::write(&book, book_text).unwrap();
+        fs::write(&chapter, "== One\n\ndisk text\n").unwrap();
+        let (book_uri, chapter_uri) = (file_uri(&book), file_uri(&chapter));
+        open_document(server, &book_uri, book_text).await;
+        open_document(server, &chapter_uri, "== One\n\nunsaved text\n").await;
+        let preview = preview::Preview::start(
+            preview_converter::AsciidoctorConverter::new().unwrap(),
+            std::time::Duration::from_millis(10),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        let (port, token) = address(&preview);
+        *server.preview.lock() = Some(Arc::new(preview));
+        Some((book_uri, chapter_uri, Stream::open(port, &token).await))
+    }
+
+    #[tokio::test]
+    async fn test_preview_of_a_chapter_shows_the_book_with_the_unsaved_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((_, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .preview_open(vec![serde_json::json!(chapter_uri)])
+            .await
+            .unwrap();
+        let seen = stream.until("unsaved text").await;
+        // The converted document is the book, with the chapter's buffer text.
+        assert!(
+            seen.contains(&format!(r#""file":"{}""#, root.join("book.adoc").display())),
+            "{seen}"
+        );
+        assert!(seen.contains("intro"), "{seen}");
+        assert!(!seen.contains("disk text"), "{seen}");
+        // A block of the chapter names its file in the table.
+        assert!(seen.contains("data-src-0"), "{seen}");
+        assert!(seen.contains("ch1.adoc"), "{seen}");
+
+        // Editing the chapter converts the book again.
+        change_document(server, &chapter_uri, 2, "== One\n\nnewer text\n").await;
+        stream.until("newer text").await;
+
+        // The cursor event names the chapter, not the book.
+        server
+            .cursor_moved(CursorMovedParams {
+                uri: chapter_uri.clone(),
+                line: 2,
+            })
+            .await;
+        let seen = stream.until(r#""line":3}"#).await;
+        assert!(
+            seen.contains(&format!(
+                r#"data: {{"file":"{}","line":3}}"#,
+                root.join("ch1.adoc").display()
+            )),
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_editing_a_chapter_converts_the_book_while_the_book_is_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((book_uri, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .preview_open(vec![serde_json::json!(book_uri)])
+            .await
+            .unwrap();
+        stream.until("unsaved text").await;
+        // The book is the active buffer; a change in the chapter still counts.
+        change_document(server, &chapter_uri, 2, "== One\n\nedited elsewhere\n").await;
+        stream.until("edited elsewhere").await;
+    }
+
+    #[tokio::test]
+    async fn test_part_mode_shows_the_chapter_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((_, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .preview_open(vec![
+                serde_json::json!(chapter_uri),
+                serde_json::json!({ "mode": "part" }),
+            ])
+            .await
+            .unwrap();
+        let seen = stream.until("unsaved text").await;
+        assert!(
+            seen.contains(&format!(r#""file":"{}""#, root.join("ch1.adoc").display())),
+            "{seen}"
+        );
+        assert!(!seen.contains("intro"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn test_preview_of_a_document_nobody_includes_is_shown_alone() {
+        use preview::testing::{address, start, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let lonely = root.join("lonely.adoc");
+        fs::write(&lonely, "").unwrap();
+        let uri = file_uri(&lonely);
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        *server.preview.lock() = Some(Arc::new(preview));
+        let mut stream = Stream::open(port, &token).await;
+
+        open_document(server, &uri, "alone").await;
+        server
+            .preview_open(vec![serde_json::json!(uri)])
+            .await
+            .unwrap();
+        let seen = stream.until("<p>alone</p>").await;
+        assert!(
+            seen.contains(&format!(r#""file":"{}""#, lonely.display())),
+            "{seen}"
+        );
     }
 }

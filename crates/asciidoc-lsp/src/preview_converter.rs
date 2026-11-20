@@ -23,6 +23,9 @@ use tokio::sync::mpsc;
 /// The Ruby extension, written next to a run as a file for `-r`.
 const EXTENSION: &str = include_str!("../assets/sourceline.rb");
 
+/// Environment variable that names the overlay file for the Ruby extension.
+const OVERLAY_ENV: &str = "ASCIIDOC_LSP_OVERLAY";
+
 /// How long the worker waits for further requests before it converts.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -56,6 +59,10 @@ pub struct ConvertRequest {
     /// `-a name=value` pairs, for example from
     /// `AttributeRegistry::config_attributes`.
     pub attributes: Vec<(String, String)>,
+    /// Texts of included files that differ from the disk (unsaved buffers),
+    /// by absolute path. Asciidoctor reads these instead of the file, with
+    /// all include semantics (`leveloffset`, `tags`, `lines`, nesting).
+    pub overlay: Vec<(PathBuf, String)>,
 }
 
 /// The result for one request.
@@ -194,39 +201,91 @@ struct ExtensionFile {
     file: PathBuf,
 }
 
+/// A new folder in the temp directory that only the current user can enter.
+fn private_dir() -> io::Result<PathBuf> {
+    let base = std::env::temp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut last_error = io::Error::other("no free folder name");
+    for attempt in 0..8 {
+        let dir = base.join(format!(
+            "asciidoc-lsp-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last_error = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
+/// Write `content` to `file` for the current user only.
+fn write_private(file: &Path, content: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(file)?.write_all(content.as_bytes())
+}
+
 impl ExtensionFile {
     fn write() -> io::Result<Self> {
-        let base = std::env::temp_dir();
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        let mut last_error = io::Error::other("no free folder name");
-        for attempt in 0..8 {
-            let dir = base.join(format!(
-                "asciidoc-lsp-{}-{stamp}-{attempt}",
-                std::process::id()
-            ));
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            match builder.create(&dir) {
-                Ok(()) => {
-                    let file = dir.join("sourceline.rb");
-                    if let Err(error) = std::fs::write(&file, EXTENSION) {
-                        let _ = std::fs::remove_dir_all(&dir);
-                        return Err(error);
-                    }
-                    return Ok(Self { dir, file });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last_error = error,
-                Err(error) => return Err(error),
-            }
+        let dir = private_dir()?;
+        let file = dir.join("sourceline.rb");
+        if let Err(error) = write_private(&file, EXTENSION) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(error);
         }
-        Err(last_error)
+        Ok(Self { dir, file })
     }
 }
 
 impl Drop for ExtensionFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The overlay of one run as a JSON file `{absolute path: text}` in a private
+/// folder, removed on drop. The extension reads it from the environment
+/// variable [`OVERLAY_ENV`], so no path or text reaches the command line or
+/// the document's attributes.
+#[derive(Debug)]
+struct OverlayFile {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl OverlayFile {
+    fn write(entries: &[(PathBuf, String)]) -> io::Result<Self> {
+        let map: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(path, text)| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    serde_json::Value::String(text.clone()),
+                )
+            })
+            .collect();
+        let json = serde_json::to_string(&map).map_err(io::Error::other)?;
+        let dir = private_dir()?;
+        let file = dir.join("overlay.json");
+        if let Err(error) = write_private(&file, &json) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+        Ok(Self { dir, file })
+    }
+}
+
+impl Drop for OverlayFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -293,7 +352,7 @@ impl AsciidoctorConverter {
         extract_stylesheet(&page).ok_or(ConvertError::StylesheetMissing)
     }
 
-    fn command(&self, request: &ConvertRequest) -> Command {
+    fn command(&self, request: &ConvertRequest, overlay: Option<&Path>) -> Command {
         let base_dir = request.file.parent().unwrap_or(Path::new("."));
         let mut command = Command::new(&self.program);
         command
@@ -319,6 +378,9 @@ impl AsciidoctorConverter {
         for (name, value) in &request.attributes {
             command.arg("-a").arg(format!("{name}={value}@"));
         }
+        if let Some(overlay) = overlay {
+            command.env(OVERLAY_ENV, overlay);
+        }
         command
             .args(["-o", "-", "-"])
             .stdin(Stdio::piped())
@@ -331,15 +393,27 @@ impl AsciidoctorConverter {
 
 impl Convert for AsciidoctorConverter {
     async fn convert(&self, request: &ConvertRequest) -> Result<String, ConvertError> {
-        let mut child = self.command(request).spawn().map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                ConvertError::AsciidoctorMissing {
-                    program: self.program.clone(),
+        // Held until the run ends or its future is dropped.
+        let overlay = if request.overlay.is_empty() {
+            None
+        } else {
+            Some(OverlayFile::write(&request.overlay)?)
+        };
+        let mut child = self
+            .command(
+                request,
+                overlay.as_ref().map(|overlay| overlay.file.as_path()),
+            )
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    ConvertError::AsciidoctorMissing {
+                        program: self.program.clone(),
+                    }
+                } else {
+                    ConvertError::Io(error)
                 }
-            } else {
-                ConvertError::Io(error)
-            }
-        })?;
+            })?;
         let stdin = child.stdin.take();
         let text = request.text.as_bytes();
         let write = async {
@@ -411,6 +485,7 @@ mod tests {
             file: PathBuf::from("/doc.adoc"),
             text: text.to_owned(),
             attributes: Vec::new(),
+            overlay: Vec::new(),
         }
     }
 
@@ -477,7 +552,7 @@ mod tests {
         let mut request = request("= T");
         request.file = PathBuf::from("/work/guide.adoc");
         request.attributes = vec![("toc".to_owned(), "left".to_owned())];
-        let command = converter.command(&request);
+        let command = converter.command(&request, None);
         let args: Vec<String> = command
             .as_std()
             .get_args()
@@ -573,6 +648,7 @@ mod tests {
                 text: std::fs::read_to_string(&file).unwrap(),
                 file,
                 attributes: Vec::new(),
+                overlay: Vec::new(),
             })
             .await
             .unwrap();
@@ -587,5 +663,150 @@ mod tests {
         assert!(html.contains("data-src-0"), "{html}");
         assert!(html.contains(r#"id="adoc-source-files""#), "{html}");
         assert!(html.contains("mid.adoc"), "{html}");
+    }
+
+    /// A chapter tree where the overlay replaces what is on disk.
+    fn write_book(dir: &Path) {
+        std::fs::create_dir_all(dir.join("chapters/sub")).unwrap();
+        let files = [
+            (
+                "book.adoc",
+                "= Book\n\ninclude::chapters/one.adoc[leveloffset=+1]\n\n\
+                 include::chapters/two.adoc[tag=keep]\n\n\
+                 include::chapters/three.adoc[lines=2..3]\n",
+            ),
+            (
+                "chapters/one.adoc",
+                "= One\n\ndisk text\n\ninclude::sub/inner.adoc[]\n",
+            ),
+            ("chapters/sub/inner.adoc", "disk inner\n"),
+            (
+                "chapters/two.adoc",
+                "// tag::keep[]\ndisk kept\n// end::keep[]\n\ndisk dropped\n",
+            ),
+            ("chapters/three.adoc", "disk l1\n\ndisk l3\n\ndisk l5\n"),
+        ];
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
+
+    fn overlay_of(dir: &Path, entries: &[(&str, &str)]) -> Vec<(PathBuf, String)> {
+        entries
+            .iter()
+            .map(|(name, text)| (dir.join(name), (*text).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_overlay_replaces_included_files_and_keeps_include_semantics() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        write_book(&dir);
+        let file = dir.join("book.adoc");
+        let overlay = overlay_of(
+            &dir,
+            &[
+                // The nested include is relative to this file's folder.
+                (
+                    "chapters/one.adoc",
+                    "= One\n\nunsaved text\n\ninclude::sub/inner.adoc[]\n",
+                ),
+                ("chapters/sub/inner.adoc", "unsaved inner\n"),
+                (
+                    "chapters/two.adoc",
+                    "// tag::keep[]\nunsaved kept\n// end::keep[]\n\nunsaved dropped\n",
+                ),
+                (
+                    "chapters/three.adoc",
+                    "unsaved l1\n\nunsaved l3\n\nunsaved l5\n",
+                ),
+            ],
+        );
+        let converter = AsciidoctorConverter::new().unwrap();
+        let html = converter
+            .convert(&ConvertRequest {
+                text: std::fs::read_to_string(&file).unwrap(),
+                file,
+                attributes: Vec::new(),
+                overlay,
+            })
+            .await
+            .unwrap();
+        assert!(!html.contains("disk"), "{html}");
+        assert!(html.contains("unsaved text"), "{html}");
+        assert!(html.contains("unsaved inner"), "{html}");
+        // leveloffset=+1 turns the chapter title into a section title.
+        assert!(html.contains("<h2"), "{html}");
+        assert!(html.contains("unsaved kept"), "{html}");
+        assert!(!html.contains("unsaved dropped"), "{html}");
+        // lines=2..3 selects the blank line and the third line.
+        assert!(html.contains("unsaved l3"), "{html}");
+        assert!(!html.contains("unsaved l1"), "{html}");
+        assert!(!html.contains("unsaved l5"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_overlay_file_that_is_not_on_disk_can_be_included() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let converter = AsciidoctorConverter::new().unwrap();
+        let html = converter
+            .convert(&ConvertRequest {
+                file: dir.join("book.adoc"),
+                text: "= Book\n\ninclude::fresh.adoc[]\n".to_owned(),
+                attributes: Vec::new(),
+                overlay: overlay_of(&dir, &[("fresh.adoc", "only in the buffer\n")]),
+            })
+            .await
+            .unwrap();
+        assert!(html.contains("only in the buffer"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_without_overlay_includes_come_from_disk() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        write_book(&dir);
+        let file = dir.join("book.adoc");
+        let converter = AsciidoctorConverter::new().unwrap();
+        let html = converter
+            .convert(&ConvertRequest {
+                text: std::fs::read_to_string(&file).unwrap(),
+                file,
+                attributes: Vec::new(),
+                overlay: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(html.contains("disk text"), "{html}");
+        assert!(html.contains("disk inner"), "{html}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_overlay_file_is_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let overlay = OverlayFile::write(&[(PathBuf::from("/a.adoc"), "x".to_owned())]).unwrap();
+        let dir = overlay.dir.clone();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&overlay.file), 0o600);
+        let json = std::fs::read_to_string(&overlay.file).unwrap();
+        assert_eq!(json, r#"{"/a.adoc":"x"}"#);
+        drop(overlay);
+        assert!(!dir.exists());
     }
 }

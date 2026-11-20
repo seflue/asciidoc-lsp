@@ -14,8 +14,11 @@
 //! `scroll-map.js`, `morphdom.js` and `events` (SSE).
 //!
 //! Events, each with one line of JSON as data:
-//! - `html`: `{file, lineCount, html}`, a finished conversion of `file`.
-//! - `cursor`: `{file, line}`; `line` is a 1-based source line, see
+//! - `html`: `{file, lineCount, html}`, a finished conversion of `file`: the
+//!   top-level document in whole-document mode, else the active file. The
+//!   HTML ends with the file table of its includes.
+//! - `cursor`: `{file, line}`; `file` is the file the editor is in, which can
+//!   be one that `file` includes, and `line` a 1-based source line of it, see
 //!   [`Preview::set_cursor`].
 //! - `convert-error`: `{message}`, the conversion failed.
 
@@ -709,6 +712,7 @@ mod tests {
             file: PathBuf::from("/doc.adoc"),
             text: "one\ntwo\nthree\n".to_owned(),
             attributes: Vec::new(),
+            overlay: Vec::new(),
         });
         let all = stream.until(r#""lineCount":3}"#).await;
         assert!(all.contains("event: html"), "{all}");
@@ -744,6 +748,7 @@ mod tests {
             file: PathBuf::from("/doc.adoc"),
             text: "x".to_owned(),
             attributes: Vec::new(),
+            overlay: Vec::new(),
         });
         first.until("</p>").await;
         preview.set_cursor(Path::new("/doc.adoc"), 4);

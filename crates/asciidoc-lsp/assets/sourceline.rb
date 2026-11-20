@@ -8,10 +8,45 @@
 # Loaded with `asciidoctor -r <this file>`.
 require 'asciidoctor/extensions'
 require 'json'
+require 'stringio'
 
 # Asciidoctor #4907: a setext (underline) title that spans an include boundary
 # shifts the line numbers after it. Turning setext titles off avoids that.
 Asciidoctor::Compliance.underline_style_section_titles = false
+
+# Unsaved editor buffers of included files. The LSP names a JSON file
+# `{absolute path: text}` in ASCIIDOC_LSP_OVERLAY; for those paths, Asciidoctor
+# reads the buffer text instead of the file. This sits below the include
+# directive on purpose: Asciidoctor's own reader still resolves the target,
+# applies `leveloffset`, `tags`, `lines`, nesting and cycle checks, and
+# numbers the lines. An IncludeProcessor would have to redo all of that.
+module AdocBufferOverlay
+  TEXTS = begin
+    path = ENV['ASCIIDOC_LSP_OVERLAY']
+    raw = path ? JSON.parse(File.read(path)) : {}
+    raw.each_with_object({}) { |(file, text), map| map[File.expand_path(file)] = text }
+  rescue StandardError
+    {}
+  end
+
+  def self.text_for(path)
+    return nil if TEXTS.empty? || !(String === path || path.respond_to?(:to_path))
+    TEXTS[File.expand_path(path.to_s)]
+  end
+
+  def file?(path)
+    AdocBufferOverlay.text_for(path) ? true : super
+  end
+
+  def open(path, *args, **kwargs, &block)
+    text = AdocBufferOverlay.text_for(path)
+    return super unless text
+    io = StringIO.new(text.dup.force_encoding(Encoding::UTF_8))
+    block ? block.call(io) : io
+  end
+end
+
+File.singleton_class.prepend AdocBufferOverlay unless AdocBufferOverlay::TEXTS.empty?
 
 class SourceLinePreprocessor < Asciidoctor::Extensions::Preprocessor
   # The CLI has no --sourcemap in 2.0.x; the extension API turns it on.

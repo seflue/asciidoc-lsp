@@ -16,10 +16,13 @@
  * The server converts the editor's 0-based line once, before it reaches the
  * page. Do not add or subtract 1 in this file.
  *
- * Phase 1 differences from the vscode port: only anchors of the main file
- * count. Blocks from an included file carry `data-src-K` besides
- * `data-line-N`, and their N counts lines of that other file; they are
- * dropped (see `mainFileAnchors`).
+ * Differences from the vscode port: asciidoctor-vscode previews one file at a
+ * time. Here a page can show a whole document, and the cursor can be in the
+ * main file or in an included one. Blocks from an included file carry
+ * `data-src-K` besides `data-line-N`, and their N counts lines of that other
+ * file, so lines are only comparable within one file: `fileAnchors` picks the
+ * anchors of the file the cursor is in (the main file, or file K of the
+ * page's file table), and `srcForFile` finds K.
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) {
@@ -53,23 +56,65 @@
 
   /**
    * Anchors usable for the mapping, from `{line, src?, top}` entries in
-   * document order: drops included-file blocks (their lines belong to
-   * another file) and entries whose line does not rise, so the sequence
-   * stays strictly ascending and interpolation and binary search hold.
-   * Pixel space of an included block is not lost: it lies between its main
-   * file neighbours, and the interpolation spans it.
+   * document order, for one file: `src` is `null` for the main file or the
+   * index K of an included file (`data-src-K`). Lines of another file are
+   * dropped, as are entries whose line does not rise, so the sequence stays
+   * strictly ascending and interpolation and binary search hold.
+   *
+   * A file included more than once counts with its first occurrence: the
+   * anchors stop where an included file's lines fall back, which is where
+   * its next occurrence starts. (A main file has one occurrence.) Pixel
+   * space of other files' blocks is not lost: it lies between the file's own
+   * neighbours, and the interpolation spans it.
    */
-  function mainFileAnchors(entries) {
+  function fileAnchors(entries, src) {
+    var wanted = src === undefined ? null : src
     var result = []
     var last = 0
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i]
-      if (entry.src !== undefined && entry.src !== null) continue
-      if (entry.line <= last) continue
+      var from = entry.src === undefined ? null : entry.src
+      if (from !== wanted) continue
+      if (entry.line <= last) {
+        if (wanted !== null && result.length) break
+        continue
+      }
       result.push({ line: entry.line, top: entry.top })
       last = entry.line
     }
     return result
+  }
+
+  /** Anchors of the main file; see `fileAnchors`. */
+  function mainFileAnchors(entries) {
+    return fileAnchors(entries, null)
+  }
+
+  /**
+   * The file table of a page: the JSON text of `<script id="adoc-source-files">`,
+   * an array of absolute paths where the index is K of `data-src-K`. Empty
+   * for anything that is not such an array.
+   */
+  function parseFileTable(text) {
+    var table
+    try {
+      table = JSON.parse(text)
+    } catch (error) {
+      return []
+    }
+    return Array.isArray(table) ? table : []
+  }
+
+  /**
+   * Which anchors `file` owns on a page whose converted document is
+   * `shownFile` with the file table `table`: `null` for the main file, the
+   * index K for an included one (the first, if the table lists it twice),
+   * `undefined` if the page does not show `file` at all.
+   */
+  function srcForFile(table, shownFile, file) {
+    if (file === shownFile) return null
+    var index = table.indexOf(file)
+    return index < 0 ? undefined : index
   }
 
   /**
@@ -165,7 +210,10 @@
   return {
     ANCHOR_SELECTOR: ANCHOR_SELECTOR,
     parseAnchorClass: parseAnchorClass,
+    fileAnchors: fileAnchors,
     mainFileAnchors: mainFileAnchors,
+    parseFileTable: parseFileTable,
+    srcForFile: srcForFile,
     withSentinel: withSentinel,
     anchorIndicesForLine: anchorIndicesForLine,
     scrollTopForLine: scrollTopForLine,
