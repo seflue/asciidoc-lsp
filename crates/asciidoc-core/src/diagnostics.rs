@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::anchor_scope::{AnchorScope, CatalogCache};
-pub use crate::paths::display_path;
-use crate::paths::{is_uri, resolve_doc_target};
+use crate::paths::{display_path, is_uri, resolve_doc_target};
 use crate::targets::{ImageOutcome, Readings, Target, TargetResult};
 use crate::types::{
     Diagnostic, DiagnosticKind, DocumentModel, ImagesdirOrigin, MissingImage, Span,
@@ -305,7 +304,7 @@ pub fn collect_diagnostics(
                 } else {
                     DiagnosticKind::BrokenInclude {
                         path: written,
-                        documents: if readings.len() > 1 {
+                        documents: if catalogs.scopes_at(path).len() > 1 {
                             missing
                         } else {
                             Vec::new()
@@ -3300,5 +3299,105 @@ mod tests {
         .map(|(line, level, path)| (line, level, path.to_string()))
         .collect();
         assert_eq!(found, expected);
+    }
+
+    /// The include diagnostics of `file` as (level, path, documents named).
+    fn include_diagnostics(
+        ws: &Workspace,
+        file: &Path,
+    ) -> Vec<(&'static str, String, Vec<String>)> {
+        ws.diagnostics_for(file)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DiagnosticKind::BrokenInclude { path, documents } => Some((
+                    "error",
+                    path.clone(),
+                    documents
+                        .iter()
+                        .map(|doc| doc.display().to_string())
+                        .collect(),
+                )),
+                DiagnosticKind::OptionalIncludeNotFound { path } => {
+                    Some(("info", path.clone(), Vec::new()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A scanned workspace of `files` (relative path, content) in a
+    /// temporary folder, with its canonical root.
+    fn written_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Workspace) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for (path, content) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        (tmp, root, ws)
+    }
+
+    /// A broken include names the documents that lack the target, counted
+    /// as xrefs are: among every document that reads the file, also one
+    /// that reads it only in part and so never counts as missing.
+    #[test]
+    fn test_broken_include_names_its_documents_although_a_partial_reader_is_no_judge() {
+        let (_tmp, root, ws) = written_workspace(&[
+            ("book.adoc", "= Book\n\ninclude::part.adoc[]\n"),
+            ("web.adoc", "= Web\n\ninclude::part.adoc[tag=a]\n"),
+            (
+                "part.adoc",
+                "// tag::a[]\ninclude::gone.adoc[]\n// end::a[]\n",
+            ),
+        ]);
+
+        assert_eq!(
+            include_diagnostics(&ws, &root.join("part.adoc")),
+            vec![(
+                "error",
+                "gone.adoc".to_string(),
+                vec!["book.adoc".to_string()]
+            )]
+        );
+    }
+
+    /// Each top-level document is judged with its own attributes; the
+    /// diagnostic names those where the target is missing.
+    #[test]
+    fn test_broken_include_names_the_documents_where_it_is_missing() {
+        let (_tmp, root, ws) = written_workspace(&[
+            ("book.adoc", "= Book\n:d: a\n\ninclude::part.adoc[]\n"),
+            ("web.adoc", "= Web\n:d: b\n\ninclude::part.adoc[]\n"),
+            ("part.adoc", "include::{d}/x.adoc[]\n"),
+            ("a/x.adoc", "X\n"),
+        ]);
+
+        assert_eq!(
+            include_diagnostics(&ws, &root.join("part.adoc")),
+            vec![(
+                "error",
+                "{d}/x.adoc".to_string(),
+                vec!["web.adoc".to_string()]
+            )]
+        );
+    }
+
+    /// Only documents that read a file in part read it: what is missing in
+    /// it is no one's to report.
+    #[test]
+    fn test_include_missing_in_a_file_only_partial_readers_read_is_not_reported() {
+        let (_tmp, root, ws) = written_workspace(&[
+            ("web.adoc", "= Web\n\ninclude::part.adoc[tag=a]\n"),
+            (
+                "part.adoc",
+                "// tag::a[]\nText.\n// end::a[]\n\ninclude::gone.adoc[]\n",
+            ),
+        ]);
+
+        assert_eq!(include_diagnostics(&ws, &root.join("part.adoc")), vec![]);
     }
 }

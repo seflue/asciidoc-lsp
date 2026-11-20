@@ -2802,6 +2802,17 @@ mod tests {
             .collect();
         assert_eq!(targets, vec![intro.as_path()]);
         assert_eq!(broken_includes(&ws, &chapters), 1);
+        let named: Vec<PathBuf> = ws
+            .diagnostics_for(&chapters)
+            .iter()
+            .filter_map(|d| match &d.kind {
+                crate::types::DiagnosticKind::BrokenInclude { documents, .. } => Some(documents),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(named, vec![PathBuf::from("docs/print/guide/guide.adoc")]);
 
         // A graph walk from the entry gets there too.
         let ws = Workspace::build(&root, &root.join("docs/handbook/handbook.adoc"));

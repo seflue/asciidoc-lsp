@@ -608,6 +608,34 @@ mod tests {
         );
     }
 
+    /// Two top-level documents read the include with a different folder:
+    /// a candidate is a fix only where it resolves in each of them.
+    #[test]
+    fn test_include_fix_offers_only_candidates_that_resolve_in_every_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for (path, content) in [
+            ("book.adoc", "= Book\n:d: a\n\ninclude::part.adoc[]\n"),
+            ("web.adoc", "= Web\n:d: b\n\ninclude::part.adoc[]\n"),
+            ("part.adoc", "include::{d}/chaptr.adoc[]\n"),
+            ("a/chapter.adoc", "A\n"),
+            ("a/chaptor.adoc", "A\n"),
+            ("b/chapter.adoc", "B\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let part = root.join("part.adoc");
+
+        let fixes = fixes_at(&ws, &part, "include::{d}/chaptr.adoc[]");
+
+        assert_eq!(names(&fixes), vec!["chapter.adoc"]);
+    }
+
     #[test]
     fn test_include_fix_never_suggests_a_self_include() {
         let (root, ws) = fixture_workspace();
