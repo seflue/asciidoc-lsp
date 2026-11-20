@@ -45,8 +45,8 @@ check-version:
     scripts/check-version.sh
 
 # Check the architecture rules in arc-rules.toml (frozen: arc-baseline.toml)
-arch-check:
-    cargo arc check
+arch-check *ARGS:
+    cargo arc check {{ARGS}}
 
 # Rewrite arc-baseline.toml from the current violations (review the diff!)
 arch-baseline:
