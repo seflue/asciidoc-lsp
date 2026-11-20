@@ -10,8 +10,8 @@ use std::rc::Rc;
 use crate::anchor_scope::{AnchorScope, CatalogCache};
 use crate::references::parse_xref_target;
 use crate::targets::{Readings, Target};
-use crate::types::{Diagnostic, DiagnosticKind, Xref};
-use crate::workspace::{AttributeScope, Workspace};
+use crate::types::{Diagnostic, DiagnosticKind, ResolvedXref};
+use crate::workspace::Workspace;
 
 /// A text replacement on one line; columns are byte columns like `Span`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,38 +90,24 @@ fn replacements(
         .collect()
 }
 
-/// Every ID a typo in `xref` can be fixed to: the IDs of the catalogs in
-/// which the xref is looked up. `None` where the file part does not resolve,
-/// since then the file, not the ID, is the problem.
-fn xref_candidates(
+/// Where the xref `target` on `line` of `path` points in each top-level
+/// document that reads the whole file, with that document's catalog. A
+/// document that reads only part of it is no judge of what is missing.
+fn whole_readers(
     catalogs: &CatalogCache<'_>,
-    xref: &Xref,
-    scopes: &[Rc<AnchorScope>],
-    attribute_scopes: &[AttributeScope<'_>],
-) -> Option<BTreeSet<String>> {
-    let (file_part, _) = parse_xref_target(&xref.target);
-    let mut ids = BTreeSet::new();
-    for scope in scopes {
-        let source = match file_part {
-            None => Rc::clone(scope),
-            Some(file) => {
-                let probe = Xref {
-                    target: file.to_string(),
-                    ..xref.clone()
-                };
-                let resolved = catalogs
-                    .resolve_read(scope, &probe, attribute_scopes)
-                    .ok()?;
-                if scope.contains_file(&resolved.file) {
-                    Rc::clone(scope)
-                } else {
-                    catalogs.get(&resolved.file)
-                }
-            }
-        };
-        ids.extend(source.ids().map(|(id, _)| id.to_string()));
-    }
-    Some(ids)
+    path: &Path,
+    line: usize,
+    target: &str,
+) -> Vec<(Rc<AnchorScope>, Result<ResolvedXref, DiagnosticKind>)> {
+    catalogs
+        .resolve_target(path, line, &Target::Xref(target), Readings::Build)
+        .into_iter()
+        .filter_map(|resolved| {
+            let catalog = catalogs.get(&resolved.reading.document);
+            let result = resolved.result.into_xref()?;
+            catalog.reads_whole(path).then_some((catalog, result))
+        })
+        .collect()
 }
 
 fn xref_fixes(
@@ -147,32 +133,42 @@ fn xref_fixes(
     }
 
     let catalogs = CatalogCache::new(workspace);
-    let scopes: Vec<Rc<AnchorScope>> = catalogs
-        .scopes_at(path)
-        .into_iter()
-        .filter(|scope| scope.reads_whole(path))
-        .collect();
-    let attribute_scopes = if xref.target.contains('{') {
-        workspace.scopes_at(path, xref.line)
-    } else {
-        Vec::new()
+    // Every ID a typo can be fixed to: the IDs of the catalogs in which the
+    // xref is looked up. None where the file part does not resolve, since
+    // then the file, not the ID, is the problem.
+    let sources: Option<Vec<Rc<AnchorScope>>> = match parse_xref_target(&xref.target).0 {
+        None => Some(
+            whole_readers(&catalogs, path, xref.line, &xref.target)
+                .into_iter()
+                .map(|(catalog, _)| catalog)
+                .collect(),
+        ),
+        Some(file) => whole_readers(&catalogs, path, xref.line, file)
+            .into_iter()
+            .map(|(catalog, result)| {
+                let resolved = result.ok()?;
+                Some(if catalog.contains_file(&resolved.file) {
+                    catalog
+                } else {
+                    catalogs.get(&resolved.file)
+                })
+            })
+            .collect(),
     };
-    let Some(ids) = xref_candidates(&catalogs, xref, &scopes, &attribute_scopes) else {
+    let Some(sources) = sources else {
         return Vec::new();
     };
+    let ids: BTreeSet<String> = sources
+        .iter()
+        .flat_map(|source| source.ids().map(|(id, _)| id.to_string()))
+        .collect();
 
     // A fix that leaves the diagnostic in another document is none.
     let prefix = &xref.target[..xref.target.len() - id.len()];
     let resolves_everywhere = |candidate: &str| {
-        let fixed = Xref {
-            target: format!("{prefix}{candidate}"),
-            ..xref.clone()
-        };
-        scopes.iter().all(|scope| {
-            catalogs
-                .resolve_read(scope, &fixed, &attribute_scopes)
-                .is_ok()
-        })
+        whole_readers(&catalogs, path, xref.line, &format!("{prefix}{candidate}"))
+            .iter()
+            .all(|(_, result)| result.is_ok())
     };
     let nearby: Vec<(&str, usize)> = near(id, ids.iter().map(String::as_str))
         .into_iter()

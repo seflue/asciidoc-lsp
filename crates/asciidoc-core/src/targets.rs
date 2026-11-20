@@ -12,13 +12,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::anchor_scope::AnchorScope;
 use crate::anchor_scope::CatalogCache;
 use crate::attributes::DOCDIR;
 use crate::paths::{
     canonicalize_if_exists, display_path, is_uri, join_doc_path, normalize_lexically,
+    resolve_doc_target,
 };
+use crate::references::parse_xref_target;
 pub use crate::types::{imagesdir_note, ImagesdirOrigin};
-use crate::workspace::AttributeScope;
+use crate::types::{DiagnosticKind, ResolvedXref, Xref};
+use crate::workspace::{AttributeScope, Workspace};
 
 /// A target as written in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,9 @@ pub enum Target<'t> {
     Image(&'t str),
     /// The path of `include::path[]`.
     Include(&'t str),
+    /// The whole target of an xref, file part and anchor: `id`, `#id`,
+    /// `file.adoc`, `file.adoc#id`.
+    Xref(&'t str),
 }
 
 /// Which readings of a file a target resolves in.
@@ -61,6 +68,8 @@ pub struct Resolved {
 pub enum TargetResult {
     Image(ImageResult),
     Include(IncludeResult),
+    /// Where the xref points, or why it is broken.
+    Xref(Result<ResolvedXref, DiagnosticKind>),
 }
 
 /// Where an include points in one reading, resolved from the folder of the
@@ -142,36 +151,106 @@ impl<'ws> CatalogCache<'ws> {
         let workspace = self.workspace();
         let file = workspace.indexed_path(file);
         let file_dir = workspace.attributes.doc_dir(&file).unwrap_or(&file);
-        let include_dir = include_dir_of(workspace, &file);
-        let builds = self.reading_scopes(&file, line, false);
+        let folder = document_folder(workspace, &file);
+        let resolved = match *target {
+            Target::Image(written) => self.resolve_in_scopes(&file, line, readings, |scope| {
+                TargetResult::Image(resolve_image(scope, file_dir, written))
+            }),
+            Target::Include(written) => self.resolve_in_scopes(&file, line, readings, |scope| {
+                TargetResult::Include(resolve_include(&scope.substitute(written), &folder))
+            }),
+            Target::Xref(written) => self.resolve_xref_readings(&file, line, written, readings),
+        };
+        resolved
+            .into_iter()
+            .filter(|resolved| {
+                let judge = resolved.reading.preview
+                    || self.get(&resolved.reading.document).reads_whole(&file);
+                judge || !resolved.result.is_failure()
+            })
+            .collect()
+    }
+
+    /// `resolve` in each reading of `file` on `line`: the top-level
+    /// documents and, with the preview, the preview last. `file` is an
+    /// indexed path.
+    fn resolve_in_scopes(
+        &self,
+        file: &Path,
+        line: usize,
+        readings: Readings,
+        resolve: impl Fn(&AttributeScope<'ws>) -> TargetResult,
+    ) -> Vec<Resolved> {
+        let builds = self.reading_scopes(file, line, false);
         let previews = if readings == Readings::WithPreview {
-            self.reading_scopes(&file, line, true)
+            self.reading_scopes(file, line, true)
         } else {
             Rc::default()
         };
         builds
             .iter()
             .chain(previews.iter())
-            .filter_map(|scope| {
-                let result = match *target {
-                    Target::Image(written) => {
-                        TargetResult::Image(resolve_image(scope, file_dir, written))
-                    }
-                    Target::Include(written) => TargetResult::Include(resolve_include(
-                        &scope.substitute(written),
-                        &include_dir,
-                    )),
-                };
-                let judge = scope.is_preview() || self.get(scope.document()).reads_whole(&file);
-                (judge || !result.is_failure()).then(|| Resolved {
-                    reading: Reading {
-                        document: scope.document().to_path_buf(),
-                        preview: scope.is_preview(),
-                    },
-                    result,
-                })
+            .map(|scope| Resolved {
+                reading: Reading {
+                    document: scope.document().to_path_buf(),
+                    preview: scope.is_preview(),
+                },
+                result: resolve(scope),
             })
             .collect()
+    }
+
+    /// The xref `written` on `line` of `file` in each reading: a bare ID in
+    /// each top-level document, the preview takes no part, where every
+    /// reference to a neighbouring chapter would be broken; a file part in
+    /// each top-level document and, for a file others include, the preview,
+    /// which reads the file alone (ADR-009). A file part with an attribute
+    /// reference reads with the attributes of each reading. `file` is an
+    /// indexed path.
+    fn resolve_xref_readings(
+        &self,
+        file: &Path,
+        line: usize,
+        written: &str,
+        readings: Readings,
+    ) -> Vec<Resolved> {
+        let xref = Xref {
+            target: written.to_string(),
+            display_text: None,
+            line,
+            span: None,
+            target_col: 0,
+        };
+        let resolve = |catalog: &AnchorScope, preview, attributes| Resolved {
+            reading: Reading {
+                document: catalog.document().to_path_buf(),
+                preview,
+            },
+            result: TargetResult::Xref(self.resolve_xref_in(catalog, &xref, attributes)),
+        };
+        let with_preview = readings == Readings::WithPreview;
+        match parse_xref_target(written).0 {
+            None => self
+                .scopes_at(file)
+                .iter()
+                .map(|catalog| resolve(catalog, false, None))
+                .collect(),
+            Some(part) if part.contains('{') => {
+                self.resolve_in_scopes(file, line, readings, |scope| {
+                    let catalog = self.get(scope.document());
+                    TargetResult::Xref(self.resolve_xref_in(&catalog, &xref, Some(scope)))
+                })
+            }
+            Some(_) => {
+                let preview = (with_preview && self.is_included(file))
+                    .then(|| resolve(&self.get(file), true, None));
+                self.scopes_at(file)
+                    .iter()
+                    .map(|catalog| resolve(catalog, false, None))
+                    .chain(preview)
+                    .collect()
+            }
+        }
     }
 
     /// Where a path of the kind of `target` starts from in each top-level
@@ -191,7 +270,11 @@ impl<'ws> CatalogCache<'ws> {
                     prefix: scope.substitute(typed),
                 },
                 Target::Include(typed) => BaseDir {
-                    dir: include_dir_of(workspace, &file),
+                    dir: document_folder(workspace, &file),
+                    prefix: scope.substitute(typed),
+                },
+                Target::Xref(typed) => BaseDir {
+                    dir: document_folder(workspace, scope.document()),
                     prefix: scope.substitute(typed),
                 },
             })
@@ -245,7 +328,7 @@ impl TargetResult {
     pub fn into_image(self) -> Option<ImageResult> {
         match self {
             Self::Image(image) => Some(image),
-            Self::Include(_) => None,
+            Self::Include(_) | Self::Xref(_) => None,
         }
     }
 
@@ -254,16 +337,26 @@ impl TargetResult {
     pub fn into_include(self) -> Option<IncludeResult> {
         match self {
             Self::Include(include) => Some(include),
-            Self::Image(_) => None,
+            Self::Image(_) | Self::Xref(_) => None,
         }
     }
 
-    /// The target is missing: the one result a reader of only part of the
-    /// file may not give.
+    /// The result of a [`Target::Xref`].
+    #[must_use]
+    pub fn into_xref(self) -> Option<Result<ResolvedXref, DiagnosticKind>> {
+        match self {
+            Self::Xref(xref) => Some(xref),
+            Self::Image(_) | Self::Include(_) => None,
+        }
+    }
+
+    /// The target is missing or broken: the one result a reader of only part
+    /// of the file may not give.
     fn is_failure(&self) -> bool {
         match self {
             Self::Image(image) => matches!(image.outcome, ImageOutcome::Missing { .. }),
             Self::Include(include) => !include.exists && !include.is_remote(),
+            Self::Xref(xref) => xref.is_err(),
         }
     }
 }
@@ -281,15 +374,35 @@ pub fn resolve_include_in_folder(written: &str, folder: &Path) -> IncludeResult 
     resolve_include(written, folder)
 }
 
-/// The folder includes in `file` resolve from: its document folder (a
-/// symlink's own folder for a symlinked file), else its parent.
-fn include_dir_of(workspace: &crate::workspace::Workspace, file: &Path) -> PathBuf {
+/// The folder paths in `file` start from: its document folder (a symlink's
+/// own folder for a symlinked file), else its parent.
+fn document_folder(workspace: &Workspace, file: &Path) -> PathBuf {
     workspace
         .attributes
         .doc_dir(file)
         .or_else(|| file.parent())
         .unwrap_or(file)
         .to_path_buf()
+}
+
+/// The file part `file` of an xref read in the top-level document
+/// `document`, as a path. Asciidoctor resolves it from the folder of
+/// `document`, also when the xref stands in an included file (ADR-009).
+/// `attributes`, the scope of `document` on the line of the xref, fills in
+/// attribute references in it, else the registry does.
+pub(crate) fn xref_file(
+    workspace: &Workspace,
+    document: &Path,
+    attributes: Option<&AttributeScope<'_>>,
+    file: &str,
+) -> Option<PathBuf> {
+    match (attributes, workspace.attributes.doc_dir(document)) {
+        (Some(attributes), Some(dir)) => Some(canonicalize_if_exists(join_doc_path(
+            dir,
+            &attributes.substitute(file),
+        ))),
+        _ => resolve_doc_target(document, file, &workspace.attributes),
+    }
 }
 
 /// The include `substituted` from the folder `dir`.
@@ -1134,5 +1247,308 @@ mod tests {
         let missing = resolve_include_in_folder("b.adoc", &root);
         assert!(!missing.exists);
         assert!(resolve_include_in_folder("https://example.com/x.adoc", &root).is_remote());
+    }
+
+    /// One xref's results as (document relative to `root`, preview, outcome
+    /// with the file relative to `root`).
+    fn xref(
+        root: &Path,
+        ws: &Workspace,
+        file: &str,
+        line: usize,
+        written: &str,
+        readings: Readings,
+    ) -> Vec<(String, bool, String)> {
+        let relative = |path: &Path| path.strip_prefix(root).unwrap().display().to_string();
+        CatalogCache::new(ws)
+            .resolve_target(&root.join(file), line, &Target::Xref(written), readings)
+            .into_iter()
+            .map(|resolved| {
+                let outcome = match resolved.result.into_xref().unwrap() {
+                    Ok(found) => format!("found {}:{}", relative(&found.file), found.line),
+                    Err(_) => "broken".to_string(),
+                };
+                (
+                    relative(&resolved.reading.document),
+                    resolved.reading.preview,
+                    outcome,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_xref_file_part_resolves_from_the_folder_of_the_top_level_document() {
+        let (root, ws) = fixture("xref_path_in_include");
+
+        // `index.adoc` includes `chapters/reference.adoc`, not `reference.adoc`
+        // next to it: the path is read from the master's folder (ADR-009).
+        // The preview reads the chapter alone, from its own folder, where the
+        // answer is the other way round.
+        assert_eq!(
+            xref(
+                &root,
+                &ws,
+                "chapters/setup.adoc",
+                9,
+                "chapters/reference.adoc#ref-options",
+                Readings::WithPreview
+            ),
+            vec![
+                reading("index.adoc", false, "found chapters/reference.adoc:3"),
+                reading("chapters/setup.adoc", true, "broken"),
+            ]
+        );
+        assert_eq!(
+            xref(
+                &root,
+                &ws,
+                "chapters/setup.adoc",
+                11,
+                "reference.adoc#ref-options",
+                Readings::WithPreview
+            ),
+            vec![
+                reading("index.adoc", false, "broken"),
+                reading(
+                    "chapters/setup.adoc",
+                    true,
+                    "found chapters/reference.adoc:3"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xref_build_leaves_out_the_preview() {
+        let (root, ws) = fixture("xref_path_in_include");
+
+        // Only the preview finds it: broken where the file is converted
+        // (ADR-010).
+        assert_eq!(
+            xref(
+                &root,
+                &ws,
+                "chapters/setup.adoc",
+                11,
+                "reference.adoc#ref-options",
+                Readings::Build
+            ),
+            vec![reading("index.adoc", false, "broken")]
+        );
+    }
+
+    #[test]
+    fn test_xref_file_without_anchor_points_at_line_one() {
+        let (root, ws) = fixture("xref_path_in_include");
+
+        assert_eq!(
+            xref(
+                &root,
+                &ws,
+                "chapters/setup.adoc",
+                9,
+                "chapters/reference.adoc",
+                Readings::Build
+            ),
+            vec![reading(
+                "index.adoc",
+                false,
+                "found chapters/reference.adoc:1"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_xref_to_a_file_that_is_missing_is_broken_not_found_by_name() {
+        let (root, ws) = fixture("xref_path_in_include");
+
+        // `setup.adoc` exists, but not next to `index.adoc` (ADR-009).
+        assert_eq!(
+            xref(
+                &root,
+                &ws,
+                "chapters/setup.adoc",
+                18,
+                "setup.adoc#setup-notes",
+                Readings::Build
+            ),
+            vec![reading("index.adoc", false, "broken")]
+        );
+    }
+
+    #[test]
+    fn test_xref_bare_id_has_no_preview_even_with_preview_readings() {
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "book.adoc",
+                "= Book\n\n[[other]]\n== Other\n\ninclude::part.adoc[]\n",
+            ),
+            ("part.adoc", "<<other>>\n"),
+        ]);
+
+        // Read alone, `part.adoc` would not know `other`: a preview would be
+        // broken for every reference to a neighbouring chapter.
+        assert_eq!(
+            xref(&root, &ws, "part.adoc", 1, "other", Readings::WithPreview),
+            vec![reading("book.adoc", false, "found book.adoc:3")]
+        );
+    }
+
+    #[test]
+    fn test_xref_bare_id_is_judged_in_each_top_level_document() {
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "book.adoc",
+                "= Book\n\n[[x]]\n== X\n\ninclude::part.adoc[]\n",
+            ),
+            ("web.adoc", "= Web\n\ninclude::part.adoc[]\n"),
+            ("part.adoc", "<<x>>\n"),
+        ]);
+
+        assert_eq!(
+            xref(&root, &ws, "part.adoc", 1, "#x", Readings::Build),
+            vec![
+                reading("book.adoc", false, "found book.adoc:3"),
+                reading("web.adoc", false, "broken"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xref_attribute_in_the_file_part_is_substituted_in_each_reading() {
+        let (_tmp, root, ws) = scanned(&[
+            ("book.adoc", "= Book\n:ed: a\n\ninclude::part.adoc[]\n"),
+            ("web.adoc", "= Web\n:ed: b\n\ninclude::part.adoc[]\n"),
+            ("part.adoc", "xref:{ed}.adoc#top[]\n"),
+            ("a.adoc", "= A\n\n[[top]]\n== Top\n"),
+            ("b.adoc", "= B\n"),
+        ]);
+
+        assert_eq!(
+            xref(&root, &ws, "part.adoc", 1, "{ed}.adoc#top", Readings::Build),
+            vec![
+                reading("book.adoc", false, "found a.adoc:3"),
+                reading("web.adoc", false, "broken"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xref_attribute_in_the_file_part_reads_the_preview_without_the_master() {
+        let (_tmp, root, ws) = scanned(&[
+            ("book.adoc", "= Book\n:ed: a\n\ninclude::part.adoc[]\n"),
+            ("part.adoc", "xref:{ed}.adoc#top[]\n"),
+            ("a.adoc", "= A\n\n[[top]]\n== Top\n"),
+        ]);
+
+        // The preview does not see `:ed:` of the master: the reference stays.
+        assert_eq!(
+            xref(
+                &root,
+                &ws,
+                "part.adoc",
+                1,
+                "{ed}.adoc#top",
+                Readings::WithPreview
+            ),
+            vec![
+                reading("book.adoc", false, "found a.adoc:3"),
+                reading("part.adoc", true, "broken"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xref_of_a_reader_of_only_part_of_the_file_drops_its_failure_keeps_its_hit() {
+        let part = "// tag::a[]\n<<x>>\n// end::a[]\n";
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "book.adoc",
+                "= Book\n\n[[x]]\n== X\n\ninclude::part.adoc[]\n",
+            ),
+            ("web.adoc", "= Web\n\ninclude::part.adoc[tag=a]\n"),
+            ("part.adoc", part),
+        ]);
+
+        // `x` is missing in the partial reader: dropped, not judged.
+        assert_eq!(
+            xref(&root, &ws, "part.adoc", 2, "x", Readings::Build),
+            vec![reading("book.adoc", false, "found book.adoc:3")]
+        );
+
+        // Where the partial reader hits, it is kept.
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "book.adoc",
+                "= Book\n\n[[x]]\n== X\n\ninclude::part.adoc[]\n",
+            ),
+            (
+                "web.adoc",
+                "= Web\n\n[[x]]\n== X\n\ninclude::part.adoc[tag=a]\n",
+            ),
+            ("part.adoc", part),
+        ]);
+        assert_eq!(
+            xref(&root, &ws, "part.adoc", 2, "x", Readings::Build),
+            vec![
+                reading("book.adoc", false, "found book.adoc:3"),
+                reading("web.adoc", false, "found web.adoc:3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xref_base_dirs_start_from_the_folder_of_each_top_level_document() {
+        let (_tmp, root, ws) = scanned(&[
+            (
+                "en/book.adoc",
+                "= Book\n:lang: en\n\ninclude::../shared/part.adoc[]\n",
+            ),
+            (
+                "de/book.adoc",
+                "= Buch\n:lang: de\n\ninclude::../shared/part.adoc[]\n",
+            ),
+            ("shared/part.adoc", "xref:{lang}-x.adoc[]\n"),
+        ]);
+        let bases = CatalogCache::new(&ws).base_dirs(
+            &root.join("shared/part.adoc"),
+            1,
+            &Target::Xref("{lang}-x"),
+        );
+
+        // Not the folder of the file holding the xref, and the prefix as
+        // each reading substitutes it.
+        assert_eq!(
+            bases,
+            vec![
+                BaseDir {
+                    dir: root.join("de"),
+                    prefix: "de-x".to_string(),
+                },
+                BaseDir {
+                    dir: root.join("en"),
+                    prefix: "en-x".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xref_base_dirs_leave_out_the_preview() {
+        let (root, ws) = fixture("xref_path_in_include");
+        let bases = CatalogCache::new(&ws).base_dirs(
+            &root.join("chapters/setup.adoc"),
+            9,
+            &Target::Xref("chapters/ref"),
+        );
+
+        assert_eq!(
+            bases,
+            vec![BaseDir {
+                dir: root.clone(),
+                prefix: "chapters/ref".to_string(),
+            }]
+        );
     }
 }

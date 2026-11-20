@@ -5,14 +5,14 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tower_lsp_server::ls_types::Position;
 
-use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
+use asciidoc_core::anchor_scope::CatalogCache;
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::extractors::{element_attr_id, find_child_text, is_valid_anchor_id};
-use asciidoc_core::paths::{canonicalize_if_exists, join_doc_path, normalize_lexically};
+use asciidoc_core::paths::normalize_lexically;
 use asciidoc_core::pdf_theme::{
     is_builtin_theme, is_pdf_path_attribute, resolve_pdf_attribute, PdfPath, PDF_THEME,
 };
-use asciidoc_core::references::{parse_xref_target, xref_names_file};
+use asciidoc_core::references::parse_xref_target;
 use asciidoc_core::targets::{
     imagesdir_note, resolve_image_in_folder, resolve_include_in_folder, ImageOutcome, ImageResult,
     IncludeResult, Readings, Target,
@@ -26,8 +26,7 @@ use asciidoc_core::workspace::{
 
 use crate::positions;
 use crate::scopes::{
-    collapse_if_agree, document_dir, file_display_name, path_scopes, reading_label, scope_label,
-    unique_in_order,
+    collapse_if_agree, document_dir, file_display_name, reading_label, scope_label, unique_in_order,
 };
 
 /// Classification of a node found at a cursor position.
@@ -188,17 +187,10 @@ pub fn resolve_goto_definitions(
             };
             let catalogs = CatalogCache::new(ws);
             unique_in_order(
-                resolve_xref_targets(
-                    ws,
-                    &catalogs,
-                    doc_path,
-                    target,
-                    node_info.line,
-                    Readings::Build,
-                )
-                .into_iter()
-                .filter_map(|(_, resolved)| resolved.ok())
-                .map(|resolved| (resolved.file, resolved.line)),
+                resolve_xref_targets(&catalogs, doc_path, target, node_info.line, Readings::Build)
+                    .into_iter()
+                    .filter_map(|(_, resolved)| resolved.ok())
+                    .map(|resolved| (resolved.file, resolved.line)),
             )
         }
         // On a definition or anchor goto-definition is a no-op.
@@ -498,7 +490,6 @@ pub fn resolve_hover(
             let ws = workspace?;
             let catalogs = CatalogCache::new(ws);
             let resolved = resolve_xref_targets(
-                ws,
                 &catalogs,
                 doc_path,
                 target,
@@ -593,7 +584,6 @@ pub fn resolve_hover(
             let ws = workspace?;
             let catalogs = CatalogCache::new(ws);
             let texts: Vec<(String, String)> = resolve_xref_targets(
-                ws,
                 &catalogs,
                 doc_path,
                 id,
@@ -809,6 +799,26 @@ fn resolve_include_targets(
         .collect()
 }
 
+/// How an xref on `line` resolves, per reading (`readings` says whether the
+/// preview takes part), each with its reading's label. Shared by
+/// go-to-definition, hover, find-references, rename and the explain report.
+fn resolve_xref_targets(
+    catalogs: &CatalogCache<'_>,
+    doc_path: &Path,
+    target: &str,
+    line: usize,
+    readings: Readings,
+) -> Vec<(String, Result<ResolvedXref, DiagnosticKind>)> {
+    catalogs
+        .resolve_target(doc_path, line, &Target::Xref(target), readings)
+        .into_iter()
+        .filter_map(|resolved| {
+            let result = resolved.result.into_xref()?;
+            Some((reading_label(&resolved.reading), result))
+        })
+        .collect()
+}
+
 /// The distinct existing files among `targets`, in order.
 fn existing_targets(targets: &[(String, IncludeResult)]) -> Vec<PathBuf> {
     unique_in_order(
@@ -852,7 +862,7 @@ fn anchor_definitions_of_xref(
     id: &str,
     line: usize,
 ) -> Vec<AnchorLocation> {
-    let definitions = xref_definitions(ws, catalogs, doc_path, target, id, line);
+    let definitions = xref_definitions(catalogs, doc_path, target, id, line);
     close_definitions(ws, catalogs, id, definitions)
 }
 
@@ -886,8 +896,7 @@ fn close_definitions(
             }) else {
                 continue;
             };
-            for location in
-                xref_definitions(ws, catalogs, &reference.path, &xref.target, id, xref.line)
+            for location in xref_definitions(catalogs, &reference.path, &xref.target, id, xref.line)
             {
                 push_definition(&mut definitions, location);
             }
@@ -902,7 +911,6 @@ fn close_definitions(
 /// top-level document that reads the file, with the explicit definitions
 /// that follow it.
 fn xref_definitions(
-    ws: &Workspace,
     catalogs: &CatalogCache<'_>,
     doc_path: &Path,
     target: &str,
@@ -910,8 +918,7 @@ fn xref_definitions(
     line: usize,
 ) -> Vec<AnchorLocation> {
     let mut definitions = Vec::new();
-    for (_, resolved) in resolve_xref_targets(ws, catalogs, doc_path, target, line, Readings::Build)
-    {
+    for (_, resolved) in resolve_xref_targets(catalogs, doc_path, target, line, Readings::Build) {
         if let Ok(ResolvedXref {
             file,
             line,
@@ -1007,88 +1014,6 @@ fn anchor_reference_locations(
     });
     locations.dedup_by(|a, b| a.path == b.path && a.line == b.line && a.col == b.col);
     locations
-}
-
-/// How an xref on `line` resolves, per top-level document, with each
-/// document's own ID catalog. The file part is read from the folder of the
-/// document, as Asciidoctor reads it, also in an included file. A target
-/// with a file part also resolves
-/// in the editor's preview of a file others include (ADR-4): the path as
-/// the preview sees it, and the ID in the catalog of that file read alone,
-/// which is what Asciidoctor knows when it converts the file on its own. A
-/// bare ID has no preview, where every reference to a neighbouring chapter
-/// would be broken. `readings` says whether the preview takes part. Each
-/// result comes with its scope's label. Shared by go-to-definition, hover,
-/// find-references, rename and the explain report.
-fn resolve_xref_targets(
-    ws: &Workspace,
-    catalogs: &CatalogCache<'_>,
-    doc_path: &Path,
-    target: &str,
-    line: usize,
-    readings: Readings,
-) -> Vec<(String, Result<ResolvedXref, DiagnosticKind>)> {
-    let xref = asciidoc_core::types::Xref {
-        target: target.to_string(),
-        display_text: None,
-        line,
-        span: None,
-        target_col: 0,
-    };
-    // A document that reads `doc_path` only in part is no judge of what is
-    // missing there (the walk knows no tag regions): a failure is dropped.
-    let known = |catalog: &AnchorScope, resolved: Result<ResolvedXref, DiagnosticKind>| {
-        (resolved.is_ok() || catalog.reads_whole(doc_path)).then_some(resolved)
-    };
-    if !xref_names_file(target) {
-        return catalogs
-            .scopes_at(doc_path)
-            .iter()
-            .filter_map(|catalog| {
-                let resolved = catalogs.resolve_xref_in(catalog, &xref, |_| None);
-                known(catalog, resolved)
-                    .map(|resolved| (file_display_name(catalog.document()), resolved))
-            })
-            .collect();
-    }
-    if target.contains('{') {
-        // An attribute reference in the file part reads differently in each
-        // scope, so each scope is read for its own attributes.
-        return path_scopes(ws, doc_path, line)
-            .filter(|scope| readings == Readings::WithPreview || !scope.is_preview())
-            .filter_map(|scope| {
-                let catalog = catalogs.get(scope.document());
-                let dir = document_dir(scope.document(), Some(ws));
-                let resolved = catalogs.resolve_xref_in(&catalog, &xref, |file| {
-                    Some(canonicalize_if_exists(join_doc_path(
-                        dir,
-                        &scope.substitute(file),
-                    )))
-                });
-                known(&catalog, resolved).map(|resolved| (scope_label(&scope), resolved))
-            })
-            .collect();
-    }
-    // The same scopes as `path_scopes`: one per top-level document and, for a
-    // file others include, its preview, which reads the file alone.
-    let preview = (readings == Readings::WithPreview && catalogs.is_included(doc_path))
-        .then(|| catalogs.get(doc_path));
-    catalogs
-        .scopes_at(doc_path)
-        .into_iter()
-        .map(|catalog| (file_display_name(catalog.document()), catalog))
-        .chain(preview.map(|catalog| {
-            let label = format!("{} (preview)", file_display_name(catalog.document()));
-            (label, catalog)
-        }))
-        .filter_map(|(label, catalog)| {
-            let dir = document_dir(catalog.document(), Some(ws));
-            let resolved = catalogs.resolve_xref_in(&catalog, &xref, |file| {
-                Some(canonicalize_if_exists(join_doc_path(dir, file)))
-            });
-            known(&catalog, resolved).map(|resolved| (label, resolved))
-        })
-        .collect()
 }
 
 /// Build a debug report of what go-to-definition and hover see at `pos`.
@@ -1318,7 +1243,7 @@ fn definition_json(definition: &AttributeDefinition) -> Value {
 fn explain_xref(ws: &Workspace, doc_path: &Path, target: &str, line: usize) -> Value {
     let catalogs = CatalogCache::new(ws);
     let scopes: Vec<Value> =
-        resolve_xref_targets(ws, &catalogs, doc_path, target, line, Readings::WithPreview)
+        resolve_xref_targets(&catalogs, doc_path, target, line, Readings::WithPreview)
             .into_iter()
             .map(|(label, resolved)| match resolved {
                 Ok(resolved) => json!({

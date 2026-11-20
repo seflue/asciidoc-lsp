@@ -628,7 +628,7 @@ impl FileLocation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedXref {
     pub file: PathBuf,
     pub line: usize,

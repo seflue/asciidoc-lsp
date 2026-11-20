@@ -10,10 +10,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-use crate::paths::{canonicalize_if_exists, join_doc_path, resolve_doc_target};
 use crate::reading::{read_in_order, ReadingVisitor};
 use crate::references::{effective_id_separator, generate_section_id, parse_xref_target};
-use crate::targets::ReadingScopeCache;
+use crate::targets::{xref_file, ReadingScopeCache, Readings, Target};
 use crate::types::{
     Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, FileLocation, IncludeEdge,
     ResolvedXref, Section, Xref,
@@ -177,7 +176,10 @@ impl<'ws> CatalogCache<'ws> {
     }
 
     /// Where `xref` points when read in `scope`, one top-level document.
-    /// `resolve_file` turns the file part of the target into a path.
+    /// The file part of the target is resolved from the folder of that
+    /// document ([`crate::targets`] holds the rule); `attributes`, the scope
+    /// of the document on the line of the xref, fills in attribute
+    /// references in it, else the registry does.
     ///
     /// A bare or `#id` target is an ID of the document. `file#id` is internal
     /// when `file` is part of the document, so the ID is searched in the
@@ -193,7 +195,7 @@ impl<'ws> CatalogCache<'ws> {
         &self,
         scope: &AnchorScope,
         xref: &Xref,
-        resolve_file: impl FnOnce(&str) -> Option<PathBuf>,
+        attributes: Option<&AttributeScope<'_>>,
     ) -> Result<ResolvedXref, DiagnosticKind> {
         let broken = || DiagnosticKind::BrokenXref {
             target: xref.target.clone(),
@@ -219,7 +221,8 @@ impl<'ws> CatalogCache<'ws> {
         };
         // Only the path Asciidoctor reads names the file (ADR-009): a file
         // of the same name in another folder is no target.
-        let resolved = resolve_file(file_ref).ok_or_else(broken)?;
+        let resolved =
+            xref_file(self.workspace, scope.document(), attributes, file_ref).ok_or_else(broken)?;
         let (file, _) = self
             .workspace
             .documents
@@ -241,30 +244,6 @@ impl<'ws> CatalogCache<'ws> {
                 .map(|location| located(id, location))
         };
         location.ok_or_else(broken)
-    }
-
-    /// [`Self::resolve_xref_in`] for an xref in a file `scope` reads, with the
-    /// file part resolved as Asciidoctor resolves it when it converts the
-    /// document `scope`: from that document's folder, in its attribute scope
-    /// among `attribute_scopes` (the scopes of the xref's line, needed only
-    /// when the target has an attribute reference).
-    ///
-    /// # Errors
-    /// Returns a `DiagnosticKind::BrokenXref` if the file or the ID cannot be
-    /// found.
-    pub(crate) fn resolve_read(
-        &self,
-        scope: &AnchorScope,
-        xref: &Xref,
-        attribute_scopes: &[AttributeScope<'_>],
-    ) -> Result<ResolvedXref, DiagnosticKind> {
-        let attributes = attribute_scopes
-            .iter()
-            .find(|candidate| candidate.document() == scope.document());
-        self.resolve_xref_in(scope, xref, |file| {
-            self.workspace
-                .resolve_xref_file(scope.document(), attributes, file)
-        })
     }
 
     /// The xrefs of `id` that point at one of the `definitions`: those that
@@ -323,24 +302,24 @@ impl<'ws> CatalogCache<'ws> {
                 anchor == Some(id) || (include_natural && file.is_none())
             });
             for xref in named {
-                let attribute_scopes = if xref.target.contains('{') {
-                    workspace.scopes_at(path, xref.line)
-                } else {
-                    Vec::new()
-                };
-                let reaches_definition = self.scopes_at(path).iter().any(|scope| {
-                    self.resolve_read(scope, xref, &attribute_scopes)
-                        .is_ok_and(|resolved| {
-                            resolved
-                                .id
-                                .as_ref()
-                                .is_none_or(|rid| definition_ids.contains(rid))
-                                && definitions.iter().any(|definition| {
-                                    resolved.file == definition.file
-                                        && resolved.line == definition.line
-                                })
-                        })
-                });
+                let reaches_definition = self
+                    .resolve_target(
+                        path,
+                        xref.line,
+                        &Target::Xref(&xref.target),
+                        Readings::Build,
+                    )
+                    .into_iter()
+                    .filter_map(|resolved| resolved.result.into_xref()?.ok())
+                    .any(|resolved| {
+                        resolved
+                            .id
+                            .as_ref()
+                            .is_none_or(|rid| definition_ids.contains(rid))
+                            && definitions.iter().any(|definition| {
+                                resolved.file == definition.file && resolved.line == definition.line
+                            })
+                    });
                 if reaches_definition {
                     let (col, end_col) = xref.id_span().map_or((0, 0), |(_, c, e)| (c, e));
                     references.push(FileLocation::new(path.clone(), xref.line, col, end_col));
@@ -426,25 +405,6 @@ impl Workspace {
             }
         }
         definitions
-    }
-
-    /// The file part of an xref read in the top-level document `document`,
-    /// as a path. Asciidoctor resolves it from the folder of `document`, also
-    /// when the xref stands in an included file. `attributes` is the scope of
-    /// `document`, which fills in attribute references in the target.
-    pub(crate) fn resolve_xref_file(
-        &self,
-        document: &Path,
-        attributes: Option<&AttributeScope<'_>>,
-        file: &str,
-    ) -> Option<PathBuf> {
-        match (attributes, self.attributes.doc_dir(document)) {
-            (Some(attributes), Some(dir)) => Some(canonicalize_if_exists(join_doc_path(
-                dir,
-                &attributes.substitute(file),
-            ))),
-            _ => resolve_doc_target(document, file, &self.attributes),
-        }
     }
 
     /// `document` is already an indexed path.
@@ -1323,9 +1283,7 @@ mod tests {
             HashMap::new(),
         );
         let scope = ws.anchor_scope_of(source);
-        CatalogCache::new(&ws).resolve_xref_in(&scope, &xref(target), |file| {
-            crate::paths::resolve_doc_target(source, file, &ws.attributes)
-        })
+        CatalogCache::new(&ws).resolve_xref_in(&scope, &xref(target), None)
     }
 
     /// A file outside the document is a link to a document of its own and is
@@ -1418,40 +1376,6 @@ mod tests {
 
         assert_eq!(resolved.file, target);
         assert_eq!(resolved.line, 3);
-    }
-
-    /// The caller decides where the file part of an xref points (one
-    /// attribute scope, ADR-4); the ID lookup stays the same.
-    #[test]
-    fn test_resolve_xref_in_with_caller_resolved_file() {
-        let registry = crate::attributes::AttributeRegistry::new(Path::new("/tmp"));
-        let mut documents = HashMap::new();
-        documents.insert(
-            PathBuf::from("/web/doc.adoc"),
-            DocumentModel::test("/web/doc.adoc").with_anchors(vec![Anchor {
-                id: "x".into(),
-                reftext: None,
-                line: 5,
-            }]),
-        );
-        documents.insert(PathBuf::from("/src.adoc"), DocumentModel::test("/src.adoc"));
-        let ws = Workspace::new_with(
-            PathBuf::from("/"),
-            registry,
-            crate::graph::IncludeGraph::new(),
-            documents,
-            HashMap::new(),
-        );
-        let scope = ws.anchor_scope_of(Path::new("/src.adoc"));
-
-        let resolved = CatalogCache::new(&ws)
-            .resolve_xref_in(&scope, &xref("{edition}/doc.adoc#x"), |file| {
-                (file == "{edition}/doc.adoc").then(|| PathBuf::from("/web/doc.adoc"))
-            })
-            .unwrap();
-
-        assert_eq!(resolved.file, PathBuf::from("/web/doc.adoc"));
-        assert_eq!(resolved.line, 5);
     }
 
     fn titles_workspace() -> (Workspace, PathBuf) {

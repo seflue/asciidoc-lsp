@@ -1,24 +1,10 @@
 //! The attribute scopes a path-like value resolves in, and how features
 //! present them (ADR-4). Shared by navigation and completion.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use asciidoc_core::attributes::DOCDIR;
 use asciidoc_core::targets::Reading;
 use asciidoc_core::workspace::{AttributeScope, Workspace};
-
-/// The scopes a path on `line` of `doc_path` resolves in: one per
-/// top-level document and, for a file others include, the editor's preview
-/// of it (ADR-4).
-pub(crate) fn path_scopes<'w>(
-    ws: &'w Workspace,
-    doc_path: &Path,
-    line: usize,
-) -> impl Iterator<Item = AttributeScope<'w>> {
-    ws.scopes_at(doc_path, line)
-        .into_iter()
-        .chain(ws.preview_scope_at(doc_path, line))
-}
 
 /// Keeps only the first of `items` when every neighbouring pair is `same`:
 /// scopes that agree give one result, not one per scope (ADR-4).
@@ -37,13 +23,6 @@ pub(crate) fn unique_in_order<T: PartialEq>(items: impl IntoIterator<Item = T>) 
         }
     }
     unique
-}
-
-/// The folder paths resolve against in `scope`: its `docdir`, else `file_dir`.
-pub(crate) fn scope_docdir(scope: &AttributeScope<'_>, file_dir: &Path) -> PathBuf {
-    scope
-        .value(DOCDIR)
-        .map_or_else(|| file_dir.to_path_buf(), PathBuf::from)
 }
 
 /// The directory relative paths in `doc_path` resolve against: the document

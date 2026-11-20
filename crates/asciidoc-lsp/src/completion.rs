@@ -14,10 +14,10 @@ use asciidoc_core::builtin_attributes::{
 use asciidoc_core::paths::canonicalize_if_exists;
 use asciidoc_core::targets::Target;
 use asciidoc_core::types::{AnchorKind, AnchorLocation};
-use asciidoc_core::workspace::{AttributeScope, Workspace};
+use asciidoc_core::workspace::Workspace;
 
 use crate::positions;
-use crate::scopes::{collapse_if_agree, document_dir, scope_docdir, scope_label};
+use crate::scopes::{collapse_if_agree, document_dir, scope_label};
 
 // ---------------------------------------------------------------------------
 // Syntax Completion Catalog
@@ -1024,25 +1024,16 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     // The file as each top-level document reads it (ADR-4), from the
     // document's folder, as Asciidoctor reads it; anchors of any of them. The
     // preview takes no part, as for goto (ADR-010).
-    let base = document_dir(doc_path, Some(ws));
-    let resolved: Vec<(PathBuf, String)> = ws
-        .scopes_at(doc_path, line)
-        .into_iter()
-        .map(|scope| (scope_docdir(&scope, base), scope.substitute(file)))
-        .filter(|(_, resolved)| !resolved.contains('{'))
-        .collect();
-    if resolved.is_empty() {
-        return Vec::new();
-    }
-
+    let bases = CatalogCache::new(ws).base_dirs(doc_path, line, &Target::Xref(file));
     // A file that exists is matched by its canonical path (downstream
     // compares against `std::fs::canonicalize(&loc.file)`). One that does not
     // exist at the resolved path is no target, as for go-to-definition and
     // the diagnostics: a file of the same name elsewhere offers nothing.
-    let canonical_targets: Vec<PathBuf> = resolved
+    let canonical_targets: Vec<PathBuf> = bases
         .iter()
-        .filter_map(|(dir, resolved)| {
-            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(dir, resolved)).ok()
+        .filter(|base| !base.prefix.contains('{'))
+        .filter_map(|base| {
+            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(&base.dir, &base.prefix)).ok()
         })
         .collect();
     // No targets would mean the current document to `anchors_of_documents`.
@@ -1070,10 +1061,20 @@ pub(crate) fn resolve_xref_path_completions(
     closing: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let base = document_dir(doc_path, ws);
-    let listings = path_listings(prefix, doc_path, line, ws, base.to_path_buf(), |scope| {
-        scope_docdir(scope, base)
-    });
+    let listings = match ws {
+        Some(ws) => CatalogCache::new(ws)
+            .base_dirs(doc_path, line, &Target::Xref(prefix))
+            .into_iter()
+            .map(|base| PathListing {
+                base_dir: base.dir,
+                resolved_prefix: base.prefix,
+            })
+            .collect(),
+        None => vec![PathListing {
+            base_dir: document_dir(doc_path, None).to_path_buf(),
+            resolved_prefix: prefix.to_string(),
+        }],
+    };
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
     // When a `[` follows later in the same target (`closing == ""`): drop the bracket
@@ -1223,34 +1224,6 @@ fn resolve_path_completions(
 struct PathListing {
     base_dir: PathBuf,
     resolved_prefix: String,
-}
-
-/// One [`PathListing`] per scope of `doc_path` on `line` (ADR-4), each
-/// starting from `base_dir(scope)`; without a workspace one from
-/// `fallback_base` with `prefix` as typed. The preview scope takes no part:
-/// paths complete only where goto follows them, in the top-level documents
-/// (ADR-010).
-fn path_listings(
-    prefix: &str,
-    doc_path: &Path,
-    line: usize,
-    ws: Option<&Workspace>,
-    fallback_base: PathBuf,
-    base_dir: impl Fn(&AttributeScope<'_>) -> PathBuf,
-) -> Vec<PathListing> {
-    let Some(ws) = ws else {
-        return vec![PathListing {
-            base_dir: fallback_base,
-            resolved_prefix: prefix.to_string(),
-        }];
-    };
-    ws.scopes_at(doc_path, line)
-        .into_iter()
-        .map(|scope| PathListing {
-            base_dir: base_dir(&scope),
-            resolved_prefix: scope.substitute(prefix),
-        })
-        .collect()
 }
 
 /// The candidates of one [`PathListing`] for the typed `prefix`.

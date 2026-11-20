@@ -169,25 +169,18 @@ pub fn collect_diagnostics(
                 catalogs.scopes_at(path)
             };
         for xref in &doc.xrefs {
-            // The file part of the target is resolved in each reading
-            // document's own attribute scope, as go-to-definition does; the
-            // scopes are only needed when the target has an attribute.
-            let attribute_scopes = if xref.target.contains('{') {
-                workspace.scopes_at(path, xref.line)
-            } else {
-                Vec::new()
-            };
             // A document that reads the file only in part is no judge of what
             // is missing in it, so it counts neither as missing nor as found.
-            let missing: Vec<PathBuf> = reading
-                .iter()
-                .filter(|scope| scope.reads_whole(path))
-                .filter(|scope| {
-                    catalogs
-                        .resolve_read(scope, xref, &attribute_scopes)
-                        .is_err()
-                })
-                .map(|scope| display_path(root, scope.document()))
+            let missing: Vec<PathBuf> = catalogs
+                .resolve_target(
+                    path,
+                    xref.line,
+                    &Target::Xref(&xref.target),
+                    Readings::Build,
+                )
+                .into_iter()
+                .filter(|resolved| matches!(&resolved.result, TargetResult::Xref(Err(_))))
+                .map(|resolved| display_path(root, &resolved.reading.document))
                 .collect();
             if !missing.is_empty() {
                 diags.entry(path.clone()).or_default().push(Diagnostic {
