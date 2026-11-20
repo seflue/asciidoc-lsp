@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn resolve(ws: &Workspace, file: &Path, name: &str, line: Option<usize>) -> Vec<PdfPath> {
-        ws.resolve_pdf_attribute(file, name, line).unwrap().paths
+        resolve_pdf_attribute(ws, file, name, line).unwrap().paths
     }
 
     /// Asciidoctor PDF loads the theme when conversion starts, after the
@@ -848,9 +848,7 @@ mod tests {
             ]
         );
         // `{pdf-themesdir}` in main.adoc: set in the included file.
-        let reference = ws
-            .resolve_pdf_attribute(&main, PDF_THEMESDIR, None)
-            .unwrap();
+        let reference = resolve_pdf_attribute(&ws, &main, PDF_THEMESDIR, None).unwrap();
         assert_eq!(reference.paths, vec![PdfPath::Absolute(root.join("theme"))]);
         let source = reference.source.unwrap();
         assert_eq!((source.file, source.line), (shared, 1));

@@ -10,7 +10,9 @@ use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::diagnostics::display_path;
 use asciidoc_core::extractors::{element_attr_id, find_child_text, is_valid_anchor_id};
 use asciidoc_core::paths::{canonicalize_if_exists, is_uri, join_doc_path, normalize_lexically};
-use asciidoc_core::pdf_theme::{is_builtin_theme, is_pdf_path_attribute, PdfPath, PDF_THEME};
+use asciidoc_core::pdf_theme::{
+    is_builtin_theme, is_pdf_path_attribute, resolve_pdf_attribute, PdfPath, PDF_THEME,
+};
 use asciidoc_core::references::{parse_xref_target, xref_names_file};
 use asciidoc_core::types::{
     AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref,
@@ -425,7 +427,7 @@ pub fn resolve_hover(
 
     match &node_info.kind {
         NodeKind::AttributeRef { name } if is_pdf_path_attribute(name) => {
-            let resolution = workspace?.resolve_pdf_attribute(doc_path, name, None)?;
+            let resolution = resolve_pdf_attribute(workspace?, doc_path, name, None)?;
             let mut text = format!(":{name}: {}", pdf_paths_display(name, &resolution.paths));
             if let Some(source) = resolution.source {
                 let display_path = file_display_name(&source.file);
@@ -436,7 +438,7 @@ pub fn resolve_hover(
         // An unset entry resolves to no paths; it falls through to the generic arm.
         NodeKind::AttributeDef { name, unset: false } if is_pdf_path_attribute(name) => {
             let resolution =
-                workspace?.resolve_pdf_attribute(doc_path, name, Some(node_info.line))?;
+                resolve_pdf_attribute(workspace?, doc_path, name, Some(node_info.line))?;
             Some(format!(
                 ":{name}: {}",
                 pdf_paths_display(name, &resolution.paths)

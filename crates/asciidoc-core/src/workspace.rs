@@ -11,7 +11,6 @@ use crate::graph::{
     build_graph, build_graph_with_overrides, include_edges, parse_single_file, IncludeGraph,
 };
 use crate::paths::relative_path;
-use crate::pdf_theme::PdfResolution;
 use crate::reading::{read_in_order, ReadingVisitor};
 use crate::types::{
     AttributeDef, AttributeRef, Diagnostic, DocumentModel, FileLocation, PossibleDefinition,
@@ -189,19 +188,6 @@ impl Workspace {
             }
         }
         results
-    }
-
-    /// Resolve `pdf-theme`, `pdf-themesdir` or `pdf-fontsdir` as seen from
-    /// `file`: the entry on `line` when given, else the value a reference
-    /// in `file` sees. See [`crate::pdf_theme::resolve_pdf_attribute`].
-    #[must_use]
-    pub fn resolve_pdf_attribute(
-        &self,
-        file: &Path,
-        name: &str,
-        line: Option<usize>,
-    ) -> Option<PdfResolution> {
-        crate::pdf_theme::resolve_pdf_attribute(self, file, name, line)
     }
 
     /// The attributes in effect on `line` of `file`, one scope per top-level
