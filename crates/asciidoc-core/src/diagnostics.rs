@@ -149,7 +149,7 @@ fn declared_tags<'a>(
     cache
         .entry(target.to_path_buf())
         .or_insert_with(|| {
-            std::fs::read_to_string(target)
+            crate::source_text::read_adoc_file(target)
                 .ok()
                 .map(|text| crate::extractors::extract_tag_directives(&text))
         })

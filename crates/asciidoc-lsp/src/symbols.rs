@@ -264,9 +264,9 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
         let Some(uri) = path_to_uri(path) else {
             continue;
         };
-        let content = file_cache
-            .entry(path.clone())
-            .or_insert_with(|| std::fs::read_to_string(path).unwrap_or_default());
+        let content = file_cache.entry(path.clone()).or_insert_with(|| {
+            asciidoc_core::source_text::read_adoc_file(path).unwrap_or_default()
+        });
 
         // Sections
         for section in &doc.sections {
@@ -320,9 +320,9 @@ pub(crate) fn collect_workspace_symbols(ws: &Workspace, query: &str) -> Vec<Symb
         let Some(uri) = path_to_uri(&loc.file) else {
             continue;
         };
-        let content = file_cache
-            .entry(loc.file.clone())
-            .or_insert_with(|| std::fs::read_to_string(&loc.file).unwrap_or_default());
+        let content = file_cache.entry(loc.file.clone()).or_insert_with(|| {
+            asciidoc_core::source_text::read_adoc_file(&loc.file).unwrap_or_default()
+        });
         symbols.push(make_symbol_info(
             id.clone(),
             SymbolKind::CONSTANT,

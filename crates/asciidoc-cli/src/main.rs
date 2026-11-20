@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
         print_include_tree(&tree, cli.all);
     } else {
         // Single-file mode: parse and extract everything
-        let source = std::fs::read_to_string(&cli.path)?;
+        let source = asciidoc_core::source_text::read_adoc_file(&cli.path)?;
         let mut block_parser = asciidoc_core::parser::init_block_parser()?;
         let block_tree = asciidoc_core::parser::parse(&mut block_parser, &source)?;
         let root = block_tree.root_node();

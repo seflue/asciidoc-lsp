@@ -13,6 +13,7 @@ pub mod quick_fix;
 mod reading;
 pub mod references;
 mod section_levels;
+pub mod source_text;
 pub mod substituted_refs;
 pub mod types;
 pub mod ventilate;

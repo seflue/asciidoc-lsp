@@ -2017,7 +2017,7 @@ fn read_content(path: &Path, overrides: &HashMap<PathBuf, Arc<String>>) -> Strin
     if let Some(content) = overrides.get(path) {
         return content.to_string();
     }
-    match std::fs::read_to_string(path) {
+    match asciidoc_core::source_text::read_adoc_file(path) {
         Ok(content) => content,
         Err(e) => {
             tracing::warn!("failed to read file for rename: {}: {e}", path.display());

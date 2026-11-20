@@ -536,7 +536,7 @@ fn merge_config_chain(
             if limit == ChainLimit::Before(&config_path) {
                 return;
             }
-            let Ok(content) = std::fs::read_to_string(&config_path) else {
+            let Ok(content) = crate::source_text::read_adoc_file(&config_path) else {
                 continue;
             };
             // Synthetic attribute: {asciidoctorconfigdir} = directory of this config
@@ -702,7 +702,7 @@ impl ConfigRead<'_> {
         if self.stack.contains(&canonical) {
             return;
         }
-        let Ok(included) = std::fs::read_to_string(&target) else {
+        let Ok(included) = crate::source_text::read_adoc_file(&target) else {
             return;
         };
         self.apply_text(&target, &included, merged);
@@ -951,6 +951,27 @@ mod tests {
         let registry = AttributeRegistry::new(Path::new("/tmp/docs"));
         let dummy = Path::new("/tmp/docs/file.adoc");
         assert_eq!(registry.resolve(dummy, "docdir"), Some("/tmp/docs"));
+    }
+
+    /// A BOM at the start of a config file or of a file it includes does not
+    /// hide the first entry.
+    #[test]
+    fn test_config_and_config_include_with_bom_are_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(
+            root.join(".asciidoctorconfig"),
+            "\u{FEFF}:from-config: c\ninclude::attrs.adoc[]\n",
+        )
+        .unwrap();
+        fs::write(root.join("attrs.adoc"), "\u{FEFF}:from-include: i\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+
+        let doc = root.join("doc.adoc");
+        assert_eq!(registry.resolve(&doc, "from-config"), Some("c"));
+        assert_eq!(registry.resolve(&doc, "from-include"), Some("i"));
     }
 
     #[test]

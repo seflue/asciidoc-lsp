@@ -218,7 +218,9 @@ impl AsciiDocLsp {
         if let Some(state) = docs.get(uri) {
             Some(Arc::clone(&state.content))
         } else if let Some(path) = uri.to_file_path() {
-            std::fs::read_to_string(path.as_ref()).ok().map(Arc::new)
+            asciidoc_core::source_text::read_adoc_file(path.as_ref())
+                .ok()
+                .map(Arc::new)
         } else {
             None
         }
@@ -241,7 +243,7 @@ impl AsciiDocLsp {
                 .filter_map(|(path, file_diags)| {
                     let uri = symbols::path_to_uri(path)?;
                     let content: String = docs.get(&uri).map_or_else(
-                        || std::fs::read_to_string(path).unwrap_or_default(),
+                        || asciidoc_core::source_text::read_adoc_file(path).unwrap_or_default(),
                         |s| (*s.content).clone(),
                     );
                     let lsp_diags = diagnostics_convert::convert_diagnostics(file_diags, &content);
@@ -427,7 +429,7 @@ impl LanguageServer for AsciiDocLsp {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
-        let content = params.text_document.text;
+        let content = asciidoc_core::source_text::strip_bom_owned(params.text_document.text);
         let version = params.text_document.version;
 
         self.documents.lock().insert(
@@ -495,7 +497,7 @@ impl LanguageServer for AsciiDocLsp {
                 docs.insert(
                     uri.clone(),
                     DocumentState {
-                        content: Arc::new(change.text),
+                        content: Arc::new(asciidoc_core::source_text::strip_bom_owned(change.text)),
                         version: new_version,
                     },
                 );
@@ -890,7 +892,7 @@ impl LanguageServer for AsciiDocLsp {
             };
             let file_content = overrides.get(&path).map_or_else(
                 || {
-                    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    asciidoc_core::source_text::read_adoc_file(&path).unwrap_or_else(|e| {
                         tracing::warn!(
                             "failed to read file for rename edit: {}: {e}",
                             path.display()
@@ -1262,7 +1264,7 @@ fn location_range(
     overrides: &HashMap<PathBuf, Arc<String>>,
 ) -> Range {
     let content = overrides.get(&loc.path).map_or_else(
-        || std::fs::read_to_string(&loc.path).unwrap_or_default(),
+        || asciidoc_core::source_text::read_adoc_file(&loc.path).unwrap_or_default(),
         |content| (**content).clone(),
     );
     Range {
@@ -2280,6 +2282,23 @@ mod tests {
             .await
             .unwrap();
         (service, socket)
+    }
+
+    #[tokio::test]
+    async fn test_did_open_and_did_change_strip_a_leading_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("bom.adoc");
+        fs::write(&path, "").unwrap();
+        let uri = file_uri(&path);
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+
+        open_document(server, &uri, "\u{FEFF}:a: 1\n").await;
+        assert_eq!(*server.get_document_content(&uri).unwrap(), ":a: 1\n");
+
+        change_document(server, &uri, 2, "\u{FEFF}:b: 2\n").await;
+        assert_eq!(*server.get_document_content(&uri).unwrap(), ":b: 2\n");
     }
 
     #[tokio::test]

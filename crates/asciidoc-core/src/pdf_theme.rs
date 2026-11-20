@@ -596,6 +596,7 @@ mod tests {
             ("uppercase-name.adoc", &[2]),
             ("crlf.adoc", &[4]),
             ("bom-titled.adoc", &[2]),
+            ("bom-untitled.adoc", &[1]),
         ];
         // Known limitation, false alarm: `include::include-tag-included.adoc[tag=t]`
         // reads the whole file, the oracle reads only the tagged lines and
@@ -609,9 +610,7 @@ mod tests {
         // - a title in an include does not open the header;
         // - an unresolved include blinds the walk;
         // - an unterminated comment block in an include, closed by the
-        //   parent, is uncertain;
-        // - the BOM before the first entry of an untitled document is not
-        //   skipped.
+        //   parent, is uncertain.
         let missed: &[&str] = &[
             "ifndef-in-untitled.adoc",
             "revision-ifeval.adoc",
@@ -621,7 +620,6 @@ mod tests {
             "ifndef-attr-set-in-body.adoc",
             "unterminated-comment-in-include.adoc",
             "unterminated-comment-in-include-included.adoc",
-            "bom-untitled.adoc",
         ];
         let all = [oracle, false_alarms].concat();
         // The premise of the CRLF entry: the fixture has CRLF line ends.
@@ -634,6 +632,16 @@ mod tests {
                 .any(|w| w == b"\r\n"),
             "crlf.adoc must contain CRLF line ends"
         );
+        // The premise of the BOM entries: the fixtures start with a BOM.
+        for name in ["bom-untitled.adoc", "bom-titled.adoc"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/pdf_header")
+                .join(name);
+            assert!(
+                std::fs::read(&path).unwrap().starts_with(b"\xEF\xBB\xBF"),
+                "{name} must start with a BOM"
+            );
+        }
         let found = fixture_pdf_lines();
         assert_eq!(found, expected(&all));
         for name in missed {

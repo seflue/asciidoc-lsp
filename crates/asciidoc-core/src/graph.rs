@@ -303,7 +303,7 @@ pub fn parse_single_file(
     // Read file: prefer override content, fall back to disk
     let source: Cow<str> = match overrides.get(canonical) {
         Some(content) => Cow::Borrowed(content.as_str()),
-        None => Cow::Owned(std::fs::read_to_string(canonical).ok()?),
+        None => Cow::Owned(crate::source_text::read_adoc_file(canonical).ok()?),
     };
 
     // Parse with block parser
