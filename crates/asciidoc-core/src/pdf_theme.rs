@@ -1008,6 +1008,43 @@ mod tests {
         }
     }
 
+    /// Hover reads the whole document through the attribute scope, where an
+    /// entry inside a conditional counts as set. Diagnostics read only the
+    /// header and treat that entry as uncertain.
+    #[test]
+    fn hover_counts_entries_in_conditionals_as_set() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_theme_body_entries")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let doc = root.join("hover-conditional.adoc");
+        let expected = vec![PdfPath::Absolute(PathBuf::from("/custom/themes"))];
+        assert_eq!(resolve(&ws, &doc, PDF_THEMESDIR, Some(4)), expected);
+        assert_eq!(resolve(&ws, &doc, PDF_THEMESDIR, None), expected);
+        assert_eq!(pdf_diags(&ws, &doc), vec![]);
+    }
+
+    /// A reference to an entry in a conditional is substituted for hover
+    /// too, the attribute counts as set there.
+    #[test]
+    fn hover_substitutes_references_to_entries_in_conditionals() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_theme_body_entries")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let doc = root.join("hover-conditional-reference.adoc");
+        let expected = vec![PdfPath::Absolute(PathBuf::from("/custom/themes"))];
+        assert_eq!(resolve(&ws, &doc, PDF_THEMESDIR, Some(6)), expected);
+        assert_eq!(resolve(&ws, &doc, PDF_THEMESDIR, None), expected);
+        assert_eq!(pdf_diags(&ws, &doc), vec![]);
+    }
+
     #[test]
     fn resolution_rules() {
         let dir = PdfPath::Absolute(PathBuf::from("/themes"));

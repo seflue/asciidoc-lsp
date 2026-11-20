@@ -1,0 +1,6 @@
+= Reference to an entry in a conditional
+:pdf-theme: default-sans
+ifdef::foo[]
+:dir: /custom
+endif::[]
+:pdf-themesdir: {dir}/themes

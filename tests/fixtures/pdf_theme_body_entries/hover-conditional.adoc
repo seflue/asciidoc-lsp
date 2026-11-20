@@ -1,0 +1,5 @@
+= Entry in a conditional
+:pdf-theme: default-sans
+ifdef::foo[]
+:pdf-themesdir: /custom/themes
+endif::[]
