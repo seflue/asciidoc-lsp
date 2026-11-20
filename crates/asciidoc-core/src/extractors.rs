@@ -1964,6 +1964,25 @@ mod tests {
         assert_eq!(images_of(source), vec![(15, "e.png".to_string())]);
     }
 
+    /// An empty value ends at its comma: the attributes after it count.
+    #[test]
+    fn test_extract_includes_reads_attributes_after_an_empty_value() {
+        let mut p = parser::init_block_parser().unwrap();
+        let source = "include::a.adoc[tag=,leveloffset=+1]\n\ninclude::b.adoc[lines=,tag=t,]\n";
+        let tree = parser::parse(&mut p, source).unwrap();
+        let includes = extract_includes(tree.root_node(), source.as_bytes());
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+
+        assert_eq!(
+            includes[0].attributes,
+            [pair("tag", ""), pair("leveloffset", "+1")]
+        );
+        assert_eq!(
+            includes[1].attributes,
+            [pair("lines", ""), pair("tag", "t")]
+        );
+    }
+
     #[test]
     fn test_extract_includes() {
         let mut p = parser::init_block_parser().unwrap();

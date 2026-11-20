@@ -54,11 +54,10 @@ fn required_tags(
     };
     let value = substitute(value);
     let value = value.trim();
-    // The grammar splits a quoted value at its comma (`tags="a,b"` yields
-    // `"a`), so an open quote is a grammar artifact: no diagnostic beats a
-    // false one. It also folds a following attribute into an empty value
-    // (`tags=,lines=1`); an unquoted value ends at its first comma, as in
-    // Asciidoctor, which also substitutes before it parses the list.
+    // A value that opens a quote without closing it is not ours to read:
+    // no diagnostic beats a false one. An unquoted value ends at its first
+    // comma, as in Asciidoctor, which also substitutes before it parses the
+    // list.
     let unquoted = QUOTES
         .iter()
         .find_map(|quote| value.strip_prefix(*quote)?.strip_suffix(*quote));
@@ -86,47 +85,23 @@ fn required_tags(
 
 /// Whether an include is marked optional, as Asciidoctor reads it: an
 /// `optional-option` attribute, or `optional` in any `opts` list after
-/// substitution. The grammar splits a quoted list at its commas
-/// (`opts="step,optional"` yields `opts="step` and a key `optional"`), so a
-/// quoted value that does not close takes the following keys along up to
-/// the one that does.
+/// substitution and without its quotes.
 fn is_optional(attributes: &[(String, String)], substitute: impl Fn(&str) -> String) -> bool {
-    let mut rest = attributes.iter();
-    while let Some((name, value)) = rest.next() {
+    attributes.iter().any(|(name, value)| {
         if name == "optional-option" {
             return true;
         }
         if name != "opts" {
-            continue;
+            return false;
         }
         let value = substitute(value);
         let value = value.trim();
-        let mut entries: Vec<String> = Vec::new();
-        match QUOTES.iter().find(|quote| value.starts_with(**quote)) {
-            Some(quote) if value.len() > 1 && value.ends_with(*quote) => {
-                entries.push(value[1..value.len() - 1].to_string());
-            }
-            Some(quote) => {
-                entries.push(value[1..].to_string());
-                for (key, _) in rest.by_ref() {
-                    if let Some(last) = key.strip_suffix(*quote) {
-                        entries.push(last.to_string());
-                        break;
-                    }
-                    entries.push(key.clone());
-                }
-            }
-            None => entries.push(value.to_string()),
-        }
-        if entries
+        let list = QUOTES
             .iter()
-            .flat_map(|entry| entry.split(','))
-            .any(|option| option.trim() == "optional")
-        {
-            return true;
-        }
-    }
-    false
+            .find_map(|quote| value.strip_prefix(*quote)?.strip_suffix(*quote))
+            .unwrap_or(value);
+        list.split(',').any(|option| option.trim() == "optional")
+    })
 }
 
 /// The tag names the file at `target` opens, `None` when it cannot be read.
@@ -3158,10 +3133,8 @@ mod tests {
     #[case::empty_tag_wins_over_tags(&[("tag", ""), ("tags", "m")], &[])]
     #[case::duplicate_tag_last_wins(&[("tag", "missing"), ("tag", "present")], &["present"])]
     #[case::duplicate_tag_last_wins_second(&[("tag", "present"), ("tag", "missing")], &["missing"])]
-    #[case::quoted_comma_value_split_by_grammar_no_diagnostic(&[("tags", "\"present")], &[])]
-    #[case::single_quote_split_by_grammar_no_diagnostic(&[("tags", "'a")], &[])]
-    #[case::unquoted_comma_in_tag_is_grammar_misparse(&[("tag", ",tags=m22")], &[])]
-    #[case::empty_tags_folds_next_attribute_no_diagnostic(&[("tags", ",lines=1")], &[])]
+    #[case::unterminated_double_quote_no_diagnostic(&[("tags", "\"present")], &[])]
+    #[case::unterminated_single_quote_no_diagnostic(&[("tags", "'a")], &[])]
     #[case::unquoted_tags_comma_ends_value(&[("tags", "present,m30")], &["present"])]
     fn test_required_tags_follows_asciidoctor_selection(
         #[case] attributes: &[(&str, &str)],
@@ -3212,9 +3185,7 @@ mod tests {
 
     /// Asciidoctor 2.0.26, `asciidoctor -v -o - tests/fixtures/include_tags/main.adoc`:
     /// the `tag '...' not found` warnings by line. Left out: line 25,
-    /// `tag={undefined}`, where the LSP does not know build-time attributes,
-    /// and line 39, `tags="present,m14"`, where the grammar splits the quoted
-    /// value at the comma and the LSP stays quiet rather than guess.
+    /// `tag={undefined}`, where the LSP does not know build-time attributes.
     #[test]
     fn test_include_tags_match_asciidoctor() {
         let (root, ws) = fixture_workspace("include_tags");
@@ -3236,6 +3207,7 @@ mod tests {
             missing_tag(28, "case", CONFIG),
             missing_tag(32, "absent", "part.adoc"),
             missing_tag(36, "listing", CONFIG),
+            missing_tag(39, "m14", CONFIG),
             missing_tag(40, "m19", CONFIG),
             missing_tag(52, "missing2", CONFIG),
             missing_tag(53, "m50", CONFIG),
@@ -3316,14 +3288,11 @@ mod tests {
     }
 
     #[test]
-    fn test_include_tag_quoted_comma_value_split_by_grammar_no_diagnostic() {
+    fn test_include_tag_quoted_comma_value_is_read_whole() {
         let (root, ws) = fixture_workspace("include_tags");
 
-        let on_line: Vec<_> = include_tag_diagnostics(&ws, &root.join("main.adoc"))
-            .into_iter()
-            .filter(|(line, _)| *line == 39)
-            .collect();
-        assert!(on_line.is_empty(), "{on_line:?}");
+        assert!(include_tag_diagnostics(&ws, &root.join("main.adoc"))
+            .contains(&missing_tag(39, "m14", CONFIG)));
     }
 
     /// A non-adoc target is always read from disk, even when the workspace
