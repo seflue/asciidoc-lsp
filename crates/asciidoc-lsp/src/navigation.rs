@@ -665,13 +665,18 @@ fn per_document_hover(mut texts: Vec<(String, String)>) -> String {
         .join("\n\n")
 }
 
-/// Description and choice values of a completion-catalog document attribute.
+/// Description and choice values of a built-in document attribute.
 fn catalog_attribute_doc(name: &str) -> Option<String> {
-    let (detail, values) = crate::completion::doc_attribute_doc(name)?;
+    let attribute = asciidoc_core::builtin_attributes::builtin_attribute(name)?;
+    let values = attribute.choices();
     if values.is_empty() {
-        Some(detail.to_string())
+        Some(attribute.description.to_string())
     } else {
-        Some(format!("{detail}\n\nValues: {}", values.join(", ")))
+        Some(format!(
+            "{}\n\nValues: {}",
+            attribute.description,
+            values.join(", ")
+        ))
     }
 }
 
@@ -1802,7 +1807,7 @@ pub fn prepare_rename(
             })
         }
         NodeKind::AttributeRef { name } | NodeKind::AttributeDef { name, .. }
-            if crate::completion::doc_attribute_doc(name).is_some() =>
+            if asciidoc_core::builtin_attributes::builtin_attribute(name).is_some() =>
         {
             None
         }
@@ -1889,7 +1894,7 @@ pub fn rename_conflict(
             if !is_valid_attribute_name(new_name) {
                 return Some(format!("`{new_name}` is not a valid attribute name"));
             }
-            if crate::completion::doc_attribute_doc(new_name).is_some() {
+            if asciidoc_core::builtin_attributes::builtin_attribute(new_name).is_some() {
                 return Some(format!("`{new_name}` is a built-in attribute"));
             }
             let defined = workspace?.definition_sites(doc_path, node_info.line, new_name);

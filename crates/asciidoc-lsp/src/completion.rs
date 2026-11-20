@@ -8,6 +8,9 @@ use tower_lsp_server::ls_types::{
 };
 
 use asciidoc_core::anchor_scope::AnchorScope;
+use asciidoc_core::builtin_attributes::{
+    builtin_attribute, BuiltinAttribute, BuiltinValues, BUILTIN_ATTRIBUTES,
+};
 use asciidoc_core::paths::canonicalize_if_exists;
 use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::{AttributeScope, Workspace};
@@ -101,81 +104,6 @@ const ADMONITIONS: &[SyntaxEntry] = &[
         name: "CAUTION:",
         snippet: "CAUTION: $0",
         detail: "Caution admonition",
-    },
-];
-
-/// Document attributes — triggered after `:` at line start (e.g. `:to` → `:toc:`).
-/// `snippet` does NOT include the leading `:` (already typed).
-const DOC_ATTRIBUTES: &[SyntaxEntry] = &[
-    SyntaxEntry {
-        name: "toc",
-        snippet: "toc: ${1|auto,left,right,preamble|}",
-        detail: "Table of contents placement",
-    },
-    SyntaxEntry {
-        name: "icons",
-        snippet: "icons: ${1|font,image|}",
-        detail: "Icon mode",
-    },
-    SyntaxEntry {
-        name: "source-highlighter",
-        snippet: "source-highlighter: ${1|rouge,highlight.js,coderay|}",
-        detail: "Source code highlighter",
-    },
-    SyntaxEntry {
-        name: "doctype",
-        snippet: "doctype: ${1|article,book,manpage,inline|}",
-        detail: "Document type",
-    },
-    SyntaxEntry {
-        name: "imagesdir",
-        snippet: "imagesdir: ${1:images}",
-        detail: "Images directory",
-    },
-    SyntaxEntry {
-        name: "numbered",
-        snippet: "numbered:",
-        detail: "Auto-number sections (deprecated, use sectnums)",
-    },
-    SyntaxEntry {
-        name: "experimental",
-        snippet: "experimental:",
-        detail: "Enable experimental features (kbd, btn, menu)",
-    },
-    SyntaxEntry {
-        name: "data-uri",
-        snippet: "data-uri:",
-        detail: "Embed images as data URIs",
-    },
-    SyntaxEntry {
-        name: "sectnums",
-        snippet: "sectnums:",
-        detail: "Number sections",
-    },
-    SyntaxEntry {
-        name: "sectanchors",
-        snippet: "sectanchors:",
-        detail: "Add anchors to section titles",
-    },
-    SyntaxEntry {
-        name: "sectlinks",
-        snippet: "sectlinks:",
-        detail: "Make section titles self-links",
-    },
-    SyntaxEntry {
-        name: "stem",
-        snippet: "stem: ${1|latexmath,asciimath|}",
-        detail: "Enable STEM (math) support",
-    },
-    SyntaxEntry {
-        name: "toclevels",
-        snippet: "toclevels: ${1:2}",
-        detail: "Number of ToC depth levels",
-    },
-    SyntaxEntry {
-        name: "hardbreaks-option",
-        snippet: "hardbreaks-option:",
-        detail: "Force hard line breaks",
     },
 ];
 
@@ -498,10 +426,8 @@ fn attribute_value_target(before_cursor: &str) -> Option<(&'static str, usize)> 
     if !value.chars().all(is_attribute_value_char) {
         return None;
     }
-    let entry = DOC_ATTRIBUTES
-        .iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name))?;
-    snippet_choices(entry.snippet).map(|_| (entry.name, before_cursor.len() - value.len()))
+    let entry = builtin_attribute(name)?;
+    (!entry.choices().is_empty()).then(|| (entry.name, before_cursor.len() - value.len()))
 }
 
 /// How far a target token extends past the cursor.
@@ -1562,7 +1488,30 @@ fn resolve_admonition_completions(prefix: &str) -> Vec<CompletionItem> {
 
 /// Resolve document attribute completions filtered by prefix.
 fn resolve_doc_attribute_completions(prefix: &str) -> Vec<CompletionItem> {
-    resolve_syntax_catalog(DOC_ATTRIBUTES, prefix, CompletionItemKind::PROPERTY)
+    BUILTIN_ATTRIBUTES
+        .iter()
+        .filter(|e| e.name.starts_with(prefix))
+        .map(|e| CompletionItem {
+            label: e.name.to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some(e.description.to_string()),
+            insert_text: Some(attribute_snippet(e)),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// The snippet that completes `:name` to an entry line; the leading `:` is
+/// already typed.
+fn attribute_snippet(attribute: &BuiltinAttribute) -> String {
+    match attribute.values {
+        BuiltinValues::None => format!("{}:", attribute.name),
+        BuiltinValues::Choices(choices) => {
+            format!("{}: ${{1|{}|}}", attribute.name, choices.join(","))
+        }
+        BuiltinValues::Example(example) => format!("{}: ${{1:{example}}}", attribute.name),
+    }
 }
 
 /// Items for `names` that start with `prefix` (ASCII case-insensitive), each
@@ -1614,25 +1563,6 @@ fn resolve_source_language_completions(prefix: &str, span: TargetSpan) -> Vec<Co
     )
 }
 
-/// The values of a snippet's choice list (`${1|a,b|}`). Placeholders
-/// (`${1:images}`) and snippets without a placeholder yield `None`.
-fn snippet_choices(snippet: &str) -> Option<impl Iterator<Item = &str>> {
-    let (_, rest) = snippet.split_once("${1|")?;
-    let (list, _) = rest.split_once("|}")?;
-    Some(list.split(','))
-}
-
-/// Description and choice values of the catalog document attribute `name`,
-/// matched ASCII case-insensitively; no values when its snippet offers no
-/// choice list.
-pub(crate) fn doc_attribute_doc(name: &str) -> Option<(&'static str, Vec<&'static str>)> {
-    let entry = DOC_ATTRIBUTES
-        .iter()
-        .find(|entry| entry.name.eq_ignore_ascii_case(name))?;
-    let values = snippet_choices(entry.snippet).map_or_else(Vec::new, Iterator::collect);
-    Some((entry.detail, values))
-}
-
 /// Resolve the values of the catalog attribute `name` that start with
 /// `prefix`. Each item replaces the value token (`span`).
 fn resolve_attribute_value_completions(
@@ -1640,17 +1570,17 @@ fn resolve_attribute_value_completions(
     prefix: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let Some(entry) = DOC_ATTRIBUTES.iter().find(|e| e.name == name) else {
+    let Some(entry) = BUILTIN_ATTRIBUTES.iter().find(|e| e.name == name) else {
         return Vec::new();
     };
-    snippet_choices(entry.snippet)
-        .into_iter()
-        .flatten()
+    entry
+        .choices()
+        .iter()
         .filter(|value| value.starts_with(prefix))
         .map(|value| CompletionItem {
             label: value.to_string(),
             kind: Some(CompletionItemKind::ENUM_MEMBER),
-            detail: Some(entry.detail.to_string()),
+            detail: Some(entry.description.to_string()),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range: span.range_to(span.end_col),
                 new_text: value.to_string(),
@@ -1847,56 +1777,6 @@ mod tests {
     use super::*;
     use crate::test_support::scanned;
     use rstest::rstest;
-
-    #[test]
-    fn test_snippet_choices_reads_choice_list() {
-        let choices: Vec<&str> = snippet_choices("toc: ${1|auto,left,right,preamble|}")
-            .unwrap()
-            .collect();
-        assert_eq!(choices, vec!["auto", "left", "right", "preamble"]);
-    }
-
-    #[rstest]
-    #[case("imagesdir: ${1:images}")]
-    #[case("numbered:")]
-    fn test_snippet_choices_ignore_placeholders(#[case] snippet: &str) {
-        assert!(snippet_choices(snippet).is_none());
-    }
-
-    #[test]
-    fn test_doc_attribute_doc_has_description_and_choices() {
-        assert_eq!(
-            doc_attribute_doc("toc"),
-            Some((
-                "Table of contents placement",
-                vec!["auto", "left", "right", "preamble"]
-            ))
-        );
-    }
-
-    #[test]
-    fn test_doc_attribute_doc_without_choices() {
-        assert_eq!(
-            doc_attribute_doc("imagesdir"),
-            Some(("Images directory", vec![]))
-        );
-        assert_eq!(
-            doc_attribute_doc("sectnums"),
-            Some(("Number sections", vec![]))
-        );
-    }
-
-    #[test]
-    fn test_doc_attribute_doc_matches_name_case_insensitively() {
-        assert_eq!(doc_attribute_doc("TOC"), doc_attribute_doc("toc"));
-        assert!(doc_attribute_doc("TOC").is_some());
-    }
-
-    #[test]
-    fn test_doc_attribute_doc_unknown_name() {
-        assert_eq!(doc_attribute_doc("myattr"), None);
-        assert_eq!(doc_attribute_doc("pdf-theme"), None);
-    }
 
     /// Span for resolver tests that don't look at where the target starts.
     const AT_LINE_START: TargetSpan = TargetSpan {
@@ -4052,6 +3932,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_doc_attribute_snippets_are_exact() {
+        let insert_text = |name: &str| {
+            resolve_doc_attribute_completions(name)
+                .into_iter()
+                .find(|item| item.label == name)
+                .and_then(|item| item.insert_text)
+                .unwrap()
+        };
+        assert_eq!(insert_text("imagesdir"), "imagesdir: ${1:images}");
+        assert_eq!(insert_text("toclevels"), "toclevels: ${1:2}");
+        assert_eq!(insert_text("toc"), "toc: ${1|auto,left,right,preamble|}");
+    }
+
+    #[test]
     fn test_resolve_doc_attribute_enum() {
         let items = resolve_doc_attribute_completions("toc");
         assert_eq!(items.len(), 2);
@@ -4519,7 +4413,6 @@ mod tests {
 
         check(BLOCK_MACROS, "BLOCK_MACROS");
         check(ADMONITIONS, "ADMONITIONS");
-        check(DOC_ATTRIBUTES, "DOC_ATTRIBUTES");
         check(INLINE_MACROS, "INLINE_MACROS");
     }
 

@@ -1,5 +1,6 @@
 pub mod anchor_scope;
 pub mod attributes;
+pub mod builtin_attributes;
 pub mod diagnostics;
 pub mod error;
 pub mod extractors;
