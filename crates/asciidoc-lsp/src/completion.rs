@@ -11,7 +11,7 @@ use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::builtin_attributes::{
     builtin_attribute, BuiltinAttribute, BuiltinValues, BUILTIN_ATTRIBUTES,
 };
-use asciidoc_core::targets::{canonical_if_exists, document_dir, join_in_folder, BaseDir, Target};
+use asciidoc_core::targets::{document_dir, is_same_file, BaseDir, Target};
 use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::Workspace;
 
@@ -1020,14 +1020,13 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
         );
     }
 
-    // The file as each top-level document reads it (ADR-4), from the
-    // document's folder, as Asciidoctor reads it; anchors of any of them. The
-    // preview takes no part, as for goto (ADR-010).
+    // The file as each top-level document reads it, anchors of any of them
+    // ([`CatalogCache::base_dirs`] holds the readings and folders).
     let bases = CatalogCache::new(ws).base_dirs(doc_path, line, &Target::Xref(file));
     // A file that exists is matched by its canonical path (downstream
     // compares against `std::fs::canonicalize(&loc.file)`). One that does not
-    // exist at the resolved path is no target, as for go-to-definition and
-    // the diagnostics: a file of the same name elsewhere offers nothing.
+    // exist at the resolved path is no target: a file of the same name
+    // elsewhere offers nothing.
     let canonical_targets: Vec<PathBuf> = bases
         .iter()
         .filter(|base| !base.prefix.contains('{'))
@@ -1058,20 +1057,7 @@ pub(crate) fn resolve_xref_path_completions(
     closing: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let listings = match ws {
-        Some(ws) => CatalogCache::new(ws)
-            .base_dirs(doc_path, line, &Target::Xref(prefix))
-            .into_iter()
-            .map(|base| PathListing {
-                base_dir: base.dir,
-                resolved_prefix: base.prefix,
-            })
-            .collect(),
-        None => vec![PathListing {
-            base_dir: document_dir(doc_path, None).to_path_buf(),
-            resolved_prefix: prefix.to_string(),
-        }],
-    };
+    let listings = path_listings(doc_path, line, ws, &Target::Xref(prefix), prefix);
     // For fresh edits (`closing == "[]"`): place cursor BEFORE `[` (so user can
     // type `#anchor` to chain cross-file anchor completion) with Tab → label slot.
     // When a `[` follows later in the same target (`closing == ""`): drop the bracket
@@ -1142,8 +1128,8 @@ fn anchor_completion_item(
 enum PathCompletionFilter<'a> {
     /// Only `.adoc` files
     Adoc,
-    /// Every text file except hidden ones and `current`, the canonical path
-    /// of the document itself
+    /// Every text file except hidden ones and `current`, the document
+    /// itself
     IncludeTarget { current: &'a Path },
     /// Only image files (png, jpg, svg, ...)
     Image,
@@ -1199,7 +1185,7 @@ fn is_text_file(path: &Path) -> bool {
 ///   with the full path, so clients need not guess where the path starts.
 fn resolve_path_completions(
     prefix: &str,
-    listings: &[PathListing],
+    listings: &[BaseDir],
     ext_filter: PathCompletionFilter<'_>,
     file_snippet: &str,
     span: TargetSpan,
@@ -1216,22 +1202,34 @@ fn resolve_path_completions(
     items
 }
 
-/// Where one attribute scope lists path candidates: the folder the path
-/// starts from and the typed prefix with that scope's values substituted.
-struct PathListing {
-    base_dir: PathBuf,
-    resolved_prefix: String,
+/// Where each reading of `doc_path` lists the candidates of the `target`
+/// being typed ([`CatalogCache::base_dirs`]); without a workspace, the
+/// folder of `doc_path` with the target as typed.
+fn path_listings(
+    doc_path: &Path,
+    line: usize,
+    ws: Option<&Workspace>,
+    target: &Target<'_>,
+    prefix: &str,
+) -> Vec<BaseDir> {
+    match ws {
+        Some(ws) => CatalogCache::new(ws).base_dirs(doc_path, line, target),
+        None => vec![BaseDir {
+            dir: document_dir(doc_path, None).to_path_buf(),
+            prefix: prefix.to_string(),
+        }],
+    }
 }
 
-/// The candidates of one [`PathListing`] for the typed `prefix`.
+/// The candidates of one [`BaseDir`] for the typed `prefix`.
 fn list_path_items(
     prefix: &str,
-    listing: &PathListing,
+    listing: &BaseDir,
     ext_filter: PathCompletionFilter<'_>,
     file_snippet: &str,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let resolved_prefix = &listing.resolved_prefix;
+    let resolved_prefix = &listing.prefix;
     // Bail on unresolved attributes (still contains `{`)
     if resolved_prefix.contains('{') {
         return Vec::new();
@@ -1242,12 +1240,11 @@ fn list_path_items(
         Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
         None => ("", prefix),
     };
-    let (resolved_dir, filter) = match resolved_prefix.rfind('/') {
-        Some(idx) => (&resolved_prefix[..=idx], &resolved_prefix[idx + 1..]),
-        None => ("", resolved_prefix.as_str()),
-    };
+    let filter = resolved_prefix
+        .rfind('/')
+        .map_or(resolved_prefix.as_str(), |idx| &resolved_prefix[idx + 1..]);
 
-    let list_dir = join_in_folder(&listing.base_dir, resolved_dir);
+    let list_dir = listing.listing_dir();
     // A `/` right after the token belongs to the directory item.
     let dir_end_col = span.end_col + u32::from(span.next == Some('/'));
 
@@ -1294,7 +1291,7 @@ fn list_path_items(
                             .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc")),
                         PathCompletionFilter::IncludeTarget { current } => {
                             !name.starts_with('.')
-                                && canonical_if_exists(path.clone()) != current
+                                && !is_same_file(&path, current)
                                 && is_text_file(&path)
                         }
                         PathCompletionFilter::Image => {
@@ -1341,26 +1338,12 @@ pub(crate) fn resolve_include_completions(
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let listings = match ws {
-        Some(ws) => CatalogCache::new(ws)
-            .base_dirs(doc_path, line, &Target::Include(prefix))
-            .into_iter()
-            .map(|base| PathListing {
-                base_dir: base.dir,
-                resolved_prefix: base.prefix,
-            })
-            .collect(),
-        None => vec![PathListing {
-            base_dir: document_dir(doc_path, None).to_path_buf(),
-            resolved_prefix: prefix.to_string(),
-        }],
-    };
-    let current = canonical_if_exists(doc_path.to_path_buf());
+    let listings = path_listings(doc_path, line, ws, &Target::Include(prefix), prefix);
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(
         prefix,
         &listings,
-        PathCompletionFilter::IncludeTarget { current: &current },
+        PathCompletionFilter::IncludeTarget { current: doc_path },
         "[${1:opts}]",
         span,
     )
@@ -1375,20 +1358,7 @@ pub(crate) fn resolve_image_completions(
     ws: Option<&Workspace>,
     span: TargetSpan,
 ) -> Vec<CompletionItem> {
-    let listings = match ws {
-        Some(ws) => CatalogCache::new(ws)
-            .base_dirs(doc_path, line, &Target::Image(prefix))
-            .into_iter()
-            .map(|base| PathListing {
-                base_dir: base.dir,
-                resolved_prefix: base.prefix,
-            })
-            .collect(),
-        None => vec![PathListing {
-            base_dir: document_dir(doc_path, None).to_path_buf(),
-            resolved_prefix: prefix.to_string(),
-        }],
-    };
+    let listings = path_listings(doc_path, line, ws, &Target::Image(prefix), prefix);
     // Cursor lands inside `[]` on the `alt` placeholder for image alt text.
     resolve_path_completions(
         prefix,
@@ -3159,6 +3129,25 @@ mod tests {
         let items =
             resolve_include_completions("{edition}/", &paths[2], 3, Some(&ws), AT_LINE_START);
         assert_eq!(labels(&items), vec!["p.adoc", "w.adoc"]);
+    }
+
+    /// In `book/chapters/ch.adoc`, included by `book/main.adoc`, `{docdir}`
+    /// is `book/` (the top-level document's folder), so `{docdir}/../` lists
+    /// the folder above the book, not the book's own folder.
+    #[test]
+    fn test_docdir_completions_in_a_subfolder_file_start_from_the_top_level_folder() {
+        let (_dir, ws, paths) = scanned(&[
+            ("book/main.adoc", "= B\n\ninclude::chapters/ch.adoc[]\n"),
+            ("book/chapters/ch.adoc", "== C\n\ninclude::{docdir}/../\n"),
+            ("assets/pic.png", ""),
+            ("assets/part.adoc", ""),
+        ]);
+        let include =
+            resolve_include_completions("{docdir}/../", &paths[1], 3, Some(&ws), AT_LINE_START);
+        assert_eq!(labels(&include), vec!["assets/", "book/"]);
+        let image =
+            resolve_image_completions("{docdir}/../", &paths[1], 3, Some(&ws), AT_LINE_START);
+        assert_eq!(labels(&image), vec!["assets/", "book/"]);
     }
 
     // --- Include targets: any text file, not hidden, not the document itself ---

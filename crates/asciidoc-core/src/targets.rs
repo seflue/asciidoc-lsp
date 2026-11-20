@@ -7,6 +7,14 @@
 //! and the handling of readers that read the file only in part live here and
 //! nowhere else; features ask [`CatalogCache::resolve_target`] and present.
 //! Whether results that agree are shown once is the feature's decision.
+//!
+//! Without a workspace there are no readings: a file stands alone, and the
+//! editor still shows where its images and includes point and offers paths
+//! to type. [`resolve_image_in_folder`], [`resolve_include_in_folder`] and
+//! [`document_dir`] serve that case, resolving below a given folder with the
+//! same rule as one reading. Callers join and canonicalise no path
+//! themselves: they ask for [`BaseDir::listing_dir`], [`is_same_file`] or
+//! [`config_relative_path`].
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -150,16 +158,20 @@ impl<'ws> CatalogCache<'ws> {
                 TargetResult::Image(resolve_image(scope, file_dir, written))
             }),
             Target::Include(written) => self.resolve_in_scopes(&file, line, readings, |scope| {
-                TargetResult::Include(resolve_include(&scope.substitute(written), &folder))
+                let mut include = resolve_include(&scope.substitute(written), &folder);
+                // An indexed document that is not saved yet is a target too.
+                include.exists |=
+                    !include.is_remote() && workspace.documents.contains_key(&include.path);
+                TargetResult::Include(include)
             }),
             Target::Xref(written) => self.resolve_xref_readings(&file, line, written, readings),
         };
         resolved
             .into_iter()
             .filter(|resolved| {
-                let judge = resolved.reading.preview
-                    || self.get(&resolved.reading.document).reads_whole(&file);
-                judge || !resolved.result.is_failure()
+                !resolved.result.is_failure()
+                    || resolved.reading.preview
+                    || self.get(&resolved.reading.document).reads_whole(&file)
             })
             .collect()
     }
@@ -448,20 +460,37 @@ pub fn document_dir<'a>(doc_path: &'a Path, workspace: Option<&'a Workspace>) ->
         .unwrap_or(doc_path)
 }
 
-/// `relative` joined onto `folder`, `..` segments popped textually. Symlinks
-/// are kept.
+/// A relative path value (`./`, `../`) of a config file, joined onto the
+/// document directory of `file`: the config value is prepended text, so
+/// Asciidoctor resolves it where `file` uses it. `None` for any other value.
 #[must_use]
-pub fn join_in_folder(folder: &Path, relative: &str) -> PathBuf {
-    join_doc_path(folder, relative)
+pub fn config_relative_path(workspace: &Workspace, file: &Path, value: &str) -> Option<PathBuf> {
+    if !(value.starts_with("./") || value.starts_with("../")) {
+        return None;
+    }
+    Some(join_doc_path(workspace.attributes.doc_dir(file)?, value))
 }
 
-/// The canonical form of `path`, or `path` itself when it does not exist.
+/// Whether `a` and `b` are the same file, symlinks followed where the files
+/// exist.
 #[must_use]
-pub fn canonical_if_exists(path: PathBuf) -> PathBuf {
-    canonicalize_if_exists(path)
+pub fn is_same_file(a: &Path, b: &Path) -> bool {
+    canonicalize_if_exists(a.to_path_buf()) == canonicalize_if_exists(b.to_path_buf())
 }
 
 impl BaseDir {
+    /// The folder whose entries complete the typed prefix: the folders the
+    /// prefix already names, below this folder, `..` segments popped
+    /// textually and symlinks kept.
+    #[must_use]
+    pub fn listing_dir(&self) -> PathBuf {
+        let folders = self
+            .prefix
+            .rfind('/')
+            .map_or("", |idx| &self.prefix[..=idx]);
+        join_doc_path(&self.dir, folders)
+    }
+
     /// The canonical path of the typed prefix below this folder, `None` when
     /// it does not exist.
     #[must_use]
@@ -1639,5 +1668,83 @@ mod tests {
                 prefix: "chapters/ref".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn test_include_of_an_indexed_document_not_saved_yet_exists() {
+        let (_tmp, root, mut ws) = scanned(&[("main.adoc", "= Main\n\ninclude::draft.adoc[]\n")]);
+        let draft = root.join("draft.adoc");
+        assert_eq!(
+            include(&root, &ws, "main.adoc", 3, "draft.adoc", Readings::Build),
+            vec![reading("main.adoc", false, "missing draft.adoc")]
+        );
+
+        let buffers = std::collections::HashMap::from([(
+            draft.clone(),
+            std::sync::Arc::new("Draft.\n".to_string()),
+        )]);
+        ws.update_file(&draft, &buffers);
+
+        assert_eq!(
+            include(&root, &ws, "main.adoc", 3, "draft.adoc", Readings::Build),
+            vec![reading("main.adoc", false, "found draft.adoc")]
+        );
+    }
+
+    #[test]
+    fn test_include_missing_in_a_file_only_partial_readers_read_is_not_judged() {
+        let (_tmp, root, ws) = scanned(&[
+            ("web.adoc", "= Web\n\ninclude::part.adoc[tag=a]\n"),
+            (
+                "part.adoc",
+                "// tag::a[]\nText.\n// end::a[]\n\ninclude::gone.adoc[]\n",
+            ),
+        ]);
+
+        assert_eq!(
+            include(&root, &ws, "part.adoc", 5, "gone.adoc", Readings::Build),
+            vec![]
+        );
+        // The preview reads the whole file and does judge.
+        assert_eq!(
+            include(
+                &root,
+                &ws,
+                "part.adoc",
+                5,
+                "gone.adoc",
+                Readings::WithPreview
+            ),
+            vec![reading("part.adoc", true, "missing gone.adoc")]
+        );
+    }
+
+    #[test]
+    fn test_listing_dir_is_the_base_below_the_folders_typed_so_far() {
+        let base = |prefix: &str| BaseDir {
+            dir: PathBuf::from("/docs/chapters"),
+            prefix: prefix.to_string(),
+        };
+
+        assert_eq!(base("").listing_dir(), PathBuf::from("/docs/chapters"));
+        assert_eq!(base("in").listing_dir(), PathBuf::from("/docs/chapters"));
+        assert_eq!(
+            base("../shared/in").listing_dir(),
+            PathBuf::from("/docs/shared")
+        );
+        assert_eq!(
+            base("sub/").listing_dir(),
+            PathBuf::from("/docs/chapters/sub")
+        );
+    }
+
+    #[test]
+    fn test_same_file_follows_symlinks_of_files_that_exist() {
+        let (_tmp, root, _ws) = scanned(&[("a.adoc", "A\n"), ("b.adoc", "B\n")]);
+        std::os::unix::fs::symlink(root.join("a.adoc"), root.join("link.adoc")).unwrap();
+
+        assert!(is_same_file(&root.join("link.adoc"), &root.join("a.adoc")));
+        assert!(!is_same_file(&root.join("a.adoc"), &root.join("b.adoc")));
+        assert!(is_same_file(&root.join("new.adoc"), &root.join("new.adoc")));
     }
 }

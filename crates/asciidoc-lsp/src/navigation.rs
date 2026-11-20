@@ -13,7 +13,7 @@ use asciidoc_core::pdf_theme::{
 };
 use asciidoc_core::references::parse_xref_target;
 use asciidoc_core::targets::{
-    document_dir, imagesdir_note, join_in_folder, resolve_image_in_folder,
+    config_relative_path, document_dir, imagesdir_note, resolve_image_in_folder,
     resolve_include_in_folder, ImageOutcome, ImageResult, IncludeResult, Readings, Target,
 };
 use asciidoc_core::types::{
@@ -726,16 +726,6 @@ fn config_definition_hover(
         let _ = write!(text, "\n\nOverrides {overridden}");
     }
     text
-}
-
-/// A relative path value (`./`, `../`) from an `.asciidoctorconfig`, joined
-/// onto the document directory of `doc_path`: the config value is prepended
-/// text, so Asciidoctor resolves it where the document uses it.
-fn config_relative_path(ws: &Workspace, doc_path: &Path, value: &str) -> Option<PathBuf> {
-    if !(value.starts_with("./") || value.starts_with("../")) {
-        return None;
-    }
-    Some(join_in_folder(ws.attributes().doc_dir(doc_path)?, value))
 }
 
 /// Where an image resolves, for comparing readings: the file, or the URL.
