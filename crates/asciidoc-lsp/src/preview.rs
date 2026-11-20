@@ -515,27 +515,27 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// The content type for a file name, by extension; images the browser shows
-/// get theirs, anything else is a plain download.
-fn content_type_of(path: &Path) -> &'static str {
+/// The content type for a file name, by extension. Only images the browser
+/// shows have one; the route serves nothing else.
+fn content_type_of(path: &Path) -> Option<&'static str> {
     let extension = path
         .extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
     match extension.as_deref() {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("svg") => "image/svg+xml",
-        Some("webp") => "image/webp",
-        Some("avif") => "image/avif",
-        Some("bmp") => "image/bmp",
-        Some("ico") => "image/x-icon",
-        _ => "application/octet-stream",
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("svg") => Some("image/svg+xml"),
+        Some("webp") => Some("image/webp"),
+        Some("avif") => Some("image/avif"),
+        Some("bmp") => Some("image/bmp"),
+        Some("ico") => Some("image/x-icon"),
+        _ => None,
     }
 }
 
-/// The file at `encoded` (a percent-encoded path below `root`) and its
-/// content type, or `None` if it is not a regular file inside the root.
+/// The image at `encoded` (a percent-encoded path below `root`) and its
+/// content type, or `None` if it is not an image file inside the root.
 ///
 /// The path is checked twice: only plain names are accepted (no `..`, no
 /// absolute path), and the canonical path, with symlinks resolved, must lie
@@ -559,13 +559,14 @@ fn read_inside(root: &Path, relative: &Path) -> Option<(&'static str, Vec<u8>)> 
     {
         return None;
     }
+    let content_type = content_type_of(relative)?;
     let root = root.canonicalize().ok()?;
     let path = root.join(relative).canonicalize().ok()?;
     if !path.starts_with(&root) || !path.metadata().ok()?.is_file() {
         return None;
     }
     let body = std::fs::read(&path).ok()?;
-    Some((content_type_of(&path), body))
+    Some((content_type, body))
 }
 
 async fn write_events(stream: &mut TcpStream, events: &[Event]) -> io::Result<()> {
@@ -757,7 +758,9 @@ mod tests {
         std::fs::write(root.join("images/pic.png"), b"PNG-bytes").unwrap();
         std::fs::write(root.join("images/my pic.SVG"), "<svg/>").unwrap();
         std::fs::write(root.join("images/data.bin"), "x").unwrap();
+        std::fs::write(root.join("images/PIC.TXT"), "x").unwrap();
         std::fs::write(outer.join("secret.png"), "secret").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outer.join("secret.png"), root.join("images/link.png")).unwrap();
         (tmp, root)
     }
@@ -771,7 +774,6 @@ mod tests {
         for (path, content_type) in [
             ("images/pic.png", "image/png"),
             ("images/my%20pic.SVG", "image/svg+xml"),
-            ("images/data.bin", "application/octet-stream"),
         ] {
             let response = get(port, &format!("/{token}/files/{path}"), &host).await;
             assert!(status_line(&response).contains("200"), "{path}: {response}");
@@ -805,6 +807,8 @@ mod tests {
             "images/../../secret.png",
             "images/link.png",
             "images/missing.png",
+            "images/data.bin",
+            "images/PIC.TXT",
             "images",
             "images/",
             "",
