@@ -228,9 +228,9 @@ impl AsciiDocLsp {
         }
     }
 
-    /// Whether the document on show reads one of the `changed` files. Ask
-    /// before the watcher events reach the workspace: a deleted file leaves
-    /// the index and with it the read set.
+    /// Whether the document on show reads one of the `changed` files. Callers
+    /// ask before and after the watcher events reach the workspace: a deleted
+    /// file leaves the read set, a created one only enters it.
     fn preview_reads_any(&self, changed: &[PathBuf]) -> bool {
         if self.preview.lock().is_none() || self.preview_active.lock().is_none() {
             return false;
@@ -672,11 +672,13 @@ impl LanguageServer for AsciiDocLsp {
             .iter()
             .filter_map(|event| document_path(&event.uri))
             .collect();
-        let affects_preview = self.preview_reads_any(&changed);
+        // Before the events: a deleted file leaves the index and the read set.
+        let read_before = self.preview_reads_any(&changed);
         if let Some(diagnostics) = self.compute_watched_files_update(params) {
             self.publish_workspace_diagnostics(&diagnostics).await;
         }
-        if affects_preview {
+        // After them: a created file only enters the read set now.
+        if read_before || self.preview_reads_any(&changed) {
             self.preview_files_changed();
         }
     }
@@ -5340,6 +5342,48 @@ mod tests {
             })
             .await;
         stream.until("Unresolved directive").await;
+    }
+
+    #[tokio::test]
+    async fn test_recreating_an_included_chapter_converts_the_book() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((book_uri, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&chapter_uri),
+            })
+            .await;
+        server
+            .preview_open(vec![serde_json::json!(book_uri)])
+            .await
+            .unwrap();
+        stream.until("disk text").await;
+        fs::remove_file(root.join("ch1.adoc")).unwrap();
+        server
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: chapter_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        stream.until("Unresolved directive").await;
+        fs::write(root.join("ch1.adoc"), "== One\n\nrestored text\n").unwrap();
+        server
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: chapter_uri,
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+        stream.until("restored text").await;
     }
 
     #[tokio::test]
