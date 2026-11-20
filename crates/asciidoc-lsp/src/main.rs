@@ -4,7 +4,7 @@ mod completion;
 mod diagnostics_convert;
 mod navigation;
 mod positions;
-mod scopes;
+mod present;
 mod semantic_tokens;
 mod symbols;
 #[cfg(test)]

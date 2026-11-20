@@ -8,14 +8,13 @@ use tower_lsp_server::ls_types::Position;
 use asciidoc_core::anchor_scope::CatalogCache;
 use asciidoc_core::attributes::{config_attribute_at, AttributeSource};
 use asciidoc_core::extractors::{element_attr_id, find_child_text, is_valid_anchor_id};
-use asciidoc_core::paths::normalize_lexically;
 use asciidoc_core::pdf_theme::{
     is_builtin_theme, is_pdf_path_attribute, resolve_pdf_attribute, PdfPath, PDF_THEME,
 };
 use asciidoc_core::references::parse_xref_target;
 use asciidoc_core::targets::{
-    imagesdir_note, resolve_image_in_folder, resolve_include_in_folder, ImageOutcome, ImageResult,
-    IncludeResult, Readings, Target,
+    document_dir, imagesdir_note, join_in_folder, resolve_image_in_folder,
+    resolve_include_in_folder, ImageOutcome, ImageResult, IncludeResult, Readings, Target,
 };
 use asciidoc_core::types::{
     AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref,
@@ -25,8 +24,8 @@ use asciidoc_core::workspace::{
 };
 
 use crate::positions;
-use crate::scopes::{
-    collapse_if_agree, document_dir, file_display_name, reading_label, scope_label, unique_in_order,
+use crate::present::{
+    collapse_if_agree, file_display_name, reading_label, scope_label, unique_in_order,
 };
 
 /// Classification of a node found at a cursor position.
@@ -736,9 +735,7 @@ fn config_relative_path(ws: &Workspace, doc_path: &Path, value: &str) -> Option<
     if !(value.starts_with("./") || value.starts_with("../")) {
         return None;
     }
-    Some(normalize_lexically(
-        &ws.attributes().doc_dir(doc_path)?.join(value),
-    ))
+    Some(join_in_folder(ws.attributes().doc_dir(doc_path)?, value))
 }
 
 /// Where an image resolves, for comparing readings: the file, or the URL.

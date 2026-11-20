@@ -361,6 +361,39 @@ impl TargetResult {
     }
 }
 
+/// The folder relative paths in `doc_path` start from: the document folder
+/// from the workspace (a symlink's own folder for a symlinked document), else
+/// `doc_path`'s parent.
+#[must_use]
+pub fn document_dir<'a>(doc_path: &'a Path, workspace: Option<&'a Workspace>) -> &'a Path {
+    workspace
+        .and_then(|ws| ws.attributes().doc_dir(doc_path))
+        .or_else(|| doc_path.parent())
+        .unwrap_or(doc_path)
+}
+
+/// `relative` joined onto `folder`, `..` segments popped textually. Symlinks
+/// are kept.
+#[must_use]
+pub fn join_in_folder(folder: &Path, relative: &str) -> PathBuf {
+    join_doc_path(folder, relative)
+}
+
+/// The canonical form of `path`, or `path` itself when it does not exist.
+#[must_use]
+pub fn canonical_if_exists(path: PathBuf) -> PathBuf {
+    canonicalize_if_exists(path)
+}
+
+impl BaseDir {
+    /// The canonical path of the typed prefix below this folder, `None` when
+    /// it does not exist.
+    #[must_use]
+    pub fn canonical_target(&self) -> Option<PathBuf> {
+        std::fs::canonicalize(join_doc_path(&self.dir, &self.prefix)).ok()
+    }
+}
+
 /// An image target resolved without a workspace, below `folder`, with no
 /// `imagesdir`.
 #[must_use]

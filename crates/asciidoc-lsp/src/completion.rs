@@ -11,13 +11,12 @@ use asciidoc_core::anchor_scope::{AnchorScope, CatalogCache};
 use asciidoc_core::builtin_attributes::{
     builtin_attribute, BuiltinAttribute, BuiltinValues, BUILTIN_ATTRIBUTES,
 };
-use asciidoc_core::paths::canonicalize_if_exists;
-use asciidoc_core::targets::Target;
+use asciidoc_core::targets::{canonical_if_exists, document_dir, join_in_folder, BaseDir, Target};
 use asciidoc_core::types::{AnchorKind, AnchorLocation};
 use asciidoc_core::workspace::Workspace;
 
 use crate::positions;
-use crate::scopes::{collapse_if_agree, document_dir, scope_label};
+use crate::present::{collapse_if_agree, scope_label};
 
 // ---------------------------------------------------------------------------
 // Syntax Completion Catalog
@@ -1032,9 +1031,7 @@ pub(crate) fn resolve_xref_cross_anchor_completions(
     let canonical_targets: Vec<PathBuf> = bases
         .iter()
         .filter(|base| !base.prefix.contains('{'))
-        .filter_map(|base| {
-            std::fs::canonicalize(asciidoc_core::paths::join_doc_path(&base.dir, &base.prefix)).ok()
-        })
+        .filter_map(BaseDir::canonical_target)
         .collect();
     // No targets would mean the current document to `anchors_of_documents`.
     if canonical_targets.is_empty() {
@@ -1250,7 +1247,7 @@ fn list_path_items(
         None => ("", resolved_prefix.as_str()),
     };
 
-    let list_dir = asciidoc_core::paths::normalize_lexically(&listing.base_dir.join(resolved_dir));
+    let list_dir = join_in_folder(&listing.base_dir, resolved_dir);
     // A `/` right after the token belongs to the directory item.
     let dir_end_col = span.end_col + u32::from(span.next == Some('/'));
 
@@ -1297,7 +1294,7 @@ fn list_path_items(
                             .is_some_and(|ext| ext.eq_ignore_ascii_case("adoc")),
                         PathCompletionFilter::IncludeTarget { current } => {
                             !name.starts_with('.')
-                                && canonicalize_if_exists(path.clone()) != current
+                                && canonical_if_exists(path.clone()) != current
                                 && is_text_file(&path)
                         }
                         PathCompletionFilter::Image => {
@@ -1358,7 +1355,7 @@ pub(crate) fn resolve_include_completions(
             resolved_prefix: prefix.to_string(),
         }],
     };
-    let current = canonicalize_if_exists(doc_path.to_path_buf());
+    let current = canonical_if_exists(doc_path.to_path_buf());
     // Cursor lands inside `[]` on the `opts` placeholder for include options.
     resolve_path_completions(
         prefix,
