@@ -1,0 +1,6 @@
+= T
+ifdef::nope[]
+include::include-in-false-branch-included.adoc[]
+endif::[]
+
+Body.

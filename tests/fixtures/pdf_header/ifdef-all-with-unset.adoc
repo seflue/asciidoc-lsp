@@ -1,0 +1,8 @@
+= T
+:a:
+:nope2!:
+ifdef::a+nope2[]
+:pdf-theme: nosuch
+endif::[]
+
+Body.

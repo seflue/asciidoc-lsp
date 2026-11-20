@@ -1,0 +1,4 @@
+= T
+include::sub/relative-dotdot-included.adoc[]
+
+Body.

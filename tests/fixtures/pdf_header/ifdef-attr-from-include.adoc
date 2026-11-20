@@ -1,0 +1,7 @@
+= T
+include::ifdef-attr-from-include-included.adoc[]
+ifdef::corpflag[]
+:pdf-theme: nosuch
+endif::[]
+
+Body.

@@ -1,0 +1,4 @@
+.Blocktitle
+:pdf-theme: nosuch
+
+Para.

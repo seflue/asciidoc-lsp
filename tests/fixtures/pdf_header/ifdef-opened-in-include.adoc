@@ -1,0 +1,6 @@
+= T
+include::ifdef-opened-in-include-included.adoc[]
+:pdf-theme: nosuch
+endif::[]
+
+Body.

@@ -1,0 +1,7 @@
+= T
+include::unterminated-comment-in-include-included.adoc[]
+:pdf-theme: nosuch
+////
+:pdf-theme: nosuch
+
+Body.

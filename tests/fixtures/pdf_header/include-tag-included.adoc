@@ -1,0 +1,4 @@
+// tag::t[]
+:a: b
+// end::t[]
+:pdf-theme: nosuch

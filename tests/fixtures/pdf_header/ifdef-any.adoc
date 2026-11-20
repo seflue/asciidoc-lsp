@@ -1,0 +1,7 @@
+= T
+:a:
+ifdef::nope,a[]
+:pdf-theme: nosuch
+endif::[]
+
+Body.

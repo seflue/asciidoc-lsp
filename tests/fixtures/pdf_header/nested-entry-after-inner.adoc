@@ -1,0 +1,4 @@
+= T
+include::nested-entry-after-inner-included.adoc[]
+
+Body.

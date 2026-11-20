@@ -1,0 +1,5 @@
+= T
+include::does-not-exist.adoc[]
+:pdf-theme: nosuch
+
+Body.

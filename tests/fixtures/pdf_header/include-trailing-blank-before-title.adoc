@@ -1,0 +1,5 @@
+include::include-trailing-blank-before-title-included.adoc[]
+= T
+:pdf-theme: nosuch
+
+Body.

@@ -1,0 +1,4 @@
+= T
+include::include-tag-included.adoc[tag=t]
+
+Body.

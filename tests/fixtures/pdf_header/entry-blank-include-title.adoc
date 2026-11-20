@@ -1,0 +1,7 @@
+:a: b
+
+include::entry-blank-include-title-included.adoc[]
+= T
+:pdf-theme: nosuch
+
+Body.

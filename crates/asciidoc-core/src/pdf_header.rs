@@ -34,9 +34,14 @@ use crate::types::{
 };
 use crate::workspace::Workspace;
 
-/// Attributes an Asciidoctor PDF build defines.
+/// Attributes an Asciidoctor PDF build defines. The converter sets
+/// `basebackend` to `html` (`converter.rb:135`), so `basebackend-html` holds
+/// and `basebackend-pdf` does not.
 const PDF_BACKEND_ATTRIBUTES: &[&str] =
-    &["backend", "backend-pdf", "basebackend", "basebackend-pdf"];
+    &["backend", "backend-pdf", "basebackend", "basebackend-html"];
+
+/// Attributes the PDF build leaves unset, however the build is called.
+const PDF_UNSET_ATTRIBUTES: &[&str] = &["basebackend-pdf"];
 
 /// An attribute entry of the header: where it stands and its value with the
 /// references substituted.
@@ -360,6 +365,7 @@ impl HeaderWalk<'_> {
             Some(HeaderValue::Unset) => Tri::No,
             Some(HeaderValue::Uncertain) => Tri::Unknown,
             None if PDF_BACKEND_ATTRIBUTES.contains(&name) => Tri::Yes,
+            None if PDF_UNSET_ATTRIBUTES.contains(&name) => Tri::No,
             None => match self.workspace.attributes().preset(self.root, name) {
                 Some((AttributeLayer::Config, _)) => Tri::Yes,
                 // The other builtins exist in the editor only.

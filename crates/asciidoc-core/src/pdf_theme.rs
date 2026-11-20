@@ -571,15 +571,71 @@ mod tests {
             ("revision-invalid-entry.adoc", &[5]),
             ("title-paragraph-as-author.adoc", &[3]),
             ("continued-entry-no-revision.adoc", &[4]),
+            ("include-blank-before-title.adoc", &[3]),
+            ("include-trailing-blank-before-title.adoc", &[3]),
+            ("blank-lines-before-title.adoc", &[4]),
+            ("entry-blank-include-title.adoc", &[5]),
+            ("three-levels-third-included.adoc", &[1]),
+            ("nested-entry-after-inner-included.adoc", &[2]),
+            ("sets-nosuch-theme-included.adoc", &[1]),
+            ("relative-dotdot-second-included.adoc", &[1]),
+            ("ifdef-own-attr.adoc", &[4]),
+            ("ifdef-attr-from-include.adoc", &[4]),
+            ("ifdef-any.adoc", &[4]),
+            ("ifndef-after-unset.adoc", &[5]),
+            ("ifdef-basebackend-html.adoc", &[3]),
+            ("ifndef-basebackend-pdf.adoc", &[3]),
+            ("nested-ifdef.adoc", &[7]),
+            ("ifdef-opened-in-include.adoc", &[3]),
+            ("untitled-include-trailing-blank.adoc", &[2]),
+            ("untitled-anchor-then-entry.adoc", &[2]),
+            ("untitled-blocktitle-then-entry.adoc", &[2]),
+            ("untitled-comment-blank-entry.adoc", &[3]),
+            ("author-then-colon-comma.adoc", &[4]),
+            ("oneline-ifdef-include-included.adoc", &[1]),
+            ("uppercase-name.adoc", &[2]),
+            ("crlf.adoc", &[4]),
+            ("bom-titled.adoc", &[2]),
         ];
+        // Known limitation, false alarm: `include::include-tag-included.adoc[tag=t]`
+        // reads the whole file, the oracle reads only the tagged lines and
+        // stays `nil`.
+        let false_alarms: &[(&str, &[usize])] = &[("include-tag-included.adoc", &[4])];
         // Known limitations, missed errors (oracle `nosuch`, the LSP is quiet):
         // - `ifndef::foo[]` holds unless the build sets `foo`; nothing says
         //   `foo` is unset and a build may pass `-a foo`, so the branch is
-        //   unknown;
-        // - nothing in an `ifeval` branch is checked.
-        let missed: &[&str] = &["ifndef-in-untitled.adoc", "revision-ifeval.adoc"];
+        //   unknown, also for an attribute set in the body;
+        // - nothing in an `ifeval` branch is checked;
+        // - a title in an include does not open the header;
+        // - an unresolved include blinds the walk;
+        // - an unterminated comment block in an include, closed by the
+        //   parent, is uncertain;
+        // - the BOM before the first entry of an untitled document is not
+        //   skipped.
+        let missed: &[&str] = &[
+            "ifndef-in-untitled.adoc",
+            "revision-ifeval.adoc",
+            "title-in-include.adoc",
+            "title-in-include-included.adoc",
+            "missing-include.adoc",
+            "ifndef-attr-set-in-body.adoc",
+            "unterminated-comment-in-include.adoc",
+            "unterminated-comment-in-include-included.adoc",
+            "bom-untitled.adoc",
+        ];
+        let all = [oracle, false_alarms].concat();
+        // The premise of the CRLF entry: the fixture has CRLF line ends.
+        let crlf =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/pdf_header/crlf.adoc");
+        assert!(
+            std::fs::read(&crlf)
+                .unwrap()
+                .windows(2)
+                .any(|w| w == b"\r\n"),
+            "crlf.adoc must contain CRLF line ends"
+        );
         let found = fixture_pdf_lines();
-        assert_eq!(found, expected(oracle));
+        assert_eq!(found, expected(&all));
         for name in missed {
             assert!(found.iter().all(|(file, _)| file != name), "{name}");
         }
