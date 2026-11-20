@@ -771,6 +771,37 @@ mod tests {
         assert!(html.contains("only in the buffer"), "{html}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_overlay_matches_an_include_through_a_symlinked_folder() {
+        if !asciidoctor_available() {
+            eprintln!("skipped: asciidoctor is not on the PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/ch.adoc"), "disk text\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("shared")).unwrap();
+        let converter = AsciidoctorConverter::new().unwrap();
+        // The LSP keys the overlay by the canonical path.
+        let html = converter
+            .convert(&ConvertRequest {
+                file: dir.join("book.adoc"),
+                text: "= Book\n\ninclude::shared/ch.adoc[]\n".to_owned(),
+                attributes: Vec::new(),
+                overlay: overlay_of(&dir, &[("real/ch.adoc", "unsaved text\n")]),
+            })
+            .await
+            .unwrap();
+        assert!(html.contains("unsaved text"), "{html}");
+        // The file table names the canonical path too.
+        assert!(
+            html.contains(&dir.join("real/ch.adoc").display().to_string()),
+            "{html}"
+        );
+    }
+
     #[tokio::test]
     async fn test_without_overlay_includes_come_from_disk() {
         if !asciidoctor_available() {

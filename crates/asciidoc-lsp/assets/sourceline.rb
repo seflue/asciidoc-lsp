@@ -21,17 +21,26 @@ Asciidoctor::Compliance.underline_style_section_titles = false
 # applies `leveloffset`, `tags`, `lines`, nesting and cycle checks, and
 # numbers the lines. An IncludeProcessor would have to redo all of that.
 module AdocBufferOverlay
+  # Canonical path, like the LSP's keys: Asciidoctor does not resolve
+  # symlinks. A file that exists only in an editor buffer keeps its
+  # expanded path.
+  def self.canonical(path)
+    File.realpath(path)
+  rescue SystemCallError
+    File.expand_path(path)
+  end
+
   TEXTS = begin
     path = ENV['ASCIIDOC_LSP_OVERLAY']
     raw = path ? JSON.parse(File.read(path)) : {}
-    raw.each_with_object({}) { |(file, text), map| map[File.expand_path(file)] = text }
+    raw.each_with_object({}) { |(file, text), map| map[canonical(file)] = text }
   rescue StandardError
     {}
   end
 
   def self.text_for(path)
     return nil if TEXTS.empty? || !(String === path || path.respond_to?(:to_path))
-    TEXTS[File.expand_path(path.to_s)]
+    TEXTS[canonical(path.to_s)]
   end
 
   def file?(path)
@@ -66,6 +75,7 @@ class SourceLineTreeprocessor < Asciidoctor::Extensions::Treeprocessor
       file = loc.file.to_s
       role = "data-line-#{loc.lineno}"
       unless loc.file.nil? || file == docfile
+        file = AdocBufferOverlay.canonical(file)
         idx = files.index(file) || (files << file).size - 1
         role = "data-src-#{idx} #{role}"
       end
