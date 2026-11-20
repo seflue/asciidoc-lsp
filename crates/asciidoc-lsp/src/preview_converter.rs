@@ -792,6 +792,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tilde_image_targets_are_plain_relative_paths() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let text = "image::~draft.png[One]\n\nimage::~/home.png[Two]\n\nimage::~nosuchuser_x/a.png[Three]\n";
+        let html = convert_with_root(&root, root.join("doc.adoc"), text).await;
+        assert!(html.contains(r#"src="files/~draft.png""#), "{html}");
+        assert!(html.contains(r#"src="files/~/home.png""#), "{html}");
+        assert!(
+            html.contains(r#"src="files/~nosuchuser_x/a.png""#),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_ascii_text_with_percent_escapes_does_not_abort_the_conversion() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let text = "image::Bild-\u{e4}%C3%A4.png[Mixed]\n\nimage::ok.png[Ok]\n";
+        let html = convert_with_root(&root, root.join("doc.adoc"), text).await;
+        assert!(html.contains(r#"src="files/ok.png""#), "{html}");
+        assert!(html.contains("Mixed"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_a_drive_letter_is_not_a_url_scheme() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // On Linux `C:/x` is a relative folder below the base directory, so a
+        // rewrite shows that the drive letter was taken as a path.
+        let text = ":imagesdir: C:/x\n\nimage::img.png[Drive]\n";
+        let html = convert_with_root(&root, root.join("doc.adoc"), text).await;
+        assert!(html.contains(r#"src="files/C%3A/x/img.png""#), "{html}");
+        // A two-letter scheme still is a URL.
+        let html =
+            convert_with_root(&root, root.join("doc.adoc"), "image::ab://x/y.png[Url]\n").await;
+        assert!(html.contains(r#"src="ab://x/y.png""#), "{html}");
+    }
+
+    #[tokio::test]
     async fn test_without_a_root_image_urls_stay_as_they_are() {
         if !asciidoctor_available() {
             return;

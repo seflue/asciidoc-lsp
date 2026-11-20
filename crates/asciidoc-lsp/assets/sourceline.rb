@@ -105,7 +105,8 @@ end
 # relative to the page and goes through the server's file route.
 class ImageSrcPostprocessor < Asciidoctor::Extensions::Postprocessor
   IMG_SRC = /(<img\b[^>]*?\ssrc=")([^"]*)(")/
-  SCHEME = /\A[a-zA-Z][a-zA-Z0-9+.\-]*:/
+  # At least two characters: `C:/` is a Windows path, not a scheme.
+  SCHEME = /\A[a-zA-Z][a-zA-Z0-9+.\-]+:/
 
   def process(doc, output)
     root = ENV['ASCIIDOC_LSP_ROOT']
@@ -127,6 +128,8 @@ class ImageSrcPostprocessor < Asciidoctor::Extensions::Postprocessor
     return nil if src.empty? || src.start_with?('//') || src.match?(SCHEME)
     # The converter escapes `&` in the attribute value.
     path = decode(src.gsub('&amp;', '&'))
+    # `~` is no home folder in a URL; keep expand_path from reading it so.
+    path = "./#{path}" if path.start_with?('~')
     full = File.expand_path(path, base)
     candidates = [full, AdocBufferOverlay.canonical(full)].uniq
     roots.each do |root|
@@ -136,10 +139,13 @@ class ImageSrcPostprocessor < Asciidoctor::Extensions::Postprocessor
       end
     end
     nil
+  rescue ArgumentError, EncodingError
+    # One odd target must not fail the whole conversion.
+    nil
   end
 
   def decode(text)
-    text.gsub(/%([0-9A-Fa-f]{2})/) { $1.hex.chr }.force_encoding(Encoding::UTF_8)
+    text.b.gsub(/%([0-9A-Fa-f]{2})/n) { $1.hex.chr }.force_encoding(Encoding::UTF_8)
   end
 
   def encode(path)
