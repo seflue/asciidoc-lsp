@@ -258,12 +258,28 @@ fn is_block_metadata(line: &str) -> bool {
     })
 }
 
+/// The 1-based line `node` ends on; a node that ends after a line break ends
+/// on the line before.
+fn last_line(node: tree_sitter::Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row
+    } else {
+        end.row + 1
+    }
+}
+
 /// Paragraph styles Asciidoctor renders as verbatim text.
 const VERBATIM_PARAGRAPH_STYLES: &[&str] = &["listing", "literal", "source"];
 
+/// Paragraph style that only keeps a block macro line as text: the inline
+/// macros of its text still render.
+const VERSE_STYLE: &str = "verse";
+
 /// The 1-based line ranges of paragraphs and block macros a `[listing]`,
 /// `[literal]` or `[source]` line above turns into verbatim text: a macro
-/// there renders as written.
+/// there renders as written. A `[verse]` line turns only a block macro into
+/// text, the inline macros of a verse paragraph render.
 #[must_use]
 pub fn extract_verbatim_paragraph_lines(
     node: tree_sitter::Node,
@@ -292,12 +308,15 @@ fn walk_for_verbatim_paragraphs(
                     .and_then(|style| style.utf8_text(source).ok())
             })
             .next_back();
-        if style.is_some_and(|style| VERBATIM_PARAGRAPH_STYLES.contains(&style)) {
+        let verbatim = style.is_some_and(|style| VERBATIM_PARAGRAPH_STYLES.contains(&style));
+        if verbatim || style == Some(VERSE_STYLE) {
             results.extend(
                 children
                     .iter()
-                    .filter(|child| matches!(child.kind(), "paragraph" | "block_macro"))
-                    .map(|child| child.start_position().row + 1..=child.end_position().row + 1),
+                    .filter(|child| {
+                        child.kind() == "block_macro" || (verbatim && child.kind() == "paragraph")
+                    })
+                    .map(|child| child.start_position().row + 1..=last_line(*child)),
             );
         }
     }

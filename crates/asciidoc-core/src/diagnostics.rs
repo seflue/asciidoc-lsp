@@ -1457,8 +1457,9 @@ mod tests {
         assert_eq!(image_messages_of(source, &[]), vec![]);
     }
 
-    /// Asciidoctor renders no image in a `[listing]`, `[literal]` or
-    /// `[source]` paragraph, nor in a branch of `ifdef`, `ifndef` or
+    /// Asciidoctor renders no image in a `[listing]`, `[literal]`,
+    /// `[source]` or `[verse]` paragraph (`VERBATIM_STYLES`, checked in
+    /// `Parser.next_block` before block macros), nor in a branch of `ifdef`, `ifndef` or
     /// `ifeval`, which the LSP does not evaluate. A `[comment]` paragraph
     /// starting with a block macro still renders the image (oracle:
     /// `asciidoctor -a data-uri` warns for it).
@@ -1473,7 +1474,8 @@ mod tests {
                       ifndef::x[image::f.png[]]\n\n\
                       ifeval::[1 == 2]\nimage::g.png[]\nendif::[]\n\n\
                       [comment]\nimage::h.png[]\n\n\
-                      image::i.png[]\n";
+                      image::i.png[]\n\n\
+                      [verse]\nimage::j.png[]\n";
         let lines: Vec<usize> = image_messages_of(source, &[])
             .into_iter()
             .map(|(line, _)| line)
@@ -1555,6 +1557,34 @@ mod tests {
         #[case] images: &[&str],
     ) {
         assert_eq!(image_messages_of(text, images), vec![]);
+    }
+
+    /// A `[verse]` paragraph is verbatim for block parsing (`image::` there
+    /// stays text) but keeps the normal substitutions, inline macros
+    /// included. `[listing]`, `[literal]` and `[source]` have none.
+    #[test]
+    fn test_inline_image_in_verse_paragraph_is_checked() {
+        let source = "= T\n\n\
+                      [verse]\nimage::a.png[]\n\n\
+                      [verse]\nVerse image:b.png[] inline.\n\n\
+                      [source]\nCode image:c.png[] inline.\n";
+        let lines: Vec<usize> = image_messages_of(source, &[])
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(lines, vec![7]);
+    }
+
+    /// A `[verse]` paragraph whose first line is a block macro: only that
+    /// line stays text, the inline image in the next line renders.
+    #[test]
+    fn test_inline_image_after_block_macro_line_in_verse_is_checked() {
+        let source = "= T\n\n[verse]\nimage::a.png[]\nthen image:b.png[] inline.\n";
+        let lines: Vec<usize> = image_messages_of(source, &[])
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(lines, vec![5]);
     }
 
     /// `part.adoc` is read whole by `book.adoc` (finds the image) and only
