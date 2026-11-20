@@ -35,6 +35,54 @@ pub fn extract_block_images(node: tree_sitter::Node, source: &[u8]) -> Vec<Image
     results
 }
 
+/// Paragraph styles Asciidoctor renders as verbatim text.
+const VERBATIM_PARAGRAPH_STYLES: &[&str] = &["listing", "literal", "source"];
+
+/// The 1-based line ranges of paragraphs and block macros a `[listing]`,
+/// `[literal]` or `[source]` line above turns into verbatim text: a macro
+/// there renders as written.
+#[must_use]
+pub fn extract_verbatim_paragraph_lines(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Vec<std::ops::RangeInclusive<usize>> {
+    let mut results = Vec::new();
+    walk_for_verbatim_paragraphs(node, source, &mut results);
+    results
+}
+
+fn walk_for_verbatim_paragraphs(
+    node: tree_sitter::Node,
+    source: &[u8],
+    results: &mut Vec<std::ops::RangeInclusive<usize>>,
+) {
+    let mut cursor = node.walk();
+    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+    if node.kind() == "section_block" {
+        // The last attribute line that sets a style wins.
+        let style = children
+            .iter()
+            .filter(|child| child.kind() == "element_attr")
+            .filter_map(|attr| {
+                find_child_node(*attr, "positional_attr")
+                    .and_then(|positional| find_child_node(positional, "block_style"))
+                    .and_then(|style| style.utf8_text(source).ok())
+            })
+            .next_back();
+        if style.is_some_and(|style| VERBATIM_PARAGRAPH_STYLES.contains(&style)) {
+            results.extend(
+                children
+                    .iter()
+                    .filter(|child| matches!(child.kind(), "paragraph" | "block_macro"))
+                    .map(|child| child.start_position().row + 1..=child.end_position().row + 1),
+            );
+        }
+    }
+    for child in children {
+        walk_for_verbatim_paragraphs(child, source, results);
+    }
+}
+
 #[must_use]
 pub fn extract_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<AttributeDef> {
     let mut results = Vec::new();
@@ -804,11 +852,16 @@ fn walk_for_images(
     if node.kind() == macro_kind
         && find_child_text(node, name_kind, source).as_deref() == Some("image")
     {
-        results.push(ImageMacro {
-            path: find_child_text(node, "target", source).unwrap_or_default(),
-            line: node.start_position().row + 1,
-            span: node_span(node),
-        });
+        let path = find_child_text(node, "target", source).unwrap_or_default();
+        // Asciidoctor's `InlineImageMacroRx` takes no target starting with
+        // `:`: `image::x[]` inside a line is no inline image.
+        if !path.starts_with(':') {
+            results.push(ImageMacro {
+                path,
+                line: node.start_position().row + 1,
+                span: node_span(node),
+            });
+        }
         return;
     }
     let mut cursor = node.walk();

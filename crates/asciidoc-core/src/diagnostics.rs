@@ -1428,6 +1428,135 @@ mod tests {
         assert_eq!(includes, vec![5]);
     }
 
+    /// Image diagnostics of `main.adoc` with `source`, the files in `images`
+    /// created next to it, as `(line, message)`.
+    fn image_messages_of(source: &str, images: &[&str]) -> Vec<(usize, String)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for image in images {
+            let path = root.join(image);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "PNG").unwrap();
+        }
+        let main = root.join("main.adoc");
+        std::fs::write(&main, source).unwrap();
+        let mut ws = crate::workspace::Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        image_messages(&ws, &main)
+    }
+
+    /// Asciidoctor's inline image macro takes no target starting with `:`
+    /// (`InlineImageMacroRx`), so `image::x[]` inside a line is no image. In
+    /// an `a|` cell it is a block image, which the LSP leaves unchecked
+    /// rather than reading `:x` as a missing file.
+    #[test]
+    fn test_block_image_syntax_inside_a_line_is_no_inline_image() {
+        let source = "= T\n\n|===\na|image::here.png[]\n|===\n\nText image::here.png[]trailing\n";
+        assert_eq!(image_messages_of(source, &["here.png"]), vec![]);
+        assert_eq!(image_messages_of(source, &[]), vec![]);
+    }
+
+    /// Asciidoctor renders no image in a `[listing]`, `[literal]` or
+    /// `[source]` paragraph, nor in a branch of `ifdef`, `ifndef` or
+    /// `ifeval`, which the LSP does not evaluate. A `[comment]` paragraph
+    /// starting with a block macro still renders the image (oracle:
+    /// `asciidoctor -a data-uri` warns for it).
+    #[test]
+    fn test_no_image_diagnostic_in_verbatim_paragraphs_and_conditionals() {
+        let source = "= T\n\n\
+                      [listing]\nimage::a.png[]\n\n\
+                      [literal]\nimage::b.png[]\n\n\
+                      [source,ruby]\nimage::c.png[]\n\n\
+                      [literal]\nText image:d.png[] x.\n\n\
+                      ifdef::nope[]\nimage::e.png[]\nendif::[]\n\n\
+                      ifndef::x[image::f.png[]]\n\n\
+                      ifeval::[1 == 2]\nimage::g.png[]\nendif::[]\n\n\
+                      [comment]\nimage::h.png[]\n\n\
+                      image::i.png[]\n";
+        let lines: Vec<usize> = image_messages_of(source, &[])
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(lines, vec![26, 28]);
+    }
+
+    /// Contexts in which Asciidoctor renders the image and warns when the
+    /// file is missing (oracle: `asciidoctor -a data-uri`): the line of the
+    /// single message, the files that exist next to `main.adoc`.
+    #[rstest::rstest]
+    #[case::inline_in_table_cell("= T\n\n|===\n|image:x.png[]\n|===\n", &[], 4)]
+    #[case::inline_in_block_title("= T\n\n.Fig image:x.png[]\nText.\n", &[], 3)]
+    #[case::inline_in_list_item("= T\n\n* item image:x.png[]\n", &[], 3)]
+    #[case::inline_in_footnote("= T\n\nNote.footnote:[image:x.png[]]\n", &[], 3)]
+    #[case::block_in_list_continuation("= T\n\n* item\n+\nimage::x.png[]\n", &[], 5)]
+    #[case::inline_after_block_syntax_in_line(
+        "= T\n\nimage::ok.png[] and image:x.png[] inline.\n",
+        &["ok.png"],
+        3
+    )]
+    #[case::inline_in_delimited_verse("= T\n\n[verse]\n____\nText image:x.png[] y\n____\n", &[], 5)]
+    #[case::inline_in_verse_with_attribution(
+        "= T\n\n[verse, Carl Sandburg, Fog]\nText image:x.png[] y\n",
+        &[],
+        4
+    )]
+    #[case::after_imagesdir_is_unset(
+        "= T\n:imagesdir: img\n:imagesdir!:\n\nimage::x.png[]\n",
+        &["img/x.png"],
+        5
+    )]
+    #[case::file_name_with_space("= T\n\nimage::with space.png[]\n", &[], 3)]
+    fn test_image_is_checked_where_asciidoctor_renders_it(
+        #[case] text: &str,
+        #[case] images: &[&str],
+        #[case] line: usize,
+    ) {
+        let lines: Vec<usize> = image_messages_of(text, images)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(lines, vec![line]);
+    }
+
+    /// A differing case of the extension is a missing file. Only a
+    /// case-sensitive file system tells `Exists.PNG` from `exists.png`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_image_extension_case_must_match() {
+        let lines: Vec<usize> = image_messages_of("= T\n\nimage::Exists.PNG[]\n", &["exists.png"])
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(lines, vec![3]);
+    }
+
+    /// Contexts in which Asciidoctor renders no image or the file exists:
+    /// no message.
+    #[rstest::rstest]
+    #[case::escaped("= T\n\nEscaped \\image:x.png[] text.\n", &[])]
+    #[case::inline_passthrough("= T\n\nPass +image:x.png[]+ text.\n", &[])]
+    #[case::macro_passthrough("= T\n\nMacro pass:[image:x.png[]] text.\n", &[])]
+    #[case::passthrough_block("= T\n\n++++\nimage::x.png[]\n++++\n", &[])]
+    #[case::line_comment("= T\n\n// image::x.png[]\n", &[])]
+    #[case::block_comment("= T\n\n////\nimage::x.png[]\n////\n", &[])]
+    #[case::literal_with_role("= T\n\n[literal.role]\nimage::x.png[]\n", &[])]
+    #[case::source_with_options("= T\n\n[source%linenums,ruby]\nimage::x.png[]\n", &[])]
+    #[case::titled_listing("= T\n\n.Titled\n[listing]\nimage::x.png[]\n", &[])]
+    #[case::anchored_literal("= T\n\n[[anc]]\n[literal]\nimage::x.png[]\n", &[])]
+    #[case::block_macro_in_delimited_verse("= T\n\n[verse]\n____\nimage::x.png[]\n____\n", &[])]
+    #[case::nested_conditional(
+        "= T\n\nifndef::nope[]\nifdef::x[]\nimage::x.png[]\nendif::[]\nendif::[]\n",
+        &[]
+    )]
+    #[case::file_name_with_space("= T\n\nimage::with space.png[]\n", &["with space.png"])]
+    fn test_no_image_diagnostic_where_asciidoctor_renders_none(
+        #[case] text: &str,
+        #[case] images: &[&str],
+    ) {
+        assert_eq!(image_messages_of(text, images), vec![]);
+    }
+
     /// `part.adoc` is read whole by `book.adoc` (finds the image) and only
     /// in part by `web.adoc` (would miss it, but renders nothing of the
     /// image outside its tag), and the preview finds it too: no warning.

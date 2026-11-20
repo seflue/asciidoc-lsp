@@ -1578,14 +1578,17 @@ fn classify_inline_node(
                 }
                 if macro_name == "image" {
                     let path = find_child_text(n, "target", source).unwrap_or_default();
-                    return Some(NodeInfo {
-                        kind: NodeKind::Image {
-                            path,
-                            inline: true,
-                            attrlist: macro_attrlist(n, source),
-                        },
-                        line: n.start_position().row + 1,
-                    });
+                    // `image::x[]` inside a line is no inline image.
+                    if !path.starts_with(':') {
+                        return Some(NodeInfo {
+                            kind: NodeKind::Image {
+                                path,
+                                inline: true,
+                                attrlist: macro_attrlist(n, source),
+                            },
+                            line: n.start_position().row + 1,
+                        });
+                    }
                 }
             }
             "xref" => {
@@ -4672,6 +4675,30 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
             }
         );
         assert_eq!(info.line, 3); // 1-indexed
+    }
+
+    /// `image::x[]` inside a line is no inline image (`InlineImageMacroRx`
+    /// takes no target starting with `:`), as the diagnostics treat it: the
+    /// hover must not read `:x` as a missing file.
+    #[test]
+    fn test_find_node_block_image_syntax_inside_a_line_is_no_image() {
+        for (content, line, character) in [
+            ("= T\n\n|===\na|image::x.png[]\n|===\n", 3, 8),
+            ("= T\n\nText image::x.png[]trailing\n", 2, 14),
+            ("= T\n\nimage::x.png[]trailing\n", 2, 8),
+        ] {
+            let info = find_node_at_position(content, Position { line, character });
+            assert!(
+                !matches!(
+                    info,
+                    Some(NodeInfo {
+                        kind: NodeKind::Image { .. },
+                        ..
+                    })
+                ),
+                "{content:?}: {info:?}"
+            );
+        }
     }
 
     #[test]

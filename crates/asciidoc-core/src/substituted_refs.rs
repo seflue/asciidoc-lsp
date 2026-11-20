@@ -586,6 +586,14 @@ fn scan_preprocessor(source: &str) -> Preprocessor {
     Preprocessor { locked, possible }
 }
 
+/// Per 0-based line of `source`: a conditional directive (`ifdef`, `ifndef`,
+/// `ifeval`, `endif`) or a line inside a block conditional. The LSP does not
+/// evaluate conditionals, so it cannot tell whether such a line is rendered.
+#[must_use]
+pub(crate) fn conditional_lines(source: &str) -> Vec<bool> {
+    scan_preprocessor(source).locked
+}
+
 /// The attribute name of an entry line (`:name:`, `:name!:`, `:!name:`,
 /// optionally followed by a value).
 fn entry_line_name(line: &str) -> Option<&str> {

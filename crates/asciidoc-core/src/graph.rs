@@ -323,6 +323,18 @@ pub fn parse_single_file(
         crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
     let mut images = crate::extractors::extract_block_images(root_node, source.as_bytes());
     images.extend(inline_images);
+    // Not rendered as images: macros in verbatim-styled paragraphs and, as
+    // far as the LSP can tell, in conditional branches.
+    let verbatim =
+        crate::extractors::extract_verbatim_paragraph_lines(root_node, source.as_bytes());
+    let conditional = crate::substituted_refs::conditional_lines(&source);
+    images.retain(|image| {
+        let in_conditional = conditional
+            .get(image.line.saturating_sub(1))
+            .copied()
+            .unwrap_or(false);
+        !in_conditional && !verbatim.iter().any(|lines| lines.contains(&image.line))
+    });
     images.sort_by_key(|image| image.line);
     let mut anchors = crate::extractors::extract_anchors(root_node, source.as_bytes());
     anchors.extend(inline_anchors);
