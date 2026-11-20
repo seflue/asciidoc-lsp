@@ -594,6 +594,76 @@ mod tests {
         assert_eq!((body[0].ty, body[0].text.as_str()), ("raw", "fn main() {}"));
     }
 
+    /// A listing without a style is raw too, and `*x*` in it is no bold.
+    #[test]
+    fn unstyled_listing_body_is_raw() {
+        let tokens = decoded("----\n*x*\n----\n");
+
+        let body = on_line(&tokens, 1);
+        assert_eq!(body.len(), 1, "{body:#?}");
+        assert_eq!((body[0].ty, body[0].text.as_str()), ("raw", "*x*"));
+    }
+
+    /// `source` of `[source,rust]` is the block style, a type.
+    #[test]
+    fn source_style_is_a_type_not_a_parameter() {
+        let tokens = decoded("[source,rust]\n----\nfn x() {}\n----\n");
+
+        let style = on_line(&tokens, 0)
+            .into_iter()
+            .find(|t| t.text == "source")
+            .unwrap();
+        assert_eq!(style.ty, "type");
+    }
+
+    /// Delimiters and text of a `[NOTE]` block carry the admonition token.
+    #[test]
+    fn admonition_block_body_and_delimiters_are_marked() {
+        let tokens = decoded("[NOTE]\n====\ntext\n====\n");
+
+        for (line, text) in [(1, "===="), (2, "text"), (3, "====")] {
+            let on = on_line(&tokens, line);
+            assert!(
+                on.iter()
+                    .any(|t| t.ty == "admonition" && t.text == text && t.mods == ["note"]),
+                "{on:#?}"
+            );
+        }
+    }
+
+    /// A role after the admonition style keeps delimiters and body marked,
+    /// and a multi-line, multi-paragraph body is marked on every line.
+    #[test]
+    fn admonition_with_role_and_long_body_is_marked() {
+        let tokens = decoded("[NOTE.role]\n====\na1\na2\n\nb1\nb2\n====\n");
+
+        for (line, text) in [
+            (1, "===="),
+            (2, "a1"),
+            (3, "a2"),
+            (5, "b1"),
+            (6, "b2"),
+            (7, "===="),
+        ] {
+            let on = on_line(&tokens, line);
+            assert!(
+                on.iter()
+                    .any(|t| t.ty == "admonition" && t.text == text && t.mods == ["note"]),
+                "line {line}: {on:#?}"
+            );
+        }
+    }
+
+    /// A listing with named attributes only has no style: raw body.
+    #[test]
+    fn listing_with_named_attributes_only_is_raw() {
+        let tokens = decoded("[subs=+quotes]\n----\n*x*\n----\n");
+
+        let body = on_line(&tokens, 2);
+        assert_eq!(body.len(), 1, "{body:#?}");
+        assert_eq!((body[0].ty, body[0].text.as_str()), ("raw", "*x*"));
+    }
+
     #[test]
     fn construct_over_a_line_break_is_split_per_line() {
         let tokens = decoded(FIXTURE);
