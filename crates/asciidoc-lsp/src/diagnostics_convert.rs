@@ -38,6 +38,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
         | DiagnosticKind::CircularInclude { .. }
         | DiagnosticKind::SectionOutOfSequence { .. }
         | DiagnosticKind::UnterminatedBlock { .. }
+        | DiagnosticKind::ImageNotFound { .. }
         | DiagnosticKind::UnanchoredPdfPath { .. } => ls_types::DiagnosticSeverity::WARNING,
         DiagnosticKind::OptionalIncludeNotFound { .. } => ls_types::DiagnosticSeverity::INFORMATION,
         DiagnosticKind::UndefinedConditionalAttr { .. } => ls_types::DiagnosticSeverity::HINT,
@@ -58,6 +59,26 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_convert_image_not_found_is_warning() {
+        let diags = vec![CoreDiagnostic {
+            file: PathBuf::from("/test.adoc"),
+            line: 1,
+            span: None,
+            kind: DiagnosticKind::ImageNotFound {
+                path: "a.png".into(),
+                missing: vec![],
+            },
+        }];
+
+        let result = convert_diagnostics(&diags, "image::a.png[]\n");
+
+        assert_eq!(
+            result[0].severity,
+            Some(ls_types::DiagnosticSeverity::WARNING)
+        );
+    }
 
     #[test]
     fn test_convert_broken_xref_is_warning() {

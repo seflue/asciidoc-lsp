@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
         // from the block tree
         let inline_ranges =
             asciidoc_core::extractors::collect_inline_ranges(root, source.as_bytes());
-        let (xrefs, inline_anchors) =
+        let (xrefs, inline_anchors, _) =
             asciidoc_core::extractors::extract_inline_content_safe(&inline_ranges, &source);
         let mut anchors = asciidoc_core::extractors::extract_anchors(root, source.as_bytes());
         anchors.extend(inline_anchors);

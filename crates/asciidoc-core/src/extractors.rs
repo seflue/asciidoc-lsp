@@ -1,6 +1,7 @@
 use crate::types::{
     Anchor, AttributeDef, AttributeRef, BlockTitle, ConditionalDirective, ConditionalKind,
-    ConditionalOperator, IncludeMacro, Placement, Section, Span, UnterminatedBlock, Xref,
+    ConditionalOperator, ImageMacro, IncludeMacro, Placement, Section, Span, UnterminatedBlock,
+    Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -16,6 +17,21 @@ pub fn extract_sections(node: tree_sitter::Node, source: &[u8]) -> Vec<Section> 
 pub fn extract_includes(node: tree_sitter::Node, source: &[u8]) -> Vec<IncludeMacro> {
     let mut results = Vec::new();
     walk_for_includes(node, source, &mut results);
+    results
+}
+
+/// The block image macros (`image::target[]`). Inline ones come from the
+/// inline tree, see [`extract_inline_content_safe`].
+#[must_use]
+pub fn extract_block_images(node: tree_sitter::Node, source: &[u8]) -> Vec<ImageMacro> {
+    let mut results = Vec::new();
+    walk_for_images(
+        node,
+        source,
+        "block_macro",
+        "block_macro_name",
+        &mut results,
+    );
     results
 }
 
@@ -224,7 +240,8 @@ pub fn collect_inline_ranges(node: tree_sitter::Node, source: &[u8]) -> Vec<tree
     ranges
 }
 
-/// Extract xrefs and anchors by parsing each inline range individually.
+/// Extract xrefs, anchors and inline image macros by parsing each inline
+/// range individually.
 ///
 /// Parsing all ranges in a single `set_included_ranges` call can cause
 /// cross-range misparses: e.g. a `+` in one paragraph matches a `+` in
@@ -234,25 +251,25 @@ pub fn collect_inline_ranges(node: tree_sitter::Node, source: &[u8]) -> Vec<tree
 pub fn extract_inline_content_safe(
     ranges: &[tree_sitter::Range],
     source: &str,
-) -> (Vec<Xref>, Vec<Anchor>) {
-    let mut all_xrefs = Vec::new();
-    let mut all_anchors = Vec::new();
+) -> (Vec<Xref>, Vec<Anchor>, Vec<ImageMacro>) {
+    let mut found = InlineContent::default();
 
     let Ok(mut parser) = crate::parser::init_inline_parser() else {
-        return (all_xrefs, all_anchors);
+        return (found.xrefs, found.anchors, found.images);
     };
 
     for range in ranges {
-        extract_range(
-            &mut parser,
-            *range,
-            source,
-            &mut all_xrefs,
-            &mut all_anchors,
-        );
+        extract_range(&mut parser, *range, source, &mut found);
     }
 
-    (all_xrefs, all_anchors)
+    (found.xrefs, found.anchors, found.images)
+}
+
+#[derive(Default)]
+struct InlineContent {
+    xrefs: Vec<Xref>,
+    anchors: Vec<Anchor>,
+    images: Vec<ImageMacro>,
 }
 
 /// Parse one range and collect its xrefs and anchors. Footnote content is an
@@ -262,8 +279,7 @@ fn extract_range(
     parser: &mut tree_sitter::Parser,
     range: tree_sitter::Range,
     source: &str,
-    xrefs: &mut Vec<Xref>,
-    anchors: &mut Vec<Anchor>,
+    found: &mut InlineContent,
 ) {
     if parser.set_included_ranges(&[range]).is_err() {
         return;
@@ -271,10 +287,21 @@ fn extract_range(
     let Ok(tree) = crate::parser::parse(parser, source) else {
         return;
     };
-    xrefs.extend(extract_xrefs(tree.root_node(), source.as_bytes()));
-    anchors.extend(extract_anchors(tree.root_node(), source.as_bytes()));
+    found
+        .xrefs
+        .extend(extract_xrefs(tree.root_node(), source.as_bytes()));
+    found
+        .anchors
+        .extend(extract_anchors(tree.root_node(), source.as_bytes()));
+    walk_for_images(
+        tree.root_node(),
+        source.as_bytes(),
+        "inline_macro",
+        "macro_name",
+        &mut found.images,
+    );
     for footnote in footnote_content_ranges(tree.root_node()) {
-        extract_range(parser, footnote, source, xrefs, anchors);
+        extract_range(parser, footnote, source, found);
     }
 }
 
@@ -765,6 +792,31 @@ fn walk_for_includes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<I
     }
 }
 
+/// The image macros below `node`: nodes of kind `macro_kind` whose
+/// `name_kind` child reads `image`.
+fn walk_for_images(
+    node: tree_sitter::Node,
+    source: &[u8],
+    macro_kind: &str,
+    name_kind: &str,
+    results: &mut Vec<ImageMacro>,
+) {
+    if node.kind() == macro_kind
+        && find_child_text(node, name_kind, source).as_deref() == Some("image")
+    {
+        results.push(ImageMacro {
+            path: find_child_text(node, "target", source).unwrap_or_default(),
+            line: node.start_position().row + 1,
+            span: node_span(node),
+        });
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_images(child, source, macro_kind, name_kind, results);
+    }
+}
+
 fn walk_for_attributes(node: tree_sitter::Node, source: &[u8], results: &mut Vec<AttributeDef>) {
     if node.kind() == "document_attr" {
         let name = find_child_text(node, "attr_name", source).unwrap_or_default();
@@ -1191,7 +1243,7 @@ mod tests {
         let mut p = parser::init_block_parser().unwrap();
         let tree = parser::parse(&mut p, source).unwrap();
         let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
-        let (_, anchors) = extract_inline_content_safe(&ranges, source);
+        let (_, anchors, _) = extract_inline_content_safe(&ranges, source);
         anchors
     }
 
@@ -1429,6 +1481,36 @@ mod tests {
         assert_eq!(placements, expected);
     }
 
+    /// All image macros of `source`, block and inline, as (line, target).
+    fn images_of(source: &str) -> Vec<(usize, String)> {
+        let mut p = parser::init_block_parser().unwrap();
+        let tree = parser::parse(&mut p, source).unwrap();
+        let root = tree.root_node();
+        let ranges = collect_inline_ranges(root, source.as_bytes());
+        let (_, _, inline) = extract_inline_content_safe(&ranges, source);
+        let mut images = extract_block_images(root, source.as_bytes());
+        images.extend(inline);
+        images.sort_by_key(|image| image.line);
+        images.into_iter().map(|i| (i.line, i.path)).collect()
+    }
+
+    #[test]
+    fn test_extract_images_block_and_inline() {
+        let source = "= T\n\nimage::a.png[]\n\nText image:b.png[alt] more.\n";
+        assert_eq!(
+            images_of(source),
+            vec![(3, "a.png".to_string()), (5, "b.png".to_string())]
+        );
+    }
+
+    /// Asciidoctor renders `image::x.png[]` in a listing as text.
+    #[test]
+    fn test_extract_images_skips_listing_and_literal_blocks() {
+        let source = "----\nimage::a.png[]\n----\n\n....\nimage::b.png[]\n....\n\n\
+                      ....\nimage:c.png[]\n....\n\n image::d.png[]\n\nimage::e.png[]\n";
+        assert_eq!(images_of(source), vec![(15, "e.png".to_string())]);
+    }
+
     #[test]
     fn test_extract_includes() {
         let mut p = parser::init_block_parser().unwrap();
@@ -1642,7 +1724,7 @@ mod tests {
         let mut p = parser::init_block_parser().unwrap();
         let tree = parser::parse(&mut p, source).unwrap();
         let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
-        let (xrefs, _) = extract_inline_content_safe(&ranges, source);
+        let (xrefs, _, _) = extract_inline_content_safe(&ranges, source);
         xrefs
     }
 
@@ -2095,7 +2177,7 @@ mod tests {
         let tree = parser::parse(&mut p, &source).unwrap();
 
         let ranges = collect_inline_ranges(tree.root_node(), source.as_bytes());
-        let (xrefs, _) = extract_inline_content_safe(&ranges, &source);
+        let (xrefs, _, _) = extract_inline_content_safe(&ranges, &source);
         let rows: Vec<_> = ranges.iter().map(|r| r.start_point.row).collect();
         let includes: Vec<_> = extract_includes(tree.root_node(), source.as_bytes())
             .into_iter()

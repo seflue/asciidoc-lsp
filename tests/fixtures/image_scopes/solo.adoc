@@ -1,0 +1,5 @@
+= Solo
+
+image::missing.png[]
+
+image:gone.png[]

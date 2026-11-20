@@ -22,7 +22,8 @@ use asciidoc_core::workspace::{
 use crate::positions;
 use crate::scopes::{
     collapse_if_agree, document_dir, file_display_name, path_scopes, scope_docdir,
-    scope_image_base, scope_label, unique_in_order, DocTarget,
+    scope_image_base, scope_imagesdir_note, scope_label, unique_in_order, DocTarget,
+    IMAGESDIR_NOT_SET,
 };
 
 /// Classification of a node found at a cursor position.
@@ -575,11 +576,12 @@ pub fn resolve_hover(
                         ImageTarget::Local {
                             path: target,
                             display,
+                            imagesdir_note,
                         } => {
                             let status = if target.exists() {
-                                "\u{2713} File exists"
+                                "\u{2713} File exists".to_string()
                             } else {
-                                "\u{2717} File not found"
+                                format!("\u{2717} File not found ({imagesdir_note})")
                             };
                             format!("{macro_form}{display}[{attrlist}]\n\n{status}")
                         }
@@ -750,7 +752,13 @@ fn config_relative_path(ws: &Workspace, doc_path: &Path, value: &str) -> Option<
 enum ImageTarget {
     /// A file: `path` is absolute, `display` is the human-readable path
     /// including imagesdir.
-    Local { path: PathBuf, display: String },
+    Local {
+        path: PathBuf,
+        display: String,
+        /// Where `imagesdir` comes from in that build, see
+        /// `scope_imagesdir_note`.
+        imagesdir_note: String,
+    },
     /// A URI (Asciidoctor's `uriish?`: `https:`, `data:`, ...), from the macro target or from `imagesdir`.
     Remote { url: String },
 }
@@ -786,7 +794,7 @@ fn resolve_image_targets(
 ) -> Vec<(String, ImageTarget)> {
     let file_dir = document_dir(doc_path, workspace);
     let Some(ws) = workspace else {
-        let target = image_target(image_path, file_dir, file_dir, "");
+        let target = image_target(image_path, file_dir, file_dir, "", IMAGESDIR_NOT_SET.into());
         return vec![(file_display_name(doc_path), target)];
     };
     path_scopes(ws, doc_path, line)
@@ -794,7 +802,13 @@ fn resolve_image_targets(
         .map(|scope| {
             let (base, imagesdir) = scope_image_base(&scope, file_dir);
             let doc_dir = scope_docdir(&scope, file_dir);
-            let target = image_target(&scope.substitute(image_path), &base, &doc_dir, &imagesdir);
+            let target = image_target(
+                &scope.substitute(image_path),
+                &base,
+                &doc_dir,
+                &imagesdir,
+                scope_imagesdir_note(&scope),
+            );
             (scope_label(&scope), target)
         })
         .collect()
@@ -803,7 +817,13 @@ fn resolve_image_targets(
 /// An image target from its substituted path, the folder it resolves
 /// against and the `imagesdir` shown in front of it. An absolute path shown
 /// is shown relative to `doc_dir` as far as `display_path` allows.
-fn image_target(resolved_path: &str, base: &Path, doc_dir: &Path, imagesdir: &str) -> ImageTarget {
+fn image_target(
+    resolved_path: &str,
+    base: &Path,
+    doc_dir: &Path,
+    imagesdir: &str,
+    imagesdir_note: String,
+) -> ImageTarget {
     let mut display = if imagesdir.is_empty() || is_remote_url(resolved_path) {
         resolved_path.to_string()
     } else {
@@ -820,6 +840,7 @@ fn image_target(resolved_path: &str, base: &Path, doc_dir: &Path, imagesdir: &st
     ImageTarget::Local {
         path: join_doc_path(base, resolved_path),
         display,
+        imagesdir_note,
     }
 }
 
@@ -1319,6 +1340,7 @@ fn explain_image(label: &str, target: ImageTarget) -> Value {
         ImageTarget::Local {
             path: target,
             display,
+            ..
         } => {
             // Same existence gate as go-to-definition: the path gd returns.
             let canonical_target = target.canonicalize().ok();
@@ -2412,7 +2434,8 @@ mod tests {
         );
         assert_eq!(
             resolve_hover(&content, at(9, 8), &path, Some(&ws)).unwrap(),
-            "In index.adoc:\nimage::images/preview.png[]\n\n\u{2717} File not found\n\n\
+            "In index.adoc:\nimage::images/preview.png[]\n\n\u{2717} File not found \
+             (imagesdir from index.adoc:2)\n\n\
              In chapter.adoc (preview):\nimage::preview.png[]\n\n\u{2713} File exists"
         );
 
@@ -5083,7 +5106,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         assert_eq!(
             hover,
             "In book.adoc:\nimage::img/pic.png[]\n\n\u{2713} File exists\n\n\
-             In ch.adoc (preview):\nimage::pic.png[]\n\n\u{2717} File not found"
+             In ch.adoc (preview):\nimage::pic.png[]\n\n\u{2717} File not found \
+             (imagesdir not set in this build)"
         );
     }
 
@@ -5693,7 +5717,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
         assert_eq!(
             hover,
-            "image::/asciidoc-lsp-absent/images/logo.png[Logo]\n\n\u{2717} File not found"
+            "image::/asciidoc-lsp-absent/images/logo.png[Logo]\n\n\
+             \u{2717} File not found (imagesdir from a.adoc:2)"
         );
     }
 
@@ -5974,7 +5999,10 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         };
 
         let hover = resolve_hover(doc, pos, &a, Some(&ws)).unwrap();
-        assert_eq!(hover, "image:missing.png[]\n\n\u{2717} File not found");
+        assert_eq!(
+            hover,
+            "image:missing.png[]\n\n\u{2717} File not found (imagesdir not set in this build)"
+        );
         assert!(resolve_goto_definitions(doc, pos, &a, Some(&ws)).is_empty());
     }
 

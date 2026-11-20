@@ -42,6 +42,16 @@ pub struct IncludeMacro {
     pub placement: Placement,
 }
 
+/// An `image::` or `image:` macro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageMacro {
+    /// The target as written, attribute references unsubstituted.
+    pub path: String,
+    pub line: usize,
+    /// Range of the macro, from `line` to where it ends.
+    pub span: Span,
+}
+
 /// A source range that starts on a diagnostic's or xref's `line` and may end on a later one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -165,6 +175,9 @@ pub struct DocumentModel {
     pub sections: Vec<Section>,
     pub includes: Vec<IncludeMacro>,
     pub xrefs: Vec<Xref>,
+    /// Image macros Asciidoctor renders, in document order; the text of a
+    /// listing or literal block is none.
+    pub images: Vec<ImageMacro>,
     pub anchors: Vec<Anchor>,
     /// The titles of blocks with an ID, by the line of the ID.
     pub block_titles: Vec<BlockTitle>,
@@ -283,6 +296,12 @@ pub enum DiagnosticKind {
         attribute: String,
         value: String,
     },
+    /// An image no top-level document (or the editor's preview of the file)
+    /// finds at `path`, resolved with the `imagesdir` of that build.
+    ImageNotFound {
+        path: String,
+        missing: Vec<MissingImage>,
+    },
     /// Reserved for future typo detection (Levenshtein against known attributes).
     /// Currently unused: ifdef/ifndef attributes are build-time-dependent,
     /// so the LSP cannot verify them.
@@ -300,6 +319,17 @@ pub enum DiagnosticKind {
     },
 }
 
+/// A build in which an image is missing, see [`DiagnosticKind::ImageNotFound`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingImage {
+    /// The top-level document, or the previewed file.
+    pub document: PathBuf,
+    pub preview: bool,
+    /// Display path and line of the `imagesdir` entry in effect there;
+    /// `None` when `imagesdir` is not set.
+    pub imagesdir_from: Option<(PathBuf, usize)>,
+}
+
 impl fmt::Display for DiagnosticKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -313,6 +343,23 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::BrokenInclude { path } => {
                 write!(f, "Broken include: {path}")
+            }
+            DiagnosticKind::ImageNotFound { path, missing } => {
+                write!(f, "Image not found: {path}")?;
+                let builds: Vec<_> = missing
+                    .iter()
+                    .map(|build| {
+                        let preview = if build.preview { " (preview)" } else { "" };
+                        let imagesdir = match &build.imagesdir_from {
+                            Some((file, line)) => {
+                                format!("imagesdir from {}:{line}", file.display())
+                            }
+                            None => "imagesdir not set in this build".to_string(),
+                        };
+                        format!("{}{preview}: {imagesdir}", build.document.display())
+                    })
+                    .collect();
+                write!(f, " ({})", builds.join("; "))
             }
             DiagnosticKind::OptionalIncludeNotFound { path } => {
                 write!(f, "Optional include not found: {path}")
@@ -490,6 +537,7 @@ impl DocumentModel {
             sections: vec![],
             includes: vec![],
             xrefs: vec![],
+            images: vec![],
             anchors: vec![],
             block_titles: vec![],
             attributes: vec![],
@@ -513,6 +561,10 @@ impl DocumentModel {
     }
     pub fn with_xrefs(mut self, xrefs: Vec<Xref>) -> Self {
         self.xrefs = xrefs;
+        self
+    }
+    pub fn with_images(mut self, images: Vec<ImageMacro>) -> Self {
+        self.images = images;
         self
     }
     pub fn with_anchors(mut self, anchors: Vec<Anchor>) -> Self {

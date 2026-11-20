@@ -1,0 +1,4 @@
+= Book
+:imagesdir: images
+
+include::chapters/shared.adoc[]

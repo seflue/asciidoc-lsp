@@ -1,0 +1,9 @@
+== Shared
+
+image::logo.png[]
+
+include::setdir.adoc[]
+
+image::logo.png[]
+
+image::only-preview.png[]

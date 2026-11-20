@@ -319,8 +319,11 @@ pub fn parse_single_file(
     // the block tree. Parse each range individually to prevent cross-range
     // passthrough misparses.
     let inline_ranges = crate::extractors::collect_inline_ranges(root_node, source.as_bytes());
-    let (xrefs, inline_anchors) =
+    let (xrefs, inline_anchors, inline_images) =
         crate::extractors::extract_inline_content_safe(&inline_ranges, &source);
+    let mut images = crate::extractors::extract_block_images(root_node, source.as_bytes());
+    images.extend(inline_images);
+    images.sort_by_key(|image| image.line);
     let mut anchors = crate::extractors::extract_anchors(root_node, source.as_bytes());
     anchors.extend(inline_anchors);
     // Document order: the first definition of an id is the one that counts.
@@ -357,6 +360,7 @@ pub fn parse_single_file(
         sections,
         includes: includes_raw,
         xrefs,
+        images,
         anchors,
         block_titles,
         attributes: file_attrs,

@@ -2871,7 +2871,8 @@ mod tests {
             "image::{logo-name} | :logo-name: logo.svg\n\nDefined in ch1.adoc:4 | <self>:3",
             "image::sub/nested | image::../assets/sub/nested.svg[]\n\n✓ File exists \
              | <fx>/real/project/assets/sub/nested.svg:0",
-            "image::missing | image::../assets/missing.svg[]\n\n✗ File not found | -",
+            "image::missing | image::../assets/missing.svg[]\n\n\
+             ✗ File not found (imagesdir from ch1.adoc:2) | -",
             "{my_variable} | :my_variable: value\n\nDefined in ch1.adoc:3 | <self>:2",
             "complete \"image::\\n\" | inline.svg, logo.svg, sub/",
             "complete \"image::sub/\" | nested.svg",
@@ -3138,7 +3139,7 @@ mod tests {
 
         assert_eq!(
             hover.as_deref(),
-            Some("image::logo.svg[]\n\n✗ File not found")
+            Some("image::logo.svg[]\n\n✗ File not found (imagesdir not set in this build)")
         );
         assert_eq!(target, None);
     }
@@ -3205,8 +3206,10 @@ mod tests {
         assert_eq!(
             image.as_deref(),
             Some(
-                "In via-link.adoc:\nimage::logo.svg[]\n\n✗ File not found\n\n\
-                 In twice.adoc (preview):\nimage::../assets/logo.svg[]\n\n✗ File not found"
+                "In via-link.adoc:\nimage::logo.svg[]\n\n\
+                 ✗ File not found (imagesdir not set in this build)\n\n\
+                 In twice.adoc (preview):\nimage::../assets/logo.svg[]\n\n\
+                 ✗ File not found (imagesdir from .asciidoctorconfig:1)"
             )
         );
     }
@@ -4467,7 +4470,10 @@ mod tests {
             hover_text(server, &uri, position_of(&text, "image::only-root", 9))
                 .await
                 .as_deref(),
-            Some("image::./images/only-root.png[]\n\n✗ File not found")
+            Some(
+                "image::./images/only-root.png[]\n\n\
+                 ✗ File not found (imagesdir from .asciidoctorconfig:1)"
+            )
         );
         assert_eq!(
             hover_text(server, &uri, position_of(&text, "{imagesdir}", 2)).await,

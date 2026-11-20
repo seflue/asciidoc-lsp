@@ -1,0 +1,11 @@
+== Shared
+
+image::logo.png[]
+
+Inline image:logo.png[] here.
+
+image::gone.png[]
+
+----
+image::gone.png[]
+----

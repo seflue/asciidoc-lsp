@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::anchor_scope::{AnchorScope, CatalogCache};
-use crate::paths::{is_uri, resolve_doc_target};
-use crate::types::{Diagnostic, DiagnosticKind, DocumentModel, Span};
+use crate::attributes::DOCDIR;
+use crate::paths::{is_uri, join_doc_path, resolve_doc_target};
+use crate::types::{Diagnostic, DiagnosticKind, DocumentModel, MissingImage, Span};
 use crate::workspace::Workspace;
 
 /// A duplicate: the second definition (file, line), the ID, and the first.
@@ -155,6 +156,30 @@ fn declared_tags<'a>(
         .as_deref()
 }
 
+/// Whether the image `target` of a macro in `file` is a file in `scope`, or
+/// cannot be judged: a URI, or a reference the scope leaves unresolved.
+/// Resolved as Asciidoctor does: against `imagesdir` below `docdir`.
+fn image_exists(
+    scope: &crate::workspace::AttributeScope<'_>,
+    file: &Path,
+    target: &str,
+    registry: &crate::attributes::AttributeRegistry,
+) -> bool {
+    let target = scope.substitute(target);
+    let imagesdir = scope.value("imagesdir").unwrap_or_default();
+    if target.contains('{') || is_uri(&target) || is_uri(&imagesdir) {
+        return true;
+    }
+    let docdir = scope
+        .value(DOCDIR)
+        .map(PathBuf::from)
+        .or_else(|| registry.doc_dir(file).map(Path::to_path_buf));
+    let Some(docdir) = docdir else {
+        return true;
+    };
+    join_doc_path(&join_doc_path(&docdir, &imagesdir), &target).exists()
+}
+
 /// Collect all diagnostics across the workspace, grouped by file.
 ///
 /// Paths named inside messages are display paths, see `display_path`:
@@ -259,6 +284,74 @@ pub fn collect_diagnostics(
                         } else {
                             Vec::new()
                         },
+                    },
+                });
+            }
+        }
+
+        // 1c. Missing images, per top-level document and, for a file others
+        // include, in the editor's preview of it: one diagnostic per macro,
+        // naming the builds that miss the file and where their `imagesdir`
+        // comes from.
+        // A document that reads the file only in part is no judge of which
+        // images are rendered, so it is left out like for the xrefs.
+        let whole_readers: HashSet<PathBuf> = if doc.images.is_empty() {
+            HashSet::new()
+        } else {
+            catalogs
+                .scopes_at(path)
+                .iter()
+                .filter(|scope| scope.reads_whole(path))
+                .map(|scope| scope.document().to_path_buf())
+                .collect()
+        };
+        // The scopes of this file, walked once per state of its own
+        // attribute entries and includes: the scope on a line only changes
+        // with the entries and includes before it.
+        let mut image_scopes: HashMap<(usize, usize), Vec<crate::workspace::AttributeScope<'_>>> =
+            HashMap::new();
+        for image in &doc.images {
+            let entries_before = doc
+                .attributes
+                .iter()
+                .filter(|attr| attr.line < image.line)
+                .count();
+            let includes_before = doc
+                .includes
+                .iter()
+                .filter(|inc| inc.line < image.line)
+                .count();
+            let scopes = image_scopes
+                .entry((entries_before, includes_before))
+                .or_insert_with(|| {
+                    workspace
+                        .scopes_at(path, image.line)
+                        .into_iter()
+                        .filter(|scope| whole_readers.contains(scope.document()))
+                        .chain(workspace.preview_scope_at(path, image.line))
+                        .collect()
+                });
+            let missing: Vec<MissingImage> = scopes
+                .iter()
+                .filter(|scope| !image_exists(scope, path, &image.path, registry))
+                .map(|scope| MissingImage {
+                    document: display_path(root, scope.document()),
+                    preview: scope.is_preview(),
+                    imagesdir_from: scope
+                        .value("imagesdir")
+                        .filter(|value| !value.is_empty())
+                        .and_then(|_| scope.definition("imagesdir")?.source)
+                        .map(|source| (display_path(root, &source.file), source.line)),
+                })
+                .collect();
+            if !missing.is_empty() {
+                diags.entry(path.clone()).or_default().push(Diagnostic {
+                    file: path.clone(),
+                    line: image.line,
+                    span: Some(image.span),
+                    kind: DiagnosticKind::ImageNotFound {
+                        path: image.path.clone(),
+                        missing,
                     },
                 });
             }
@@ -1144,6 +1237,233 @@ mod tests {
         ws.scan_workspace();
         ws.recalculate_diagnostics();
         (root, ws)
+    }
+
+    /// The messages of the image diagnostics of `file`, by line.
+    fn image_messages(ws: &crate::workspace::Workspace, file: &Path) -> Vec<(usize, String)> {
+        ws.diagnostics_for(file)
+            .iter()
+            .filter(|d| matches!(d.kind, DiagnosticKind::ImageNotFound { .. }))
+            .map(|d| (d.line, d.kind.to_string()))
+            .collect()
+    }
+
+    /// An include between two images sets `imagesdir`: the image before it
+    /// is judged without, the image after it with the directory.
+    #[test]
+    fn test_image_scope_follows_include_between_images() {
+        let (root, ws) = fixture_workspace("image_scopes_includes");
+
+        assert_eq!(
+            image_messages(&ws, &root.join("main.adoc")),
+            vec![(
+                3,
+                "Image not found: logo.png (main.adoc: imagesdir not set in this build)"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// The reverse: found before the include, missing in the directory the
+    /// include sets.
+    #[test]
+    fn test_image_scope_include_can_make_later_image_missing() {
+        let (root, ws) = fixture_workspace("image_scopes_includes");
+
+        assert_eq!(
+            image_messages(&ws, &root.join("reverse.adoc")),
+            vec![(
+                7,
+                "Image not found: top.png (reverse.adoc: imagesdir from setdir.adoc:1)".to_string()
+            )]
+        );
+    }
+
+    /// `book.adoc` sets `imagesdir: img`, `web.adoc` does not; both include
+    /// `shared.adoc`. The image is missing where `imagesdir` is not set,
+    /// and in the preview of the shared file, which sees neither. The
+    /// `image::` in the listing block is text and gets nothing.
+    #[test]
+    fn test_image_missing_in_one_top_level_document_names_it() {
+        let (root, ws) = fixture_workspace("image_scopes");
+
+        assert_eq!(
+            image_messages(&ws, &root.join("shared.adoc")),
+            vec![
+                (
+                    3,
+                    "Image not found: logo.png (web.adoc: imagesdir not set in this build; \
+                     shared.adoc (preview): imagesdir not set in this build)"
+                        .to_string()
+                ),
+                (
+                    5,
+                    "Image not found: logo.png (web.adoc: imagesdir not set in this build; \
+                     shared.adoc (preview): imagesdir not set in this build)"
+                        .to_string()
+                ),
+                (
+                    7,
+                    "Image not found: gone.png (book.adoc: imagesdir from book.adoc:2; \
+                     web.adoc: imagesdir not set in this build; \
+                     shared.adoc (preview): imagesdir not set in this build)"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// `chapters/shared.adoc` is included by `book.adoc` and `web.adoc` from
+    /// the root and sits in a subfolder. An image resolves against the
+    /// folder of the top-level document, the preview against the folder of
+    /// the file. Asciidoctor reports the same: `logo.png` at line 3 for
+    /// `web.adoc` and the preview, at line 7 for the preview alone, and
+    /// `only-preview.png` for `book.adoc` and `web.adoc`, not the preview.
+    #[test]
+    fn test_image_in_included_subfolder_resolves_against_top_level_folder() {
+        let (root, ws) = fixture_workspace("image_scopes_subdir");
+
+        assert_eq!(
+            image_messages(&ws, &root.join("chapters/shared.adoc")),
+            vec![
+                (
+                    3,
+                    "Image not found: logo.png (web.adoc: imagesdir not set in this build; \
+                     chapters/shared.adoc (preview): imagesdir not set in this build)"
+                        .to_string()
+                ),
+                (
+                    7,
+                    "Image not found: logo.png (chapters/shared.adoc (preview): \
+                     imagesdir from chapters/setdir.adoc:1)"
+                        .to_string()
+                ),
+                (
+                    9,
+                    "Image not found: only-preview.png (book.adoc: \
+                     imagesdir from chapters/setdir.adoc:1; \
+                     web.adoc: imagesdir from chapters/setdir.adoc:1)"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Found by the only top-level document, missing in the file's own
+    /// preview: a warning too, the file's `.asciidoctorconfig` can fix it.
+    #[test]
+    fn test_image_missing_only_in_preview_is_reported() {
+        let (root, ws) = fixture_workspace("image_scopes");
+
+        assert_eq!(
+            image_messages(&ws, &root.join("shared2.adoc")),
+            vec![(
+                3,
+                "Image not found: logo.png (shared2.adoc (preview): \
+                 imagesdir not set in this build)"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_image_missing_in_single_document_block_and_inline() {
+        let (root, ws) = fixture_workspace("image_scopes");
+
+        assert_eq!(
+            image_messages(&ws, &root.join("solo.adoc")),
+            vec![
+                (
+                    3,
+                    "Image not found: missing.png (solo.adoc: imagesdir not set in this build)"
+                        .to_string()
+                ),
+                (
+                    5,
+                    "Image not found: gone.png (solo.adoc: imagesdir not set in this build)"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Pins: `image::` in a listing block is literal text, `include::` there
+    /// stays active.
+    #[test]
+    fn test_image_in_listing_gets_no_diagnostic_but_include_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("main.adoc");
+        std::fs::write(
+            &main,
+            "= T\n\n----\nimage::missing.png[]\ninclude::missing.adoc[]\n----\n\nimage::missing.png[]\n",
+        )
+        .unwrap();
+        let mut ws = crate::workspace::Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        let images: Vec<usize> = image_messages(&ws, &main).iter().map(|m| m.0).collect();
+        let includes: Vec<usize> = ws
+            .diagnostics_for(&main)
+            .iter()
+            .filter(|d| matches!(d.kind, DiagnosticKind::BrokenInclude { .. }))
+            .map(|d| d.line)
+            .collect();
+        assert_eq!(images, vec![8]);
+        assert_eq!(includes, vec![5]);
+    }
+
+    /// `part.adoc` is read whole by `book.adoc` (finds the image) and only
+    /// in part by `web.adoc` (would miss it, but renders nothing of the
+    /// image outside its tag), and the preview finds it too: no warning.
+    #[test]
+    fn test_image_not_judged_by_document_reading_file_in_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("img")).unwrap();
+        std::fs::write(root.join("img/logo.png"), "x").unwrap();
+        std::fs::write(root.join("logo.png"), "x").unwrap();
+        std::fs::write(
+            root.join("book.adoc"),
+            "= Book\n:imagesdir: img\n\ninclude::part.adoc[]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("web.adoc"),
+            "= Web\n:imagesdir: nowhere\n\ninclude::part.adoc[tag=a]\n",
+        )
+        .unwrap();
+        let part = root.join("part.adoc");
+        std::fs::write(
+            &part,
+            "// tag::a[]\nText.\n// end::a[]\n\nimage::logo.png[]\n",
+        )
+        .unwrap();
+        let mut ws = crate::workspace::Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        assert_eq!(image_messages(&ws, &part), vec![]);
+    }
+
+    /// Images the LSP cannot judge get no diagnostic: a URI target, a URI
+    /// `imagesdir`, a reference to an unset attribute.
+    #[rstest::rstest]
+    #[case::uri_target("= T\n\nimage::https://example.com/x.png[]\n")]
+    #[case::data_uri_target("= T\n\nimage::data:image/png;base64,AAAA[]\n")]
+    #[case::uri_imagesdir("= T\n:imagesdir: https://cdn.example.com/img\n\nimage::x.png[]\n")]
+    #[case::unresolved_attribute("= T\n\nimage::{unset-dir}/x.png[]\n")]
+    fn test_image_not_judged_without_a_file_to_check(#[case] text: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("main.adoc");
+        std::fs::write(&main, text).unwrap();
+        let mut ws = crate::workspace::Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+
+        assert_eq!(image_messages(&ws, &main), vec![]);
     }
 
     fn anchor_scope_workspace() -> (PathBuf, crate::workspace::Workspace) {

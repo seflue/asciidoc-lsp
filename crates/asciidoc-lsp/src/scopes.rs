@@ -48,6 +48,28 @@ pub(crate) fn scope_image_base(scope: &AttributeScope<'_>, file_dir: &Path) -> (
     (base, imagesdir)
 }
 
+/// Where the `imagesdir` of `scope` comes from, for a missing image:
+/// "imagesdir from part.adoc:3" or "imagesdir not set in this build".
+pub(crate) fn scope_imagesdir_note(scope: &AttributeScope<'_>) -> String {
+    scope
+        .value("imagesdir")
+        .filter(|value| !value.is_empty())
+        .and_then(|_| scope.definition("imagesdir")?.source)
+        .map_or_else(
+            || IMAGESDIR_NOT_SET.to_string(),
+            |source| {
+                format!(
+                    "imagesdir from {}:{}",
+                    file_display_name(&source.file),
+                    source.line
+                )
+            },
+        )
+}
+
+/// The note for a build without `imagesdir`.
+pub(crate) const IMAGESDIR_NOT_SET: &str = "imagesdir not set in this build";
+
 /// The folder paths resolve against in `scope`: its `docdir`, else `file_dir`.
 pub(crate) fn scope_docdir(scope: &AttributeScope<'_>, file_dir: &Path) -> PathBuf {
     scope
