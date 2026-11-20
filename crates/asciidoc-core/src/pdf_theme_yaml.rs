@@ -72,26 +72,38 @@ pub fn check_theme(theme: &Path, dirs: &ThemeDirs<'_>) -> Vec<ThemeFinding> {
     };
     let theme_folder = theme.parent().unwrap_or_else(|| Path::new("/"));
     let mut findings: Vec<ThemeFinding> = Vec::new();
-    visit(root, &mut Vec::new(), &mut |key, value, line| {
-        if let Some(finding) = check_value(key, value, line, theme_folder, dirs) {
-            // An alias repeats its anchor's value at the anchor's line.
-            if !findings
+    visit(root, &mut Vec::new(), &mut |key, value, line, col| {
+        let Some(finding) = check_value(key, value, line, theme_folder, dirs) else {
+            return;
+        };
+        // An alias of a scalar anchor sits at the alias (`*name`), not at its
+        // anchor: the path is reported once, where the first check found it.
+        // An alias of a mapping anchor repeats the anchor's values at their
+        // own lines.
+        let repeated = if is_alias_at(&source, line, col) {
+            findings.iter().any(|f| f.path == finding.path)
+        } else {
+            findings
                 .iter()
                 .any(|f| f.line == finding.line && f.path == finding.path)
-            {
-                findings.push(finding);
-            }
+        };
+        if !repeated {
+            findings.push(finding);
         }
     });
     findings.sort_by_key(|f| f.line);
     findings
 }
 
-/// Call `f` with the key path, text and line of every string scalar. A
-/// sequence adds nothing to the key path.
-fn visit(node: &MarkedYaml<'_>, key: &mut Vec<String>, f: &mut impl FnMut(&[String], &str, usize)) {
+/// Call `f` with the key path, text, line and column of every string
+/// scalar. A sequence adds nothing to the key path.
+fn visit(
+    node: &MarkedYaml<'_>,
+    key: &mut Vec<String>,
+    f: &mut impl FnMut(&[String], &str, usize, usize),
+) {
     if let Some(text) = node.data.as_str() {
-        f(key, text, node.span.start.line());
+        f(key, text, node.span.start.line(), node.span.start.col());
     } else if let Some(mapping) = node.data.as_mapping() {
         for (name, value) in mapping {
             key.push(name.data.as_str().unwrap_or_default().to_string());
@@ -143,6 +155,16 @@ fn check_value(
             (!path.is_file()).then(|| missing(path, Vec::new()))
         }
     }
+}
+
+/// Whether the node at 1-based `line`, 0-based `col` of `source` is an
+/// alias (`*name`).
+fn is_alias_at(source: &str, line: usize, col: usize) -> bool {
+    source
+        .lines()
+        .nth(line.saturating_sub(1))
+        .and_then(|text| text.chars().nth(col))
+        == Some('*')
 }
 
 /// An attribute or theme variable reference: the value is not known here.
@@ -274,6 +296,42 @@ mod tests {
                 (2, "base.logo".to_string()),
                 (5, "heading.logo".to_string()),
             ]
+        );
+    }
+
+    /// An alias of a scalar anchor carries the alias's own position, not the
+    /// anchor's: the missing path is still reported once, at the anchor.
+    #[test]
+    fn aliases_of_a_scalar_anchor_do_not_repeat_its_finding() {
+        let yaml = "shared: &img image:dup.png[]\nheader:\n  bg: *img\nfooter:\n  bg: *img\n";
+        assert_eq!(findings(yaml), vec![(1, "shared".to_string())]);
+    }
+
+    /// The column of an alias counts characters: a key with a non-ASCII
+    /// character in front of it must not turn the alias into a second finding.
+    #[test]
+    fn alias_after_a_non_ascii_key_is_still_an_alias() {
+        let yaml = "shared: &img image:dup.png[]\nfooter:\n  größe_bild: *img\n";
+        assert_eq!(findings(yaml), vec![(1, "shared".to_string())]);
+    }
+
+    /// An alias is checked under its own key: an anchor outside the font
+    /// catalog or `extends` reports nothing there, so the alias must. The
+    /// path stays reported once where an anchor was checked the same way.
+    #[test]
+    fn alias_is_checked_where_its_anchor_is_not() {
+        let yaml = "base_font: &f missing-x.ttf\nfont:\n  catalog:\n    Body:\n      normal: *f\n";
+        assert_eq!(
+            findings(yaml),
+            vec![(5, "font.catalog.Body.normal".to_string())]
+        );
+        let yaml = "parent: &p nosuch.yml\nextends: *p\n";
+        assert_eq!(findings(yaml), vec![(2, "extends".to_string())]);
+        let yaml =
+            "font:\n  catalog:\n    A:\n      normal: &f missing.ttf\n    B:\n      normal: *f\n";
+        assert_eq!(
+            findings(yaml),
+            vec![(4, "font.catalog.A.normal".to_string())]
         );
     }
 
