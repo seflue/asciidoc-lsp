@@ -4,17 +4,21 @@
 //! Asciidoctor PDF reads these from the top-level document it converts, so an
 //! entry in an included file (a shared `pdf-settings.adoc`) counts for every
 //! document that includes it. A value is taken after attribute substitution
-//! in the file that sets it, with `{docdir}` of the top-level document that
-//! includes it, checked once per such document. A relative value resolves against the working
-//! directory of the build, which the server cannot know.
+//! with the attributes the top-level document knows at that line (its own
+//! entries and those of earlier includes), else with what that document
+//! starts with (`.asciidoctorconfig`, built-ins), and `{docdir}` of the
+//! top-level document. It is checked once per such document. A relative
+//! value resolves against the working directory of the build, which the
+//! server cannot know.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::attributes::{AttributeRegistry, AttributeSource, DOCDIR};
+use crate::attributes::{substitute_attributes, AttributeRegistry, AttributeSource, DOCDIR};
 use crate::graph::IncludeGraph;
 use crate::paths::normalize_lexically;
 use crate::types::{AttributeDef, Diagnostic, DiagnosticKind, DocumentModel};
+use crate::workspace::entry_name;
 
 pub const PDF_THEME: &str = "pdf-theme";
 pub const PDF_THEMESDIR: &str = "pdf-themesdir";
@@ -88,6 +92,20 @@ struct Scope<'a> {
     docdir: String,
     entries: Vec<Entry<'a>>,
     files: HashSet<&'a Path>,
+    /// What the entries so far say, in line order across the document and
+    /// its includes, by name.
+    defined: HashMap<&'a str, Known>,
+}
+
+/// What the entries so far say about one attribute.
+enum Known {
+    /// Set, value substituted when defined.
+    Set(String),
+    /// Unset: a reference stays as written, the start state does not apply.
+    Unset,
+    /// Possibly set, an entry in a block conditional: not certain, a
+    /// reference stays as written.
+    Possible,
 }
 
 /// One step of a document in line order: an attribute entry or an include.
@@ -111,6 +129,7 @@ impl<'a> Scope<'a> {
                 .to_string(),
             entries: Vec::new(),
             files: HashSet::new(),
+            defined: HashMap::new(),
         };
         scope.visit(root, documents, graph, registry);
         scope
@@ -132,7 +151,6 @@ impl<'a> Scope<'a> {
         let mut steps: Vec<(usize, Step<'a>)> = doc
             .attributes
             .iter()
-            .filter(|attr| is_pdf_path_attribute(&attr.name))
             .map(|attr| (attr.line, Step::Attribute(attr)))
             .chain(
                 graph
@@ -144,15 +162,49 @@ impl<'a> Scope<'a> {
         steps.sort_by_key(|(line, _)| *line);
         for (_, step) in steps {
             match step {
-                Step::Attribute(attr) => self.entries.push(Entry {
-                    file: doc.path.as_path(),
-                    line: attr.line,
-                    name: attr.name.as_str(),
-                    value: registry.substitute_with_docdir(&doc.path, &attr.value, &self.docdir),
-                }),
+                Step::Attribute(attr) => {
+                    let (name, unset) = entry_name(&attr.name);
+                    let possible = doc.possible_definitions.iter().any(|possible| {
+                        possible.line == attr.line && possible.name.eq_ignore_ascii_case(name)
+                    });
+                    let value = self.substitute(registry, &attr.value);
+                    if is_pdf_path_attribute(&attr.name) {
+                        self.entries.push(Entry {
+                            file: doc.path.as_path(),
+                            line: attr.line,
+                            name: attr.name.as_str(),
+                            value: value.clone(),
+                        });
+                    }
+                    let known = if unset {
+                        Known::Unset
+                    } else if possible {
+                        Known::Possible
+                    } else {
+                        Known::Set(value)
+                    };
+                    self.defined.insert(name, known);
+                }
                 Step::Include(target) => self.visit(target, documents, graph, registry),
             }
         }
+    }
+
+    /// Substitute `{name}` as the top-level document sees it at this point:
+    /// an attribute defined above in it or an include, else what the
+    /// top-level document starts with (`.asciidoctorconfig`, built-ins).
+    fn substitute(&self, registry: &AttributeRegistry, input: &str) -> String {
+        substitute_attributes(input, |name| {
+            if name == DOCDIR {
+                Some(self.docdir.clone())
+            } else {
+                match self.defined.get(name) {
+                    Some(Known::Set(value)) => Some(value.clone()),
+                    Some(Known::Unset | Known::Possible) => None,
+                    None => registry.preset(self.root, name).map(|(_, hit)| hit.value),
+                }
+            }
+        })
     }
 
     /// The `pdf-themesdir` Asciidoctor PDF uses: the last entry, else the
@@ -617,6 +669,67 @@ mod tests {
             ),
             vec![PdfPath::Absolute(root.join("docs/theme/custom-theme.yml"))]
         );
+    }
+
+    /// An attribute the top-level document defines before the include
+    /// substitutes in the shared file (committed fixture
+    /// `tests/fixtures/pdf_top_level_attrs`), with the value at the include
+    /// line: `top.adoc` redefines `theme-root` after the include.
+    #[test]
+    fn attributes_of_top_level_document_substitute_in_shared_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/pdf_top_level_attrs")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        let shared = root.join("shared/pdf.adoc");
+
+        let missing_dir = root.join("theme");
+        assert_eq!(
+            pdf_diags(&ws, &shared),
+            vec![
+                (1, "pdf-themesdir: not found: theme".to_string()),
+                (
+                    2,
+                    "pdf-theme: not found: theme/custom-theme.yml".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            resolve(&ws, &shared, PDF_THEMESDIR, Some(1)),
+            vec![PdfPath::Absolute(missing_dir)]
+        );
+    }
+
+    /// Diagnostics of the shared file of a committed top-level fixture.
+    fn shared_diags(fixture: &str) -> Vec<(usize, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(fixture)
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.recalculate_diagnostics();
+        pdf_diags(&ws, &root.join("shared/pdf.adoc"))
+    }
+
+    /// `:theme-root!:` before the include leaves `{theme-root}` unresolved
+    /// in the shared file, as in Asciidoctor: nothing to check, no report
+    /// (fixture `tests/fixtures/pdf_top_level_unset`).
+    #[test]
+    fn unset_in_top_level_document_leaves_reference_unresolved() {
+        assert_eq!(shared_diags("pdf_top_level_unset"), vec![]);
+    }
+
+    /// An entry in a block conditional may not run, so `{theme-root}` is
+    /// not known at the include (fixture
+    /// `tests/fixtures/pdf_top_level_conditional`).
+    #[test]
+    fn conditional_entry_in_top_level_document_is_not_certain() {
+        assert_eq!(shared_diags("pdf_top_level_conditional"), vec![]);
     }
 
     #[test]

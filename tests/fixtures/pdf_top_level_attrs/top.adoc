@@ -1,0 +1,4 @@
+= Top
+:theme-root: {docdir}/theme
+include::shared/pdf.adoc[]
+:theme-root: {docdir}/late
