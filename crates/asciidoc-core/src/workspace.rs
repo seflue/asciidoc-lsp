@@ -280,6 +280,38 @@ impl Workspace {
         top_level_documents_in(&self.include_graph.doc_roots(&self.documents), file)
     }
 
+    /// The top-level documents that include `file`, in path order. Empty
+    /// when no document includes it: `file` is then a top-level document
+    /// itself, or stands alone.
+    #[must_use]
+    pub fn including_top_level_documents(&self, file: &Path) -> Vec<PathBuf> {
+        let file = self.indexed_path(file);
+        self.top_level_documents_of(&file).unwrap_or_default()
+    }
+
+    /// The indexed documents the top-level document `top` reads: itself and
+    /// every document reachable through its includes, in path order.
+    #[must_use]
+    pub fn documents_read_by(&self, top: &Path) -> Vec<PathBuf> {
+        let top = self.indexed_path(top);
+        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut stack = vec![top.as_path()];
+        while let Some(file) = stack.pop() {
+            if !self.documents.contains_key(file) || !seen.insert(file) {
+                continue;
+            }
+            stack.extend(
+                self.include_graph
+                    .includes_of(file)
+                    .iter()
+                    .map(|edge| edge.target.as_path()),
+            );
+        }
+        let mut files: Vec<PathBuf> = seen.into_iter().map(Path::to_path_buf).collect();
+        files.sort();
+        files
+    }
+
     /// The scope on `line` of `file`, reading the document `root`.
     fn scope(&self, root: PathBuf, file: &Path, line: usize, preview: bool) -> AttributeScope<'_> {
         let mut walk = ReadingWalk {
@@ -3454,5 +3486,55 @@ mod tests {
         for m in &messages {
             assert!(!m.contains(&base_str), "absolute path in: {m}");
         }
+    }
+
+    #[test]
+    fn test_including_top_level_documents_and_documents_read_by() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let write = |name: &str, text: &str| {
+            fs::write(root.join(name), text).unwrap();
+        };
+        write(
+            "book.adoc",
+            "= Book\n\ninclude::ch1.adoc[]\n\ninclude::ch2.adoc[]\n",
+        );
+        write("ch1.adoc", "== One\n\ninclude::deep.adoc[]\n");
+        write("ch2.adoc", "== Two\n");
+        write("deep.adoc", "text\n");
+        write("other.adoc", "= Other\n\ninclude::ch2.adoc[]\n");
+        write("lonely.adoc", "= Lonely\n");
+        let mut ws = Workspace::build(&root, &root.join("book.adoc"));
+        for name in ["other.adoc", "lonely.adoc"] {
+            ws.ensure_file(&root.join(name), &HashMap::new());
+        }
+
+        let tops = |name: &str| ws.including_top_level_documents(&root.join(name));
+        assert_eq!(tops("deep.adoc"), [root.join("book.adoc")]);
+        assert_eq!(tops("ch1.adoc"), [root.join("book.adoc")]);
+        assert_eq!(
+            tops("ch2.adoc"),
+            [root.join("book.adoc"), root.join("other.adoc")]
+        );
+        assert!(
+            tops("book.adoc").is_empty(),
+            "a top-level document has none"
+        );
+        assert!(tops("lonely.adoc").is_empty(), "a lone file has none");
+
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(ws.documents_read_by(&root.join("book.adoc"))),
+            ["book.adoc", "ch1.adoc", "ch2.adoc", "deep.adoc"]
+        );
+        assert_eq!(
+            names(ws.documents_read_by(&root.join("lonely.adoc"))),
+            ["lonely.adoc"]
+        );
     }
 }
