@@ -249,7 +249,8 @@ pub struct HeaderEntry {
     pub value: String,
 }
 
-/// A preprocessor conditional line.
+/// A preprocessor directive line, as [`crate::preprocessor::directive`]
+/// recognizes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
     /// `ifdef::a,b[]` and `ifndef::a+b[]`; `content` is the text in the
@@ -260,10 +261,17 @@ pub enum Directive {
         operator: ConditionalOperator,
         content: Option<String>,
     },
-    /// `ifeval::[expression]`, not evaluated.
+    /// `ifeval::[expression]` with an expression the reader accepts, not
+    /// evaluated.
     Ifeval,
-    /// `endif::[]`.
-    Endif,
+    /// `endif::[]`, or `endif::name[]` with the target in lower case.
+    Endif { target: Option<String> },
+    /// `include::target[attrlist]`.
+    Include { target: String },
+    /// A line the reader consumes with an error and acts on in no way:
+    /// `ifdef::[]`, `endif::[text]`, `ifeval::target[...]`, `ifeval::[]`
+    /// without a valid expression.
+    Dropped,
 }
 
 /// An attribute that may be defined at `line` without the LSP being able to

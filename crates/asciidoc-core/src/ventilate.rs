@@ -5,6 +5,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::error::CoreError;
+use crate::preprocessor::directive;
 
 /// Replacement for one paragraph: byte range in the document and its new text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,7 +316,8 @@ fn reads_as_block_syntax(line: &str) -> bool {
         || is_delimiter_line(line)
         || ADMONITION_LABELS.iter().any(|label| line.starts_with(label))
         || is_attribute_entry(line)
-        || is_preprocessor_directive(line)
+        // Asciidoctor reads a directive on any line, inside a paragraph too.
+        || directive(line).is_some()
         // Block title: a period followed by anything but whitespace.
         || line
             .strip_prefix('.')
@@ -371,16 +373,6 @@ pub(crate) fn is_attribute_entry(line: &str) -> bool {
     name.trim_start_matches('!')
         .starts_with(|c: char| c.is_alphanumeric() || c == '_')
         && (after.is_empty() || after.starts_with(char::is_whitespace))
-}
-
-/// Whether `line` is a preprocessor directive, which Asciidoctor reads on
-/// any line, inside a paragraph too: `include::`, `ifdef::`, `ifndef::`,
-/// `ifeval::` or `endif::`, up to a closing `]` at the end of the line.
-fn is_preprocessor_directive(line: &str) -> bool {
-    ["include::", "ifdef::", "ifndef::", "ifeval::", "endif::"]
-        .iter()
-        .any(|directive| line.starts_with(directive))
-        && line.ends_with(']')
 }
 
 /// Whether Asciidoctor would read `line`, as the first line of a paragraph,

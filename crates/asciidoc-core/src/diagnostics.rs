@@ -128,7 +128,7 @@ fn declared_tags<'a>(
         .or_insert_with(|| {
             crate::source_text::read_adoc_file(target)
                 .ok()
-                .map(|text| crate::extractors::extract_tag_directives(&text))
+                .map(|text| crate::preprocessor::extract_tag_directives(&text))
         })
         .as_deref()
 }

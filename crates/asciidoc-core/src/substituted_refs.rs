@@ -2,7 +2,7 @@
 
 use tree_sitter::{Node, Parser, Range};
 
-use crate::extractors::parse_directive;
+use crate::preprocessor::read_lines;
 use crate::types::{AttributeRef, Directive, PossibleDefinition};
 use crate::workspace::entry_name;
 
@@ -532,66 +532,55 @@ struct Preprocessor {
     possible: Vec<PossibleDefinition>,
 }
 
-/// The reader's view of the conditionals, line by line: the directives
-/// [`parse_directive`] takes, a line it rejects is text. Their block form
-/// opens, `endif` closes; the single-line form with content opens nothing. Conditionals are
-/// not evaluated (the attributes they test depend on the build), so the
-/// lines they cover are not checked; an entry in a single-line conditional
-/// is only a possible definition.
+/// The reader's view of the conditionals, line by line, from
+/// [`read_lines`]. Conditionals are not evaluated (the attributes they test
+/// depend on the build), so the lines they cover are not checked; an entry
+/// in a single-line conditional is only a possible definition.
 fn scan_preprocessor(source: &str) -> Preprocessor {
-    // How many block conditionals are open.
-    let mut open = 0usize;
     let mut locked = Vec::new();
     let mut possible = Vec::new();
-    for (index, line) in source.lines().enumerate() {
-        match parse_directive(line.trim_end()) {
-            Some(Directive::Condition { content, .. }) => {
-                locked.push(true);
-                match content {
-                    None => open += 1,
-                    Some(content) => {
-                        let entry = content
-                            .strip_prefix(':')
-                            .and_then(|entry| entry.split_once(':'));
-                        if let Some((name, _)) = entry {
-                            possible.push(PossibleDefinition {
-                                name: entry_name(name).0.to_string(),
-                                line: index + 1,
-                            });
-                        }
-                    }
+    for (index, (read, line)) in read_lines(source)
+        .into_iter()
+        .zip(source.lines())
+        .enumerate()
+    {
+        let conditional = matches!(
+            read.directive,
+            Some(
+                Directive::Condition { .. }
+                    | Directive::Ifeval
+                    | Directive::Endif { .. }
+                    | Directive::Dropped
+            )
+        );
+        locked.push(conditional || read.in_block);
+        match read.directive {
+            Some(Directive::Condition {
+                content: Some(content),
+                ..
+            }) => {
+                let entry = content
+                    .strip_prefix(':')
+                    .and_then(|entry| entry.split_once(':'));
+                if let Some((name, _)) = entry {
+                    possible.push(PossibleDefinition {
+                        name: entry_name(name).0.to_string(),
+                        line: index + 1,
+                    });
                 }
             }
-            Some(Directive::Ifeval) => {
-                locked.push(true);
-                open += 1;
-            }
-            Some(Directive::Endif) => {
-                locked.push(true);
-                open = open.saturating_sub(1);
-            }
-            None => {
-                locked.push(open > 0);
-                if open > 0 {
-                    if let Some(name) = entry_line_name(line) {
-                        possible.push(PossibleDefinition {
-                            name: name.to_string(),
-                            line: index + 1,
-                        });
-                    }
+            None if read.in_block => {
+                if let Some(name) = entry_line_name(line) {
+                    possible.push(PossibleDefinition {
+                        name: name.to_string(),
+                        line: index + 1,
+                    });
                 }
             }
+            _ => {}
         }
     }
     Preprocessor { locked, possible }
-}
-
-/// Per 0-based line of `source`: a conditional directive (`ifdef`, `ifndef`,
-/// `ifeval`, `endif`) or a line inside a block conditional. The LSP does not
-/// evaluate conditionals, so it cannot tell whether such a line is rendered.
-#[must_use]
-pub(crate) fn conditional_lines(source: &str) -> Vec<bool> {
-    scan_preprocessor(source).locked
 }
 
 /// The attribute name of an entry line (`:name:`, `:name!:`, `:!name:`,
@@ -1092,19 +1081,6 @@ mod tests {
         let source = "ifdef::g[]\n{a}\nifdef::h[]\n{b}\nendif::[]\n{c}\nendif::[]\n{d}\n\
                       ifdef::g[{e}]\nifeval::[\"{f}\" == \"y\"]\n{g}\nendif::[]\n{h}\n";
         assert_eq!(names(source), ["d", "h"]);
-    }
-
-    /// The reader takes a directive it rejects for a text line, or drops it
-    /// without opening a block: whitespace in the target, text in an `endif`,
-    /// no target.
-    #[test]
-    fn malformed_directives_open_and_close_nothing() {
-        assert_eq!(conditional_lines("ifdef::a b[]\nX\n"), [false, false]);
-        assert_eq!(conditional_lines("ifdef::[]\nX\n"), [false, false]);
-        assert_eq!(
-            conditional_lines("ifdef::g[]\nendif::x[text]\nY\nendif::[]\nZ\n"),
-            [true, true, true, true, false]
-        );
     }
 
     #[test]

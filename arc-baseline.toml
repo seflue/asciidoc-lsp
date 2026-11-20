@@ -75,10 +75,7 @@ symbols = ["is_attribute_entry"]
 rule = "no-cycles"
 from = "asciidoc-core::graph"
 to = "asciidoc-core::substituted_refs"
-symbols = [
-    "conditional_lines",
-    "extract",
-]
+symbols = ["extract"]
 
 [[violations]]
 rule = "no-cycles"

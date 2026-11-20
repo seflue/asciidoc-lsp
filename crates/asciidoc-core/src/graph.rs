@@ -327,7 +327,7 @@ pub fn parse_single_file(
     // far as the LSP can tell, in conditional branches.
     let verbatim =
         crate::extractors::extract_verbatim_paragraph_lines(root_node, source.as_bytes());
-    let conditional = crate::substituted_refs::conditional_lines(&source);
+    let conditional = crate::preprocessor::conditional_lines(&source);
     images.retain(|image| {
         let in_conditional = conditional
             .get(image.line.saturating_sub(1))
@@ -346,9 +346,9 @@ pub fn parse_single_file(
     let attribute_refs = crate::extractors::extract_attribute_refs(&source);
 
     // Extract conditional directives (ifdef/ifndef) via byte-scanning
-    let conditionals = crate::extractors::extract_conditionals(&source);
+    let conditionals = crate::preprocessor::extract_conditionals(&source);
 
-    let tags = crate::extractors::extract_tag_directives(&source);
+    let tags = crate::preprocessor::extract_tag_directives(&source);
 
     let unterminated_blocks =
         crate::extractors::extract_unterminated_blocks(root_node, source.as_bytes());

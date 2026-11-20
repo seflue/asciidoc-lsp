@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::extractors::extract_conditionals;
-use crate::types::{AttributeDef, ConditionalDirective, ConditionalKind, ConditionalOperator};
+use crate::preprocessor::directive;
+use crate::types::{
+    AttributeDef, ConditionalDirective, ConditionalKind, ConditionalOperator, Directive,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeSource {
@@ -824,35 +826,45 @@ const LINE_CONTINUATION: &str = " \\";
 fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
     let mut result = Vec::new();
     let mut lines = content.lines().enumerate().peekable();
-    while let Some((idx, line)) = lines.next() {
-        let line = line.trim();
-        if let Some(directive) = extract_conditionals(line).pop() {
-            let text = line
-                .split_once('[')
-                .and_then(|(_, rest)| rest.strip_suffix(']'))
-                .filter(|text| !text.is_empty());
-            let single_line = text.map(|text| {
-                let mut entries = parse_asciidoctorconfig(text);
-                for entry in &mut entries {
-                    if let ConfigEntry::Set { line, .. } | ConfigEntry::Unset { line, .. } = entry {
-                        *line = idx + 1;
-                    }
+    while let Some((idx, raw)) = lines.next() {
+        if let Some(read) = directive(raw) {
+            match read {
+                Directive::Condition {
+                    kind,
+                    names,
+                    operator,
+                    content,
+                } => {
+                    let single_line = content.map(|text| {
+                        let mut entries = parse_asciidoctorconfig(&text);
+                        for entry in &mut entries {
+                            if let ConfigEntry::Set { line, .. } | ConfigEntry::Unset { line, .. } =
+                                entry
+                            {
+                                *line = idx + 1;
+                            }
+                        }
+                        entries
+                    });
+                    result.push(ConfigEntry::Conditional {
+                        directive: ConditionalDirective {
+                            kind,
+                            attributes: names,
+                            operator,
+                            line: idx + 1,
+                        },
+                        single_line,
+                    });
                 }
-                entries
-            });
-            result.push(ConfigEntry::Conditional {
-                directive,
-                single_line,
-            });
-        } else if line.starts_with("ifeval::[") && line.ends_with(']') {
-            result.push(ConfigEntry::Ifeval);
-        } else if line.starts_with("endif::") && line.ends_with(']') {
-            result.push(ConfigEntry::Endif);
-        } else if let Some(target) = include_target(line) {
-            result.push(ConfigEntry::Include {
-                target: target.to_string(),
-            });
-        } else if line.starts_with(':') && line.len() > 1 {
+                Directive::Ifeval => result.push(ConfigEntry::Ifeval),
+                Directive::Endif { .. } => result.push(ConfigEntry::Endif),
+                Directive::Include { target } => result.push(ConfigEntry::Include { target }),
+                Directive::Dropped => {}
+            }
+            continue;
+        }
+        let line = raw.trim();
+        if line.starts_with(':') && line.len() > 1 {
             if let Some(rest) = line.strip_prefix(':') {
                 if let Some((key, value)) = rest.split_once(':') {
                     let key = key.trim();
@@ -932,13 +944,6 @@ fn entry_at(
         };
         Some(ConfigAttribute::new(file, line, raw))
     })
-}
-
-/// The target of an `include::target[...]` line; the attribute list is not read.
-fn include_target(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("include::")?;
-    let (target, _) = rest.split_once('[')?;
-    (!target.is_empty() && rest.ends_with(']')).then_some(target)
 }
 
 #[cfg(test)]
@@ -1521,6 +1526,39 @@ mod tests {
         assert_eq!(
             (source.file, source.line),
             (sub.join(".asciidoctorconfig.adoc"), 11)
+        );
+    }
+
+    /// The directives of a config file are the lines the reader takes for
+    /// them (Asciidoctor 2.0.26): indented or escaped ones are text, a line
+    /// it drops opens nothing, an include target holds inner whitespace.
+    #[test]
+    fn test_config_directives_follow_the_reader() {
+        let kinds = |content: &str| -> Vec<&'static str> {
+            parse_asciidoctorconfig(content)
+                .iter()
+                .map(|entry| match entry {
+                    ConfigEntry::Set { .. } => "set",
+                    ConfigEntry::Unset { .. } => "unset",
+                    ConfigEntry::Include { .. } => "include",
+                    ConfigEntry::Conditional { .. } => "conditional",
+                    ConfigEntry::Ifeval => "ifeval",
+                    ConfigEntry::Endif => "endif",
+                })
+                .collect()
+        };
+        assert_eq!(
+            kinds("ifdef::FOO[]  \n:a: 1\nendif::[]\n"),
+            ["conditional", "set", "endif"]
+        );
+        assert_eq!(kinds(" ifdef::foo[]\n:a: 1\n endif::[]\n"), ["set"]);
+        assert_eq!(kinds("\\ifdef::foo[]\n:a: 1\n"), ["set"]);
+        assert_eq!(kinds("ifdef::[]\n:a: 1\nendif::[x]\n"), ["set"]);
+        assert_eq!(kinds("ifeval::[nonsense]\n:a: 1\n"), ["set"]);
+        assert_eq!(kinds("ifdef::foo[] trailing\n"), Vec::<&str>::new());
+        assert_eq!(
+            kinds("include::a b.adoc[]\ninclude::[]\n include::c.adoc[]\n"),
+            ["include"]
         );
     }
 

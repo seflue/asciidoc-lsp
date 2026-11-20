@@ -10,6 +10,7 @@ pub mod paths;
 mod pdf_header;
 pub mod pdf_theme;
 mod pdf_theme_yaml;
+pub mod preprocessor;
 pub mod quick_fix;
 mod reading;
 pub mod references;

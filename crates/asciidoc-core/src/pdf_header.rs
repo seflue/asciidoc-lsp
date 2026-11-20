@@ -18,9 +18,9 @@
 //! uncertain.
 //!
 //! Limits, each a line that classifies or reads differently from the reader:
-//! a directive the reader drops with an error (`endif::x[text]`, `ifdef::[]`)
-//! is a text line here, and a line is classified on its own, without the
-//! conditionals around it.
+//! an `endif` for another target than the open block (`endif::x[]`) closes
+//! the block here but not in the reader, and a line is classified on its
+//! own, without the conditionals around it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -287,7 +287,7 @@ impl HeaderWalk<'_> {
 
     fn directive(&mut self, directive: &Directive, file: &Path, line: usize, top_level: bool) {
         match directive {
-            Directive::Endif => {
+            Directive::Endif { .. } => {
                 self.branches.pop();
                 if self
                     .drained
@@ -297,6 +297,8 @@ impl HeaderWalk<'_> {
                 }
             }
             Directive::Ifeval => self.open(Branch::Unknown),
+            // The reader consumes the line and acts on none of it.
+            Directive::Include { .. } | Directive::Dropped => {}
             Directive::Condition {
                 kind,
                 names,

@@ -1,7 +1,7 @@
+use crate::preprocessor::directive;
 use crate::types::{
-    Anchor, AttributeDef, AttributeRef, BlockTitle, ConditionalDirective, ConditionalKind,
-    ConditionalOperator, Directive, HeaderEntry, HeaderLine, ImageMacro, IncludeMacro, Placement,
-    Section, Span, UnterminatedBlock, Xref,
+    Anchor, AttributeDef, AttributeRef, BlockTitle, Directive, HeaderEntry, HeaderLine, ImageMacro,
+    IncludeMacro, Placement, Section, Span, UnterminatedBlock, Xref,
 };
 
 // --- Block-level extractors (work on block parse tree) ---
@@ -115,7 +115,9 @@ fn classify_header_line(lines: &[&str], index: usize) -> (HeaderLine, usize) {
             (HeaderLine::Comment, 1)
         };
     }
-    if let Some(directive) = parse_directive(line) {
+    // An include is the line of the include graph (`HeaderLine::Include`);
+    // one the graph has no edge for is text here.
+    if let Some(directive) = directive(line).filter(|d| !matches!(d, Directive::Include { .. })) {
         return (HeaderLine::Directive(directive), 1);
     }
     if let Some((entry, taken)) = parse_entry(lines, index) {
@@ -153,49 +155,6 @@ fn is_not_revision(line: &str) -> bool {
         && line
             .match_indices(',')
             .all(|(at, _)| line[at + 1..].starts_with(':'))
-}
-
-/// `ifdef`, `ifndef`, `ifeval` and `endif` as Asciidoctor's preprocessor
-/// takes them: at the start of a line, the target without whitespace, the
-/// line ending in `]`. A directive it would reject is a text line.
-pub(crate) fn parse_directive(line: &str) -> Option<Directive> {
-    if !line.ends_with(']') || line.starts_with('[') {
-        return None;
-    }
-    let (name, rest) = ["ifdef", "ifndef", "ifeval", "endif"]
-        .into_iter()
-        .find_map(|name| Some((name, line.strip_prefix(name)?.strip_prefix("::")?)))?;
-    let (target, text) = rest.split_once('[')?;
-    if target.contains(char::is_whitespace) {
-        return None;
-    }
-    let text = text.strip_suffix(']').filter(|text| !text.is_empty());
-    match name {
-        "endif" => text.is_none().then_some(Directive::Endif),
-        "ifeval" => (target.is_empty() && text.is_some()).then_some(Directive::Ifeval),
-        _ if target.is_empty() => None,
-        _ => {
-            let (operator, delimiter) = match target.find([',', '+']) {
-                Some(at) if target.as_bytes()[at] == b',' => (ConditionalOperator::Or, ','),
-                Some(_) => (ConditionalOperator::And, '+'),
-                None => (ConditionalOperator::Single, ','),
-            };
-            Some(Directive::Condition {
-                kind: if name == "ifdef" {
-                    ConditionalKind::Ifdef
-                } else {
-                    ConditionalKind::Ifndef
-                },
-                names: target
-                    .to_lowercase()
-                    .split(delimiter)
-                    .map(str::to_string)
-                    .collect(),
-                operator,
-                content: text.map(str::to_string),
-            })
-        }
-    }
 }
 
 /// An attribute entry line, `:name: value`, `:name!:` or `:!name:`, and the
@@ -432,108 +391,6 @@ pub fn extract_attribute_refs(source: &str) -> Vec<AttributeRef> {
                 }
             }
             i += 1;
-        }
-    }
-
-    results
-}
-
-// --- Tag directive extraction (byte-based, no tree-sitter) ---
-
-/// Names of the tags a file opens (`tag::name[]`), as Asciidoctor's include
-/// preprocessor reads them from the raw lines.
-///
-/// The prefix does not matter (`# `, `//`, `<!-- `), but no word character may
-/// precede `tag::`. After `[]` the line ends or a space follows. Only the
-/// first directive of a line counts, and only when it is a start directive:
-/// an `end::` ends the search of that line. Markup (comment blocks, listings)
-/// and conditionals play no role. Names are returned in file order,
-/// duplicates included.
-#[must_use]
-pub fn extract_tag_directives(source: &str) -> Vec<String> {
-    source.lines().filter_map(tag_directive_of_line).collect()
-}
-
-/// The tag a raw line opens, see [`extract_tag_directives`].
-fn tag_directive_of_line(line: &str) -> Option<String> {
-    for (start, _) in line.char_indices() {
-        let rest = &line[start..];
-        let opens = rest.starts_with("tag::");
-        if !opens && !rest.starts_with("end::") {
-            continue;
-        }
-        let after_word = line[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        if !after_word {
-            continue;
-        }
-        let rest = &rest["tag::".len()..];
-        let run_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let name = rest[..run_end].strip_suffix("[]").filter(|n| !n.is_empty());
-        let terminated = rest[run_end..]
-            .chars()
-            .next()
-            .is_none_or(|c| c == ' ' || c == '\r');
-        let Some(name) = name.filter(|_| terminated) else {
-            continue;
-        };
-        return opens.then(|| name.to_string());
-    }
-    None
-}
-
-// --- Conditional directive extraction (byte-based, no tree-sitter) ---
-
-/// Extract `ifdef::name[` and `ifndef::name[` directives from source text.
-///
-/// Only matches directives at the start of a line (`AsciiDoc` spec requirement).
-/// Ignores `endif::`, multi-attribute forms, and `ifeval::`.
-#[must_use]
-pub fn extract_conditionals(source: &str) -> Vec<ConditionalDirective> {
-    let mut results = Vec::new();
-
-    for (line_idx, line) in source.lines().enumerate() {
-        let (kind, rest) = if let Some(rest) = line.strip_prefix("ifdef::") {
-            (ConditionalKind::Ifdef, rest)
-        } else if let Some(rest) = line.strip_prefix("ifndef::") {
-            (ConditionalKind::Ifndef, rest)
-        } else {
-            continue;
-        };
-
-        if let Some(bracket_pos) = rest.find('[') {
-            let name = &rest[..bracket_pos];
-            if name.is_empty() {
-                continue;
-            }
-
-            let is_valid_part = |p: &str| {
-                !p.is_empty()
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            };
-
-            let (parts, operator) = if name.contains('+') {
-                (
-                    name.split('+').collect::<Vec<_>>(),
-                    ConditionalOperator::And,
-                )
-            } else if name.contains(',') {
-                (name.split(',').collect::<Vec<_>>(), ConditionalOperator::Or)
-            } else {
-                (vec![name], ConditionalOperator::Single)
-            };
-
-            if parts.iter().all(|p| is_valid_part(p)) {
-                results.push(ConditionalDirective {
-                    kind,
-                    attributes: parts.iter().map(std::string::ToString::to_string).collect(),
-                    operator,
-                    line: line_idx + 1,
-                });
-            }
         }
     }
 
@@ -1510,6 +1367,7 @@ fn extract_block_macro_attrs(node: tree_sitter::Node, source: &[u8]) -> Vec<(Str
 mod tests {
     use super::*;
     use crate::parser;
+    use crate::types::{ConditionalKind, ConditionalOperator};
 
     fn header_lines_of(source: &str) -> Vec<HeaderLine> {
         let mut p = parser::init_block_parser().unwrap();
@@ -1621,7 +1479,7 @@ mod tests {
                 content: content.map(ToString::to_string),
             })
         };
-        let source = "ifdef::A,b[]\nifndef::a+b[:x: y]\nifeval::[1 == 1]\nendif::[]\n\\ifdef::a[]\nifdef::a b[]\nendif::x[text]\n";
+        let source = "ifdef::A,b[]\nifndef::a+b[:x: y]\nifeval::[1 == 1]\nendif::[]\n\\ifdef::a[]\nifdef::a b[]\nendif::x[text]\nendif::Name[]\ninclude::a.adoc[]\n";
         assert_eq!(
             header_lines_of(source),
             vec![
@@ -1638,10 +1496,14 @@ mod tests {
                     Some(":x: y")
                 ),
                 HeaderLine::Directive(Directive::Ifeval),
-                HeaderLine::Directive(Directive::Endif),
+                HeaderLine::Directive(Directive::Endif { target: None }),
                 HeaderLine::Text,
                 HeaderLine::Text,
-                HeaderLine::Text,
+                HeaderLine::Directive(Directive::Dropped),
+                HeaderLine::Directive(Directive::Endif {
+                    target: Some("name".into())
+                }),
+                HeaderLine::Include,
             ]
         );
     }
@@ -2453,96 +2315,6 @@ mod tests {
         );
     }
 
-    // --- extract_conditionals tests ---
-
-    #[test]
-    fn test_extract_conditionals_ifdef() {
-        let source = "= Title\n\nifdef::backend[]\nSome content.\nendif::backend[]\n";
-        let result = extract_conditionals(source);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifdef);
-        assert_eq!(result[0].attributes[0], "backend");
-        assert_eq!(result[0].line, 3);
-    }
-
-    #[test]
-    fn test_extract_conditionals_ifndef() {
-        let source = "= Title\n\nifndef::source-dir[]\nFallback.\nendif::source-dir[]\n";
-        let result = extract_conditionals(source);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifndef);
-        assert_eq!(result[0].attributes[0], "source-dir");
-        assert_eq!(result[0].line, 3);
-    }
-
-    #[test]
-    fn test_extract_conditionals_mixed() {
-        let source = "ifdef::backend[]\nContent.\nendif::[]\nifndef::icons[]\nMore.\nendif::[]\n";
-        let result = extract_conditionals(source);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifdef);
-        assert_eq!(result[0].attributes[0], "backend");
-        assert_eq!(result[1].kind, crate::types::ConditionalKind::Ifndef);
-        assert_eq!(result[1].attributes[0], "icons");
-    }
-
-    #[test]
-    fn test_extract_conditionals_and_operator() {
-        let source = "ifdef::backend+icons[]\nContent.\nendif::[]\n";
-        let result = extract_conditionals(source);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].attributes, vec!["backend", "icons"]);
-        assert_eq!(result[0].operator, crate::types::ConditionalOperator::And);
-        assert_eq!(result[0].line, 1);
-    }
-
-    #[test]
-    fn test_extract_conditionals_or_operator() {
-        let source = "ifndef::backend,icons[]\nFallback.\nendif::[]\n";
-        let result = extract_conditionals(source);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].attributes, vec!["backend", "icons"]);
-        assert_eq!(result[0].operator, crate::types::ConditionalOperator::Or);
-        assert_eq!(result[0].kind, crate::types::ConditionalKind::Ifndef);
-    }
-
-    #[test]
-    fn test_extract_conditionals_and_three_attrs() {
-        let source = "ifdef::a+b+c[]\nendif::[]\n";
-        let result = extract_conditionals(source);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].attributes, vec!["a", "b", "c"]);
-        assert_eq!(result[0].operator, crate::types::ConditionalOperator::And);
-    }
-
-    #[test]
-    fn test_extract_conditionals_invalid_multi_attr() {
-        // Empty part after split should be rejected
-        let source = "ifdef::backend+[]\n";
-        let result = extract_conditionals(source);
-        assert!(
-            result.is_empty(),
-            "Invalid multi-attr must be rejected, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_extract_conditionals_not_at_line_start() {
-        let source = "Some text ifdef::attr[]\n";
-        let result = extract_conditionals(source);
-        assert!(
-            result.is_empty(),
-            "ifdef not at line start must be ignored, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_extract_conditionals_ignores_endif() {
-        let source = "endif::attr[]\n";
-        let result = extract_conditionals(source);
-        assert!(result.is_empty(), "endif must be ignored, got: {result:?}");
-    }
-
     #[test]
     fn test_xref_pagebreak_not_detected() {
         // <<< is a page break, not a cross-reference
@@ -2738,75 +2510,6 @@ mod tests {
             unterminated("= T\n////\nx\n////\n////\ny\n"),
             [("comment", "////".to_string(), 5)]
         );
-    }
-
-    /// Asciidoctor reads raw lines of an include target: any prefix before
-    /// `tag::name[]` is fine, a backslash does not escape.
-    #[rstest::rstest]
-    #[case::hash("# tag::a[]")]
-    #[case::slashes("//tag::a[]")]
-    #[case::html_comment("<!-- tag::a[] -->")]
-    #[case::bare("tag::a[]")]
-    #[case::dash("-tag::a[]")]
-    #[case::backslash("# \\tag::a[]")]
-    fn test_extract_tag_directives_any_prefix(#[case] line: &str) {
-        assert_eq!(extract_tag_directives(line), ["a"]);
-    }
-
-    #[test]
-    fn test_extract_tag_directives_ignores_end_only() {
-        assert_eq!(extract_tag_directives("// end::a[]"), Vec::<String>::new());
-    }
-
-    #[rstest::rstest]
-    #[case::letters("# mytag::a[]")]
-    #[case::underscore("_tag::a[]")]
-    #[case::unicode_letter("\u{e9}tag::a[]")]
-    fn test_extract_tag_directives_needs_word_boundary(#[case] line: &str) {
-        assert_eq!(extract_tag_directives(line), Vec::<String>::new());
-    }
-
-    #[rstest::rstest]
-    #[case::glued("tag::a[]x", &[])]
-    #[case::tab("tag::a[]\tx", &[])]
-    #[case::space("tag::a[] more", &["a"])]
-    #[case::carriage_return("tag::a[]\r", &["a"])]
-    fn test_extract_tag_directives_needs_space_or_eol_after_brackets(
-        #[case] line: &str,
-        #[case] expected: &[&str],
-    ) {
-        assert_eq!(extract_tag_directives(line), expected);
-    }
-
-    #[rstest::rstest]
-    #[case::second_tag_ignored("// tag::a[] tag::b[]", &["a"])]
-    #[case::end_first("# end::z[] tag::b[]", &[])]
-    #[case::next_occurrence_after_glued("# mytag::x[] tag::b[]", &["b"])]
-    fn test_extract_tag_directives_first_directive_per_line(
-        #[case] line: &str,
-        #[case] expected: &[&str],
-    ) {
-        assert_eq!(extract_tag_directives(line), expected);
-    }
-
-    #[test]
-    fn test_extract_tag_directives_name_without_whitespace() {
-        assert_eq!(
-            extract_tag_directives("// tag::sp ace[]"),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn test_extract_tag_directives_ignores_markup_and_conditionals() {
-        let source =
-            "////\n// tag::a[]\n////\n----\ntag::b[]\n----\nifdef::nope[]\n# tag::c[]\nendif::[]\n";
-        assert_eq!(extract_tag_directives(source), ["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_extract_tag_directives_is_case_sensitive() {
-        assert_eq!(extract_tag_directives("# tag::Case[]"), ["Case"]);
     }
 
     /// `(context, delimiter, line)` of every unterminated block in `source`.
