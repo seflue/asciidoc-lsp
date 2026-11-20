@@ -395,34 +395,7 @@ impl LanguageServer for AsciiDocLsp {
         // Without this, external edits to `.asciidoctorconfig*` and `.adoc` files
         // outside open buffers leave caches stale.
         if *self.can_request_file_watcher.lock() {
-            let watchers = vec![
-                FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/.asciidoctorconfig".into()),
-                    kind: None,
-                },
-                FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/.asciidoctorconfig.adoc".into()),
-                    kind: None,
-                },
-                FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/*.adoc".into()),
-                    kind: None,
-                },
-                FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/*.asciidoc".into()),
-                    kind: None,
-                },
-            ];
-            // Serializing a struct of `Vec<FileSystemWatcher>` cannot fail in
-            // practice (no maps with non-string keys, no exotic types).
-            let register_options =
-                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
-                    .expect("DidChangeWatchedFilesRegistrationOptions serialization");
-            let registration = Registration {
-                id: "asciidoc-lsp/watched-files".into(),
-                method: "workspace/didChangeWatchedFiles".into(),
-                register_options: Some(register_options),
-            };
+            let registration = watched_files_registration();
             if let Err(err) = self.client.register_capability(vec![registration]).await {
                 tracing::warn!(?err, "register_capability for didChangeWatchedFiles failed");
             }
@@ -1056,6 +1029,53 @@ impl LanguageServer for AsciiDocLsp {
 enum WatchedKind {
     Config,
     AsciiDoc,
+    Image,
+}
+
+/// Extensions of the image files whose appearance or removal changes the
+/// missing-image diagnostics.
+const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "svg", "webp"];
+
+/// One watcher per image extension.
+fn image_watchers() -> impl Iterator<Item = FileSystemWatcher> {
+    IMAGE_EXTENSIONS.into_iter().map(|ext| FileSystemWatcher {
+        glob_pattern: GlobPattern::String(format!("**/*.{ext}")),
+        kind: None,
+    })
+}
+
+/// The `workspace/didChangeWatchedFiles` registration sent from `initialized`:
+/// config files, `.adoc` sources and image files.
+fn watched_files_registration() -> Registration {
+    let watchers = vec![
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/.asciidoctorconfig".into()),
+            kind: None,
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/.asciidoctorconfig.adoc".into()),
+            kind: None,
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.adoc".into()),
+            kind: None,
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.asciidoc".into()),
+            kind: None,
+        },
+    ];
+    // Serializing a struct of `Vec<FileSystemWatcher>` cannot fail in
+    // practice (no maps with non-string keys, no exotic types).
+    let watchers = watchers.into_iter().chain(image_watchers()).collect();
+    let register_options =
+        serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+            .expect("DidChangeWatchedFilesRegistrationOptions serialization");
+    Registration {
+        id: "asciidoc-lsp/watched-files".into(),
+        method: "workspace/didChangeWatchedFiles".into(),
+        register_options: Some(register_options),
+    }
 }
 
 /// AsciiDoc-relevant events extracted from a `DidChangeWatchedFilesParams`
@@ -1064,6 +1084,9 @@ enum WatchedKind {
 #[derive(Debug, Default)]
 struct ClassifiedEvents {
     config_changed: bool,
+    /// An image file appeared, vanished or changed: the diagnostics need a
+    /// recalculation, no document is parsed again.
+    images_changed: bool,
     adoc_events: Vec<(PathBuf, FileChangeType)>,
 }
 
@@ -1087,10 +1110,11 @@ fn classify_events(
             Some(WatchedKind::AsciiDoc) if !is_path_open(&path, open_buffers) => {
                 out.adoc_events.push((path, change.typ));
             }
+            Some(WatchedKind::Image) => out.images_changed = true,
             Some(WatchedKind::AsciiDoc) | None => {}
         }
     }
-    if !out.config_changed && out.adoc_events.is_empty() {
+    if !out.config_changed && !out.images_changed && out.adoc_events.is_empty() {
         None
     } else {
         Some(out)
@@ -1158,13 +1182,16 @@ fn resolve_deleted_doc_key(path: &Path) -> PathBuf {
 
 /// Classify a watched-file path. The watcher globs may match unrelated files
 /// (`**/*` is permissive); the handler routes only `.asciidoctorconfig*` and
-/// `.adoc` / `.asciidoc` files and ignores everything else.
+/// `.adoc` / `.asciidoc` files and image files, and ignores everything else.
 fn classify_watched_path(path: &Path) -> Option<WatchedKind> {
     let name = path.file_name()?.to_str()?;
     let ext = path.extension().and_then(|e| e.to_str());
     match (name, ext) {
         (".asciidoctorconfig" | ".asciidoctorconfig.adoc", _) => Some(WatchedKind::Config),
         (_, Some("adoc" | "asciidoc")) => Some(WatchedKind::AsciiDoc),
+        (_, Some(ext)) if IMAGE_EXTENSIONS.iter().any(|i| i.eq_ignore_ascii_case(ext)) => {
+            Some(WatchedKind::Image)
+        }
         _ => None,
     }
 }
@@ -1861,6 +1888,64 @@ mod tests {
             classify_watched_path(Path::new("/ws/sub/bar.asciidoc")),
             Some(WatchedKind::AsciiDoc)
         );
+    }
+
+    #[test]
+    fn test_classify_watched_path_image() {
+        for name in [
+            "a.png", "a.jpg", "a.jpeg", "a.gif", "a.svg", "a.webp", "A.PNG",
+        ] {
+            assert_eq!(
+                classify_watched_path(&Path::new("/ws/img").join(name)),
+                Some(WatchedKind::Image),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_events_image_only_batch_is_relevant() {
+        let open: HashSet<PathBuf> = HashSet::new();
+        let changes = vec![make_event(
+            "file:///ws/img/logo.png",
+            FileChangeType::CREATED,
+        )];
+        let classified = classify_events(changes, &open).expect("image event is relevant");
+        assert!(classified.images_changed);
+        assert!(!classified.config_changed);
+        assert!(classified.adoc_events.is_empty());
+    }
+
+    #[test]
+    fn test_image_watchers_cover_image_extensions() {
+        let globs: Vec<String> = image_watchers()
+            .filter_map(|w| match w.glob_pattern {
+                GlobPattern::String(glob) => Some(glob),
+                GlobPattern::Relative(_) => None,
+            })
+            .collect();
+        assert_eq!(globs.len(), IMAGE_EXTENSIONS.len());
+        assert!(globs.contains(&"**/*.png".to_string()));
+        assert!(globs.contains(&"**/*.svg".to_string()));
+    }
+
+    #[test]
+    fn test_watched_files_registration_includes_image_globs() {
+        let registration = watched_files_registration();
+        assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
+        let options: DidChangeWatchedFilesRegistrationOptions =
+            serde_json::from_value(registration.register_options.expect("register options"))
+                .expect("deserialize registration options");
+        let globs: Vec<String> = options
+            .watchers
+            .into_iter()
+            .filter_map(|w| match w.glob_pattern {
+                GlobPattern::String(glob) => Some(glob),
+                GlobPattern::Relative(_) => None,
+            })
+            .collect();
+        assert!(globs.contains(&"**/*.png".to_string()));
+        assert!(globs.contains(&"**/*.adoc".to_string()));
     }
 
     #[test]
@@ -3886,6 +3971,44 @@ mod tests {
             assert_eq!(broken_xrefs(server, &key), vec!["extra-anchor"]);
             assert_eq!(broken_includes(server, &key), 1);
         }
+    }
+
+    /// A missing image is reported until its file appears, and again once
+    /// it is deleted; the adoc file is not parsed again for it.
+    #[tokio::test]
+    async fn test_image_watch_events_update_missing_image_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let doc = root.join("a.adoc");
+        let image = root.join("logo.png");
+        fs::write(&doc, "= A\n\nimage::logo.png[]\n").unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        assert_eq!(missing_images(server, &doc), 1, "initially missing");
+
+        fs::write(&image, "").unwrap();
+        notify_watched(server, &image, FileChangeType::CREATED).await;
+        assert_eq!(missing_images(server, &doc), 0, "after create");
+
+        fs::remove_file(&image).unwrap();
+        notify_watched(server, &image, FileChangeType::DELETED).await;
+        assert_eq!(missing_images(server, &doc), 1, "after delete");
+    }
+
+    /// Number of missing-image diagnostics the server holds for `path`.
+    fn missing_images(server: &AsciiDocLsp, path: &Path) -> usize {
+        let ws = server.workspace.lock();
+        ws.as_ref()
+            .unwrap()
+            .diagnostics_for(path)
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    asciidoc_core::types::DiagnosticKind::ImageNotFound { .. }
+                )
+            })
+            .count()
     }
 
     /// T9.7: a watcher event for an open document keeps the editor's
