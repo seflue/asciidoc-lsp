@@ -491,6 +491,25 @@ impl AttributeRegistry {
         names
     }
 
+    /// The config-chain attributes `file` sees, as `(name, value)` pairs sorted
+    /// by name, for Asciidoctor's `-a`: the CLI does not read
+    /// `.asciidoctorconfig` itself. Values are already substituted (a
+    /// `{asciidoctorconfigdir}` reference is a path); the synthetic
+    /// `asciidoctorconfigdir` and the builtins are left out. Empty until
+    /// [`Self::ensure_config_for_dir`] has run for the document directory.
+    #[must_use]
+    pub fn config_attributes(&self, file: &Path) -> Vec<(String, String)> {
+        let mut attributes: Vec<(String, String)> = self
+            .config_chain(file)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| name.as_str() != "asciidoctorconfigdir" && name.as_str() != DOCDIR)
+            .map(|(name, entry)| (name.clone(), entry.value.clone()))
+            .collect();
+        attributes.sort();
+        attributes
+    }
+
     /// Substitute all `{attr}` references in a string using `resolve()`.
     #[must_use]
     pub(crate) fn substitute(&self, file: &Path, input: &str) -> String {
@@ -958,6 +977,31 @@ fn entry_at(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_config_attributes_for_docs_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let docs = root.join("docs");
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&docs);
+
+        let attributes = registry.config_attributes(&docs.join("index.adoc"));
+        let lsp_source = attributes
+            .iter()
+            .find(|(name, _)| name == "lsp-source-dir")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            lsp_source,
+            Some(format!("{}/../crates/asciidoc-lsp/src", docs.display()).as_str())
+        );
+        assert!(attributes
+            .iter()
+            .all(|(name, _)| name != "asciidoctorconfigdir"));
+        assert!(attributes.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    }
 
     #[test]
     fn test_builtin_docdir() {
