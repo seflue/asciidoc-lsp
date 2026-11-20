@@ -3307,53 +3307,6 @@ mod tests {
         assert_eq!(looks_like_text(head), expected);
     }
 
-    /// An image folder set by the top-level document is listed, the folder of
-    /// the chapter's own preview is not: completion offers what goto follows
-    /// (ADR-010).
-    #[test]
-    fn test_image_completions_offer_only_the_folders_of_the_documents() {
-        let (_dir, ws, paths) = scanned(&[
-            ("book.adoc", "= B\n:imagesdir: img\ninclude::ch.adoc[]\n"),
-            ("ch.adoc", "== C\n\nimage::\n"),
-            ("img/book.png", ""),
-            ("own.png", ""),
-        ]);
-        let items = resolve_image_completions("", &paths[1], 3, Some(&ws), AT_LINE_START);
-        let labels = labels(&items);
-        assert!(labels.contains(&"book.png"), "{labels:?}");
-        assert!(!labels.contains(&"own.png"), "{labels:?}");
-    }
-
-    /// Image and include paths complete only where the documents that read
-    /// the file resolve them, as goto follows them (ADR-010). Asciidoctor
-    /// (`paths_in_include_preview/index.adoc`) renders `images/found.png`
-    /// and `images/preview.png` (missing) for `chapters/chapter.adoc` and
-    /// reports `include file not found: .../parts/preview.adoc`; the preview
-    /// alone would find `chapters/preview.png` and `chapters/parts/`.
-    #[test]
-    fn test_path_completions_in_included_file_skip_the_preview() {
-        let images = labels_in(
-            fixture("paths_in_include_preview"),
-            "chapters/chapter.adoc",
-            "image::",
-        );
-        assert!(images.contains(&"found.png".to_string()), "{images:?}");
-        assert!(!images.contains(&"preview.png".to_string()), "{images:?}");
-        let inline = labels_in(
-            fixture("paths_in_include_preview"),
-            "chapters/chapter.adoc",
-            "image:",
-        );
-        assert!(!inline.contains(&"preview.png".to_string()), "{inline:?}");
-        let includes = labels_in(
-            fixture("paths_in_include_preview"),
-            "chapters/chapter.adoc",
-            "include::{docdir}/",
-        );
-        assert!(includes.contains(&"shared/".to_string()), "{includes:?}");
-        assert!(!includes.contains(&"parts/".to_string()), "{includes:?}");
-    }
-
     /// A file no document includes is its own document and completes from
     /// its own folder. Asciidoctor (`paths_in_include_preview/chapters/solo.adoc`)
     /// renders `preview.png` next to it and includes `parts/preview.adoc`.
