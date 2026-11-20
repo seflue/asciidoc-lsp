@@ -222,6 +222,30 @@ impl AsciiDocLsp {
         }
     }
 
+    /// Files changed on disk: convert again if the document on show reads
+    /// one of them.
+    fn preview_files_changed(&self, changed: &[PathBuf]) {
+        let running = self.preview.lock().clone();
+        let Some(preview) = running else {
+            return;
+        };
+        let Some(active) = self.preview_active.lock().clone() else {
+            return;
+        };
+        let Some(shown) = self.preview_shown.lock().clone() else {
+            return;
+        };
+        let affects = self.workspace.lock().as_ref().is_some_and(|ws| {
+            let read = ws.documents_read_by(&shown);
+            changed.iter().any(|path| read.contains(path))
+        });
+        if affects {
+            if let Some(request) = self.preview_request(&active) {
+                self.send_preview_request(&preview, request);
+            }
+        }
+    }
+
     /// `workspace/executeCommand` [`PREVIEW_OPEN_COMMAND`]: start the preview
     /// server if needed, make the document the active one and answer with the
     /// page URL as `{"url": ...}`.
@@ -630,9 +654,15 @@ impl LanguageServer for AsciiDocLsp {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let changed: Vec<PathBuf> = params
+            .changes
+            .iter()
+            .filter_map(|event| document_path(&event.uri))
+            .collect();
         if let Some(diagnostics) = self.compute_watched_files_update(params) {
             self.publish_workspace_diagnostics(&diagnostics).await;
         }
+        self.preview_files_changed(&changed);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -771,6 +801,8 @@ impl LanguageServer for AsciiDocLsp {
                 }
             }
         }
+        // The disk text replaces a discarded buffer in the preview.
+        self.preview_buffer_changed(&uri);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -5209,6 +5241,61 @@ mod tests {
         // The book is the active buffer; a change in the chapter still counts.
         change_document(server, &chapter_uri, 2, "== One\n\nedited elsewhere\n").await;
         stream.until("edited elsewhere").await;
+    }
+
+    #[tokio::test]
+    async fn test_closing_a_chapter_buffer_shows_the_disk_text_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((book_uri, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .preview_open(vec![serde_json::json!(book_uri)])
+            .await
+            .unwrap();
+        stream.until("unsaved text").await;
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&chapter_uri),
+            })
+            .await;
+        stream.until("disk text").await;
+    }
+
+    #[tokio::test]
+    async fn test_external_change_to_a_closed_chapter_converts_the_book() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let Some((book_uri, chapter_uri, mut stream)) = book_preview(&root, server).await else {
+            return;
+        };
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&chapter_uri),
+            })
+            .await;
+        server
+            .preview_open(vec![serde_json::json!(book_uri)])
+            .await
+            .unwrap();
+        stream.until("disk text").await;
+        fs::write(root.join("ch1.adoc"), "== One\n\nchanged on disk\n").unwrap();
+        server
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: chapter_uri,
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        stream.until("changed on disk").await;
     }
 
     #[tokio::test]
