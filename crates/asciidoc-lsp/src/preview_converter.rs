@@ -197,10 +197,10 @@ async fn run<C: Convert>(
     }
 }
 
-/// The extension file for `-r`, in a private temporary folder that is
-/// removed on drop.
+/// A file in a private temporary folder that is removed on drop: the
+/// extension file for `-r`, or the overlay of one run.
 #[derive(Debug)]
-struct ExtensionFile {
+struct PrivateFile {
     dir: PathBuf,
     file: PathBuf,
 }
@@ -239,11 +239,12 @@ fn write_private(file: &Path, content: &str) -> io::Result<()> {
     options.open(file)?.write_all(content.as_bytes())
 }
 
-impl ExtensionFile {
-    fn write() -> io::Result<Self> {
+impl PrivateFile {
+    /// Write `content` to `name` in a new private folder.
+    fn write(name: &str, content: &str) -> io::Result<Self> {
         let dir = private_dir()?;
-        let file = dir.join("sourceline.rb");
-        if let Err(error) = write_private(&file, EXTENSION) {
+        let file = dir.join(name);
+        if let Err(error) = write_private(&file, content) {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(error);
         }
@@ -251,47 +252,34 @@ impl ExtensionFile {
     }
 }
 
-impl Drop for ExtensionFile {
+impl Drop for PrivateFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// The overlay of one run as a JSON file `{absolute path: text}` in a private
-/// folder, removed on drop. The extension reads it from the environment
-/// variable [`OVERLAY_ENV`], so no path or text reaches the command line or
-/// the document's attributes.
-#[derive(Debug)]
-struct OverlayFile {
-    dir: PathBuf,
-    file: PathBuf,
+/// The overlay of one run as a JSON file `{absolute path: text}`. The
+/// extension reads it from the environment variable [`OVERLAY_ENV`], so no
+/// path or text reaches the command line or the document's attributes.
+fn overlay_file(entries: &[(PathBuf, String)]) -> io::Result<PrivateFile> {
+    let map: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(path, text)| {
+            (
+                path.to_string_lossy().into_owned(),
+                serde_json::Value::String(text.clone()),
+            )
+        })
+        .collect();
+    let json = serde_json::to_string(&map).map_err(io::Error::other)?;
+    PrivateFile::write("overlay.json", &json)
 }
 
-impl OverlayFile {
-    fn write(entries: &[(PathBuf, String)]) -> io::Result<Self> {
-        let map: serde_json::Map<String, serde_json::Value> = entries
-            .iter()
-            .map(|(path, text)| {
-                (
-                    path.to_string_lossy().into_owned(),
-                    serde_json::Value::String(text.clone()),
-                )
-            })
-            .collect();
-        let json = serde_json::to_string(&map).map_err(io::Error::other)?;
-        let dir = private_dir()?;
-        let file = dir.join("overlay.json");
-        if let Err(error) = write_private(&file, &json) {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(error);
-        }
-        Ok(Self { dir, file })
-    }
-}
-
-impl Drop for OverlayFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+/// The failure of an Asciidoctor run that ended unsuccessfully.
+fn run_failed(output: &std::process::Output) -> ConvertError {
+    ConvertError::Failed {
+        status: output.status.to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     }
 }
 
@@ -299,7 +287,7 @@ impl Drop for OverlayFile {
 #[derive(Debug)]
 pub struct AsciidoctorConverter {
     program: String,
-    extension: ExtensionFile,
+    extension: PrivateFile,
     root: Option<PathBuf>,
 }
 
@@ -319,7 +307,7 @@ impl AsciidoctorConverter {
     pub fn with_program(program: &str) -> Result<Self, ConvertError> {
         Ok(Self {
             program: program.to_owned(),
-            extension: ExtensionFile::write()?,
+            extension: PrivateFile::write("sourceline.rb", EXTENSION)?,
             root: None,
         })
     }
@@ -347,23 +335,23 @@ impl AsciidoctorConverter {
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    ConvertError::AsciidoctorMissing {
-                        program: self.program.clone(),
-                    }
-                } else {
-                    ConvertError::Io(error)
-                }
-            })?;
+            .map_err(|error| self.spawn_error(error))?;
         if !output.status.success() {
-            return Err(ConvertError::Failed {
-                status: output.status.to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
+            return Err(run_failed(&output));
         }
         let page = String::from_utf8(output.stdout).map_err(|_| ConvertError::InvalidOutput)?;
         extract_stylesheet(&page).ok_or(ConvertError::StylesheetMissing)
+    }
+
+    /// A failure to start the program: it is missing, or the start failed.
+    fn spawn_error(&self, error: io::Error) -> ConvertError {
+        if error.kind() == io::ErrorKind::NotFound {
+            ConvertError::AsciidoctorMissing {
+                program: self.program.clone(),
+            }
+        } else {
+            ConvertError::Io(error)
+        }
     }
 
     fn command(&self, request: &ConvertRequest, overlay: Option<&Path>) -> Command {
@@ -414,7 +402,7 @@ impl Convert for AsciidoctorConverter {
         let overlay = if request.overlay.is_empty() {
             None
         } else {
-            Some(OverlayFile::write(&request.overlay)?)
+            Some(overlay_file(&request.overlay)?)
         };
         let mut child = self
             .command(
@@ -422,15 +410,7 @@ impl Convert for AsciidoctorConverter {
                 overlay.as_ref().map(|overlay| overlay.file.as_path()),
             )
             .spawn()
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    ConvertError::AsciidoctorMissing {
-                        program: self.program.clone(),
-                    }
-                } else {
-                    ConvertError::Io(error)
-                }
-            })?;
+            .map_err(|error| self.spawn_error(error))?;
         let stdin = child.stdin.take();
         let text = request.text.as_bytes();
         let write = async {
@@ -447,10 +427,7 @@ impl Convert for AsciidoctorConverter {
         let (written, output) = tokio::join!(write, child.wait_with_output());
         let output = output?;
         if !output.status.success() {
-            return Err(ConvertError::Failed {
-                status: output.status.to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
+            return Err(run_failed(&output));
         }
         written?;
         String::from_utf8(output.stdout).map_err(|_| ConvertError::InvalidOutput)
@@ -1028,7 +1005,7 @@ mod tests {
     #[test]
     fn test_overlay_file_is_private_and_removed_on_drop() {
         use std::os::unix::fs::PermissionsExt;
-        let overlay = OverlayFile::write(&[(PathBuf::from("/a.adoc"), "x".to_owned())]).unwrap();
+        let overlay = overlay_file(&[(PathBuf::from("/a.adoc"), "x".to_owned())]).unwrap();
         let dir = overlay.dir.clone();
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
