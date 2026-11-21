@@ -73,20 +73,42 @@ struct AsciiDocLsp {
     /// `workspace/didChangeWatchedFiles`. Set in `initialize()`,
     /// consumed in `initialized()`.
     can_request_file_watcher: Mutex<bool>,
+    preview: PreviewState,
+}
+
+/// What the live preview keeps between requests. Each field has its own
+/// lock, as they were separate fields of the server before.
+#[derive(Debug, Default)]
+struct PreviewState {
     /// The preview server; `None` until the first
     /// [`PREVIEW_OPEN_COMMAND`].
-    preview: Mutex<Option<Arc<preview::Preview>>>,
+    server: Mutex<Option<Arc<preview::Preview>>>,
     /// Serialises the start of the preview server, which awaits.
-    preview_start: tokio::sync::Mutex<()>,
+    start: tokio::sync::Mutex<()>,
     /// The document the preview follows: the last one named by the open
     /// command or by [`CURSOR_MOVED_METHOD`].
-    preview_active: Mutex<Option<Uri>>,
+    active: Mutex<Option<Uri>>,
     /// What the preview converts for the active document, as the last open
     /// command set it.
-    preview_mode: Mutex<preview_target::PreviewMode>,
+    mode: Mutex<preview_target::PreviewMode>,
     /// The document of the last conversion request: the top-level document
     /// in whole-document mode, else the active one.
-    preview_shown: Mutex<Option<PathBuf>>,
+    shown: Mutex<Option<PathBuf>>,
+}
+
+impl PreviewState {
+    /// The running preview server, if one was started.
+    fn running(&self) -> Option<Arc<preview::Preview>> {
+        self.server.lock().clone()
+    }
+
+    /// The running preview server and the document it follows; `None` while
+    /// either is missing.
+    fn following(&self) -> Option<(Arc<preview::Preview>, Uri)> {
+        let preview = self.running()?;
+        let active = self.active.lock().clone()?;
+        Some((preview, active))
+    }
 }
 
 impl AsciiDocLsp {
@@ -99,24 +121,18 @@ impl AsciiDocLsp {
             diagnostics: Mutex::new(HashMap::new()),
             published_diagnostics: Mutex::new(HashSet::new()),
             can_request_file_watcher: Mutex::new(false),
-            preview: Mutex::new(None),
-            preview_start: tokio::sync::Mutex::new(()),
-            preview_active: Mutex::new(None),
-            preview_mode: Mutex::new(preview_target::PreviewMode::default()),
-            preview_shown: Mutex::new(None),
+            preview: PreviewState::default(),
         }
     }
 
     /// The running preview server, started on first use. Fails with a hint
     /// if Asciidoctor is not installed.
     async fn ensure_preview(&self) -> Result<Arc<preview::Preview>> {
-        let running = self.preview.lock().clone();
-        if let Some(preview) = running {
+        if let Some(preview) = self.preview.running() {
             return Ok(preview);
         }
-        let _starting = self.preview_start.lock().await;
-        let running = self.preview.lock().clone();
-        if let Some(preview) = running {
+        let _starting = self.preview.start.lock().await;
+        if let Some(preview) = self.preview.running() {
             return Ok(preview);
         }
         let root = self.root.lock().clone();
@@ -134,7 +150,7 @@ impl AsciiDocLsp {
                 .await
                 .map_err(preview_error)?;
         let preview = Arc::new(preview);
-        *self.preview.lock() = Some(Arc::clone(&preview));
+        *self.preview.server.lock() = Some(Arc::clone(&preview));
         Ok(preview)
     }
 
@@ -158,8 +174,8 @@ impl AsciiDocLsp {
     fn preview_request(&self, uri: &Uri) -> Option<preview_converter::ConvertRequest> {
         let active = document_path(uri)?;
         let buffers = self.open_buffers();
-        let shown = self.preview_shown.lock().clone();
-        let whole = *self.preview_mode.lock() == preview_target::PreviewMode::Document;
+        let shown = self.preview.shown.lock().clone();
+        let whole = *self.preview.mode.lock() == preview_target::PreviewMode::Document;
         let guard = self.workspace.lock();
         let workspace = guard.as_ref();
         let file = if whole {
@@ -196,23 +212,19 @@ impl AsciiDocLsp {
         preview: &preview::Preview,
         request: preview_converter::ConvertRequest,
     ) {
-        *self.preview_shown.lock() = Some(request.file.clone());
+        *self.preview.shown.lock() = Some(request.file.clone());
         preview.request_convert(request);
     }
 
     /// A buffer's text changed: convert again if it is the active one or part
     /// of the document on show.
     fn preview_buffer_changed(&self, uri: &Uri) {
-        let running = self.preview.lock().clone();
-        let Some(preview) = running else {
-            return;
-        };
-        let Some(active) = self.preview_active.lock().clone() else {
+        let Some((preview, active)) = self.preview.following() else {
             return;
         };
         let affects = active == *uri || {
             let (Some(changed), Some(shown)) =
-                (document_path(uri), self.preview_shown.lock().clone())
+                (document_path(uri), self.preview.shown.lock().clone())
             else {
                 return;
             };
@@ -232,10 +244,10 @@ impl AsciiDocLsp {
     /// ask before and after the watcher events reach the workspace: a deleted
     /// file leaves the read set, a created one only enters it.
     fn preview_reads_any(&self, changed: &[PathBuf]) -> bool {
-        if self.preview.lock().is_none() || self.preview_active.lock().is_none() {
+        if self.preview.server.lock().is_none() || self.preview.active.lock().is_none() {
             return false;
         }
-        let Some(shown) = self.preview_shown.lock().clone() else {
+        let Some(shown) = self.preview.shown.lock().clone() else {
             return false;
         };
         self.workspace.lock().as_ref().is_some_and(|ws| {
@@ -247,11 +259,7 @@ impl AsciiDocLsp {
     /// Files changed on disk and the document on show reads one of them
     /// ([`Self::preview_reads_any`]): convert again.
     fn preview_files_changed(&self) {
-        let running = self.preview.lock().clone();
-        let Some(preview) = running else {
-            return;
-        };
-        let Some(active) = self.preview_active.lock().clone() else {
+        let Some((preview, active)) = self.preview.following() else {
             return;
         };
         if let Some(request) = self.preview_request(&active) {
@@ -269,8 +277,8 @@ impl AsciiDocLsp {
         let (uri, mode) = preview_target::parse_open_arguments(arguments, PREVIEW_OPEN_COMMAND)
             .map_err(jsonrpc::Error::invalid_params)?;
         let preview = self.ensure_preview().await?;
-        *self.preview_mode.lock() = mode;
-        *self.preview_active.lock() = Some(uri.clone());
+        *self.preview.mode.lock() = mode;
+        *self.preview.active.lock() = Some(uri.clone());
         if let Some(request) = self.preview_request(&uri) {
             self.send_preview_request(&preview, request);
         }
@@ -285,15 +293,14 @@ impl AsciiDocLsp {
         reason = "`LspServiceBuilder::custom_method` takes an async handler"
     )]
     async fn cursor_moved(&self, params: CursorMovedParams) {
-        let running = self.preview.lock().clone();
-        let Some(preview) = running else {
+        let Some(preview) = self.preview.running() else {
             return;
         };
         let Some(file) = document_path(&params.uri) else {
             return;
         };
         let switched = {
-            let mut active = self.preview_active.lock();
+            let mut active = self.preview.active.lock();
             let switched = active.as_ref() != Some(&params.uri);
             if switched {
                 *active = Some(params.uri.clone());
@@ -304,7 +311,7 @@ impl AsciiDocLsp {
             // The page already shows the document if the new active one is
             // part of it.
             if let Some(request) = self.preview_request(&params.uri) {
-                if self.preview_shown.lock().as_ref() != Some(&request.file) {
+                if self.preview.shown.lock().as_ref() != Some(&request.file) {
                     self.send_preview_request(&preview, request);
                 }
             }
@@ -5098,7 +5105,7 @@ mod tests {
             .await
             .is_err());
         assert!(
-            server.preview.lock().is_none(),
+            server.preview.server.lock().is_none(),
             "nothing starts on bad input"
         );
     }
@@ -5123,11 +5130,11 @@ mod tests {
                 line: 0,
             })
             .await;
-        assert!(server.preview_active.lock().is_none());
+        assert!(server.preview.active.lock().is_none());
 
         let preview = start().await;
         let (port, token) = address(&preview);
-        *server.preview.lock() = Some(Arc::new(preview));
+        *server.preview.server.lock() = Some(Arc::new(preview));
         let mut stream = Stream::open(port, &token).await;
 
         open_document(server, &uri_a, "alpha").await;
@@ -5157,7 +5164,7 @@ mod tests {
             })
             .await;
         stream.until("<p>gamma</p>").await;
-        assert_eq!(server.preview_active.lock().as_ref(), Some(&uri_b));
+        assert_eq!(server.preview.active.lock().as_ref(), Some(&uri_b));
     }
 
     /// A book with one chapter whose buffer is open and unsaved, shown by a
@@ -5186,7 +5193,7 @@ mod tests {
         .await
         .unwrap();
         let (port, token) = address(&preview);
-        *server.preview.lock() = Some(Arc::new(preview));
+        *server.preview.server.lock() = Some(Arc::new(preview));
         Some((book_uri, chapter_uri, Stream::open(port, &token).await))
     }
 
@@ -5424,7 +5431,7 @@ mod tests {
         let server = service.inner();
         let preview = start().await;
         let (port, token) = address(&preview);
-        *server.preview.lock() = Some(Arc::new(preview));
+        *server.preview.server.lock() = Some(Arc::new(preview));
         let mut stream = Stream::open(port, &token).await;
 
         open_document(server, &uri, "alone").await;
