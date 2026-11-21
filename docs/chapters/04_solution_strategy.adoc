@@ -1,10 +1,10 @@
-== Solution Strategy
+= Solution Strategy
 
 * Parsing is based on tree-sitter grammars (xref:chapters/09_architecture_decisions.adoc#adr-treesitter[ADR-1]).
 * The server is written in Rust (xref:chapters/09_architecture_decisions.adoc#adr-rust[ADR-2]).
 * AsciiDoc semantics are resolved in `asciidoc-core`, without a second parser (xref:chapters/09_architecture_decisions.adoc#adr-semantics[ADR-4]).
 
-=== Grammar
+== Grammar
 
 The grammar is the project's fork of the archived cathaysia `tree-sitter-asciidoc` grammar and is maintained in-house.
 It is included as the git submodule `vendor/tree-sitter-asciidoc`.
@@ -13,7 +13,7 @@ The root `Cargo.toml` points both grammar crates to the submodule via `[patch.cr
 The grammar ships as two languages: `tree-sitter-asciidoc` for block structure and `tree-sitter-asciidoc-inline` for inline markup.
 See xref:chapters/08_concepts.adoc#parsing-concepts[Tree-sitter Integration].
 
-=== Technology Stack Summary
+== Technology Stack Summary
 
 [cols="1,2", options="header"]
 |===

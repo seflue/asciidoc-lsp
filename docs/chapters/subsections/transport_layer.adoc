@@ -1,4 +1,4 @@
-=== Transport Layer
+= Transport Layer
 
 [[transport]]
 The Transport Layer is responsible for all communication between the editor (LSP client) and the asciidoc-lsp server.

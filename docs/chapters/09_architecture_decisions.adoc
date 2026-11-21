@@ -1,7 +1,9 @@
-== Architecture Decisions
+= Architecture Decisions
 
 [[adr-treesitter]]
-=== ADR-1: Use Tree-sitter for Parsing
+== ADR-1: Use Tree-sitter for Parsing
+
+:grammar-url: https://github.com/seflue/tree-sitter-asciidoc[]
 
 *Status:* Accepted
 
@@ -11,7 +13,7 @@ Three parser options were evaluated: writing a custom PEG parser, using the `acd
 
 *Decision:*
 We chose Tree-sitter as the parser.
-The grammar is the project's fork (github.com/seflue/tree-sitter-asciidoc) of the archived cathaysia grammar, included as the git submodule `vendor/tree-sitter-asciidoc`; the root Cargo.toml patches both grammar crates to it via `[patch.crates-io]`.
+The grammar is the project's fork ({grammar-url}) of the archived cathaysia grammar, included as the git submodule `vendor/tree-sitter-asciidoc`; the root Cargo.toml patches both grammar crates to it via `[patch.crates-io]`.
 The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing model.
 
 *Consequences:*
@@ -22,7 +24,7 @@ The dual-grammar approach (block + inline) aligns with AsciiDoc's own processing
 * Negative: The dual-grammar approach adds complexity to the parser integration; for details, see xref:chapters/08_concepts.adoc#parsing-concepts[Parsing Concepts].
 
 [[adr-rust]]
-=== ADR-2: Implement in Rust
+== ADR-2: Implement in Rust
 
 *Status:* Accepted
 
@@ -46,7 +48,7 @@ Tree-sitter's Rust bindings are first-class, and Rust's ownership model prevents
 For the building block structure, see xref:chapters/05_building_block_view.adoc#building-blocks[Building Block View].
 
 [[adr-dual-parser]]
-=== ADR-3: Tree-sitter-Only-First, Dual-Parser Later
+== ADR-3: Tree-sitter-Only-First, Dual-Parser Later
 
 *Status:* Superseded by xref:chapters/09_architecture_decisions.adoc#adr-semantics[ADR-4]
 
@@ -68,7 +70,7 @@ The `acdc-parser` is introduced only if specific semantic features (full attribu
 The quality goals and stakeholder expectations that drove this trade-off are documented in xref:chapters/01_introduction_and_goals.adoc[Introduction and Goals] and xref:chapters/08_concepts.adoc#parsing-concepts[Parsing Concepts].
 
 [[adr-semantics]]
-=== ADR-4: Resolve AsciiDoc Semantics in asciidoc-core
+== ADR-4: Resolve AsciiDoc Semantics in asciidoc-core
 
 *Status:* Accepted
 

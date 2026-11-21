@@ -1,4 +1,4 @@
-== Introduction and Goals
+= Introduction and Goals
 
 AsciiDoc is a lightweight markup language for technical documentation.
 Editor support lags behind Markdown.
@@ -6,13 +6,13 @@ asciidoc-lsp is a language server for AsciiDoc written in Rust.
 It parses with tree-sitter grammars and provides document symbols, go to definition, references, rename, completion, diagnostics, and hover.
 
 [[project-goals]]
-=== Project Goals
+== Project Goals
 
 . Go to definition for cross-references, includes, anchors, and attributes across multi-file AsciiDoc projects.
 . Diagnostics for broken references, missing includes, and undefined attributes while you edit.
 . Awareness of workspace-wide structure: include trees, shared attributes, and references between documents.
 
-=== Stakeholders
+== Stakeholders
 
 [cols="1,2,2", options="header"]
 |===
@@ -35,7 +35,7 @@ It parses with tree-sitter grammars and provides document symbols, go to definit
 | Stable LSP protocol adherence, documented capabilities
 |===
 
-=== Quality Goals
+== Quality Goals
 
 [cols="1,2", options="header"]
 |===

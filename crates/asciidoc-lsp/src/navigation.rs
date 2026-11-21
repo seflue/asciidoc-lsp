@@ -3436,7 +3436,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
     #[test]
     fn test_find_node_xref_real_adr_content() {
-        // xref in 09_architecture_decisions.adoc line 46 was not found
+        // xref in 09_architecture_decisions.adoc line 48 was not found
         // because `+` in "(block + inline)" created a false passthrough spanning
         // spanning most of the document, swallowing the xref nodes.
         let content = fs::read_to_string(concat!(
@@ -3445,13 +3445,13 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         ))
         .unwrap();
 
-        // Line 46 (1-indexed): "...see xref:chapters/05_building_block_view.adoc#building-blocks[...]."
+        // Line 48 (1-indexed): "...see xref:chapters/05_building_block_view.adoc#building-blocks[...]."
         let pos = Position {
-            line: 45,
+            line: 47,
             character: 50,
         };
         let info = find_node_at_position(&content, pos);
-        assert!(info.is_some(), "xref on line 46 must be found");
+        assert!(info.is_some(), "xref on line 48 must be found");
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {
@@ -3462,21 +3462,21 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
     #[test]
     fn test_find_node_xref_real_adr_second_passthrough_xref() {
-        // second affected xref on line 68, also inside the false passthrough.
+        // second affected xref on line 70, also inside the false passthrough.
         let content = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/chapters/09_architecture_decisions.adoc"
         ))
         .unwrap();
 
-        // Line 68 (1-indexed): "...documented in xref:chapters/01_introduction_and_goals.adoc[...]..."
+        // Line 70 (1-indexed): "...documented in xref:chapters/01_introduction_and_goals.adoc[...]..."
         // "xref:" starts at character 91, target at 96
         let pos = Position {
-            line: 67,
+            line: 69,
             character: 100,
         };
         let info = find_node_at_position(&content, pos);
-        assert!(info.is_some(), "xref on line 68 must be found");
+        assert!(info.is_some(), "xref on line 70 must be found");
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {

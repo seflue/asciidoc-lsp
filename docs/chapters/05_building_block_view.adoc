@@ -1,9 +1,9 @@
-== Building Block View
+= Building Block View
 
 [[building-blocks]]
 The system consists of three layers: the Transport Layer handles LSP protocol communication, the Workspace Manager holds the state of all documents and their relationships, and the Semantic Layer provides the logic behind LSP features such as go-to-definition and diagnostics.
 
-=== Layer Overview
+== Layer Overview
 
 The Transport Layer receives JSON-RPC messages from the editor and dispatches them to the handlers.
 The Workspace Manager keeps the extracted data of every document in the workspace (sections, anchors, xrefs, includes, attributes) and the include relationships between them.
@@ -13,7 +13,7 @@ The Semantic Layer uses this data to implement the LSP features.
 The Transport Layer is the `asciidoc-lsp` crate.
 The Workspace Manager and the AsciiDoc-specific parts of the Semantic Layer live in `asciidoc-core`, and `asciidoc-lsp` translates their results into LSP types.
 
-=== Detailed Building Blocks
+== Detailed Building Blocks
 
 include::subsections/transport_layer.adoc[leveloffset=+1]
 

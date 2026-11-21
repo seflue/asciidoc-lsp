@@ -1,4 +1,4 @@
-=== Semantic Layer
+= Semantic Layer
 
 [[semantic]]
 The Semantic Layer builds on top of the parsed syntax trees and workspace state to provide the intelligence behind LSP features.
@@ -6,7 +6,7 @@ It is responsible for cross-reference resolution, anchor indexing, attribute sub
 
 For the overall system context, see xref:chapters/05_building_block_view.adoc#building-blocks[Building Block View].
 
-==== Cross-Reference Resolution
+== Cross-Reference Resolution
 
 The core responsibility of the Semantic Layer is resolving AsciiDoc cross-references (xrefs) to their target locations.
 This involves several steps: parsing the xref macro to extract the target document path and anchor ID, resolving the document path relative to the current file (accounting for attribute substitutions in paths), and looking up the anchor in the target document's symbol index.
@@ -17,12 +17,12 @@ The resolver handles three types of cross-references:
 * *Inter-document xrefs* — References to anchors in other files (e.g., `+xref:other.adoc#anchor[Label]+`).
 * *Implicit section IDs* — AsciiDoc automatically generates IDs from section titles. The resolver must replicate this ID generation algorithm to resolve references to sections that lack explicit anchor definitions.
 
-==== Parser Integration
+== Parser Integration
 
 The Semantic Layer reads the Tree-sitter CST (Concrete Syntax Tree) to extract semantic information.
 For example, the section headings with their titles, levels, and positions are used to build the document symbol hierarchy reported via `textDocument/documentSymbol`.
 
-==== Diagnostic Generation
+== Diagnostic Generation
 
 The Semantic Layer produces diagnostics for common issues:
 

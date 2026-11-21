@@ -1,6 +1,6 @@
-== Cross-Cutting Concepts
+= Cross-Cutting Concepts
 
-=== Tree-sitter Integration
+== Tree-sitter Integration
 
 [[parsing-concepts]]
 The server uses the AsciiDoc grammar in two languages: `tree-sitter-asciidoc` for block-level structure and `tree-sitter-asciidoc-inline` for inline markup.
@@ -12,17 +12,17 @@ Parsing all ranges in one call lets markup in one paragraph pair with markup in 
 
 The parsers are created in the `parser` module of `asciidoc-core`, and the `extractors` module reads sections, anchors, xrefs, and includes from the trees.
 
-=== Parsing on Change
+== Parsing on Change
 
 The server uses full-document sync.
 Every change re-parses the whole file, and the extracted data of that file is replaced in the workspace.
 
-=== Fault Tolerance
+== Fault Tolerance
 
 Documents in an editor are often incomplete.
 Tree-sitter inserts `ERROR` and `MISSING` nodes into the parse tree instead of aborting, so the rest of the document is still analyzed.
 
-=== Include Resolution
+== Include Resolution
 
 Include paths can contain attribute references.
 The resolver handles these forms:
