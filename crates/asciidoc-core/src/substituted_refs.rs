@@ -544,16 +544,7 @@ fn scan_preprocessor(source: &str) -> Preprocessor {
         .zip(source.lines())
         .enumerate()
     {
-        let conditional = matches!(
-            read.directive,
-            Some(
-                Directive::Condition { .. }
-                    | Directive::Ifeval
-                    | Directive::Endif { .. }
-                    | Directive::Dropped
-            )
-        );
-        locked.push(conditional || read.in_block);
+        locked.push(read.is_conditional() || read.in_block);
         match read.directive {
             Some(Directive::Condition {
                 content: Some(content),

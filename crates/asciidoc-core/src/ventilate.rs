@@ -1317,6 +1317,18 @@ mod tests {
         1,
         "One.\nTwo?\ninclude::part.adoc[] here.\n"
     )]
+    // Text for the reader (Asciidoctor 2.0.26), so it may start a line: a
+    // target with a space, an include without target
+    #[case::conditional_with_space_in_target_after_question(
+        "One. Two? ifdef::a b[]\n",
+        1,
+        "One.\nTwo?\nifdef::a b[]\n"
+    )]
+    #[case::include_without_target_after_question(
+        "One. Two? include::[]\n",
+        1,
+        "One.\nTwo?\ninclude::[]\n"
+    )]
     #[case::escaped_directive_after_question(
         "One. Two? \\include::part.adoc[]\n",
         1,

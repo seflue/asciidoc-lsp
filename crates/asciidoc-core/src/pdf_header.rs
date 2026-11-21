@@ -17,16 +17,15 @@
 //! sets afterwards is uncertain too. The checks never report what is
 //! uncertain.
 //!
-//! Limits, each a line that classifies or reads differently from the reader:
-//! an `endif` for another target than the open block (`endif::x[]`) closes
-//! the block here but not in the reader, and a line is classified on its
-//! own, without the conditionals around it.
+//! Limit, a line that classifies differently from the reader: a line is
+//! classified on its own, without the conditionals around it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::attributes::{substitute_attributes, AttributeLayer, DOCDIR};
 use crate::extractors::classify_single_line;
+use crate::preprocessor::BlockStack;
 use crate::reading::{read_in_order, ReadingVisitor};
 use crate::types::{
     ConditionalKind, ConditionalOperator, Directive, DocumentModel, HeaderEntry, HeaderLine,
@@ -87,7 +86,7 @@ impl PdfHeader {
             root,
             docdir,
             current: HashMap::new(),
-            branches: Vec::new(),
+            branches: BlockStack::new(),
             stages: Stage::BeforeTitle.bit(),
             may_have_ended: false,
             drained: None,
@@ -205,7 +204,7 @@ struct HeaderWalk<'w> {
     current: HashMap<String, HeaderValue>,
     /// The open conditional blocks, each as it applies with the ones around
     /// it. The stack runs across files, as Asciidoctor's does.
-    branches: Vec<Branch>,
+    branches: BlockStack<Branch>,
     /// The stages the reader may be in, as [`Stage::bit`]s: more than one
     /// after a line in an unknown branch that may not be there.
     stages: u8,
@@ -276,19 +275,19 @@ impl HeaderWalk<'_> {
         self.branches.last().copied().unwrap_or(Branch::Active)
     }
 
-    fn open(&mut self, local: Branch) {
-        let branch = match (self.branch(), local) {
+    /// How a block with the local branch `local` applies inside the open ones.
+    fn nested(&self, local: Branch) -> Branch {
+        match (self.branch(), local) {
             (Branch::Skipped, _) | (_, Branch::Skipped) => Branch::Skipped,
             (Branch::Unknown, _) | (_, Branch::Unknown) => Branch::Unknown,
             _ => Branch::Active,
-        };
-        self.branches.push(branch);
+        }
     }
 
     fn directive(&mut self, directive: &Directive, file: &Path, line: usize, top_level: bool) {
         match directive {
-            Directive::Endif { .. } => {
-                self.branches.pop();
+            Directive::Endif { target } => {
+                self.branches.close(target.as_deref());
                 if self
                     .drained
                     .is_some_and(|depth| self.branches.len() < depth)
@@ -296,8 +295,13 @@ impl HeaderWalk<'_> {
                     self.drained = None;
                 }
             }
-            Directive::Ifeval => self.open(Branch::Unknown),
-            // The reader consumes the line and acts on none of it.
+            Directive::Ifeval => {
+                let branch = self.nested(Branch::Unknown);
+                self.branches.open_ifeval(branch);
+            }
+            // A `Dropped` line the reader consumes with an error and acts on
+            // none of it. An `include` is never classified as a directive
+            // (see `HeaderLine::Include`), the arm only completes the match.
             Directive::Include { .. } | Directive::Dropped => {}
             Directive::Condition {
                 kind,
@@ -311,7 +315,10 @@ impl HeaderWalk<'_> {
                     Tri::Unknown => Branch::Unknown,
                 };
                 match content {
-                    None => self.open(local),
+                    None => {
+                        let branch = self.nested(local);
+                        self.branches.open_condition(names, *operator, branch);
+                    }
                     Some(text) if self.branch() != Branch::Skipped && local != Branch::Skipped => {
                         let branch = if local == Branch::Unknown {
                             Branch::Unknown
@@ -761,6 +768,29 @@ v1.0
     fn ifeval_is_an_unknown_branch() {
         let text = "= T\nJane\nv1.0\nifeval::[1 == 1]\n:pdf-theme: a\nendif::[]\n";
         assert_eq!(main(text), "uncertain");
+    }
+
+    /// The reader consumes a directive line it rejects with an error
+    /// (Asciidoctor 2.0.26: `malformed preprocessor directive`) and the
+    /// header goes on, as if the line were not there.
+    #[test]
+    fn a_dropped_directive_is_no_line_of_the_header() {
+        assert_eq!(main("= T\nifdef::[]\nJane\nv1.0\n:pdf-theme: a\n"), "set:a");
+        assert_eq!(
+            main("= T\nJane\nendif::x[text]\nv1.0\n:pdf-theme: a\n"),
+            "set:a"
+        );
+    }
+
+    /// An `endif` for another target than the open block closes nothing
+    /// (Asciidoctor 2.0.26: `mismatched preprocessor directive`): the entry
+    /// stays in the unknown branch.
+    #[test]
+    fn an_endif_for_another_target_leaves_the_branch_open() {
+        let text = "= T\nifdef::foo[]\nendif::x[]\n:pdf-theme: a\nendif::[]\n";
+        assert_eq!(main(text), "uncertain");
+        let text = "= T\nifdef::foo[]\nendif::FOO[]\n:pdf-theme: a\n";
+        assert_eq!(main(text), "set:a");
     }
 
     #[test]

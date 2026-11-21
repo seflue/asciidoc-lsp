@@ -345,7 +345,7 @@ pub fn parse_single_file(
     // Extract attribute references ({name} patterns) via byte-scanning
     let attribute_refs = crate::extractors::extract_attribute_refs(&source);
 
-    // Extract conditional directives (ifdef/ifndef) via byte-scanning
+    // Extract conditional directives (ifdef/ifndef) from the preprocessor layer
     let conditionals = crate::preprocessor::extract_conditionals(&source);
 
     let tags = crate::preprocessor::extract_tag_directives(&source);

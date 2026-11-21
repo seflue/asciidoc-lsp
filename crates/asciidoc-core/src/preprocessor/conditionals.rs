@@ -2,7 +2,7 @@
 //! evaluating them: the directives themselves, and the lines their blocks
 //! cover.
 
-use super::directive;
+use super::{directive, BlockStack};
 use crate::types::{ConditionalDirective, Directive};
 
 /// The `ifdef` and `ifndef` directives of `source`, in order, with their
@@ -30,7 +30,9 @@ pub fn extract_conditionals(source: &str) -> Vec<ConditionalDirective> {
         .collect()
 }
 
-/// One line of a file as the reader sees it.
+/// One line of a file as the reader sees it, except in a `////` comment
+/// block: the reader skips preprocessing there, a directive in it is no
+/// directive, but this layer reads it as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadLine {
     /// The directive the line is, `None` for a text line.
@@ -39,6 +41,24 @@ pub struct ReadLine {
     /// the content of an `ifdef`, `ifndef` or `ifeval` that has no `endif`
     /// yet. A directive line inside a block counts too.
     pub in_block: bool,
+}
+
+impl ReadLine {
+    /// Whether the line is a conditional directive (`ifdef`, `ifndef`,
+    /// `ifeval`, `endif`, or one the reader drops), that is a directive
+    /// but no `include`.
+    #[must_use]
+    pub fn is_conditional(&self) -> bool {
+        matches!(
+            self.directive,
+            Some(
+                Directive::Condition { .. }
+                    | Directive::Ifeval
+                    | Directive::Endif { .. }
+                    | Directive::Dropped
+            )
+        )
+    }
 }
 
 /// The lines of `source` in the state of the reader's conditional stack.
@@ -50,8 +70,7 @@ pub struct ReadLine {
 /// opens and closes nothing. Conditionals are not evaluated.
 #[must_use]
 pub fn read_lines(source: &str) -> Vec<ReadLine> {
-    // The target of each open block; an `ifeval` has none.
-    let mut open: Vec<Option<String>> = Vec::new();
+    let mut open = BlockStack::new();
     source
         .lines()
         .map(|line| {
@@ -63,20 +82,10 @@ pub fn read_lines(source: &str) -> Vec<ReadLine> {
                     operator,
                     content: None,
                     ..
-                }) => open.push(Some(names.join(match operator {
-                    crate::types::ConditionalOperator::And => "+",
-                    _ => ",",
-                }))),
-                Some(Directive::Ifeval) => open.push(None),
+                }) => open.open_condition(names, *operator, ()),
+                Some(Directive::Ifeval) => open.open_ifeval(()),
                 Some(Directive::Endif { target }) => {
-                    let matches = match (target, open.last()) {
-                        (_, None) => false,
-                        (None, Some(_)) => true,
-                        (Some(target), Some(block)) => block.as_ref() == Some(target),
-                    };
-                    if matches {
-                        open.pop();
-                    }
+                    open.close(target.as_deref());
                 }
                 _ => {}
             }
@@ -96,18 +105,7 @@ pub fn read_lines(source: &str) -> Vec<ReadLine> {
 pub fn conditional_lines(source: &str) -> Vec<bool> {
     read_lines(source)
         .iter()
-        .map(|line| {
-            line.in_block
-                || matches!(
-                    line.directive,
-                    Some(
-                        Directive::Condition { .. }
-                            | Directive::Ifeval
-                            | Directive::Endif { .. }
-                            | Directive::Dropped
-                    )
-                )
-        })
+        .map(|line| line.in_block || line.is_conditional())
         .collect()
 }
 
@@ -245,8 +243,8 @@ mod tests {
     }
 
     /// The reader drops a line of a directive it rejects with an error and
-    /// opens or closes nothing (cases c09, c10, c11, c16, c17 of the
-    /// Asciidoctor 2.0.26 runs), or takes it for a text line (c12).
+    /// opens or closes nothing (checked against
+    /// Asciidoctor 2.0.26), or takes it for a text line.
     #[test]
     fn dropped_and_text_lines_open_and_close_nothing() {
         assert_eq!(conditional_lines("ifdef::a b[]\nX\n"), [false, false]);
@@ -262,7 +260,8 @@ mod tests {
     }
 
     /// An `endif` with another target than the open block is ignored, one
-    /// without a block too (cases c11, c27, e09).
+    /// without a block too (checked against Asciidoctor 2.0.26: `mismatched
+    /// preprocessor directive`).
     #[test]
     fn an_endif_for_another_target_closes_nothing() {
         assert_eq!(

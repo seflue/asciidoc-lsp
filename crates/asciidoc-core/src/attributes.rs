@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::preprocessor::directive;
+use crate::preprocessor::{directive, BlockStack};
 use crate::types::{
     AttributeDef, ConditionalDirective, ConditionalKind, ConditionalOperator, Directive,
 };
@@ -616,10 +616,10 @@ impl ConfigRead<'_> {
     ) {
         self.stack
             .push(file.canonicalize().unwrap_or_else(|_| file.to_path_buf()));
-        // One flag per open conditional block: whether its content applies.
-        let mut blocks: Vec<bool> = Vec::new();
+        // Per open conditional block: whether its content applies.
+        let mut blocks: BlockStack<bool> = BlockStack::new();
         for entry in parse_asciidoctorconfig(content) {
-            let active = blocks.iter().all(|applies| *applies);
+            let active = blocks.values().all(|applies| *applies);
             match entry {
                 ConfigEntry::Conditional {
                     directive,
@@ -633,12 +633,14 @@ impl ConfigRead<'_> {
                             }
                         }
                         Some(_) => {}
-                        None => blocks.push(holds),
+                        None => {
+                            blocks.open_condition(&directive.attributes, directive.operator, holds);
+                        }
                     }
                 }
-                ConfigEntry::Ifeval if self.conditionals => blocks.push(true),
-                ConfigEntry::Endif if self.conditionals => {
-                    blocks.pop();
+                ConfigEntry::Ifeval if self.conditionals => blocks.open_ifeval(true),
+                ConfigEntry::Endif { target } if self.conditionals => {
+                    blocks.close(target.as_deref());
                 }
                 entry if active => self.apply_entry(file, entry, merged),
                 _ => {}
@@ -676,7 +678,7 @@ impl ConfigRead<'_> {
                 merged.remove(&name);
             }
             ConfigEntry::Include { target } => self.include(file, &target, merged),
-            ConfigEntry::Conditional { .. } | ConfigEntry::Ifeval | ConfigEntry::Endif => {}
+            ConfigEntry::Conditional { .. } | ConfigEntry::Ifeval | ConfigEntry::Endif { .. } => {}
         }
     }
 
@@ -717,7 +719,12 @@ impl ConfigRead<'_> {
         directive: &ConditionalDirective,
         merged: &HashMap<String, AttributeEntry>,
     ) -> bool {
-        let defined = |name: &String| merged.contains_key(name) || self.builtin.contains_key(name);
+        // The names of the directive are lowered, as Asciidoctor lowers
+        // attribute names; the entries keep the spelling they were written in.
+        let defined = |name: &String| {
+            let is_name = |key: &String| key.to_lowercase() == *name;
+            merged.keys().any(is_name) || self.builtin.keys().any(is_name)
+        };
         let names = &directive.attributes;
         let any = names.iter().any(defined);
         let all = names.iter().all(defined);
@@ -815,8 +822,9 @@ enum ConfigEntry {
     },
     /// `ifeval::[...]`: opens a block, not evaluated.
     Ifeval,
-    /// `endif::...[]`: closes the innermost block.
-    Endif,
+    /// `endif::...[]`: closes the innermost block, if the target (lower
+    /// case) is none or the block's.
+    Endif { target: Option<String> },
 }
 
 /// Ends an attribute value that continues on the next line, as in Asciidoctor.
@@ -857,7 +865,7 @@ fn parse_asciidoctorconfig(content: &str) -> Vec<ConfigEntry> {
                     });
                 }
                 Directive::Ifeval => result.push(ConfigEntry::Ifeval),
-                Directive::Endif { .. } => result.push(ConfigEntry::Endif),
+                Directive::Endif { target } => result.push(ConfigEntry::Endif { target }),
                 Directive::Include { target } => result.push(ConfigEntry::Include { target }),
                 Directive::Dropped => {}
             }
@@ -1543,7 +1551,7 @@ mod tests {
                     ConfigEntry::Include { .. } => "include",
                     ConfigEntry::Conditional { .. } => "conditional",
                     ConfigEntry::Ifeval => "ifeval",
-                    ConfigEntry::Endif => "endif",
+                    ConfigEntry::Endif { .. } => "endif",
                 })
                 .collect()
         };
@@ -1602,6 +1610,124 @@ mod tests {
 
         assert!(merged.contains_key("from-rel"));
         assert!(!merged.contains_key("from-nested"));
+    }
+
+    /// The names of the entries applied from `content` as an
+    /// `.asciidoctorconfig.adoc` (conditionals evaluated), sorted.
+    fn applied_names(content: &str) -> Vec<String> {
+        let builtin = HashMap::new();
+        let mut read = ConfigRead {
+            builtin: &builtin,
+            conditionals: true,
+            max_depth: 1,
+            stack: Vec::new(),
+            watch: None,
+        };
+        let mut merged = HashMap::new();
+        read.apply_text(
+            Path::new("/nonexistent/.asciidoctorconfig.adoc"),
+            content,
+            &mut merged,
+        );
+        let mut names: Vec<String> = merged.into_keys().collect();
+        names.sort();
+        names
+    }
+
+    /// Asciidoctor lowers the names of a conditional and of an entry, so
+    /// `ifdef::FOO[]` holds after `:FOO: 1` and after `:foo: 1`, in lists
+    /// with `,` and `+` too (checked against Asciidoctor 2.0.26 with a
+    /// document). The entries keep the spelling they were written in.
+    #[test]
+    fn test_config_conditionals_ignore_the_case_of_entry_names() {
+        assert_eq!(
+            applied_names(":FOO: 1\nifdef::FOO[]\n:a: 1\nendif::[]\n"),
+            ["FOO", "a"]
+        );
+        assert_eq!(
+            applied_names(":FOO: 1\nifdef::foo[]\n:a: 1\nendif::[]\n"),
+            ["FOO", "a"]
+        );
+        assert_eq!(
+            applied_names(":foo: 1\nifdef::FOO[]\n:a: 1\nendif::[]\n"),
+            ["a", "foo"]
+        );
+        assert_eq!(
+            applied_names(":Foo: 1\nifdef::foo[:a: 1]\nifndef::FOO[:b: 1]\n"),
+            ["Foo", "a"]
+        );
+        assert_eq!(
+            applied_names(":Foo: 1\nifdef::nope,FOO[:a: 1]\nifndef::NOPE,foo[:b: 1]\n"),
+            ["Foo", "a"]
+        );
+        assert_eq!(
+            applied_names(":Foo: 1\n:Bar: 1\nifdef::foo+BAR[:a: 1]\nifndef::foo+NOPE[:b: 1]\n"),
+            ["Bar", "Foo", "a", "b"]
+        );
+        assert_eq!(
+            applied_names(":Foo: 1\nifdef::foo+NOPE[:a: 1]\nifndef::FOO+bar[:b: 1]\n"),
+            ["Foo", "b"]
+        );
+    }
+
+    /// A config entry keeps its spelling among the preset names: `FOO`,
+    /// not `foo`.
+    #[test]
+    fn test_preset_names_keep_the_spelling_of_config_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":FOO: x\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+
+        let names = registry.preset_names(&root.join("any.adoc"));
+        assert!(names.contains("FOO"));
+        assert!(!names.contains("foo"));
+    }
+
+    /// The document header wins over the config for the name as written.
+    /// `{foo}` reaching neither `:FOO:` deviates from Asciidoctor, which
+    /// ignores the case of attribute names; kept until lookups follow it.
+    #[test]
+    fn test_document_attribute_beats_config_of_the_same_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join(".asciidoctorconfig"), ":FOO: x\n").unwrap();
+
+        let mut registry = AttributeRegistry::new(&root);
+        registry.ensure_config_for_dir(&root);
+        let file = root.join("doc.adoc");
+        registry.register_file_attributes(
+            &file,
+            &[AttributeDef {
+                name: "FOO".into(),
+                value: "y".into(),
+                line: 1,
+            }],
+        );
+
+        assert_eq!(registry.resolve(&file, "FOO"), Some("y"));
+        assert_eq!(registry.resolve(&file, "foo"), None);
+    }
+
+    /// An `endif` for another target than the open block closes nothing, as
+    /// in the reader (Asciidoctor 2.0.26: `mismatched preprocessor
+    /// directive`, the block stays open).
+    #[test]
+    fn test_config_endif_for_another_target_closes_nothing() {
+        assert_eq!(
+            applied_names("ifdef::nope[]\nendif::b[]\n:a: 1\nendif::nope[]\n:b: 1\n"),
+            ["b"]
+        );
+        assert_eq!(
+            applied_names("ifdef::nope[]\nendif::NOPE[]\n:a: 1\n"),
+            ["a"]
+        );
+        assert_eq!(
+            applied_names(":x: 1\nifdef::x[]\nendif::y[]\n:a: 1\nendif::[]\n:b: 1\n"),
+            ["a", "b", "x"]
+        );
     }
 
     #[test]

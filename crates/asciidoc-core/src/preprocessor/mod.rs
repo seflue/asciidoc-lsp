@@ -8,14 +8,20 @@
 //! earlier recognizer judged a line differently, the reader decides: see the
 //! cases in `directive.rs`, each one run through Asciidoctor.
 //!
+//! Limit: the reader does not preprocess the lines of a `////` comment
+//! block, a directive in it is text. The layer does not know the blocks and
+//! reads such a line as a directive.
+//!
 //! Not in this module: the header lines (`extract_header_lines`, which only
 //! asks [`directive`]) and the reading order over includes (`reading`), which
 //! work on what the layer recognized.
 
+mod blocks;
 mod conditionals;
 mod directive;
 mod tags;
 
+pub use blocks::BlockStack;
 pub use conditionals::{conditional_lines, extract_conditionals, read_lines, ReadLine};
 pub use directive::directive;
 pub use tags::extract_tag_directives;
@@ -28,6 +34,12 @@ mod tests {
     const KEYWORDS: [&str; 7] = [
         "ifdef", "ifndef", "ifeval", "endif", "include", "tag", "end",
     ];
+
+    /// The keywords of the directives that start a line.
+    const DIRECTIVES: [&str; 5] = ["ifdef", "ifndef", "ifeval", "endif", "include"];
+
+    /// Calls that cut a line at its `::`.
+    const SPLITS: [&str; 3] = ["split_once(\"::\")", "strip_prefix(\"::\")", "find(\"::\")"];
 
     /// String methods a line check is made of.
     const LINE_TESTS: [&str; 6] = [
@@ -52,11 +64,23 @@ mod tests {
         }
     }
 
-    /// The code lines of `text` that test a line for a directive: a string
-    /// literal `"<keyword>::` (the start of a directive or a tag directive),
-    /// or a keyword handed to a line test (`starts_with("ifdef")`). Comment
-    /// lines and the unit tests at the bottom of a file do not count, nor do
-    /// names of grammar nodes (`"ifdef" | "endif"` in a `matches!`).
+    /// The code lines of `text` that test a line for a directive:
+    /// - a string literal `"<keyword>::` (the start of a directive or a tag
+    ///   directive),
+    /// - a keyword handed to a line test (`starts_with("ifdef")`),
+    /// - two directive keywords side by side in a literal list
+    ///   (`["ifdef", "ifndef"]`, to find the one a line starts with),
+    /// - in a file that splits at `"::"`, a keyword in a `matches!` list
+    ///   (`"ifdef" | "endif"`).
+    ///
+    /// Comment lines and the unit tests at the bottom of a file (a
+    /// `#[cfg(test)]` directly before `mod tests`) do not count. Limits: a
+    /// file that does not split at `"::"` may name the keywords in a
+    /// `matches!` (the node names of the grammar do), and a literal that
+    /// builds directive text (`format!("include::{target}[]")`) or a
+    /// directive in a trailing code comment is flagged although nothing is
+    /// tested. What does not start with the keyword in a literal, or builds
+    /// it from parts, is not seen.
     fn line_checks(text: &str) -> Vec<(usize, &str)> {
         let mut needles = Vec::new();
         for keyword in KEYWORDS {
@@ -66,12 +90,37 @@ mod tests {
                 needles.push(format!(".{test}(\"{keyword}\""));
             }
         }
-        text.lines()
+        for first in DIRECTIVES {
+            for second in DIRECTIVES.iter().filter(|second| **second != first) {
+                needles.push(format!("\"{first}\", \"{second}\""));
+            }
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let end = (0..lines.len())
+            .find(|&index| {
+                lines[index].trim() == "#[cfg(test)]"
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+            })
+            .unwrap_or(lines.len());
+        let code: Vec<(usize, &str)> = lines[..end]
+            .iter()
             .enumerate()
-            .take_while(|(_, line)| line.trim() != "#[cfg(test)]")
             .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .map(|(index, line)| (index + 1, *line))
+            .collect();
+        if code
+            .iter()
+            .any(|(_, line)| SPLITS.iter().any(|split| line.contains(split)))
+        {
+            for keyword in DIRECTIVES {
+                needles.push(format!("\"{keyword}\" |"));
+                needles.push(format!("| \"{keyword}\""));
+            }
+        }
+        code.into_iter()
             .filter(|(_, line)| needles.iter().any(|needle| line.contains(needle.as_str())))
-            .map(|(index, line)| (index + 1, line))
             .collect()
     }
 
@@ -106,6 +155,10 @@ mod tests {
             r#"rest.starts_with("tag::")"#,
             r#"line.strip_prefix("ifdef")"#,
             r#"let d = "\\ifdef::x[]";"#,
+            // The pattern of the first `parse_directive`: keywords in a list.
+            r#"["ifdef", "ifndef", "ifeval", "endif"].into_iter().find_map(|name| {"#,
+            "let (name, rest) = line.split_once(\"::\")?;\nmatches!(name, \"ifdef\" | \"endif\")",
+            "#[cfg(test)]\nfn helper() {}\nlet t = line.starts_with(\"ifdef::\");",
         ];
         for line in flagged {
             assert_eq!(line_checks(line).len(), 1, "{line}");
@@ -116,7 +169,9 @@ mod tests {
             r#"// line.starts_with("ifdef::")"#,
             r#"    /// `include::target[]`"#,
             "let x = line.starts_with(\"image::\");",
-            "#[cfg(test)]\nlet t = line.starts_with(\"ifdef::\");",
+            "#[cfg(test)]\nmod tests {\nlet t = line.starts_with(\"ifdef::\");",
+            "let (name, rest) = line.split_once(\"::\")?;\nmatches!(name, \"image\" | \"audio\")",
+            r#"let kinds = ["ifdef", "section"];"#,
         ];
         for line in spared {
             assert!(line_checks(line).is_empty(), "{line}");

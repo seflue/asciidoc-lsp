@@ -137,134 +137,120 @@ mod tests {
         })
     }
 
-    /// One line per row: the case of the Asciidoctor 2.0.26 runs the line
-    /// belongs to, the line, and what the reader made of it.
+    /// One line per row: the line, and what Asciidoctor 2.0.26 made of it
+    /// (checked by running it).
     #[test]
     fn conditionals_as_asciidoctor_reads_them() {
         use ConditionalKind::{Ifdef, Ifndef};
         use ConditionalOperator::{And, Or, Single};
         let dropped = || Some(Directive::Dropped);
-        let cases: Vec<(&str, &str, Option<Directive>)> = vec![
-            ("c01", "ifdef::foo[]", ifdef(&["foo"])),
+        let cases: Vec<(&str, Option<Directive>)> = vec![
+            ("ifdef::foo[]", ifdef(&["foo"])),
             // The name is lowered: `FOO` is `-a foo`.
-            ("c02", "ifdef::FOO[]", ifdef(&["foo"])),
+            ("ifdef::FOO[]", ifdef(&["foo"])),
             // Text after the `]` makes it a text line.
-            ("c03", "ifdef::nope[] trailing", None),
+            ("ifdef::nope[] trailing", None),
             // The reader strips trailing whitespace.
-            ("c04", "ifdef::nope[]   ", ifdef(&["nope"])),
+            ("ifdef::nope[]   ", ifdef(&["nope"])),
             // Indented and escaped lines are text.
-            ("c05", " ifdef::nope[]", None),
-            ("c05", " endif::[]", None),
-            ("c06", "\\ifdef::nope[]", None),
-            ("c06", "\\endif::[]", None),
+            (" ifdef::nope[]", None),
+            (" endif::[]", None),
+            ("\\ifdef::nope[]", None),
+            ("\\endif::[]", None),
             (
-                "c07",
                 "ifdef::nope[SINGLE]",
                 condition(Ifdef, &["nope"], Single, Some("SINGLE")),
             ),
             // No target: the reader drops the line with an error.
-            ("c09", "ifdef::[]", dropped()),
-            ("c09", "ifndef::[]", dropped()),
-            ("c09", "ifdef::[text]", dropped()),
+            ("ifdef::[]", dropped()),
+            ("ifndef::[]", dropped()),
+            ("ifdef::[text]", dropped()),
             // Text in an `endif`: dropped, closes nothing.
-            ("c10", "endif::[x]", dropped()),
-            ("c11", "endif::other[]", endif(Some("other"))),
-            ("c27", "endif::FOO[]", endif(Some("foo"))),
-            ("c01", "endif::[]", endif(None)),
+            ("endif::[x]", dropped()),
+            ("endif::other[]", endif(Some("other"))),
+            ("endif::FOO[]", endif(Some("foo"))),
+            ("endif::[]", endif(None)),
             // Whitespace in the target: text.
-            ("c12", "ifdef::a b[]", None),
-            ("c28", "ifdef:: foo[]", None),
-            ("c29", "ifdef::foo\t[]", None),
+            ("ifdef::a b[]", None),
+            ("ifdef:: foo[]", None),
+            ("ifdef::foo\t[]", None),
             // No restriction on the characters of a name.
-            ("c13", "ifdef::a.b[]", ifdef(&["a.b"])),
-            ("c14", "ifeval::[1 == 1]", Some(Directive::Ifeval)),
-            ("c15", "ifeval::[1 == 2]", Some(Directive::Ifeval)),
-            ("e04", "ifeval::[1 <= 2]", Some(Directive::Ifeval)),
-            ("e05", "ifeval::[\"a\"==\"b\"]", Some(Directive::Ifeval)),
+            ("ifdef::a.b[]", ifdef(&["a.b"])),
+            ("ifeval::[1 == 1]", Some(Directive::Ifeval)),
+            ("ifeval::[1 == 2]", Some(Directive::Ifeval)),
+            ("ifeval::[1 <= 2]", Some(Directive::Ifeval)),
+            ("ifeval::[\"a\"==\"b\"]", Some(Directive::Ifeval)),
             // `ifeval` takes no target and needs an expression: dropped.
-            ("c16", "ifeval::x[1 == 1]", dropped()),
-            ("c17", "ifeval::[nonsense]", dropped()),
-            ("e01", "ifeval::[1 = 1]", dropped()),
-            ("e02", "ifeval::[1 ==]", dropped()),
-            ("e03", "ifeval::[ ]", dropped()),
-            ("e03", "ifeval::[]", dropped()),
-            ("e06", "ifeval::[1 > ]", dropped()),
-            ("e07", "ifeval::[== 1]", dropped()),
+            ("ifeval::x[1 == 1]", dropped()),
+            ("ifeval::[nonsense]", dropped()),
+            ("ifeval::[1 = 1]", dropped()),
+            ("ifeval::[1 ==]", dropped()),
+            ("ifeval::[ ]", dropped()),
+            ("ifeval::[]", dropped()),
+            ("ifeval::[1 > ]", dropped()),
+            ("ifeval::[== 1]", dropped()),
             // Keywords are lower case; a leading `[` makes it text.
-            ("c18", "IFDEF::foo[]", None),
-            ("c22", "[ifdef::nope[]]", None),
+            ("IFDEF::foo[]", None),
+            ("[ifdef::nope[]]", None),
             (
-                "c19",
                 "ifdef::foo,nope[]",
                 condition(Ifdef, &["foo", "nope"], Or, None),
             ),
             (
-                "c20",
                 "ifdef::foo+nope[]",
                 condition(Ifdef, &["foo", "nope"], And, None),
             ),
-            (
-                "c24",
-                "ifndef::foo[]",
-                condition(Ifndef, &["foo"], Single, None),
-            ),
+            ("ifndef::foo[]", condition(Ifndef, &["foo"], Single, None)),
             // The first of `,` and `+` is the delimiter.
             (
-                "c21",
                 "ifdef::nope,foo+x[]",
                 condition(Ifdef, &["nope", "foo+x"], Or, None),
             ),
-            (
-                "c21",
-                "ifdef::a+b,c[]",
-                condition(Ifdef, &["a", "b,c"], And, None),
-            ),
+            ("ifdef::a+b,c[]", condition(Ifdef, &["a", "b,c"], And, None)),
             // Empty names stay, as in `split(',', -1)`.
             (
-                "c30",
                 "ifdef::nope,,foo[]",
                 condition(Ifdef, &["nope", "", "foo"], Or, None),
             ),
             // The text runs to the last `]`.
             (
-                "c25",
                 "ifdef::foo[a] b]",
                 condition(Ifdef, &["foo"], Single, Some("a] b")),
             ),
         ];
-        for (case, line, expected) in cases {
-            assert_eq!(directive(line), expected, "{case}: {line:?}");
+        for (line, expected) in cases {
+            assert_eq!(directive(line), expected, "{line:?}");
         }
     }
 
     #[test]
     fn includes_as_asciidoctor_reads_them() {
-        let cases: Vec<(&str, &str, Option<Directive>)> = vec![
-            ("i01", "include::inc.adoc[]", include_of("inc.adoc")),
+        let cases: Vec<(&str, Option<Directive>)> = vec![
+            ("include::inc.adoc[]", include_of("inc.adoc")),
             // Whitespace inside the target is part of it.
-            ("i02", "include::my inc.adoc[]", include_of("my inc.adoc")),
+            ("include::my inc.adoc[]", include_of("my inc.adoc")),
             // At its start or end it makes the line text.
-            ("i03", "include:: inc.adoc[]", None),
-            ("i04", "include::inc.adoc []", None),
-            ("i05", "include::[]", None),
-            ("i06", "\\include::inc.adoc[]", None),
-            ("i07", "include::inc.adoc[", None),
-            ("i08", "include::inc.adoc[] x", None),
-            ("i09", " include::inc.adoc[]", None),
-            ("i10", "include::inc.adoc[]   ", include_of("inc.adoc")),
-            ("i11", "INCLUDE::inc.adoc[]", None),
-            ("i12", "include::inc.adoc[lines=1]", include_of("inc.adoc")),
-            ("i13", "include::{inc}[]", include_of("{inc}")),
-            ("i17", "include::inc.adoc[a]b[]", include_of("inc.adoc")),
-            ("i16", "include::nofile.adoc[]", include_of("nofile.adoc")),
+            ("include:: inc.adoc[]", None),
+            ("include::inc.adoc []", None),
+            ("include::[]", None),
+            ("\\include::inc.adoc[]", None),
+            ("include::inc.adoc[", None),
+            ("include::inc.adoc[] x", None),
+            (" include::inc.adoc[]", None),
+            ("include::inc.adoc[]   ", include_of("inc.adoc")),
+            ("INCLUDE::inc.adoc[]", None),
+            ("include::inc.adoc[lines=1]", include_of("inc.adoc")),
+            ("include::{inc}[]", include_of("{inc}")),
+            ("include::inc.adoc[a]b[]", include_of("inc.adoc")),
+            ("include::nofile.adoc[]", include_of("nofile.adoc")),
         ];
-        for (case, line, expected) in cases {
-            assert_eq!(directive(line), expected, "{case}: {line:?}");
+        for (line, expected) in cases {
+            assert_eq!(directive(line), expected, "{line:?}");
         }
     }
 
     /// A single-line conditional around an include is a conditional; its
-    /// content is read again by the reader (case i14).
+    /// content is read again by the reader.
     #[test]
     fn include_in_single_line_conditional_is_its_content() {
         assert_eq!(

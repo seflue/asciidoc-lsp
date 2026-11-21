@@ -217,7 +217,10 @@ pub enum HeaderLine {
     /// An attribute entry, `:name: value` or `:name!:`. The lines that carry
     /// its value on (` \` at the end) are `Covered`.
     Entry(HeaderEntry),
-    /// `ifdef`, `ifndef`, `ifeval` and `endif` at the start of a line.
+    /// `ifdef`, `ifndef`, `ifeval` and `endif` at the start of a line, or
+    /// a line of such a directive that the reader drops
+    /// ([`Directive::Dropped`]). Never an `include`: that is
+    /// [`HeaderLine::Include`].
     Directive(Directive),
     /// A line with an `include::` macro; the include graph has its edge.
     Include,
