@@ -71,24 +71,43 @@ pub enum PreviewError {
     Bind(io::Error),
 }
 
+/// The kind of a server-sent event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Html,
+    Cursor,
+    ConvertError,
+}
+
+impl EventKind {
+    /// The event name on the wire.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Cursor => "cursor",
+            Self::ConvertError => "convert-error",
+        }
+    }
+}
+
 /// One server-sent event.
 #[derive(Debug, Clone)]
 struct Event {
-    name: &'static str,
+    kind: EventKind,
     /// One line of JSON.
     data: String,
 }
 
 impl Event {
-    fn new(name: &'static str, data: &serde_json::Value) -> Self {
+    fn new(kind: EventKind, data: &serde_json::Value) -> Self {
         Self {
-            name,
+            kind,
             data: data.to_string(),
         }
     }
 
     fn frame(&self) -> String {
-        format!("event: {}\ndata: {}\n\n", self.name, self.data)
+        format!("event: {}\ndata: {}\n\n", self.kind.name(), self.data)
     }
 }
 
@@ -132,13 +151,13 @@ impl Shared {
     /// subscribes sees each event exactly once, in the replay or live.
     fn publish(&self, event: Event) {
         let mut snapshot = self.snapshot.lock();
-        match event.name {
-            "html" => {
+        match event.kind {
+            EventKind::Html => {
                 snapshot.html = Some(event.clone());
                 snapshot.error = None;
             }
-            "cursor" => snapshot.cursor = Some(event.clone()),
-            _ => snapshot.error = Some(event.clone()),
+            EventKind::Cursor => snapshot.cursor = Some(event.clone()),
+            EventKind::ConvertError => snapshot.error = Some(event.clone()),
         }
         // No receiver is fine: nobody has the page open.
         let _ = self.events.send(event);
@@ -163,7 +182,7 @@ impl Shared {
                     .copied()
                     .unwrap_or(0);
                 self.publish(Event::new(
-                    "html",
+                    EventKind::Html,
                     &serde_json::json!({
                         "file": outcome.file.to_string_lossy(),
                         "lineCount": line_count,
@@ -172,7 +191,7 @@ impl Shared {
                 ));
             }
             Err(error) => self.publish(Event::new(
-                "convert-error",
+                EventKind::ConvertError,
                 &serde_json::json!({ "message": error.to_string() }),
             )),
         }
@@ -294,7 +313,7 @@ impl Preview {
     /// `lsp_line + 1`; the page compares it with the anchors as it is.
     pub fn set_cursor(&self, file: &Path, lsp_line: u32) {
         self.shared.publish(Event::new(
-            "cursor",
+            EventKind::Cursor,
             &serde_json::json!({
                 "file": file.to_string_lossy(),
                 "line": u64::from(lsp_line) + 1,
