@@ -85,3 +85,13 @@ jobs:
       - run: npm --prefix editors/vscode run compile
       - run: npm --prefix editors/vscode test
       - run: npm --prefix editors/vscode run package
+
+  preview-js:
+    name: Preview JS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test crates/asciidoc-lsp/tests/js/*.test.js

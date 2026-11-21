@@ -19,6 +19,10 @@ check:
 test:
     cargo test
 
+# Test the preview page's JS (needs Node 20+, not part of ci)
+test-js:
+    node --test crates/asciidoc-lsp/tests/js/*.test.js
+
 # Run clippy lints (warnings = errors)
 lint:
     cargo clippy -- -D warnings

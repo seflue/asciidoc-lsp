@@ -208,6 +208,7 @@ just test           # Run all tests
 just lint           # Clippy with -D warnings (pedantic)
 just fmt-check      # Check formatting
 just ci             # All checks: fmt-check + lint + test
+just test-js        # Preview page JS tests (needs Node, not part of ci)
 just lsp            # Start the LSP server (for manual testing)
 ```
 
