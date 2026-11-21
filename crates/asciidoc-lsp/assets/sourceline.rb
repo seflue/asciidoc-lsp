@@ -4,6 +4,10 @@
 # - `data-line-N` is the line of the block in its own file.
 # - `data-src-K` is added for blocks from an included file; K indexes the
 #   file table in the page's `<script id="adoc-source-files">`.
+# - `<script id="adoc-source-includes">` lists the includes as
+#   `{parent, line, file}`: the directive stands on `line` (1-based) of file
+#   `parent`, and pulls in `file`; both are file table indices, `parent` is
+#   null for the main document.
 #
 # - Local image URLs become `files/<path below the workspace root>`, which the
 #   preview server serves; the root comes in ASCIIDOC_LSP_ROOT. The output ends
@@ -62,10 +66,28 @@ end
 
 File.singleton_class.prepend AdocBufferOverlay unless AdocBufferOverlay::TEXTS.empty?
 
+# Every include that Asciidoctor resolved: where the directive stood and what
+# it pulled in. Skipped and unresolved includes never reach `push_include`.
+module AdocIncludes
+  LIST = []
+
+  # Hooks the reader at the moment it enters an included file. Then `@file`
+  # is still the including file, and the directive line was already consumed,
+  # so `@lineno` is one past it.
+  module Recorder
+    def push_include(data, file = nil, path = nil, lineno = 1, attributes = {})
+      LIST << { parent: @file, line: @lineno - 1, file: file } if file && @file
+      super
+    end
+  end
+end
+Asciidoctor::PreprocessorReader.prepend AdocIncludes::Recorder
+
 class SourceLinePreprocessor < Asciidoctor::Extensions::Preprocessor
   # The CLI has no --sourcemap in 2.0.x; the extension API turns it on.
   def process(doc, reader)
     doc.sourcemap = true
+    AdocIncludes::LIST.clear
     reader
   end
 end
@@ -86,7 +108,19 @@ class SourceLineTreeprocessor < Asciidoctor::Extensions::Treeprocessor
       end
       node.add_role role
     end
+    main = AdocBufferOverlay.canonical(docfile.to_s)
+    # A file that rendered nothing still gets an index, so its include is
+    # listed; the page finds no content for it and adds no anchor.
+    index_of = lambda do |path|
+      path = AdocBufferOverlay.canonical(path.to_s)
+      path == main ? nil : (files.index(path) || (files << path).size - 1)
+    end
+    includes = AdocIncludes::LIST.map do |inc|
+      { 'parent' => index_of.call(inc[:parent]), 'line' => inc[:line],
+        'file' => index_of.call(inc[:file]) }
+    end
     doc.set_attr 'adoc-source-files', JSON.generate(files)
+    doc.set_attr 'adoc-source-includes', JSON.generate(includes)
     nil
   end
 end
@@ -94,10 +128,11 @@ end
 class SourceFilesPostprocessor < Asciidoctor::Extensions::Postprocessor
   # The file table, index to path, as JSON next to the converted blocks.
   def process(doc, output)
-    json = doc.attr('adoc-source-files') || '[]'
+    files = (doc.attr('adoc-source-files') || '[]').gsub('</', '<\/')
+    includes = (doc.attr('adoc-source-includes') || '[]').gsub('</', '<\/')
     # "</" must not end the script element early.
-    json = json.gsub('</', '<\/')
-    %(#{output}\n<script type="application/json" id="adoc-source-files">#{json}</script>\n)
+    %(#{output}\n<script type="application/json" id="adoc-source-files">#{files}</script>\n) +
+      %(<script type="application/json" id="adoc-source-includes">#{includes}</script>\n)
   end
 end
 

@@ -267,3 +267,248 @@ test('srcForFile uses the first index when the table lists a file twice', () => 
 test('srcForFile prefers the main file when it is also in the table', () => {
   assert.equal(map.srcForFile(['/w/m.adoc'], '/w/m.adoc', '/w/m.adoc'), null)
 })
+
+// A parent with one own block (line 7) and three consecutive includes on
+// lines 10, 12 and 14. Their content has the lines of the included files.
+const PARENT_ENTRIES = [
+  { line: 7, top: 0, bottom: 50 },
+  { line: 1, src: 0, top: 50, bottom: 100 },
+  { line: 3, src: 0, top: 100, bottom: 150 },
+  { line: 1, src: 1, top: 150, bottom: 250 },
+  { line: 1, src: 2, top: 250, bottom: 300 },
+]
+const PARENT_INCLUDES = [
+  { parent: null, line: 10, file: 0 },
+  { parent: null, line: 12, file: 1 },
+  { parent: null, line: 14, file: 2 },
+]
+
+function scrollAt(anchors, line) {
+  return map.scrollTopForLine(anchors, 0, line)
+}
+
+test('cursor on an include line maps to the start of its content', () => {
+  const anchors = map.fileAnchorsWithIncludes(PARENT_ENTRIES, PARENT_INCLUDES, null)
+  assert.equal(scrollAt(anchors, 10), 50)
+  assert.equal(scrollAt(anchors, 12), 150)
+  assert.equal(scrollAt(anchors, 14), 250)
+})
+
+test('the line after an include maps to the end of its content', () => {
+  const anchors = map.fileAnchorsWithIncludes(PARENT_ENTRIES, PARENT_INCLUDES, null)
+  assert.equal(scrollAt(anchors, 11), 150)
+  assert.equal(scrollAt(anchors, 13), 250)
+  assert.equal(scrollAt(anchors, 15), 300)
+})
+
+test('a line between two includes interpolates inside the gap only', () => {
+  const entries = [
+    { line: 7, top: 0, bottom: 50 },
+    { line: 1, src: 0, top: 50, bottom: 100 },
+    { line: 1, src: 1, top: 140, bottom: 200 },
+  ]
+  const includes = [
+    { parent: null, line: 10, file: 0 },
+    { parent: null, line: 14, file: 1 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assert.equal(scrollAt(anchors, 10), 50)
+  assert.equal(scrollAt(anchors, 11), 100)
+  assert.equal(scrollAt(anchors, 12.5), 120)
+  assert.equal(scrollAt(anchors, 14), 140)
+})
+
+test('an own anchor right after an include is kept, not replaced by its end', () => {
+  const entries = [
+    { line: 7, top: 0, bottom: 50 },
+    { line: 1, src: 0, top: 50, bottom: 100 },
+    { line: 11, top: 110, bottom: 150 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, [{ parent: null, line: 10, file: 0 }], null)
+  assert.equal(scrollAt(anchors, 11), 110)
+})
+
+test('a nested include counts into the content of its parent include', () => {
+  const entries = [
+    { line: 1, top: 0, bottom: 40 },
+    { line: 1, src: 0, top: 40, bottom: 80 },
+    { line: 1, src: 1, top: 80, bottom: 140 },
+    { line: 5, src: 0, top: 140, bottom: 200 },
+    { line: 9, top: 200, bottom: 240 },
+  ]
+  const includes = [
+    { parent: null, line: 3, file: 0 },
+    { parent: 0, line: 3, file: 1 },
+  ]
+  const main = map.fileAnchorsWithIncludes(entries, includes, null)
+  assert.equal(scrollAt(main, 3), 40)
+  assert.equal(scrollAt(main, 4), 200)
+  // In the child file the nested include has its own start and end.
+  const child = map.fileAnchorsWithIncludes(entries, includes, 0)
+  assert.equal(scrollAt(child, 1), 40)
+  assert.equal(scrollAt(child, 3), 80)
+  assert.equal(scrollAt(child, 4), 140)
+  assert.equal(scrollAt(child, 5), 140)
+})
+
+test('an include that rendered nothing adds no anchor', () => {
+  const entries = [
+    { line: 7, top: 0, bottom: 50 },
+    { line: 1, src: 1, top: 50, bottom: 100 },
+  ]
+  const includes = [
+    { parent: null, line: 10, file: 0 },
+    { parent: null, line: 12, file: 1 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assert.deepEqual(anchors.map((a) => a.line), [7, 12, 13])
+})
+
+test('the same file included twice in a row gets one extent per include', () => {
+  const entries = [
+    { line: 1, src: 0, top: 0, bottom: 50 },
+    { line: 2, src: 0, top: 50, bottom: 100 },
+    { line: 1, src: 0, top: 100, bottom: 150 },
+    { line: 2, src: 0, top: 150, bottom: 200 },
+  ]
+  const includes = [
+    { parent: null, line: 4, file: 0 },
+    { parent: null, line: 6, file: 0 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assert.equal(scrollAt(anchors, 4), 0)
+  assert.equal(scrollAt(anchors, 5), 100)
+  assert.equal(scrollAt(anchors, 6), 100)
+  assert.equal(scrollAt(anchors, 7), 200)
+})
+
+test('without includes the anchors are those of fileAnchors', () => {
+  const entries = [
+    { line: 1, top: 0, bottom: 20 },
+    { line: 3, top: 30, bottom: 60 },
+    { line: 2, src: 0, top: 60, bottom: 90 },
+  ]
+  for (const src of [null, 0]) {
+    assert.deepEqual(
+      map.fileAnchorsWithIncludes(entries, [], src),
+      JSON.parse(JSON.stringify(map.fileAnchors(entries, src)))
+    )
+  }
+})
+
+test('parseIncludeTable reads the include list and drops malformed input', () => {
+  assert.deepEqual(
+    map.parseIncludeTable('[{"parent":null,"line":3,"file":0},{"parent":0,"line":3,"file":1}]'),
+    [{ parent: null, line: 3, file: 0 }, { parent: 0, line: 3, file: 1 }]
+  )
+  assert.deepEqual(map.parseIncludeTable('[1,{"parent":"x","line":1,"file":0}]'), [])
+  for (const bad of ['', '[', '{}', 'null', undefined]) {
+    assert.deepEqual(map.parseIncludeTable(bad), [], String(bad))
+  }
+})
+
+function assertAscending(anchors) {
+  for (let i = 1; i < anchors.length; i++) {
+    assert.ok(anchors[i].line > anchors[i - 1].line, `line at ${i}`)
+    assert.ok(anchors[i].top >= anchors[i - 1].top, `top at ${i}`)
+  }
+}
+
+// docs/index.adoc: chapter 1 (file 0) on line 10, chapter 4 (file 1) with
+// leveloffset=+1 on line 12, chapter 5 (file 2) on line 14. Chapter 4 becomes
+// a sect2 and sits inside chapter 1's sect1, whose bottom lies below it.
+const NESTED_BOXES = [
+  { line: 7, top: 0, bottom: 50 },
+  { line: 1, src: 0, top: 50, bottom: 600 },
+  { line: 3, src: 0, top: 100, bottom: 200 },
+  { line: 9, src: 0, top: 200, bottom: 300 },
+  { line: 1, src: 1, top: 400, bottom: 580 },
+  { line: 3, src: 1, top: 450, bottom: 500 },
+  { line: 1, src: 2, top: 600, bottom: 900 },
+  { line: 3, src: 2, top: 650, bottom: 700 },
+]
+
+test('a section container enclosing the next include keeps the anchors ascending', () => {
+  const anchors = map.fileAnchorsWithIncludes(NESTED_BOXES, PARENT_INCLUDES, null)
+  assertAscending(anchors)
+  assert.equal(scrollAt(anchors, 10), 50)
+  assert.equal(scrollAt(anchors, 11), 400)
+  assert.equal(scrollAt(anchors, 12), 400)
+  assert.equal(scrollAt(anchors, 13), 580)
+  assert.equal(scrollAt(anchors, 14), 600)
+})
+
+test('line to scroll to line round trip on nested includes', () => {
+  const anchors = map.fileAnchorsWithIncludes(NESTED_BOXES, PARENT_INCLUDES, null)
+  for (const line of [7, 10, 12, 14]) {
+    const top = scrollAt(anchors, line)
+    assert.equal(map.sourceLineAtViewportTop(anchors, top), line, String(line))
+  }
+})
+
+test('an include anchor out of order against its neighbours is dropped', () => {
+  const entries = [
+    { line: 7, top: 100, bottom: 150 },
+    { line: 1, src: 0, top: 50, bottom: 120 },
+  ]
+  const includes = [{ parent: null, line: 10, file: 0 }]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assertAscending(anchors)
+  assert.deepEqual(anchors.map((a) => a.line), [7, 11])
+})
+
+test('a file shown verbatim first and rendered later is not taken by the first include', () => {
+  const entries = [
+    { line: 5, top: 0, bottom: 50 },
+    { line: 7, top: 50, bottom: 100 },
+    { line: 10, top: 100, bottom: 150 },
+    { line: 1, src: 0, top: 150, bottom: 200 },
+    { line: 2, src: 0, top: 200, bottom: 250 },
+  ]
+  const includes = [
+    { parent: null, line: 8, file: 0 },
+    { parent: null, line: 12, file: 0 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assertAscending(anchors)
+  assert.deepEqual(anchors.map((a) => a.line), [5, 7, 10, 12, 13])
+  assert.equal(scrollAt(anchors, 12), 150)
+  assert.equal(scrollAt(anchors, 13), 250)
+})
+
+test('nesting is per include: a direct include of a nested file is not swallowed', () => {
+  // main includes A (line 10), A includes B on its line 3, main includes B
+  // directly (line 12).
+  const entries = [
+    { line: 1, src: 0, top: 0, bottom: 50 },
+    { line: 1, src: 1, top: 50, bottom: 100 },
+    { line: 5, src: 0, top: 100, bottom: 150 },
+    { line: 1, src: 1, top: 150, bottom: 200 },
+  ]
+  const includes = [
+    { parent: null, line: 10, file: 0 },
+    { parent: 0, line: 3, file: 1 },
+    { parent: null, line: 12, file: 1 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assertAscending(anchors)
+  assert.equal(scrollAt(anchors, 10), 0)
+  assert.equal(scrollAt(anchors, 11), 150)
+  assert.equal(scrollAt(anchors, 12), 150)
+  assert.equal(scrollAt(anchors, 13), 200)
+})
+
+test('two direct includes where the first includes nothing keep separate extents', () => {
+  const entries = [
+    { line: 1, src: 0, top: 0, bottom: 50 },
+    { line: 1, src: 1, top: 50, bottom: 100 },
+  ]
+  const includes = [
+    { parent: null, line: 10, file: 0 },
+    { parent: null, line: 12, file: 1 },
+  ]
+  const anchors = map.fileAnchorsWithIncludes(entries, includes, null)
+  assert.equal(scrollAt(anchors, 10), 0)
+  assert.equal(scrollAt(anchors, 12), 50)
+  assert.equal(scrollAt(anchors, 13), 100)
+})

@@ -69,6 +69,13 @@
    * neighbours, and the interpolation spans it.
    */
   function fileAnchors(entries, src) {
+    return ownEntries(entries, src).map(function (own) {
+      return { line: own.line, top: own.top }
+    })
+  }
+
+  /** The entries `fileAnchors` keeps, with their index in `entries`. */
+  function ownEntries(entries, src) {
     var wanted = src === undefined ? null : src
     var result = []
     var last = 0
@@ -78,10 +85,172 @@
       if (from !== wanted) continue
       if (entry.line < last && wanted !== null && result.length) break
       if (entry.line <= last) continue
-      result.push({ line: entry.line, top: entry.top })
+      result.push({ line: entry.line, top: entry.top, index: i })
       last = entry.line
     }
     return result
+  }
+
+  /**
+   * Anchors of one file like `fileAnchors`, plus two per include directive of
+   * that file, so a cursor on the directive lands on the included content
+   * instead of somewhere interpolated between the file's own blocks. The
+   * included blocks carry the other file's lines and are no anchors of this
+   * one. `includes` is the page's include table, `{parent, line, file}`
+   * entries (`parent` null for the main file, as `src`); entries need
+   * `bottom` besides `top`.
+   *
+   * For the directive on line L: an anchor at L at the top of the first
+   * element of the included content, and an anchor at L + 1 at the bottom of
+   * its last element, unless the file has an anchor there. The content
+   * includes what the included file includes itself. An include that rendered
+   * nothing adds nothing.
+   */
+  function fileAnchorsWithIncludes(entries, includes, src) {
+    var wanted = src === undefined ? null : src
+    var own = ownEntries(entries, wanted)
+    var anchors = own.map(function (entry) {
+      return { line: entry.line, top: entry.top }
+    })
+    var mine = (includes || [])
+      .filter(function (inc) { return inc.parent === wanted })
+      .sort(function (a, b) { return a.line - b.line })
+    if (!mine.length) return anchors
+
+    var starts = []
+    var ends = []
+    var resume = 0
+    for (var i = 0; i < mine.length; i++) {
+      var inc = mine[i]
+      var from = resume
+      for (var j = 0; j < own.length; j++) {
+        if (own[j].line < inc.line) from = Math.max(from, own[j].index + 1)
+      }
+      var extent = includeExtent(entries, includes, inc, from)
+      if (!extent) continue
+      starts.push({ line: inc.line, top: extent.top })
+      ends.push({ line: inc.line + 1, top: extent.bottom })
+      resume = extent.end
+    }
+
+    var taken = {}
+    var merged = []
+    function add(anchor) {
+      if (taken[anchor.line]) return
+      taken[anchor.line] = true
+      merged.push({ line: anchor.line, top: anchor.top, include: anchor.include })
+    }
+    starts.forEach(function (a) { add({ line: a.line, top: a.top, include: true }) })
+    anchors.forEach(add)
+    ends.forEach(function (a) { add({ line: a.line, top: a.top, include: true }) })
+    merged.sort(function (a, b) { return a.line - b.line })
+
+    // Guard: an include anchor that would break the order in `top` against
+    // its neighbours (the file's own anchors, or the include anchors kept so
+    // far) is dropped, so the result ascends in line and top alike.
+    var nextOwnTop = new Array(merged.length)
+    var ahead = Infinity
+    for (var k = merged.length - 1; k >= 0; k--) {
+      nextOwnTop[k] = ahead
+      if (!merged[k].include) ahead = merged[k].top
+    }
+    var result = []
+    var floor = -Infinity
+    merged.forEach(function (anchor, index) {
+      if (anchor.include && (anchor.top < floor || anchor.top > nextOwnTop[index])) return
+      floor = Math.max(floor, anchor.top)
+      result.push({ line: anchor.line, top: anchor.top })
+    })
+    return result
+  }
+
+  /**
+   * The files whose content belongs to one include of `file`, as the number
+   * of times each may occur in it: `file` once, plus one occurrence per
+   * distinct include directive found in it, and so on down. Global
+   * membership would let one include swallow a later direct include of a
+   * file that it only includes itself at another place.
+   */
+  function nestedBudget(includes, file) {
+    var budget = {}
+    budget[file] = 1
+    function add(parent, depth) {
+      var seen = {}
+      includes.forEach(function (child) {
+        var key = child.line + ':' + child.file
+        if (child.parent !== parent || seen[key] || depth > 16) return
+        seen[key] = true
+        budget[child.file] = (budget[child.file] || 0) + 1
+        add(child.file, depth + 1)
+      })
+    }
+    add(file, 0)
+    return budget
+  }
+
+  /** Whether `file` is included by `ancestor`, directly or through others. */
+  function includesFile(includes, ancestor, file, depth) {
+    return depth <= 16 && includes.some(function (inc) {
+      return inc.parent === ancestor &&
+        (inc.file === file || includesFile(includes, inc.file, file, depth + 1))
+    })
+  }
+
+  /**
+   * The rendered content of include `inc`, looking at `entries` from index
+   * `from`: top of its first element, bottom of its last, and the index after
+   * it. `null` if nothing of it rendered. Content is every element of
+   * `inc.file` or of a file it includes (see `nestedBudget`), up to the first
+   * element of another file or a line of a file that falls back (its next
+   * occurrence). The search stops at the first own block of the parent after
+   * the directive: content comes before it, so a file that rendered nowhere
+   * at `inc` (inside a listing) does not take a later occurrence. The bottom
+   * is capped at the top of the next entry, because a first element that is
+   * a section container encloses what follows it.
+   */
+  function includeExtent(entries, includes, inc, from) {
+    var parent = inc.parent
+    var limit = entries.length
+    for (var p = from; p < entries.length; p++) {
+      var own = entries[p].src === undefined ? null : entries[p].src
+      if (own === parent && entries[p].line > inc.line) {
+        limit = p
+        break
+      }
+    }
+    var budget = nestedBudget(includes, inc.file)
+    var occurrences = {}
+    var lastLine = {}
+    var previous = -1
+    var first = -1
+    var last = -1
+    for (var i = from; i < limit; i++) {
+      var entry = entries[i]
+      var inside = entry.src !== undefined && budget[entry.src] > 0
+      if (first < 0) {
+        if (inside) first = i
+        else continue
+      } else if (!inside) {
+        break
+      }
+      var seen = occurrences[entry.src] || 0
+      var resumed = entry.src === previous || includesFile(includes, entry.src, previous, 0)
+      if (seen === 0 || entry.line < lastLine[entry.src] || !resumed) {
+        if (seen >= budget[entry.src]) break
+        occurrences[entry.src] = seen + 1
+      }
+      lastLine[entry.src] = entry.line
+      previous = entry.src
+      last = i
+    }
+    if (first < 0) return null
+    var top = entries[first].top
+    var bottom = top
+    for (var n = first; n <= last; n++) {
+      if (entries[n].bottom > bottom) bottom = entries[n].bottom
+    }
+    if (last + 1 < entries.length) bottom = Math.max(top, Math.min(bottom, entries[last + 1].top))
+    return { top: top, bottom: bottom, end: last + 1 }
   }
 
   /** Anchors of the main file; see `fileAnchors`. */
@@ -102,6 +271,27 @@
       return []
     }
     return Array.isArray(table) ? table : []
+  }
+
+  /**
+   * The include table of a page: the JSON text of
+   * `<script id="adoc-source-includes">`, an array of `{parent, line, file}`
+   * (`parent` null for the main file, else a file table index). Empty for
+   * anything that is not such an array.
+   */
+  function parseIncludeTable(text) {
+    var table
+    try {
+      table = JSON.parse(text)
+    } catch (error) {
+      return []
+    }
+    if (!Array.isArray(table)) return []
+    return table.filter(function (inc) {
+      return inc !== null && typeof inc === 'object' &&
+        (inc.parent === null || Number.isInteger(inc.parent)) &&
+        Number.isInteger(inc.line) && Number.isInteger(inc.file)
+    })
   }
 
   /**
@@ -211,6 +401,8 @@
     parseAnchorClass: parseAnchorClass,
     fileAnchors: fileAnchors,
     mainFileAnchors: mainFileAnchors,
+    fileAnchorsWithIncludes: fileAnchorsWithIncludes,
+    parseIncludeTable: parseIncludeTable,
     parseFileTable: parseFileTable,
     srcForFile: srcForFile,
     withSentinel: withSentinel,

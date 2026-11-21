@@ -12,7 +12,9 @@
  * the editor is in, which can be one the shown document includes. The page
  * maps it through the file table (`<script id="adoc-source-files">` in the
  * HTML): the shown document's own anchors have no `data-src-K`, an included
- * file's have its index K. A cursor in a file that the shown document does
+ * file's have its index K. The include table (`<script
+ * id="adoc-source-includes">`) lets a cursor on an `include::` line scroll to
+ * the included content. A cursor in a file that the shown document does
  * not contain is kept and applied once HTML that contains it has arrived.
  *
  * Mapping logic lives in scroll-map.js; this file only touches the DOM.
@@ -29,6 +31,7 @@
   var shownFile = null // file of the HTML in the page
   var lineCount = 0 // lines of that file, for the end sentinel
   var fileTable = [] // included files of the shown document, index = K
+  var includeTable = [] // its include directives: {parent, line, file}
   var cursor = null // last cursor event: {file, line}
 
   function followOn() {
@@ -48,6 +51,8 @@
   function readFileTable() {
     var script = document.getElementById('adoc-source-files')
     fileTable = maps.parseFileTable(script ? script.textContent : '[]')
+    var includes = document.getElementById('adoc-source-includes')
+    includeTable = maps.parseIncludeTable(includes ? includes.textContent : '[]')
   }
 
   /**
@@ -61,10 +66,12 @@
     for (var i = 0; i < elements.length; i++) {
       var parsed = maps.parseAnchorClass(elements[i].className)
       if (parsed === null) continue
-      parsed.top = elements[i].getBoundingClientRect().top
+      var rect = elements[i].getBoundingClientRect()
+      parsed.top = rect.top
+      parsed.bottom = rect.bottom
       entries.push(parsed)
     }
-    var own = maps.fileAnchors(entries, src)
+    var own = maps.fileAnchorsWithIncludes(entries, includeTable, src)
     if (src !== null) return own
     return maps.withSentinel(own, lineCount, content.getBoundingClientRect().bottom)
   }

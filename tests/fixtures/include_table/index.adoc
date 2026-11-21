@@ -1,0 +1,12 @@
+= Include Table
+:flag:
+
+include::offset.adoc[leveloffset=+1]
+
+include::tagged.adoc[tags=wanted]
+
+include::lines.adoc[lines=2..3]
+
+ifdef::flag[]
+include::guarded.adoc[]
+endif::[]

@@ -697,6 +697,92 @@ mod tests {
         assert!(html.contains("mid.adoc"), "{html}");
     }
 
+    #[tokio::test]
+    async fn test_nested_include_html_lists_the_includes() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/nested_include")
+            .canonicalize()
+            .unwrap();
+        let file = dir.join("index.adoc");
+        let html = AsciidoctorConverter::new()
+            .unwrap()
+            .convert(&ConvertRequest {
+                text: std::fs::read_to_string(&file).unwrap(),
+                file,
+                attributes: Vec::new(),
+                overlay: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let script = |id: &str| {
+            let open = format!(r#"<script type="application/json" id="{id}">"#);
+            let start = html.find(&open).unwrap() + open.len();
+            let end = start + html[start..].find("</script>").unwrap();
+            serde_json::from_str::<serde_json::Value>(&html[start..end]).unwrap()
+        };
+        let files = script("adoc-source-files");
+        assert_eq!(files.as_array().unwrap().len(), 2, "{html}");
+        // mid.adoc is file 0, inner.adoc file 1. The main file is `null`;
+        // the directives stand on line 3 of index.adoc and of mid.adoc.
+        assert_eq!(
+            script("adoc-source-includes"),
+            serde_json::json!([
+                {"parent": null, "line": 3, "file": 0},
+                {"parent": 0, "line": 3, "file": 1},
+            ]),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_include_table_covers_option_and_conditional_includes() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/include_table")
+            .canonicalize()
+            .unwrap();
+        let file = dir.join("index.adoc");
+        let html = AsciidoctorConverter::new()
+            .unwrap()
+            .convert(&ConvertRequest {
+                text: std::fs::read_to_string(&file).unwrap(),
+                file,
+                attributes: Vec::new(),
+                overlay: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let script = |id: &str| {
+            let open = format!(r#"<script type="application/json" id="{id}">"#);
+            let start = html.find(&open).unwrap() + open.len();
+            let end = start + html[start..].find("</script>").unwrap();
+            serde_json::from_str::<serde_json::Value>(&html[start..end]).unwrap()
+        };
+        // offset (leveloffset), tagged (tags=), lines (lines=) and guarded
+        // (inside ifdef) are files 0 to 3; each directive is on its own line
+        // of index.adoc, the guarded one below its `ifdef` line.
+        assert_eq!(
+            script("adoc-source-includes"),
+            serde_json::json!([
+                {"parent": null, "line": 4, "file": 0},
+                {"parent": null, "line": 6, "file": 1},
+                {"parent": null, "line": 8, "file": 2},
+                {"parent": null, "line": 11, "file": 3},
+            ]),
+            "{html}"
+        );
+        // The blocks carry the lines of the selected part of their file.
+        assert!(html.contains("sect1 data-src-0 data-line-1"), "{html}");
+        assert!(html.contains("paragraph data-src-1 data-line-4"), "{html}");
+        assert!(html.contains("paragraph data-src-2 data-line-3"), "{html}");
+        assert!(html.contains("paragraph data-src-3 data-line-1"), "{html}");
+    }
+
     /// Convert `text` as `file` with `root` as the workspace root.
     async fn convert_with_root(root: &Path, file: PathBuf, text: &str) -> String {
         AsciidoctorConverter::new()

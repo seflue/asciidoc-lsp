@@ -1,0 +1,7 @@
+Before.
+
+// tag::wanted[]
+Tagged text.
+// end::wanted[]
+
+After.
