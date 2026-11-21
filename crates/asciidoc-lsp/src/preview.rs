@@ -11,20 +11,24 @@
 //! replaces hyper, hyper-util and http-body-util.
 //!
 //! Routes below `/<token>/`: the page itself, `style.css`, `page.js`,
-//! `scroll-map.js`, `morphdom.js` and `events` (SSE), and `files/<path>`: a
-//! regular file below the workspace root (the page's local images), checked
-//! on its canonical path so `..` and symlinks cannot leave the root.
+//! `scroll-map.js`, `morphdom.js` and `events` (SSE), and `files/<path>`: an
+//! image file below the workspace root that the shown document names. The
+//! converter lists those images at the end of its HTML; the server resolves
+//! each to a canonical path and serves a request only if its own canonical
+//! path is in that list and has an image extension, so `..`, symlinks and
+//! files the document does not use stay out.
 //!
 //! Events, each with one line of JSON as data:
 //! - `html`: `{file, lineCount, html}`, a finished conversion of `file`: the
 //!   top-level document in whole-document mode, else the active file. The
-//!   HTML ends with the file table of its includes.
+//!   HTML ends with the file table of its includes; the image list is cut
+//!   off before the event goes out.
 //! - `cursor`: `{file, line}`; `file` is the file the editor is in, which can
 //!   be one that `file` includes, and `line` a 1-based source line of it, see
 //!   [`Preview::set_cursor`].
 //! - `convert-error`: `{message}`, the conversion failed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::net::Ipv4Addr;
@@ -113,6 +117,9 @@ struct Shared {
     stylesheet: String,
     /// Workspace root that `files/` serves from.
     root: Option<PathBuf>,
+    /// Canonical paths of the images the shown document names; the only
+    /// files `files/` serves.
+    allowed_images: Mutex<HashSet<PathBuf>>,
     events: broadcast::Sender<Event>,
     snapshot: Mutex<Snapshot>,
     /// Lines of the last text requested per file, for the page's end sentinel.
@@ -145,6 +152,10 @@ impl Shared {
     fn publish_outcome(&self, outcome: ConvertOutcome) {
         match outcome.result {
             Ok(html) => {
+                let (html, images) = split_image_list(&html);
+                // Before the event: the page asks for the images as soon as
+                // it has the HTML.
+                self.set_allowed_images(&images);
                 let line_count = self
                     .line_counts
                     .lock()
@@ -165,6 +176,25 @@ impl Shared {
                 &serde_json::json!({ "message": error.to_string() }),
             )),
         }
+    }
+
+    /// Replace the allowlist by the canonical paths of `listed` (paths below
+    /// the root, as in the `src`). Entries that do not resolve or lie
+    /// outside the canonical root are dropped.
+    fn set_allowed_images(&self, listed: &[String]) {
+        let Some(root) = self
+            .root
+            .as_deref()
+            .and_then(|root| root.canonicalize().ok())
+        else {
+            self.allowed_images.lock().clear();
+            return;
+        };
+        let allowed = listed
+            .iter()
+            .filter_map(|relative| canonical_inside(&root, relative))
+            .collect();
+        *self.allowed_images.lock() = allowed;
     }
 
     fn allows_host(&self, host: &str) -> bool {
@@ -217,6 +247,7 @@ impl Preview {
             port,
             stylesheet,
             root,
+            allowed_images: Mutex::new(HashSet::new()),
             events,
             snapshot: Mutex::new(Snapshot::default()),
             line_counts: Mutex::new(HashMap::new()),
@@ -485,7 +516,7 @@ async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<
             )
             .await
         }
-        Routed::File(path) => match read_workspace_file(shared.root.as_deref(), &path).await {
+        Routed::File(path) => match read_workspace_file(shared, &path).await {
             Some((content_type, body)) => {
                 write_response(&mut stream, 200, content_type, "", &body).await
             }
@@ -534,24 +565,31 @@ fn content_type_of(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// The image at `encoded` (a percent-encoded path below `root`) and its
-/// content type, or `None` if it is not an image file inside the root.
-///
-/// The path is checked twice: only plain names are accepted (no `..`, no
-/// absolute path), and the canonical path, with symlinks resolved, must lie
-/// inside the canonical root.
-async fn read_workspace_file(
-    root: Option<&Path>,
-    encoded: &str,
-) -> Option<(&'static str, Vec<u8>)> {
-    let root = root?.to_owned();
-    let relative = PathBuf::from(percent_decode(encoded)?);
-    tokio::task::spawn_blocking(move || read_inside(&root, &relative))
-        .await
-        .ok()?
+/// Opening tag of the image list that the converter puts last in its HTML.
+const IMAGE_LIST_OPEN: &str = r#"<script type="application/json" id="adoc-image-files">"#;
+const IMAGE_LIST_CLOSE: &str = "</script>\n";
+
+/// Cut the image list off the end of `html`: the HTML without it, and the
+/// paths it names. The list sits at the very end, so only the last opening
+/// tag counts and document text that looks like one cannot take its place.
+/// Without a well-formed list, no image is allowed.
+fn split_image_list(html: &str) -> (&str, Vec<String>) {
+    let Some(start) = html.rfind(IMAGE_LIST_OPEN) else {
+        return (html, Vec::new());
+    };
+    let Some(json) = html[start + IMAGE_LIST_OPEN.len()..].strip_suffix(IMAGE_LIST_CLOSE) else {
+        return (html, Vec::new());
+    };
+    // The converter wrote `<\/` for `</`, which is the same JSON string.
+    let images = serde_json::from_str(json).unwrap_or_default();
+    (&html[..start], images)
 }
 
-fn read_inside(root: &Path, relative: &Path) -> Option<(&'static str, Vec<u8>)> {
+/// The canonical path of `relative` below the canonical `root`, if it names
+/// an existing path inside it. `relative` must be plain names only: no `..`,
+/// no absolute path.
+fn canonical_inside(root: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative);
     if relative.as_os_str().is_empty()
         || !relative
             .components()
@@ -559,14 +597,38 @@ fn read_inside(root: &Path, relative: &Path) -> Option<(&'static str, Vec<u8>)> 
     {
         return None;
     }
-    let content_type = content_type_of(relative)?;
-    let root = root.canonicalize().ok()?;
     let path = root.join(relative).canonicalize().ok()?;
-    if !path.starts_with(&root) || !path.metadata().ok()?.is_file() {
+    path.starts_with(root).then_some(path)
+}
+
+/// The image at `encoded` (a percent-encoded path below the root) and its
+/// content type, or `None` if the shown document does not name it.
+///
+/// The request path is resolved like the listed ones: plain names only, then
+/// canonical, with symlinks resolved. It is served only if that canonical
+/// path is in the allowlist and itself has an image extension, so a symlink
+/// named `logo.png` that points at another kind of file is not an image.
+async fn read_workspace_file(shared: &Shared, encoded: &str) -> Option<(&'static str, Vec<u8>)> {
+    let root = shared.root.as_ref()?.clone();
+    let relative = percent_decode(encoded)?;
+    let path = tokio::task::spawn_blocking(move || {
+        canonical_inside(&root.canonicalize().ok()?, &relative)
+    })
+    .await
+    .ok()??;
+    let content_type = content_type_of(&path)?;
+    if !shared.allowed_images.lock().contains(&path) {
         return None;
     }
-    let body = std::fs::read(&path).ok()?;
-    Some((content_type, body))
+    tokio::task::spawn_blocking(move || {
+        path.metadata()
+            .ok()?
+            .is_file()
+            .then(|| std::fs::read(&path).ok())?
+    })
+    .await
+    .ok()?
+    .map(|body| (content_type, body))
 }
 
 async fn write_events(stream: &mut TcpStream, events: &[Event]) -> io::Result<()> {
@@ -621,8 +683,43 @@ pub(crate) mod testing {
         }
     }
 
+    /// Like [`EchoConverter`], and every line `img:<path>` of the text is an
+    /// image the document names, listed as Ruby's postprocessor lists them.
+    /// A text with the word `fail` does not convert.
+    pub(crate) struct ImageConverter;
+
+    impl Convert for ImageConverter {
+        async fn convert(&self, request: &ConvertRequest) -> Result<String, ConvertError> {
+            if request.text.contains("fail") {
+                return Err(ConvertError::InvalidOutput);
+            }
+            let images: Vec<&str> = request
+                .text
+                .lines()
+                .filter_map(|line| line.strip_prefix("img:"))
+                .collect();
+            Ok(format!(
+                "<p>{}</p>\n<script type=\"application/json\" id=\"adoc-image-files\">{}</script>\n",
+                request.text,
+                serde_json::to_string(&images).unwrap()
+            ))
+        }
+    }
+
     pub(crate) async fn start() -> Preview {
         start_with_root(None).await
+    }
+
+    /// A preview with [`ImageConverter`], serving from below `root`.
+    pub(crate) async fn start_with_images(root: PathBuf) -> Preview {
+        Preview::start(
+            ImageConverter,
+            Duration::from_millis(10),
+            "body{}".to_owned(),
+            Some(root),
+        )
+        .await
+        .unwrap()
     }
 
     /// Like [`start`], serving workspace files from below `root`.
@@ -703,7 +800,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{address, get, request, start, start_with_root, Stream};
+    use super::testing::{address, get, request, start, start_with_images, Stream};
     use super::*;
 
     fn status_line(response: &str) -> &str {
@@ -756,6 +853,7 @@ mod tests {
         let root = outer.join("ws");
         std::fs::create_dir_all(root.join("images")).unwrap();
         std::fs::write(root.join("images/pic.png"), b"PNG-bytes").unwrap();
+        std::fs::write(root.join("images/other.png"), b"other").unwrap();
         std::fs::write(root.join("images/my pic.SVG"), "<svg/>").unwrap();
         std::fs::write(root.join("images/data.bin"), "x").unwrap();
         std::fs::write(root.join("images/PIC.TXT"), "x").unwrap();
@@ -765,12 +863,44 @@ mod tests {
         (tmp, root)
     }
 
+    /// Convert `text` as the shown document and wait for its html event.
+    /// `text` ends in `done` plus `tag`, which marks this conversion.
+    async fn show(preview: &Preview, stream: &mut Stream, images: &[&str], tag: &str) {
+        let mut text = String::new();
+        for image in images {
+            text.push_str(&format!("img:{image}\n"));
+        }
+        text.push_str(&format!("done{tag}"));
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/doc.adoc"),
+            text,
+            attributes: Vec::new(),
+            overlay: Vec::new(),
+        });
+        stream.until(&format!("done{tag}</p>")).await;
+    }
+
+    async fn file_status(port: u16, token: &str, path: &str) -> String {
+        let host = format!("127.0.0.1:{port}");
+        let response = get(port, &format!("/{token}/files/{path}"), &host).await;
+        assert!(!response.contains("secret"), "{path}: {response}");
+        status_line(&response).to_owned()
+    }
+
     #[tokio::test]
-    async fn workspace_images_are_served_with_their_type() {
+    async fn referenced_images_are_served_with_their_type() {
         let (_tmp, root) = image_workspace();
-        let preview = start_with_root(Some(root)).await;
+        let preview = start_with_images(root).await;
         let (port, token) = address(&preview);
         let host = format!("127.0.0.1:{port}");
+        let mut stream = Stream::open(port, &token).await;
+        show(
+            &preview,
+            &mut stream,
+            &["images/pic.png", "images/my pic.SVG"],
+            "1",
+        )
+        .await;
         for (path, content_type) in [
             ("images/pic.png", "image/png"),
             ("images/my%20pic.SVG", "image/svg+xml"),
@@ -796,15 +926,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_image_list_does_not_reach_the_page() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_images(root).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show(&preview, &mut stream, &["images/pic.png"], "1").await;
+        let all = stream.until("done1</p>").await;
+        assert!(!all.contains("adoc-image-files"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn an_unreferenced_image_is_not_found() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_images(root).await;
+        let (port, token) = address(&preview);
+        assert!(file_status(port, &token, "images/pic.png")
+            .await
+            .contains("404"));
+        let mut stream = Stream::open(port, &token).await;
+        show(&preview, &mut stream, &["images/pic.png"], "1").await;
+        assert!(file_status(port, &token, "images/pic.png")
+            .await
+            .contains("200"));
+        assert!(file_status(port, &token, "images/other.png")
+            .await
+            .contains("404"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_referenced_symlink_to_a_non_image_is_not_found() {
+        let (_tmp, root) = image_workspace();
+        std::fs::write(root.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.txt"), root.join("logo.png")).unwrap();
+        let preview = start_with_images(root).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show(&preview, &mut stream, &["logo.png", "images/pic.png"], "1").await;
+        assert!(file_status(port, &token, "logo.png").await.contains("404"));
+        assert!(file_status(port, &token, "images/pic.png")
+            .await
+            .contains("200"));
+    }
+
+    #[tokio::test]
+    async fn an_image_removed_from_the_text_is_not_found_after_the_next_conversion() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_images(root).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show(&preview, &mut stream, &["images/pic.png"], "1").await;
+        assert!(file_status(port, &token, "images/pic.png")
+            .await
+            .contains("200"));
+        show(&preview, &mut stream, &["images/other.png"], "2").await;
+        assert!(file_status(port, &token, "images/pic.png")
+            .await
+            .contains("404"));
+        assert!(file_status(port, &token, "images/other.png")
+            .await
+            .contains("200"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_conversion_keeps_the_previous_allowlist() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_images(root).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show(&preview, &mut stream, &["images/pic.png"], "1").await;
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/doc.adoc"),
+            text: "img:images/other.png\nfail".to_owned(),
+            attributes: Vec::new(),
+            overlay: Vec::new(),
+        });
+        stream.until("event: convert-error").await;
+        assert!(file_status(port, &token, "images/pic.png")
+            .await
+            .contains("200"));
+        assert!(file_status(port, &token, "images/other.png")
+            .await
+            .contains("404"));
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_is_set_before_the_html_event_goes_out() {
+        let (_tmp, root) = image_workspace();
+        let preview = start_with_images(root).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        for round in 0..20 {
+            let image = if round % 2 == 0 {
+                "images/pic.png"
+            } else {
+                "images/other.png"
+            };
+            show(&preview, &mut stream, &[image], &round.to_string()).await;
+            // Asked for right after the event, as the browser does.
+            assert!(
+                file_status(port, &token, image).await.contains("200"),
+                "round {round}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn workspace_files_outside_the_root_or_missing_are_not_found() {
         let (_tmp, root) = image_workspace();
-        let preview = start_with_root(Some(root)).await;
+        let preview = start_with_images(root).await;
         let (port, token) = address(&preview);
         let host = format!("127.0.0.1:{port}");
+        let mut stream = Stream::open(port, &token).await;
+        // Even a document that names them cannot make these servable.
+        let named = [
+            "../secret.png",
+            "images/link.png",
+            "images/missing.png",
+            "images/data.bin",
+            "images/PIC.TXT",
+            "images",
+            "/etc/passwd",
+        ];
+        show(&preview, &mut stream, &named, "1").await;
         for path in [
             "../secret.png",
             "%2e%2e/secret.png",
             "images/../../secret.png",
+            "images/../images/pic.png",
             "images/link.png",
             "images/missing.png",
             "images/data.bin",
@@ -824,8 +1074,10 @@ mod tests {
     #[tokio::test]
     async fn workspace_files_keep_host_token_and_method_checks() {
         let (_tmp, root) = image_workspace();
-        let preview = start_with_root(Some(root)).await;
+        let preview = start_with_images(root).await;
         let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show(&preview, &mut stream, &["images/pic.png"], "1").await;
         let host = format!("127.0.0.1:{port}");
         let target = format!("/{token}/files/images/pic.png");
         let response = get(port, &target, "evil.example").await;

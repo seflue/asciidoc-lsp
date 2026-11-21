@@ -6,7 +6,9 @@
 #   file table in the page's `<script id="adoc-source-files">`.
 #
 # - Local image URLs become `files/<path below the workspace root>`, which the
-#   preview server serves; the root comes in ASCIIDOC_LSP_ROOT.
+#   preview server serves; the root comes in ASCIIDOC_LSP_ROOT. The output ends
+#   with `<script id="adoc-image-files">`, a JSON array of those paths: the
+#   server serves only files the shown document names there.
 #
 # Loaded with `asciidoctor -r <this file>`.
 require 'asciidoctor/extensions'
@@ -113,11 +115,17 @@ class ImageSrcPostprocessor < Asciidoctor::Extensions::Postprocessor
     return output if root.nil? || root.empty?
     roots = [File.expand_path(root), AdocBufferOverlay.canonical(root)].uniq
     base = File.expand_path(doc.base_dir)
-    output.gsub(IMG_SRC) do
+    images = []
+    rewritten = output.gsub(IMG_SRC) do
       head, src, tail = $1, $2, $3
       rel = relative_to_root(src, base, roots)
+      images << rel if rel && rel.valid_encoding?
       rel ? "#{head}files/#{encode(rel)}#{tail}" : "#{head}#{src}#{tail}"
     end
+    # Last in the output, so the server finds it by its end. "</" must not
+    # end the script element early.
+    json = JSON.generate(images.uniq).gsub('</', '<\/')
+    %(#{rewritten}<script type="application/json" id="adoc-image-files">#{json}</script>\n)
   end
 
   private

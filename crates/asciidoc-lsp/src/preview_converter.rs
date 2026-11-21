@@ -772,6 +772,14 @@ mod tests {
         );
         // Outside the root: left alone, it will not be found.
         assert!(html.contains(r#"src="../../outside.png""#), "{html}");
+        // The list at the end names the rewritten images, decoded, and no
+        // others.
+        assert!(
+            html.ends_with(
+                "id=\"adoc-image-files\">[\"images/block.png\",\"images/my pic.png\",\"images/inline.png\"]</script>\n"
+            ),
+            "{html}"
+        );
     }
 
     #[tokio::test]
