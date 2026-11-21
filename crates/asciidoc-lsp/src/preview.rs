@@ -600,7 +600,10 @@ fn split_image_list(html: &str) -> (&str, Vec<String>) {
         return (html, Vec::new());
     };
     // The converter wrote `<\/` for `</`, which is the same JSON string.
-    let images = serde_json::from_str(json).unwrap_or_default();
+    let images = serde_json::from_str(json).unwrap_or_else(|error| {
+        tracing::warn!(%error, "preview image list is malformed; serving no images");
+        Vec::new()
+    });
     (&html[..start], images)
 }
 
