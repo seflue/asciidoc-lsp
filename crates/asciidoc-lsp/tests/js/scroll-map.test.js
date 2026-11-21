@@ -31,7 +31,7 @@ const assert = Object.assign(Object.create(strict), {
 test('script publishes AdocScrollMap on the global like in the browser', () => {
   assert.equal(typeof map, 'object')
   for (const name of ['parseAnchorClass', 'fileAnchors', 'mainFileAnchors',
-    'parseFileTable', 'srcForFile', 'withSentinel', 'anchorIndicesForLine',
+    'parseFileTable', 'bodyClassName', 'srcForFile', 'withSentinel', 'withPageTop', 'anchorIndicesForLine',
     'scrollTopForLine', 'sourceLineAtViewportTop', 'shouldScroll']) {
     assert.equal(typeof map[name], 'function', name)
   }
@@ -511,4 +511,48 @@ test('two direct includes where the first includes nothing keep separate extents
   assert.equal(scrollAt(anchors, 10), 0)
   assert.equal(scrollAt(anchors, 12), 50)
   assert.equal(scrollAt(anchors, 13), 100)
+})
+
+test('bodyClassName adds the listed classes to the base class', () => {
+  assert.equal(map.bodyClassName('article', '["toc2","toc-left"]'), 'article toc2 toc-left')
+  assert.equal(map.bodyClassName('article', '[]'), 'article')
+})
+
+test('bodyClassName drops what is not a class token', () => {
+  assert.equal(map.bodyClassName('article', '["a b",1,"","ok"]'), 'article ok')
+  assert.equal(map.bodyClassName('article', '{"a":1}'), 'article')
+  assert.equal(map.bodyClassName('article', 'not json'), 'article')
+})
+
+// A titled document: header (title, inline toc) on lines 1-2 carries no
+// anchor, the first block is at line 3 and lies 80px below the page top.
+const titled = [
+  { line: 3, top: 80 },
+  { line: 7, top: 280 },
+]
+
+test('withPageTop puts line 1 at the top of the page above the first block', () => {
+  assert.deepEqual(map.withPageTop(titled, 0), [{ line: 1, top: 0 }, ...titled])
+  assert.deepEqual(map.withPageTop(titled, 150), [{ line: 1, top: -150 }, ...titled])
+})
+
+test('withPageTop leaves anchors that start at line 1, and none, alone', () => {
+  assert.deepEqual(map.withPageTop(anchors, 40), anchors)
+  assert.deepEqual(map.withPageTop([], 40), [])
+})
+
+test('a cursor in the header scrolls to the page top, not to the first block', () => {
+  const page = map.withPageTop(titled, 0)
+  assert.equal(map.scrollTopForLine(page, 0, 1), 0)
+  assert.equal(map.scrollTopForLine(page, 0, 2), 40)
+  // Scrolled down by 300: the same page, client tops shifted.
+  const scrolled = map.withPageTop(titled.map((a) => ({ line: a.line, top: a.top - 300 })), 300)
+  assert.equal(map.scrollTopForLine(scrolled, 300, 1), 0)
+})
+
+test('a page scrolled to the top stays at the top when it is pinned', () => {
+  const page = map.withPageTop(titled, 0)
+  const line = map.sourceLineAtViewportTop(page, 0)
+  assert.equal(line, 1)
+  assert.equal(map.scrollTopForLine(page, 0, line), 0)
 })

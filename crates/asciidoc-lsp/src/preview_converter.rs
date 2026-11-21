@@ -360,7 +360,7 @@ impl AsciidoctorConverter {
         command
             .arg("-r")
             .arg(&self.extension.file)
-            .args(["-s", "-B"])
+            .args(["-s", "-a", "showtitle@", "-B"])
             .arg(base_dir)
             .arg("-a")
             .arg(format!("docfile={}", request.file.display()));
@@ -781,6 +781,131 @@ mod tests {
         assert!(html.contains("paragraph data-src-1 data-line-4"), "{html}");
         assert!(html.contains("paragraph data-src-2 data-line-3"), "{html}");
         assert!(html.contains("paragraph data-src-3 data-line-1"), "{html}");
+    }
+
+    /// Convert `text` as `/doc.adoc` without a workspace root.
+    async fn convert_plain(text: &str) -> String {
+        AsciidoctorConverter::new()
+            .unwrap()
+            .convert(&request(text))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_document_title_is_shown() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= The Title\n\n== Section\n\nText.\n").await;
+        assert!(html.contains("<h1>The Title</h1>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_document_can_hide_its_title() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= The Title\n:!showtitle:\n\nText.\n").await;
+        assert!(!html.contains("<h1"), "{html}");
+    }
+
+    /// The `adoc-body-classes` table: the classes the page puts on its body.
+    fn body_classes(html: &str) -> serde_json::Value {
+        let open = r#"<script type="application/json" id="adoc-body-classes">"#;
+        let start = html
+            .find(open)
+            .unwrap_or_else(|| panic!("no table: {html}"))
+            + open.len();
+        let end = start + html[start..].find("</script>").unwrap();
+        serde_json::from_str(&html[start..end]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_toc_left_is_a_sidebar() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= T\n:toc: left\n\n== A\n\nText.\n").await;
+        assert!(html.contains(r#"<div id="toc" class="toc2">"#), "{html}");
+        assert_eq!(body_classes(&html), serde_json::json!(["toc2", "toc-left"]));
+    }
+
+    #[tokio::test]
+    async fn test_toc_right_is_a_sidebar() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= T\n:toc: right\n\n== A\n\nText.\n").await;
+        assert!(html.contains(r#"<div id="toc" class="toc2">"#), "{html}");
+        assert_eq!(
+            body_classes(&html),
+            serde_json::json!(["toc2", "toc-right"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_toc_class_attribute_names_the_toc_class() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= T\n:toc: left\n:toc-class: side\n\n== A\n\nText.\n").await;
+        assert!(html.contains(r#"<div id="toc" class="side">"#), "{html}");
+        assert_eq!(body_classes(&html), serde_json::json!(["side", "toc-left"]));
+    }
+
+    #[tokio::test]
+    async fn test_toc_class_with_several_classes_reaches_the_body() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= T\n:toc: left\n:toc-class: toc2 wide\n\n== A\n\nText.\n").await;
+        assert!(
+            html.contains(r#"<div id="toc" class="toc2 wide">"#),
+            "{html}"
+        );
+        assert_eq!(
+            body_classes(&html),
+            serde_json::json!(["toc2", "wide", "toc-left"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sidebar_toc_without_a_title_is_rewritten() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= T\n:!showtitle:\n:toc: left\n\n== A\n\nText.\n").await;
+        assert!(html.starts_with(r#"<div id="toc" class="toc2">"#), "{html}");
+        assert_eq!(body_classes(&html), serde_json::json!(["toc2", "toc-left"]));
+    }
+
+    #[tokio::test]
+    async fn test_no_body_classes_when_the_toc_div_is_not_rewritten() {
+        if !asciidoctor_available() {
+            return;
+        }
+        // The manpage embedded output puts lines before the toc div.
+        let html = convert_plain(
+            "= t(1)\n:doctype: manpage\n:toc: left\n\n== NAME\n\nt - x\n\n== SYNOPSIS\n\nt\n",
+        )
+        .await;
+        assert!(!html.contains(r#"class="toc2""#), "{html}");
+        assert_eq!(body_classes(&html), serde_json::json!([]), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_toc_auto_keeps_the_inline_toc() {
+        if !asciidoctor_available() {
+            return;
+        }
+        for header in [":toc:", ":toc: auto", ":toc: preamble", ":toc: macro"] {
+            let html = convert_plain(&format!("= T\n{header}\n\n== A\n\nText.\n")).await;
+            assert!(!html.contains("toc2"), "{header}: {html}");
+            assert_eq!(body_classes(&html), serde_json::json!([]), "{header}");
+        }
+        let html = convert_plain("= T\n:toc:\n\n== A\n\nText.\n").await;
+        assert!(html.contains(r#"<div id="toc" class="toc">"#), "{html}");
     }
 
     /// Convert `text` as `file` with `root` as the workspace root.

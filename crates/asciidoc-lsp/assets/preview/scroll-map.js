@@ -274,6 +274,26 @@
   }
 
   /**
+   * The body class attribute for a page: `base` plus the classes in `text`,
+   * the JSON text of `<script id="adoc-body-classes">`. Entries that are not
+   * a single class token are dropped; anything else than an array adds none.
+   */
+  function bodyClassName(base, text) {
+    var list
+    try {
+      list = JSON.parse(text)
+    } catch (error) {
+      return base
+    }
+    if (!Array.isArray(list)) return base
+    var classes = [base]
+    for (var i = 0; i < list.length; i++) {
+      if (typeof list[i] === 'string' && /^[^\s]+$/.test(list[i])) classes.push(list[i])
+    }
+    return classes.join(' ')
+  }
+
+  /**
    * The include table of a page: the JSON text of
    * `<script id="adoc-source-includes">`, an array of `{parent, line, file}`
    * (`parent` null for the main file, else a file table index). Empty for
@@ -318,6 +338,18 @@
     var lastLine = anchors[anchors.length - 1].line
     var line = Math.max(lineCount, lastLine + 1)
     return anchors.concat([{ line: line, top: bottom }])
+  }
+
+  /**
+   * Anchor for the top of the page: the header (title, inline toc) has no
+   * anchor, so lines above the first block would map to that block and
+   * scroll the title away. Line 1 sits at the page top, `scrollY` above the
+   * current viewport; the lines in between interpolate. Anchors that start
+   * at line 1 already cover the top.
+   */
+  function withPageTop(anchors, scrollY) {
+    if (!anchors.length || anchors[0].line <= 1) return anchors
+    return [{ line: 1, top: -scrollY }].concat(anchors)
   }
 
   /**
@@ -404,8 +436,10 @@
     fileAnchorsWithIncludes: fileAnchorsWithIncludes,
     parseIncludeTable: parseIncludeTable,
     parseFileTable: parseFileTable,
+    bodyClassName: bodyClassName,
     srcForFile: srcForFile,
     withSentinel: withSentinel,
+    withPageTop: withPageTop,
     anchorIndicesForLine: anchorIndicesForLine,
     scrollTopForLine: scrollTopForLine,
     sourceLineAtViewportTop: sourceLineAtViewportTop,

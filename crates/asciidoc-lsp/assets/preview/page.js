@@ -33,6 +33,7 @@
   var fileTable = [] // included files of the shown document, index = K
   var includeTable = [] // its include directives: {parent, line, file}
   var cursor = null // last cursor event: {file, line}
+  var baseBodyClass = document.body.className // what the page itself puts on its body
 
   function followOn() {
     return followBox.checked
@@ -56,6 +57,15 @@
   }
 
   /**
+   * Body classes of the standalone page (`toc2 toc-left` for a sidebar toc):
+   * the sidebar is laid out by the stylesheet through them.
+   */
+  function applyBodyClasses() {
+    var script = document.getElementById('adoc-body-classes')
+    document.body.className = maps.bodyClassName(baseBodyClass, script ? script.textContent : '[]')
+  }
+
+  /**
    * Anchors of one file (`src`: `null` for the shown file, else K) with their
    * current client-Y, ready for the mapping functions. Only the shown file
    * gets the end sentinel: the page knows no line count for an included one.
@@ -73,7 +83,11 @@
     }
     var own = maps.fileAnchorsWithIncludes(entries, includeTable, src)
     if (src !== null) return own
-    return maps.withSentinel(own, lineCount, content.getBoundingClientRect().bottom)
+    return maps.withSentinel(
+      maps.withPageTop(own, window.scrollY),
+      lineCount,
+      content.getBoundingClientRect().bottom
+    )
   }
 
   /** Scroll so that source line `line` is at the top of the page. */
@@ -118,6 +132,7 @@
     shownFile = message.file
     lineCount = message.lineCount
     readFileTable()
+    applyBodyClasses()
     showError(null)
     if (followOn() && cursorApplies()) revealCursor()
     else if (keepLine !== null) pinToLine(keepLine)

@@ -14,6 +14,12 @@
 #   with `<script id="adoc-image-files">`, a JSON array of those paths: the
 #   server serves only files the shown document names there.
 #
+# - Embedded output drops what the standalone page does for `:toc: left|right`:
+#   the toc div class (`toc-class`, default `toc2`) and the body classes
+#   `<toc-class> toc-<toc-position>`. The toc div gets the class, and
+#   `<script id="adoc-body-classes">` lists the body classes for the page,
+#   `[]` when the standalone page would add none.
+#
 # Loaded with `asciidoctor -r <this file>`.
 require 'asciidoctor/extensions'
 require 'json'
@@ -136,6 +142,33 @@ class SourceFilesPostprocessor < Asciidoctor::Extensions::Postprocessor
   end
 end
 
+# The standalone page's body classes for a sidebar toc, which embedded output
+# lacks (html5 converter, `convert_document`): the same condition decides.
+# The toc div gets the `toc-class` the standalone page gives it; the embedded
+# converter hardcodes `toc`. The list is JSON for the page, which sets them on
+# its own body.
+class TocLayoutPostprocessor < Asciidoctor::Extensions::Postprocessor
+  TOC_DIV = /\A(<h1[^\n]*<\/h1>\n)?<div id="toc" class="toc">/
+
+  def process(doc, output)
+    classes = []
+    if doc.sections? && doc.attr?('toc-class') && doc.attr?('toc') &&
+       doc.attr?('toc-placement', 'auto')
+      toc_class = doc.attr 'toc-class'
+      escaped = toc_class.gsub('&', '&amp;').gsub('"', '&quot;').gsub('<', '&lt;').gsub('>', '&gt;')
+      # Body classes only go with a rewritten div: a sidebar layout around an
+      # inline toc would be worse than none.
+      if output.match?(TOC_DIV)
+        output = output.sub(TOC_DIV) { %(#{$1}<div id="toc" class="#{escaped}">) }
+        classes = toc_class.split + ["toc-#{doc.attr 'toc-position', 'header'}"]
+      end
+    end
+    # "</" must not end the script element early.
+    json = JSON.generate(classes).gsub('</', '<\/')
+    %(#{output}\n<script type="application/json" id="adoc-body-classes">#{json}</script>\n)
+  end
+end
+
 # Rewrites the `src` of every `<img>` that names a local file below the
 # workspace root. The page lives at `/<token>/`, so `images/a.png` would
 # resolve there and `../images/a.png` would drop the token; `files/...` is
@@ -200,5 +233,6 @@ Asciidoctor::Extensions.register do
   preprocessor SourceLinePreprocessor
   treeprocessor SourceLineTreeprocessor
   postprocessor SourceFilesPostprocessor
+  postprocessor TocLayoutPostprocessor
   postprocessor ImageSrcPostprocessor
 end
