@@ -1988,7 +1988,7 @@ fn find_attr_def_columns(line_text: &str, name: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{opened, scanned};
+    use crate::test_support::{diagnostics_for, opened, scanned};
     use rstest::rstest;
     use std::fs;
 
@@ -2106,7 +2106,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
@@ -2258,7 +2258,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
@@ -2307,8 +2307,7 @@ mod tests {
         let at = |line, character| Position { line, character };
         let none = HashMap::new();
 
-        assert!(ws
-            .diagnostics_for(&path)
+        assert!(diagnostics_for(&ws, &path)
             .iter()
             .any(|d| d.line == 16 && matches!(&d.kind, DiagnosticKind::BrokenInclude { .. })));
         assert_eq!(
@@ -2444,7 +2443,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let path = root.join("chapters/reference.adoc");
         let content = fs::read_to_string(&path).unwrap();
         let pos = Position {
@@ -2490,7 +2489,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
@@ -2778,7 +2777,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 

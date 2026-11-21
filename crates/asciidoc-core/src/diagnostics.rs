@@ -569,6 +569,7 @@ mod tests {
     use super::*;
     use crate::attributes::AttributeRegistry;
     use crate::graph::IncludeGraph;
+    use crate::test_support::{all_diagnostics, diagnostics_for, diagnostics_map};
     use crate::types::{
         Anchor, AttributeDef, AttributeRef, DocumentModel, IncludeMacro, Placement, Section, Xref,
     };
@@ -596,13 +597,7 @@ mod tests {
         graph: IncludeGraph,
         registry: AttributeRegistry,
     ) -> HashMap<PathBuf, Vec<Diagnostic>> {
-        let workspace = Workspace::new_with(
-            PathBuf::from("/tmp"),
-            registry,
-            graph,
-            documents,
-            HashMap::new(),
-        );
+        let workspace = Workspace::new_with(PathBuf::from("/tmp"), registry, graph, documents);
         collect_diagnostics(root, &workspace)
     }
 
@@ -1156,13 +1151,13 @@ mod tests {
             .unwrap();
         let mut ws = crate::workspace::Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
     /// The messages of the image diagnostics of `file`, by line.
     fn image_messages(ws: &crate::workspace::Workspace, file: &Path) -> Vec<(usize, String)> {
-        ws.diagnostics_for(file)
+        diagnostics_for(ws, file)
             .iter()
             .filter(|d| matches!(d.kind, DiagnosticKind::ImageNotFound { .. }))
             .map(|d| (d.line, d.kind.to_string()))
@@ -1322,11 +1317,10 @@ mod tests {
         .unwrap();
         let mut ws = crate::workspace::Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         let images: Vec<usize> = image_messages(&ws, &main).iter().map(|m| m.0).collect();
-        let includes: Vec<usize> = ws
-            .diagnostics_for(&main)
+        let includes: Vec<usize> = diagnostics_for(&ws, &main)
             .iter()
             .filter(|d| matches!(d.kind, DiagnosticKind::BrokenInclude { .. }))
             .map(|d| d.line)
@@ -1349,7 +1343,7 @@ mod tests {
         std::fs::write(&main, source).unwrap();
         let mut ws = crate::workspace::Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         image_messages(&ws, &main)
     }
 
@@ -1522,7 +1516,7 @@ mod tests {
         .unwrap();
         let mut ws = crate::workspace::Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         assert_eq!(image_messages(&ws, &part), vec![]);
     }
@@ -1541,7 +1535,7 @@ mod tests {
         std::fs::write(&main, text).unwrap();
         let mut ws = crate::workspace::Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         assert_eq!(image_messages(&ws, &main), vec![]);
     }
@@ -1550,15 +1544,12 @@ mod tests {
         fixture_workspace("anchor_scope")
     }
 
-    fn broken_xrefs<'a>(
-        ws: &'a crate::workspace::Workspace,
-        file: &Path,
-    ) -> Vec<(&'a str, Vec<String>)> {
-        ws.diagnostics_for(file)
-            .iter()
-            .filter_map(|d| match &d.kind {
+    fn broken_xrefs(ws: &crate::workspace::Workspace, file: &Path) -> Vec<(String, Vec<String>)> {
+        diagnostics_for(ws, file)
+            .into_iter()
+            .filter_map(|d| match d.kind {
                 DiagnosticKind::BrokenXref { target, documents } => Some((
-                    target.as_str(),
+                    target,
                     documents
                         .iter()
                         .map(|doc| doc.file_name().unwrap().to_string_lossy().into_owned())
@@ -1579,7 +1570,10 @@ mod tests {
 
         let broken = broken_xrefs(&ws, &root.join("chapters/reference.adoc"));
 
-        assert_eq!(broken, vec![("setup-only", vec!["web.adoc".to_string()])]);
+        assert_eq!(
+            broken,
+            vec![("setup-only".to_string(), vec!["web.adoc".to_string()])]
+        );
     }
 
     /// Asciidoctor (`book.adoc`): no message. `xref:chapters/reference.adoc#setup-only[]`
@@ -1613,7 +1607,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("foo.adoc")),
-            vec![("_foo_3", vec![])]
+            vec![("_foo_3".to_string(), vec![])]
         );
     }
 
@@ -1627,7 +1621,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("solo/foreign.adoc")),
-            vec![("../chapters/setup.adoc#nope", vec![])]
+            vec![("../chapters/setup.adoc#nope".to_string(), vec![])]
         );
     }
 
@@ -1643,7 +1637,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("partial/book.adoc")),
-            vec![("a.adoc#b-id", vec![])]
+            vec![("a.adoc#b-id".to_string(), vec![])]
         );
     }
 
@@ -1683,8 +1677,8 @@ mod tests {
         assert_eq!(
             broken_xrefs(&ws, &root.join("chapters/setup.adoc")),
             vec![
-                ("reference.adoc#ref-options", vec![]),
-                ("setup.adoc#setup-notes", vec![])
+                ("reference.adoc#ref-options".to_string(), vec![]),
+                ("setup.adoc#setup-notes".to_string(), vec![])
             ]
         );
     }
@@ -1701,7 +1695,7 @@ mod tests {
     fn test_natural_xrefs_resolve_by_title_or_reftext() {
         let (root, ws) = fixture_workspace("natural_xrefs");
 
-        let broken: Vec<&str> = broken_xrefs(&ws, &root.join("main.adoc"))
+        let broken: Vec<String> = broken_xrefs(&ws, &root.join("main.adoc"))
             .into_iter()
             .map(|(target, _)| target)
             .collect();
@@ -1732,7 +1726,7 @@ mod tests {
         let broken = broken_xrefs(&ws, &root.join("chapters/reference.adoc"));
 
         assert!(
-            broken.iter().all(|(target, _)| *target != "setup-only"),
+            broken.iter().all(|(target, _)| target != "setup-only"),
             "{broken:?}"
         );
     }
@@ -1747,7 +1741,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("chapters/reference.adoc")),
-            vec![("nowhere", vec!["book.adoc".to_string()])]
+            vec![("nowhere".to_string(), vec!["book.adoc".to_string()])]
         );
     }
 
@@ -1771,7 +1765,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("part.adoc")),
-            vec![("nope", vec![])]
+            vec![("nope".to_string(), vec![])]
         );
     }
 
@@ -1786,7 +1780,10 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("s.adoc")),
-            vec![("nope", vec!["a.adoc".to_string(), "b.adoc".to_string()])]
+            vec![(
+                "nope".to_string(),
+                vec!["a.adoc".to_string(), "b.adoc".to_string()]
+            )]
         );
     }
 
@@ -1801,7 +1798,10 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("s.adoc")),
-            vec![("{edition}/doc.adoc#t", vec!["b.adoc".to_string()])]
+            vec![(
+                "{edition}/doc.adoc#t".to_string(),
+                vec!["b.adoc".to_string()]
+            )]
         );
     }
 
@@ -1812,7 +1812,7 @@ mod tests {
         file: &Path,
     ) -> Vec<(usize, String, usize, Vec<String>)> {
         let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
-        ws.diagnostics_for(file)
+        diagnostics_for(ws, file)
             .iter()
             .filter_map(|d| match &d.kind {
                 DiagnosticKind::DuplicateAnchor {
@@ -1971,7 +1971,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("c.adoc")),
-            vec![("only-in-a", vec![])]
+            vec![("only-in-a".to_string(), vec![])]
         );
     }
 
@@ -1995,7 +1995,7 @@ mod tests {
     }
 
     fn undefined_in_workspace(ws: &Workspace) -> Vec<(String, usize, String)> {
-        undefined(&ws.diagnostics)
+        undefined(&diagnostics_map(ws))
     }
 
     fn reference(name: &str, line: usize, start_col: usize) -> AttributeRef {
@@ -2343,8 +2343,7 @@ mod tests {
     fn shared_file_is_checked_per_top_level_document() {
         let (root, ws) = fixture_workspace("undefined_attributes_shared");
 
-        let reported: Vec<_> = ws
-            .diagnostics_for(&root.join("shared.adoc"))
+        let reported: Vec<_> = diagnostics_for(&ws, &root.join("shared.adoc"))
             .iter()
             .filter_map(|d| match &d.kind {
                 DiagnosticKind::UndefinedAttribute { name, documents } => Some((
@@ -2423,7 +2422,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["attr"]);
         assert_eq!(undefined_in_workspace(&ws), vec![]);
-        assert!(ws.diagnostics_for(&file).is_empty());
+        assert!(diagnostics_for(&ws, &file).is_empty());
     }
 
     // --- Attribute entry glued to a paragraph ---
@@ -2458,7 +2457,7 @@ mod tests {
         ws: &crate::workspace::Workspace,
         file: &Path,
     ) -> Vec<(usize, Vec<usize>, usize, Vec<String>)> {
-        ws.diagnostics_for(file)
+        diagnostics_for(ws, file)
             .iter()
             .filter_map(|d| match &d.kind {
                 DiagnosticKind::SectionOutOfSequence {
@@ -2501,7 +2500,7 @@ mod tests {
             vec![(17, vec![3], 4, vec![])]
         );
         assert_eq!(
-            ws.diagnostics_for(&root.join("index.adoc"))
+            diagnostics_for(&ws, &root.join("index.adoc"))
                 .iter()
                 .find_map(
                     |d| matches!(d.kind, DiagnosticKind::SectionOutOfSequence { .. })
@@ -2562,8 +2561,7 @@ mod tests {
     fn test_adversarial_project_reports_no_section_out_of_sequence() {
         let (_, ws) = fixture_workspace("adversarial_project");
 
-        let found: Vec<_> = ws
-            .all_diagnostics()
+        let found: Vec<_> = all_diagnostics(&ws)
             .into_iter()
             .filter(|d| matches!(d.kind, DiagnosticKind::SectionOutOfSequence { .. }))
             .map(|d| (d.file, d.line))
@@ -2593,7 +2591,7 @@ mod tests {
 
         assert_eq!(
             broken_xrefs(&ws, &root.join("book.adoc")),
-            vec![("a.adoc#b-id", vec![])]
+            vec![("a.adoc#b-id".to_string(), vec![])]
         );
     }
 
@@ -2673,7 +2671,7 @@ mod tests {
         ws: &crate::workspace::Workspace,
         file: &Path,
     ) -> Vec<(usize, Vec<String>)> {
-        ws.diagnostics_for(file)
+        diagnostics_for(ws, file)
             .iter()
             .filter_map(|d| match &d.kind {
                 DiagnosticKind::LevelZeroSectionOutsideBook { documents } => Some((
@@ -2741,7 +2739,7 @@ mod tests {
                 .iter()
                 .any(|(line, _)| *line == 3),
             "{:?}",
-            ws.diagnostics_for(&root.join("book/twice.adoc"))
+            diagnostics_for(&ws, &root.join("book/twice.adoc"))
         );
     }
 
@@ -2833,7 +2831,7 @@ mod tests {
             vec![(1, vec![2], 3, vec!["print.adoc".to_string()])]
         );
         assert_eq!(
-            ws.diagnostics_for(&part)[0].kind.to_string(),
+            diagnostics_for(&ws, &part)[0].kind.to_string(),
             "Section title out of sequence: expected level 2, got level 3 (in print.adoc)"
         );
         assert_eq!(out_of_sequence(&ws, &root.join("web.adoc")), vec![]);
@@ -3095,8 +3093,7 @@ mod tests {
         ws: &crate::workspace::Workspace,
         file: &Path,
     ) -> Vec<(usize, String)> {
-        let mut found: Vec<_> = ws
-            .diagnostics_for(file)
+        let mut found: Vec<_> = diagnostics_for(ws, file)
             .iter()
             .filter(|d| matches!(d.kind, DiagnosticKind::IncludeTagNotFound { .. }))
             .map(|d| (d.line, d.kind.to_string()))
@@ -3207,11 +3204,10 @@ mod tests {
     fn test_include_tag_on_missing_file_reports_only_broken_include() {
         let (root, ws) = fixture_workspace("include_tags");
 
-        let on_line: Vec<_> = ws
-            .diagnostics_for(&root.join("main.adoc"))
-            .iter()
+        let on_line: Vec<_> = diagnostics_for(&ws, &root.join("main.adoc"))
+            .into_iter()
             .filter(|d| d.line == 30)
-            .map(|d| &d.kind)
+            .map(|d| d.kind)
             .collect();
         assert!(matches!(
             on_line.as_slice(),
@@ -3237,7 +3233,7 @@ mod tests {
         let overrides = HashMap::from([(config.clone(), std::sync::Arc::new(buffer.to_string()))]);
 
         ws.update_file(&config, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         assert!(include_tag_diagnostics(&ws, &root.join("main.adoc"))
             .contains(&missing_tag(4, "missing", CONFIG)));
@@ -3251,7 +3247,7 @@ mod tests {
         let overrides = HashMap::from([(part.clone(), std::sync::Arc::new(buffer.to_string()))]);
 
         ws.update_file(&part, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         assert!(
             !include_tag_diagnostics(&ws, &root.join("main.adoc")).contains(&missing_tag(
@@ -3269,8 +3265,7 @@ mod tests {
     fn test_optional_include_not_found_matches_asciidoctor() {
         let (root, ws) = fixture_workspace("optional_include");
 
-        let mut found: Vec<_> = ws
-            .diagnostics_for(&root.join("main.adoc"))
+        let mut found: Vec<_> = diagnostics_for(&ws, &root.join("main.adoc"))
             .iter()
             .filter_map(|d| match &d.kind {
                 DiagnosticKind::OptionalIncludeNotFound { path } => {
@@ -3306,7 +3301,7 @@ mod tests {
         ws: &Workspace,
         file: &Path,
     ) -> Vec<(&'static str, String, Vec<String>)> {
-        ws.diagnostics_for(file)
+        diagnostics_for(ws, file)
             .iter()
             .filter_map(|d| match &d.kind {
                 DiagnosticKind::BrokenInclude { path, documents } => Some((
@@ -3337,7 +3332,7 @@ mod tests {
         }
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (tmp, root, ws)
     }
 

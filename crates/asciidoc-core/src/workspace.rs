@@ -6,15 +6,12 @@ use std::sync::Arc;
 use crate::attributes::{
     substitute_attributes, AttributeHit, AttributeLayer, AttributeRegistry, AttributeSource, DOCDIR,
 };
-use crate::diagnostics::collect_diagnostics;
 use crate::graph::{
     build_graph, build_graph_with_overrides, include_edges, parse_single_file, IncludeGraph,
 };
 use crate::paths::relative_path;
 use crate::reading::{read_in_order, ReadingVisitor};
-use crate::types::{
-    AttributeDef, AttributeRef, Diagnostic, DocumentModel, FileLocation, PossibleDefinition,
-};
+use crate::types::{AttributeDef, AttributeRef, DocumentModel, FileLocation, PossibleDefinition};
 
 /// Recursively find all `.adoc` files under a directory, as `(path as
 /// reached, canonical path)` pairs in a stable order.
@@ -55,7 +52,6 @@ pub struct Workspace {
     pub(crate) attributes: AttributeRegistry,
     pub(crate) include_graph: IncludeGraph,
     pub(crate) documents: HashMap<PathBuf, DocumentModel>,
-    pub(crate) diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     /// How many ID catalogs were read, for tests and `explain`.
     pub(crate) catalog_builds: AtomicUsize,
 }
@@ -65,10 +61,6 @@ impl std::fmt::Debug for Workspace {
         f.debug_struct("Workspace")
             .field("root", &self.root)
             .field("documents", &self.documents.keys().collect::<Vec<_>>())
-            .field(
-                "diagnostics_count",
-                &self.diagnostics.values().map(Vec::len).sum::<usize>(),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -100,10 +92,10 @@ impl Workspace {
         &self.documents
     }
 
-    /// Diagnostics keyed by file path.
+    /// `root` canonicalized once; document paths are canonical.
     #[must_use]
-    pub fn diagnostics_map(&self) -> &HashMap<PathBuf, Vec<Diagnostic>> {
-        &self.diagnostics
+    pub fn canonical_root(&self) -> &Path {
+        &self.canonical_root
     }
 
     /// Construct a workspace with explicit field values.
@@ -116,7 +108,6 @@ impl Workspace {
         attributes: AttributeRegistry,
         include_graph: IncludeGraph,
         documents: HashMap<PathBuf, DocumentModel>,
-        diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     ) -> Self {
         Self {
             canonical_root: crate::paths::canonicalize_if_exists(root.clone()),
@@ -124,7 +115,6 @@ impl Workspace {
             attributes,
             include_graph,
             documents,
-            diagnostics,
             catalog_builds: AtomicUsize::new(0),
         }
     }
@@ -149,7 +139,6 @@ impl Workspace {
             attributes: AttributeRegistry::new(root),
             include_graph: IncludeGraph::new(),
             documents: HashMap::new(),
-            diagnostics: HashMap::new(),
             catalog_builds: AtomicUsize::new(0),
         }
     }
@@ -165,7 +154,7 @@ impl Workspace {
         let (graph, documents) = build_graph(entry, &mut ws.attributes);
         ws.include_graph = graph;
         ws.documents = documents;
-        ws.recalculate_diagnostics();
+        ws.refresh();
         ws
     }
 
@@ -415,18 +404,6 @@ impl Workspace {
         self.documents.insert(file.to_path_buf(), doc);
     }
 
-    /// Get diagnostics for a specific file.
-    #[must_use]
-    pub fn diagnostics_for(&self, path: &Path) -> &[Diagnostic] {
-        self.diagnostics.get(path).map_or(&[], |v| v.as_slice())
-    }
-
-    /// Get all diagnostics as a flat Vec (convenience for CLI and tests).
-    #[must_use]
-    pub fn all_diagnostics(&self) -> Vec<Diagnostic> {
-        self.diagnostics.values().flatten().cloned().collect()
-    }
-
     /// Recompute each document's top-level documents, and so its `{docdir}`,
     /// from the include graph. A file whose `{docdir}` changed gets its
     /// include edges resolved again, which can change the graph, so this
@@ -454,24 +431,23 @@ impl Workspace {
         }
     }
 
-    /// Recalculate diagnostics from current workspace state.
+    /// Bring the model up to date after `ensure_file()`, `update_file()`,
+    /// `remove_file()` or `reload_config()`.
     ///
-    /// Call this after `ensure_file()` or `update_file()` to refresh diagnostics.
-    /// Not a pure recomputation: it first parses and indexes include targets
-    /// from disk that appeared since their includer was parsed (mutating
-    /// `documents`), then refreshes `{docdir}`, which depends on the whole
-    /// include graph.
-    pub fn recalculate_diagnostics(&mut self) {
+    /// First parses and indexes include targets from disk that appeared
+    /// since their includer was parsed (mutating `documents`), then
+    /// refreshes `{docdir}`, which depends on the whole include graph.
+    /// Call it before `collect_diagnostics`, which reads the result.
+    pub fn refresh(&mut self) {
         self.index_include_targets();
         self.refresh_doc_roots();
-        self.diagnostics = collect_diagnostics(&self.canonical_root, self);
     }
 
     /// Re-parse a single file that is already in the workspace.
     ///
     /// Removes old include edges for this file, re-parses with the given overrides,
-    /// and updates `documents` and `include_graph`. Does NOT rebuild diagnostics
-    /// — the caller is responsible for collecting diagnostics after the update.
+    /// and updates `documents` and `include_graph`. The caller is responsible for
+    /// `refresh()` afterwards.
     pub fn update_file(&mut self, file: &Path, overrides: &HashMap<PathBuf, Arc<String>>) {
         // Remove old edges for this file
         self.include_graph.remove_edges_from(file);
@@ -493,13 +469,12 @@ impl Workspace {
     /// Remove a file from the workspace entirely.
     ///
     /// Drops include edges originating from the file, the parsed document
-    /// model, any cached diagnostics, and the per-file attribute entry. Called
-    /// when a `.adoc` file is deleted on disk.
-    /// Caller is responsible for `recalculate_diagnostics()` afterwards.
+    /// model, and the per-file attribute entry. Called when a `.adoc` file is
+    /// deleted on disk.
+    /// Caller is responsible for `refresh()` afterwards.
     pub fn remove_file(&mut self, file: &Path) {
         self.include_graph.remove_edges_from(file);
         self.documents.remove(file);
-        self.diagnostics.remove(file);
         self.attributes.forget_file(file);
     }
 
@@ -519,7 +494,7 @@ impl Workspace {
     /// deleted on disk. Config attributes feed attribute resolution and
     /// include targets (`include::{dir}/x.adoc[]`), so every document is
     /// re-parsed, open ones from `overrides`. Caller is responsible for
-    /// `recalculate_diagnostics()` afterwards.
+    /// `refresh()` afterwards.
     pub fn reload_config(&mut self, overrides: &HashMap<PathBuf, Arc<String>>) {
         self.attributes.clear_config_chains();
         let files: Vec<PathBuf> = self.documents.keys().cloned().collect();
@@ -628,7 +603,7 @@ impl Workspace {
         let (graph, documents) = build_graph_with_overrides(entry, &mut ws.attributes, overrides);
         ws.include_graph = graph;
         ws.documents = documents;
-        ws.recalculate_diagnostics();
+        ws.refresh();
         ws
     }
 }
@@ -1025,6 +1000,7 @@ pub(crate) fn top_level_documents_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{all_diagnostics, diagnostics_for};
     use std::fs;
 
     /// Where `id` is defined in the workspace, in any top-level document.
@@ -1048,10 +1024,6 @@ mod tests {
         assert!(
             ws.include_graph.forward.is_empty(),
             "New workspace has no graph edges"
-        );
-        assert!(
-            ws.diagnostics.is_empty(),
-            "New workspace has no diagnostics"
         );
 
         // Files can be added later via ensure_file()
@@ -1081,8 +1053,7 @@ mod tests {
         assert_eq!(ws.documents.len(), 2);
         assert!(!ws.include_graph.forward.is_empty());
         // No broken refs expected
-        let broken_xrefs: Vec<_> = ws
-            .all_diagnostics()
+        let broken_xrefs: Vec<_> = all_diagnostics(&ws)
             .into_iter()
             .filter(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenXref { .. }))
             .collect();
@@ -1783,10 +1754,9 @@ mod tests {
 
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
-        let broken: Vec<_> = ws
-            .all_diagnostics()
+        let broken: Vec<_> = all_diagnostics(&ws)
             .into_iter()
             .filter_map(|d| match d.kind {
                 crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target),
@@ -1797,9 +1767,9 @@ mod tests {
     }
 
     #[test]
-    fn test_diagnostics_stored_per_file() {
+    fn test_diagnostics_grouped_per_file() {
         // Two files: A has a broken xref (warning), B has a broken include (error).
-        // diagnostics_for() must return them separately.
+        // diagnostics_for() must group them per file.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
 
@@ -1818,10 +1788,10 @@ mod tests {
 
         ws.ensure_file(&file_a_canon, &overrides);
         ws.ensure_file(&file_b_canon, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         // Diagnostics for A: should contain the broken xref
-        let diags_a = ws.diagnostics_for(&file_a_canon);
+        let diags_a = diagnostics_for(&ws, &file_a_canon);
         assert!(
             diags_a
                 .iter()
@@ -1831,7 +1801,7 @@ mod tests {
         );
 
         // Diagnostics for B: should contain the broken include
-        let diags_b = ws.diagnostics_for(&file_b_canon);
+        let diags_b = diagnostics_for(&ws, &file_b_canon);
         assert!(
             diags_b
                 .iter()
@@ -2133,9 +2103,9 @@ mod tests {
 
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
-        let diagnostics = ws.diagnostics_for(&target);
+        let diagnostics = diagnostics_for(&ws, &target);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(ws.attributes.resolve(&target, "from-config"), Some("yes"));
     }
@@ -2179,7 +2149,7 @@ mod tests {
 
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         // go-to-definition: my-target should resolve to defs.adoc
         let loc = anchor_of(&ws, "my-target").unwrap();
@@ -2190,8 +2160,7 @@ mod tests {
         );
 
         // No broken xref diagnostics
-        let broken: Vec<_> = ws
-            .all_diagnostics()
+        let broken: Vec<_> = all_diagnostics(&ws)
             .into_iter()
             .filter(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenXref { .. }))
             .collect();
@@ -2256,7 +2225,7 @@ mod tests {
 
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         let a_canon = file_a.canonicalize().unwrap();
 
@@ -2267,7 +2236,7 @@ mod tests {
             Arc::new("[[editor-anchor]]\n= Doc A Edited\n".to_string()),
         );
         ws.update_file(&a_canon, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         assert!(
             anchor_of(&ws, "editor-anchor").is_some(),
@@ -2280,7 +2249,7 @@ mod tests {
 
         // Simulate did_close: re-index from disk (no overrides)
         ws.update_file(&a_canon, &HashMap::new());
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         // After close, file should be re-indexed from disk content
         assert!(
@@ -2317,7 +2286,7 @@ mod tests {
 
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         let a_canon = file_a.canonicalize().unwrap();
 
@@ -2331,7 +2300,7 @@ mod tests {
 
         // Simulate did_close: re-index from disk
         ws.update_file(&a_canon, &HashMap::new());
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         // gd on disk-target should still resolve to defs.adoc
         let lookup = anchor_of(&ws, "disk-target");
@@ -2415,7 +2384,7 @@ mod tests {
         let b_canon = b.canonicalize().unwrap();
         ws.ensure_file(&a_canon, &overrides);
         ws.ensure_file(&b_canon, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         // Pre-condition: both files indexed everywhere
         assert!(ws.documents.contains_key(&a_canon));
@@ -2433,10 +2402,6 @@ mod tests {
         assert!(
             ws.include_graph.includes_of(&a_canon).is_empty(),
             "include edges from A removed"
-        );
-        assert!(
-            !ws.diagnostics.contains_key(&a_canon),
-            "diagnostics for A removed"
         );
 
         // B must remain
@@ -2610,9 +2575,8 @@ mod tests {
         for _ in 0..20 {
             let mut ws = Workspace::new(&root);
             ws.scan_workspace();
-            ws.recalculate_diagnostics();
-            let mut circular: Vec<(PathBuf, usize)> = ws
-                .all_diagnostics()
+            ws.refresh();
+            let mut circular: Vec<(PathBuf, usize)> = all_diagnostics(&ws)
                 .iter()
                 .filter(|d| matches!(d.kind, crate::types::DiagnosticKind::CircularInclude { .. }))
                 .map(|d| (d.file.clone(), d.line))
@@ -2665,7 +2629,7 @@ mod tests {
     }
 
     fn broken_includes(ws: &Workspace, file: &Path) -> usize {
-        ws.diagnostics_for(file)
+        diagnostics_for(ws, file)
             .iter()
             .filter(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenInclude { .. }))
             .count()
@@ -2680,7 +2644,7 @@ mod tests {
         let root = docdir_fixture();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let dir = |p: &str| root.join(p).display().to_string();
         let docdir = |p: &str| {
             ws.attributes()
@@ -2729,7 +2693,7 @@ mod tests {
         let book = root.join("book/book.adoc");
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         let book_dir = root.join("book").display().to_string();
         assert_eq!(
@@ -2793,7 +2757,7 @@ mod tests {
 
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let targets: Vec<&Path> = ws
             .include_graph()
             .includes_of(&chapters)
@@ -2802,8 +2766,7 @@ mod tests {
             .collect();
         assert_eq!(targets, vec![intro.as_path()]);
         assert_eq!(broken_includes(&ws, &chapters), 1);
-        let named: Vec<PathBuf> = ws
-            .diagnostics_for(&chapters)
+        let named: Vec<PathBuf> = diagnostics_for(&ws, &chapters)
             .iter()
             .filter_map(|d| match &d.kind {
                 crate::types::DiagnosticKind::BrokenInclude { documents, .. } => Some(documents),
@@ -2957,8 +2920,7 @@ mod tests {
 
         let ws = Workspace::build(&root, &main);
 
-        let mut broken: Vec<(usize, String)> = ws
-            .diagnostics_for(&main)
+        let mut broken: Vec<(usize, String)> = diagnostics_for(&ws, &main)
             .iter()
             .filter_map(|d| match &d.kind {
                 crate::types::DiagnosticKind::BrokenXref { target, .. } => {
@@ -3048,8 +3010,7 @@ mod tests {
 
         let ws = Workspace::build(&root, &index);
 
-        let mut broken: Vec<String> = ws
-            .diagnostics_for(&index)
+        let mut broken: Vec<String> = diagnostics_for(&ws, &index)
             .into_iter()
             .filter_map(|d| match &d.kind {
                 crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target.clone()),
@@ -3076,7 +3037,7 @@ mod tests {
 
         let ws = Workspace::build(&root, &index);
 
-        assert!(ws.diagnostics_for(&index).is_empty());
+        assert!(diagnostics_for(&ws, &index).is_empty());
     }
 
     /// `anchor:id[]` / `anchor:id[reftext]` register inline anchors. Expected
@@ -3094,8 +3055,7 @@ mod tests {
 
         let ws = Workspace::build(&root, &index);
 
-        let mut broken: Vec<String> = ws
-            .diagnostics_for(&index)
+        let mut broken: Vec<String> = diagnostics_for(&ws, &index)
             .into_iter()
             .filter_map(|d| match &d.kind {
                 crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target.clone()),
@@ -3104,8 +3064,7 @@ mod tests {
             .collect();
         broken.sort();
         assert_eq!(broken, ["1digit", "esc", "nothere", "sp ace"]);
-        let duplicates = ws
-            .diagnostics_for(&index)
+        let duplicates = diagnostics_for(&ws, &index)
             .into_iter()
             .filter(|d| {
                 matches!(
@@ -3133,8 +3092,7 @@ mod tests {
 
         let ws = Workspace::build(&root, &index);
 
-        let broken = ws
-            .diagnostics_for(&setup)
+        let broken = diagnostics_for(&ws, &setup)
             .into_iter()
             .filter(|d| {
                 matches!(&d.kind, crate::types::DiagnosticKind::BrokenXref { target, .. } if target == "intro-audience")
@@ -3160,10 +3118,10 @@ mod tests {
         .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let index = root.join("index.adoc");
         let kinds = |ws: &Workspace| -> Vec<crate::types::DiagnosticKind> {
-            ws.diagnostics_for(&index)
+            diagnostics_for(ws, &index)
                 .iter()
                 .map(|d| d.kind.clone())
                 .collect()
@@ -3187,11 +3145,11 @@ mod tests {
     fn assert_extra_target_indexed(ws: &Workspace, root: &Path) {
         let index = root.join("index.adoc");
         assert!(
-            !ws.diagnostics_for(&index)
+            !diagnostics_for(ws, &index)
                 .iter()
                 .any(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenXref { .. })),
             "xref must resolve: {:?}",
-            ws.diagnostics_for(&index)
+            diagnostics_for(ws, &index)
         );
         assert!(ws.documents.contains_key(&root.join("chapters/extra.adoc")));
         assert!(anchor_of(ws, "extra-anchor").is_some());
@@ -3208,27 +3166,27 @@ mod tests {
         )
         .unwrap();
         ws.update_file(&root.join("index.adoc"), &HashMap::new());
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_extra_target_indexed(&ws, &root);
     }
 
-    /// The includer's stale edge is enough: `recalculate_diagnostics` alone
+    /// The includer's stale edge is enough: `refresh` alone
     /// picks up a target that appeared after the includer was parsed.
     #[test]
-    fn test_recalculate_indexes_include_target_created_after_parse() {
+    fn test_refresh_indexes_include_target_created_after_parse() {
         let (_tmp, root, mut ws) = setup_include_target_created_later();
         fs::write(
             root.join("chapters/extra.adoc"),
             "[[extra-anchor]]\n== Extra\n",
         )
         .unwrap();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_extra_target_indexed(&ws, &root);
     }
 
     /// A target that includes another new file pulls it in transitively.
     #[test]
-    fn test_recalculate_indexes_new_include_targets_transitively() {
+    fn test_refresh_indexes_new_include_targets_transitively() {
         let (_tmp, root, mut ws) = setup_include_target_created_later();
         fs::write(
             root.join("chapters/extra.adoc"),
@@ -3240,13 +3198,13 @@ mod tests {
             "[[extra2-anchor]]\n== Two\n",
         )
         .unwrap();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_extra_target_indexed(&ws, &root);
         assert!(anchor_of(&ws, "extra2-anchor").is_some());
     }
 
     fn has_broken(ws: &Workspace, file: &Path) -> (bool, bool) {
-        let d = ws.diagnostics_for(file);
+        let d = diagnostics_for(ws, file);
         (
             d.iter()
                 .any(|d| matches!(d.kind, crate::types::DiagnosticKind::BrokenInclude { .. })),
@@ -3268,11 +3226,11 @@ mod tests {
         let (_tmp, root, mut ws) = setup_include_target_created_later();
         let extra = root.join("chapters/extra.adoc");
         fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_extra_target_indexed(&ws, &root);
         fs::remove_file(&extra).unwrap();
         ws.remove_file(&extra);
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(has_broken(&ws, &root.join("index.adoc")), (true, true));
         assert_eq!(count_extra(&ws), 0);
     }
@@ -3291,7 +3249,7 @@ mod tests {
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
         fs::write(root.join("snippets/config.yml"), "[[yml-anchor]]\n").unwrap();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(ws.documents.len(), 1);
     }
 
@@ -3306,7 +3264,7 @@ mod tests {
         )]);
         fs::write(&extra, "[[disk-anchor]]\n== D\n").unwrap();
         ws.ensure_file(&extra, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert!(anchor_of(&ws, "buffer-anchor").is_some());
         assert!(anchor_of(&ws, "disk-anchor").is_none());
         assert_eq!(count_extra(&ws), 1);
@@ -3314,7 +3272,7 @@ mod tests {
 
     /// Include targets outside the root are indexed too (Asciidoctor reads them).
     #[test]
-    fn test_recalculate_indexes_include_target_outside_root() {
+    fn test_refresh_indexes_include_target_outside_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let root = base.join("proj");
@@ -3328,7 +3286,7 @@ mod tests {
         ws.scan_workspace();
         fs::create_dir_all(base.join("shared")).unwrap();
         fs::write(base.join("shared/extra.adoc"), "[[extra-anchor]]\n== E\n").unwrap();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert!(anchor_of(&ws, "extra-anchor").is_some());
         assert_eq!(has_broken(&ws, &root.join("index.adoc")), (false, false));
     }
@@ -3349,20 +3307,20 @@ mod tests {
         .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let extra = root.join("real/extra.adoc");
         fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(count_extra(&ws), 1);
         assert!(ws.documents.contains_key(&extra));
         assert_eq!(has_broken(&ws, &root.join("index.adoc")), (false, false));
         // Re-parse of the includer must not add a second key.
         ws.update_file(&root.join("index.adoc"), &HashMap::new());
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(count_extra(&ws), 1);
         fs::remove_file(&extra).unwrap();
         ws.remove_file(&extra);
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(has_broken(&ws, &root.join("index.adoc")), (true, true));
         assert_eq!(count_extra(&ws), 0);
     }
@@ -3387,19 +3345,19 @@ mod tests {
         // Like did_open: addressed by the link, keyed canonically.
         ws.set_doc_dir(&real.join("index.adoc"), &base.join("linkroot"));
         ws.ensure_file(&real.join("index.adoc"), &HashMap::new());
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let index = real.join("index.adoc");
         assert!(link_index.exists());
         assert_eq!(has_broken(&ws, &index), (true, true));
         let extra = real.join("chapters/extra.adoc");
         fs::write(&extra, "[[extra-anchor]]\n== Extra\n").unwrap();
         ws.ensure_file(&extra, &HashMap::new());
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(count_extra(&ws), 1);
         assert_eq!(has_broken(&ws, &index), (false, false));
         fs::remove_file(&extra).unwrap();
         ws.remove_file(&extra);
-        ws.recalculate_diagnostics();
+        ws.refresh();
         assert_eq!(has_broken(&ws, &index), (true, true));
         assert_eq!(count_extra(&ws), 0);
     }
@@ -3408,9 +3366,8 @@ mod tests {
     fn path_bearing_messages(root: &Path) -> Vec<String> {
         let mut ws = Workspace::new(root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
-        let mut messages: Vec<String> = ws
-            .all_diagnostics()
+        ws.refresh();
+        let mut messages: Vec<String> = all_diagnostics(&ws)
             .into_iter()
             .map(|d| d.kind.to_string())
             .filter(|m| m.starts_with("Duplicate anchor") || m.starts_with("Circular include"))

@@ -83,6 +83,7 @@ pub fn generate_section_id(title: &str, prefix: &str, separator: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::all_diagnostics;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
@@ -135,8 +136,7 @@ mod tests {
     }
 
     fn broken_targets(ws: &crate::workspace::Workspace) -> Vec<String> {
-        let mut broken: Vec<String> = ws
-            .all_diagnostics()
+        let mut broken: Vec<String> = all_diagnostics(ws)
             .into_iter()
             .filter_map(|d| match d.kind {
                 crate::types::DiagnosticKind::BrokenXref { target, .. } => Some(target),

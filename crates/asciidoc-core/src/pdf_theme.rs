@@ -388,6 +388,7 @@ pub fn resolve_pdf_attribute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::diagnostics_for;
     use crate::workspace::Workspace;
     use pretty_assertions::assert_eq;
 
@@ -402,14 +403,13 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
     /// PDF diagnostics of `file`, as `(line, message)`, sorted by line.
     fn pdf_diags(ws: &Workspace, file: &Path) -> Vec<(usize, String)> {
-        let mut diags: Vec<(usize, String)> = ws
-            .diagnostics_for(file)
+        let mut diags: Vec<(usize, String)> = diagnostics_for(ws, file)
             .iter()
             .filter(|d| {
                 matches!(
@@ -436,7 +436,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
@@ -478,7 +478,7 @@ mod tests {
         }
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         let found: Vec<(&str, Vec<usize>)> = files
             .iter()
@@ -507,7 +507,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let mut found = Vec::new();
         for entry in std::fs::read_dir(&root).unwrap() {
             let path = entry.unwrap().path();
@@ -661,7 +661,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let lines = |name: &str| -> Vec<usize> {
             pdf_diags(&ws, &root.join(name))
                 .into_iter()
@@ -774,7 +774,7 @@ mod tests {
         }
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
         let found: Vec<(usize, String)> = (0..values.len())
             .flat_map(|i| {
@@ -872,7 +872,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let settings = root.join("docs/shared/pdf-settings.adoc");
 
         assert_eq!(
@@ -908,7 +908,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let shared = root.join("shared/pdf.adoc");
 
         let missing_dir = root.join("theme");
@@ -937,7 +937,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         pdf_diags(&ws, &root.join("shared/pdf.adoc"))
     }
 
@@ -1060,7 +1060,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         for name in [
             "body-themesdir.adoc",
             "skipped-themesdir.adoc",
@@ -1081,7 +1081,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let doc = root.join("hover-conditional.adoc");
         let expected = vec![PdfPath::Absolute(PathBuf::from("/custom/themes"))];
         assert_eq!(resolve(&ws, &doc, PDF_THEMESDIR, Some(4)), expected);
@@ -1099,7 +1099,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let doc = root.join("hover-conditional-reference.adoc");
         let expected = vec![PdfPath::Absolute(PathBuf::from("/custom/themes"))];
         assert_eq!(resolve(&ws, &doc, PDF_THEMESDIR, Some(6)), expected);
@@ -1194,7 +1194,7 @@ mod tests {
         .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let messages: Vec<String> = pdf_diags(&ws, &doc).into_iter().map(|(_, m)| m).collect();
         for expected in [
             format!("not found: {}", literal.display()),
@@ -1230,7 +1230,7 @@ mod tests {
         .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let messages: Vec<String> = pdf_diags(&ws, &doc).into_iter().map(|(_, m)| m).collect();
         assert!(
             messages

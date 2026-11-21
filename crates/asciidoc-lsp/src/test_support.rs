@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use asciidoc_core::diagnostics::collect_diagnostics;
+use asciidoc_core::types::Diagnostic;
 use asciidoc_core::workspace::Workspace;
 
 /// A scanned workspace of `files` (relative path, content), as the server
@@ -35,4 +37,19 @@ pub fn opened(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace, Vec<Path
         ws.ensure_file(path, &HashMap::new());
     }
     (tmp, ws, paths)
+}
+
+/// The diagnostics of `ws` by file, collected from its current model.
+pub fn diagnostics_map(ws: &Workspace) -> HashMap<PathBuf, Vec<Diagnostic>> {
+    collect_diagnostics(ws.canonical_root(), ws)
+}
+
+/// The diagnostics of one file of `ws`.
+pub fn diagnostics_for(ws: &Workspace, path: &Path) -> Vec<Diagnostic> {
+    diagnostics_map(ws).remove(path).unwrap_or_default()
+}
+
+/// All diagnostics of `ws` as a flat Vec.
+pub fn all_diagnostics(ws: &Workspace) -> Vec<Diagnostic> {
+    diagnostics_map(ws).into_values().flatten().collect()
 }

@@ -37,6 +37,7 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+use asciidoc_core::diagnostics::collect_diagnostics;
 use asciidoc_core::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,8 @@ struct AsciiDocLsp {
     documents: Mutex<HashMap<Uri, DocumentState>>,
     workspace: Mutex<Option<Workspace>>,
     root: Mutex<Option<PathBuf>>,
+    /// Diagnostics of the workspace as of the last recomputation, by file.
+    diagnostics: Mutex<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>>,
     /// URIs for which we've published non-empty diagnostics.
     /// Used to clear stale diagnostics when files become clean.
     published_diagnostics: Mutex<HashSet<Uri>>,
@@ -76,13 +79,14 @@ impl AsciiDocLsp {
             documents: Mutex::new(HashMap::new()),
             workspace: Mutex::new(None),
             root: Mutex::new(None),
+            diagnostics: Mutex::new(HashMap::new()),
             published_diagnostics: Mutex::new(HashSet::new()),
             can_request_file_watcher: Mutex::new(false),
         }
     }
 
     /// Quick-fixes for the diagnostics of `uri` that touch `range`, taken from
-    /// the workspace's own diagnostics rather than the client's copy.
+    /// the diagnostics the server last computed rather than the client's copy.
     fn quick_fix_actions(&self, uri: &Uri, range: Range, content: &str) -> CodeActionResponse {
         let Some(doc_path) = document_path(uri) else {
             return Vec::new();
@@ -91,8 +95,9 @@ impl AsciiDocLsp {
         let Some(ws) = guard.as_ref() else {
             return Vec::new();
         };
+        let diagnostics = self.diagnostics.lock();
         let mut actions = Vec::new();
-        for core_diagnostic in ws.diagnostics_for(&doc_path) {
+        for core_diagnostic in diagnostics.get(&doc_path).map_or(&[][..], Vec::as_slice) {
             let lsp_diagnostic = diagnostics_convert::convert_one(core_diagnostic, content);
             let touches =
                 lsp_diagnostic.range.start <= range.end && range.start <= lsp_diagnostic.range.end;
@@ -182,8 +187,7 @@ impl AsciiDocLsp {
             // Other (server-side proposed) FileChangeType values: ignored.
         }
 
-        ws.recalculate_diagnostics();
-        Some(ws.diagnostics_map().clone())
+        Some(self.recompute_diagnostics(ws))
     }
 
     /// Snapshot of all paths that correspond to an open editor buffer,
@@ -226,6 +230,19 @@ impl AsciiDocLsp {
         } else {
             None
         }
+    }
+
+    /// Bring the workspace model up to date, then recompute its diagnostics,
+    /// keep them and return them. The model is refreshed first: collecting
+    /// reads what the refresh indexes.
+    fn recompute_diagnostics(
+        &self,
+        ws: &mut Workspace,
+    ) -> HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>> {
+        ws.refresh();
+        let diagnostics = collect_diagnostics(ws.canonical_root(), ws);
+        self.diagnostics.lock().clone_from(&diagnostics);
+        diagnostics
     }
 
     /// Publish diagnostics for all files in the workspace.
@@ -322,7 +339,7 @@ impl LanguageServer for AsciiDocLsp {
             // tag::workspace-setup[]
             let mut ws = Workspace::new(root);
             ws.scan_workspace();
-            ws.recalculate_diagnostics();
+            self.recompute_diagnostics(&mut ws);
             // end::workspace-setup[]
             *self.workspace.lock() = Some(ws);
         }
@@ -412,7 +429,7 @@ impl LanguageServer for AsciiDocLsp {
 
         let diagnostics = {
             let ws = self.workspace.lock();
-            ws.as_ref().map(|ws| ws.diagnostics_map().clone())
+            ws.is_some().then(|| self.diagnostics.lock().clone())
         };
         if let Some(diagnostics) = diagnostics {
             self.publish_workspace_diagnostics(&diagnostics).await;
@@ -467,8 +484,7 @@ impl LanguageServer for AsciiDocLsp {
                         } else {
                             ws.ensure_file(&canonical, &overrides);
                         }
-                        ws.recalculate_diagnostics();
-                        Some(ws.diagnostics_map().clone())
+                        Some(self.recompute_diagnostics(ws))
                     } else {
                         None
                     }
@@ -522,8 +538,7 @@ impl LanguageServer for AsciiDocLsp {
                             ws.set_doc_dir(&canonical, dir);
                         }
                         ws.update_file(&canonical, &overrides);
-                        ws.recalculate_diagnostics();
-                        Some(ws.diagnostics_map().clone())
+                        Some(self.recompute_diagnostics(ws))
                     } else {
                         None
                     }
@@ -551,8 +566,7 @@ impl LanguageServer for AsciiDocLsp {
                             "did_close: re-index file from disk"
                         );
                         ws.update_file(&canonical, &HashMap::new());
-                        ws.recalculate_diagnostics();
-                        Some(ws.diagnostics_map().clone())
+                        Some(self.recompute_diagnostics(ws))
                     } else {
                         None
                     }
@@ -578,8 +592,7 @@ impl LanguageServer for AsciiDocLsp {
                             ws.set_doc_dir(&canonical, dir);
                         }
                         ws.update_file(&canonical, &overrides);
-                        ws.recalculate_diagnostics();
-                        Some(ws.diagnostics_map().clone())
+                        Some(self.recompute_diagnostics(ws))
                     } else {
                         None
                     }
@@ -1340,6 +1353,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{all_diagnostics, diagnostics_map};
     use std::fs;
     use std::path::Path;
     use std::str::FromStr;
@@ -1576,7 +1590,7 @@ mod tests {
         // We don't assert exact count since the fixture may evolve, but we verify:
         // - No excessive false positives (< 10)
         // - Each diagnostic has correct metadata
-        let all_diags = ws.all_diagnostics();
+        let all_diags = all_diagnostics(&ws);
         assert!(
             all_diags.len() < 10,
             "should not have excessive false-positive diagnostics, found: {}",
@@ -1738,7 +1752,7 @@ mod tests {
             "Empty workspace has no documents"
         );
         assert!(
-            ws.diagnostics_map().is_empty(),
+            diagnostics_map(&ws).is_empty(),
             "Empty workspace has no diagnostics"
         );
     }
@@ -3828,12 +3842,22 @@ mod tests {
             .await;
     }
 
+    /// The diagnostics the server holds for `path`.
+    fn held_diagnostics(
+        server: &AsciiDocLsp,
+        path: &Path,
+    ) -> Vec<asciidoc_core::types::Diagnostic> {
+        server
+            .diagnostics
+            .lock()
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Targets of the broken xrefs the server holds for `path`.
     fn broken_xrefs(server: &AsciiDocLsp, path: &Path) -> Vec<String> {
-        let ws = server.workspace.lock();
-        ws.as_ref()
-            .unwrap()
-            .diagnostics_for(path)
+        held_diagnostics(server, path)
             .iter()
             .filter_map(|d| match &d.kind {
                 asciidoc_core::types::DiagnosticKind::BrokenXref { target, .. } => {
@@ -3845,10 +3869,7 @@ mod tests {
     }
 
     fn broken_includes(server: &AsciiDocLsp, path: &Path) -> usize {
-        let ws = server.workspace.lock();
-        ws.as_ref()
-            .unwrap()
-            .diagnostics_for(path)
+        held_diagnostics(server, path)
             .iter()
             .filter(|d| {
                 matches!(
@@ -3926,10 +3947,7 @@ mod tests {
         let server = service.inner();
         open_document(server, &file_uri(&root.join("a.adoc")), text).await;
         let findings = |server: &AsciiDocLsp| {
-            let ws = server.workspace.lock();
-            ws.as_ref()
-                .unwrap()
-                .diagnostics_for(&root.join("a.adoc"))
+            held_diagnostics(server, &root.join("a.adoc"))
                 .iter()
                 .filter(|d| {
                     matches!(
@@ -4098,10 +4116,7 @@ mod tests {
 
     /// Number of missing-image diagnostics the server holds for `path`.
     fn missing_images(server: &AsciiDocLsp, path: &Path) -> usize {
-        let ws = server.workspace.lock();
-        ws.as_ref()
-            .unwrap()
-            .diagnostics_for(path)
+        held_diagnostics(server, path)
             .iter()
             .filter(|d| {
                 matches!(
@@ -4283,11 +4298,7 @@ mod tests {
             let (service, _socket, _uri, _text) = open_fixture(&fx, &main).await;
             let server = service.inner();
 
-            let ws = server.workspace.lock();
-            let broken: Vec<_> = ws
-                .as_ref()
-                .unwrap()
-                .diagnostics_for(&main)
+            let broken: Vec<_> = held_diagnostics(server, &main)
                 .iter()
                 .filter(|d| {
                     matches!(
@@ -4354,10 +4365,7 @@ mod tests {
         let server = service.inner();
 
         let broken_includes = {
-            let ws = server.workspace.lock();
-            ws.as_ref()
-                .unwrap()
-                .diagnostics_for(&main)
+            held_diagnostics(server, &main)
                 .iter()
                 .filter(|d| {
                     matches!(

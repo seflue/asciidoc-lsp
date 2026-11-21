@@ -2079,7 +2079,6 @@ mod tests {
             AttributeRegistry::new(root),
             IncludeGraph::new(),
             documents,
-            HashMap::new(),
         )
     }
 
@@ -2307,7 +2306,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
@@ -3039,7 +3038,6 @@ mod tests {
             dir.path().to_path_buf(),
             attrs,
             IncludeGraph::new(),
-            HashMap::new(),
             HashMap::new(),
         );
         (dir, ws, doc_file)
@@ -4581,13 +4579,7 @@ mod tests {
         let file = root.join("doc.adoc");
         let mut attrs = AttributeRegistry::new(&root);
         attrs.ensure_config_for_dir(&root);
-        let ws = Workspace::new_with(
-            root.clone(),
-            attrs,
-            IncludeGraph::new(),
-            HashMap::new(),
-            HashMap::new(),
-        );
+        let ws = Workspace::new_with(root.clone(), attrs, IncludeGraph::new(), HashMap::new());
 
         let items = resolve_image_completions("", &file, 1, Some(&ws), AT_LINE_START);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();

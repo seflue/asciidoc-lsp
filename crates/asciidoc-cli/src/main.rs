@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser as ClapParser;
 
+use asciidoc_core::diagnostics::collect_diagnostics;
 use asciidoc_core::types::IncludeTree;
 use asciidoc_core::workspace::Workspace;
 
@@ -35,7 +36,10 @@ fn main() -> anyhow::Result<()> {
             .to_path_buf();
         let ws = Workspace::build(&root, &cli.path);
 
-        let all_diags = ws.all_diagnostics();
+        let all_diags: Vec<_> = collect_diagnostics(ws.canonical_root(), &ws)
+            .into_values()
+            .flatten()
+            .collect();
         if all_diags.is_empty() {
             println!("No diagnostics found.");
         } else {

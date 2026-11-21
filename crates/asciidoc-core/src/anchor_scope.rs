@@ -1222,7 +1222,6 @@ mod tests {
             registry,
             crate::graph::IncludeGraph::new(),
             documents,
-            HashMap::new(),
         );
         let scope = ws.anchor_scope_of(source);
         CatalogCache::new(&ws).resolve_xref_in(&scope, &xref(target), None)

@@ -424,7 +424,6 @@ mod tests {
             AttributeRegistry::new(Path::new("/tmp")),
             graph,
             documents,
-            HashMap::new(),
         );
         out_of_sequence(&workspace, Path::new("/a.adoc"))
             .into_iter()

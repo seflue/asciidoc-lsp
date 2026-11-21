@@ -59,6 +59,7 @@ pub(crate) fn convert_one(diag: &CoreDiagnostic, content: &str) -> ls_types::Dia
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::diagnostics_for;
     use std::path::PathBuf;
 
     #[test]
@@ -473,7 +474,7 @@ mod tests {
         let content = std::fs::read_to_string(&main).unwrap();
         let ws = asciidoc_core::workspace::Workspace::build(&root, &main);
 
-        let result = convert_diagnostics(ws.diagnostics_for(&main), &content);
+        let result = convert_diagnostics(&diagnostics_for(&ws, &main), &content);
 
         let mut texts: Vec<(u32, String)> = result
             .iter()
@@ -511,10 +512,13 @@ mod tests {
 
         let is_open =
             |d: &&CoreDiagnostic| matches!(d.kind, DiagnosticKind::UnterminatedBlock { .. });
-        assert_eq!(ws.diagnostics_for(&main).iter().filter(is_open).count(), 0);
+        assert_eq!(
+            diagnostics_for(&ws, &main).iter().filter(is_open).count(),
+            0
+        );
 
         let content = std::fs::read_to_string(&chapter).unwrap();
-        let result = convert_diagnostics(ws.diagnostics_for(&chapter), &content);
+        let result = convert_diagnostics(&diagnostics_for(&ws, &chapter), &content);
         let result: Vec<_> = result
             .iter()
             .filter(|d| d.message.starts_with("Unterminated"))
@@ -533,7 +537,7 @@ mod tests {
 
         assert!(!ws.documents()[&banner].unterminated_blocks.is_empty());
         assert_eq!(
-            ws.diagnostics_for(&banner).iter().filter(is_open).count(),
+            diagnostics_for(&ws, &banner).iter().filter(is_open).count(),
             0
         );
     }
@@ -552,7 +556,7 @@ mod tests {
         let content = std::fs::read_to_string(&main).unwrap();
         let ws = asciidoc_core::workspace::Workspace::build(&root, &main);
 
-        let mut result = convert_diagnostics(ws.diagnostics_for(&main), &content);
+        let mut result = convert_diagnostics(&diagnostics_for(&ws, &main), &content);
         result.sort_by_key(|d| (d.range.start.line, d.range.start.character));
 
         let ranges: Vec<(u32, u32, u32, u32)> = result

@@ -254,6 +254,7 @@ fn include_fixes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::diagnostics_for;
     use crate::types::DiagnosticKind;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -266,7 +267,7 @@ mod tests {
             .unwrap();
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         (root, ws)
     }
 
@@ -281,10 +282,10 @@ mod tests {
 
     /// The diagnostic of `file` on the line of `needle` that covers it: an
     /// xref by span, an include by its whole line.
-    fn diagnostic_at<'a>(ws: &'a Workspace, file: &Path, needle: &str) -> &'a Diagnostic {
+    fn diagnostic_at(ws: &Workspace, file: &Path, needle: &str) -> Diagnostic {
         let (line, col) = locate(file, needle);
-        ws.diagnostics_for(file)
-            .iter()
+        diagnostics_for(ws, file)
+            .into_iter()
             .find(|d| {
                 d.line == line && d.span.is_none_or(|s| s.start_col <= col && col < s.end_col)
             })
@@ -295,7 +296,7 @@ mod tests {
     /// diagnostic at `needle`.
     fn fixes_at(ws: &Workspace, file: &Path, needle: &str) -> Vec<(String, bool, (usize, usize))> {
         let diagnostic = diagnostic_at(ws, file, needle);
-        quick_fixes(ws, file, diagnostic)
+        quick_fixes(ws, file, &diagnostic)
             .into_iter()
             .map(|r| {
                 assert_eq!(r.line, diagnostic.line);
@@ -628,7 +629,7 @@ mod tests {
         }
         let mut ws = Workspace::new(&root);
         ws.scan_workspace();
-        ws.recalculate_diagnostics();
+        ws.refresh();
         let part = root.join("part.adoc");
 
         let fixes = fixes_at(&ws, &part, "include::{d}/chaptr.adoc[]");
@@ -668,14 +669,13 @@ mod tests {
         let overrides = HashMap::from([(main.clone(), Arc::new(fixed.join("\n") + "\n"))]);
 
         ws.update_file(&main, &overrides);
-        ws.recalculate_diagnostics();
+        ws.refresh();
 
-        let broken: Vec<&str> = ws
-            .diagnostics_for(&main)
-            .iter()
+        let broken: Vec<String> = diagnostics_for(&ws, &main)
+            .into_iter()
             .filter(|d| d.line == line)
-            .filter_map(|d| match &d.kind {
-                DiagnosticKind::BrokenXref { target, .. } => Some(target.as_str()),
+            .filter_map(|d| match d.kind {
+                DiagnosticKind::BrokenXref { target, .. } => Some(target),
                 _ => None,
             })
             .collect();
