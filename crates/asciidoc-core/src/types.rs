@@ -586,7 +586,7 @@ impl fmt::Display for DiagnosticKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub file: PathBuf,
     pub line: usize,

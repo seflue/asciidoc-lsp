@@ -17,6 +17,7 @@ mod watchdog;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -44,6 +45,10 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use asciidoc_core::diagnostics::collect_diagnostics;
 use asciidoc_core::workspace::Workspace;
 
+/// How long the diagnostics wait after an edit: a newer edit within this
+/// time starts the wait anew, so a burst of keystrokes is computed once.
+const DIAGNOSTICS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 // ---------------------------------------------------------------------------
 // Document Store (DC-4)
 // ---------------------------------------------------------------------------
@@ -53,6 +58,29 @@ use asciidoc_core::workspace::Workspace;
 struct DocumentState {
     content: Arc<String>,
     version: i32,
+}
+
+/// Core diagnostics by file, as `collect_diagnostics` groups them.
+type DiagnosticsByFile = HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>;
+
+/// The diagnostics of one recomputation and the files whose text changed
+/// before it, which are published whether or not their diagnostics did.
+#[derive(Debug)]
+struct Recomputed {
+    /// The diagnostics generation this recomputation advanced to: a later
+    /// recomputation has a higher one.
+    generation: u64,
+    diagnostics: DiagnosticsByFile,
+    content_changed: HashSet<PathBuf>,
+}
+
+/// What the client was last sent.
+#[derive(Debug, Default)]
+struct Published {
+    /// The generation of the newest recomputation published.
+    generation: u64,
+    /// Its diagnostics, by file; a file without any is absent.
+    diagnostics: DiagnosticsByFile,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,10 +107,16 @@ struct ServerState {
     workspace: Mutex<Option<Workspace>>,
     root: Mutex<Option<PathBuf>>,
     /// Diagnostics of the workspace as of the last recomputation, by file.
-    diagnostics: Mutex<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>>,
-    /// URIs for which we've published non-empty diagnostics.
-    /// Used to clear stale diagnostics when files become clean.
-    published_diagnostics: Mutex<HashSet<Uri>>,
+    diagnostics: Mutex<DiagnosticsByFile>,
+    /// What the client was last sent. A file is published only when its
+    /// diagnostics differ from these, or its text changed. Held from the
+    /// comparison through the last send, so publications do not interleave.
+    published: tokio::sync::Mutex<Published>,
+    /// Files whose text changed since the last recomputation: their
+    /// positions are converted against the text, so they are published
+    /// even with the same diagnostics. Written and taken under the
+    /// `workspace` lock.
+    content_changed: Mutex<HashSet<PathBuf>>,
     /// Whether the client supports dynamic registration of
     /// `workspace/didChangeWatchedFiles`. Set in `initialize()`,
     /// consumed in `initialized()`.
@@ -96,6 +130,11 @@ struct ServerState {
     /// wait for `true`, so they do not answer from a workspace that is not
     /// there yet.
     workspace_ready: tokio::sync::watch::Sender<bool>,
+    /// Counts the edits and recomputations of the diagnostics. A debounced
+    /// recomputation runs only while it still holds the latest value: a
+    /// newer edit, or a recomputation in between, makes it redundant. Read
+    /// and written under the `workspace` lock.
+    diagnostics_generation: AtomicU64,
     preview: PreviewState,
     /// The task that installs the scanned workspace, for tests to await.
     #[cfg(test)]
@@ -103,6 +142,12 @@ struct ServerState {
     /// The scan thread, for tests to wait until the scan has read the disk.
     #[cfg(test)]
     scan_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// How often the diagnostics were recomputed, for tests to count.
+    #[cfg(test)]
+    recalculations: std::sync::atomic::AtomicUsize,
+    /// Every diagnostics publication in order, for tests to read.
+    #[cfg(test)]
+    publications: Mutex<Vec<(Uri, Vec<Diagnostic>)>>,
 }
 
 /// What the live preview keeps between requests. Each field has its own
@@ -148,15 +193,21 @@ impl AsciiDocLsp {
             workspace: Mutex::new(None),
             root: Mutex::new(None),
             diagnostics: Mutex::new(HashMap::new()),
-            published_diagnostics: Mutex::new(HashSet::new()),
+            published: tokio::sync::Mutex::new(Published::default()),
+            content_changed: Mutex::new(HashSet::new()),
             can_request_file_watcher: Mutex::new(false),
             pending_changes: Mutex::new(None),
             workspace_ready: tokio::sync::watch::Sender::new(true),
+            diagnostics_generation: AtomicU64::new(0),
             preview: PreviewState::default(),
             #[cfg(test)]
             scan: Mutex::new(None),
             #[cfg(test)]
             scan_thread: Mutex::new(None),
+            #[cfg(test)]
+            recalculations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            publications: Mutex::new(Vec::new()),
         }))
     }
 
@@ -408,7 +459,7 @@ impl AsciiDocLsp {
     fn compute_watched_files_update(
         &self,
         params: DidChangeWatchedFilesParams,
-    ) -> Option<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>> {
+    ) -> Option<Recomputed> {
         let classified = classify_events(params.changes, &self.open_buffer_paths())?;
         self.apply_watcher_events(classified)
     }
@@ -416,10 +467,7 @@ impl AsciiDocLsp {
     /// Apply a classified batch of watcher events to the workspace and return
     /// fresh diagnostics. Returns `None` if the workspace is not initialized;
     /// during the scan the batch is kept for the install.
-    fn apply_watcher_events(
-        &self,
-        classified: ClassifiedEvents,
-    ) -> Option<HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>> {
+    fn apply_watcher_events(&self, classified: ClassifiedEvents) -> Option<Recomputed> {
         // Open buffers are read before the workspace lock is taken, as in
         // the text-sync handlers.
         let open = classified
@@ -430,7 +478,8 @@ impl AsciiDocLsp {
             self.defer_until_installed(classified);
             return None;
         };
-        apply_classified_events(ws, classified, open.as_ref());
+        let reparsed = apply_classified_events(ws, classified, open.as_ref());
+        self.content_changed.lock().extend(reparsed);
         Some(self.recompute_diagnostics(ws))
     }
 
@@ -487,30 +536,92 @@ impl AsciiDocLsp {
 
     /// Bring the workspace model up to date, then recompute its diagnostics,
     /// keep them and return them. The model is refreshed first: collecting
-    /// reads what the refresh indexes.
-    fn recompute_diagnostics(
-        &self,
-        ws: &mut Workspace,
-    ) -> HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>> {
+    /// reads what the refresh indexes. A pending debounced recomputation
+    /// becomes redundant and is dropped.
+    fn recompute_diagnostics(&self, ws: &mut Workspace) -> Recomputed {
+        let generation = self.diagnostics_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        self.recalculations.fetch_add(1, Ordering::SeqCst);
         ws.refresh();
         let diagnostics = collect_diagnostics(ws.canonical_root(), ws);
         self.diagnostics.lock().clone_from(&diagnostics);
-        diagnostics
+        Recomputed {
+            generation,
+            diagnostics,
+            content_changed: std::mem::take(&mut *self.content_changed.lock()),
+        }
     }
 
-    /// Publish diagnostics for all files in the workspace.
+    /// Recompute and publish the diagnostics once [`DIAGNOSTICS_DEBOUNCE`]
+    /// has passed, unless the diagnostics have moved past `generation` by
+    /// then. The caller holds the workspace lock and has just advanced the
+    /// generation to `generation`.
+    fn schedule_diagnostics(&self, generation: u64) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DIAGNOSTICS_DEBOUNCE).await;
+            let diagnostics = {
+                let mut guard = server.workspace.lock();
+                let Some(ws) = guard.as_mut() else {
+                    return;
+                };
+                if server.diagnostics_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                server.recompute_diagnostics(ws)
+            };
+            server.publish_workspace_diagnostics(&diagnostics).await;
+        });
+    }
+
+    /// Publish the diagnostics of `recomputed` that the client lacks: of
+    /// each file whose diagnostics changed since the last publication or
+    /// whose text changed, and an empty list for each file that no longer
+    /// has any. The other files are neither read nor converted.
     ///
-    /// Takes pre-grouped diagnostics, converts them to LSP format,
-    /// publishes per-file, and clears stale diagnostics for files
-    /// that no longer have any.
-    async fn publish_workspace_diagnostics(
-        &self,
-        diagnostics: &HashMap<PathBuf, Vec<asciidoc_core::types::Diagnostic>>,
-    ) {
-        // Prepare all conversions without holding locks across await points
+    /// A recomputation older than the one last published is not published:
+    /// its files with changed text are converted again from the newer
+    /// diagnostics instead, which the newer publication may have skipped.
+    ///
+    /// Positions are converted against the text at publication time, not
+    /// the text the diagnostics were computed from: an edit in between
+    /// gives briefly wrong ranges, which the next quiet period corrects.
+    async fn publish_workspace_diagnostics(&self, recomputed: &Recomputed) {
+        let Recomputed {
+            generation,
+            diagnostics,
+            content_changed,
+        } = recomputed;
+        let mut published = self.published.lock().await;
+        let (changed, cleared): (Vec<_>, Vec<PathBuf>) = if *generation > published.generation {
+            let changed = diagnostics
+                .iter()
+                .filter(|(path, file_diags)| {
+                    content_changed.contains(*path)
+                        || published.diagnostics.get(*path) != Some(file_diags)
+                })
+                .collect();
+            let cleared = published
+                .diagnostics
+                .keys()
+                .filter(|path| !diagnostics.contains_key(*path))
+                .cloned()
+                .collect();
+            published.diagnostics.clone_from(diagnostics);
+            published.generation = *generation;
+            (changed, cleared)
+        } else {
+            let changed = content_changed
+                .iter()
+                .filter_map(|path| published.diagnostics.get_key_value(path))
+                .collect();
+            (changed, Vec::new())
+        };
+
+        // Convert without holding the documents lock across await points
         let conversions: Vec<(Uri, Vec<Diagnostic>)> = {
             let docs = self.documents.lock();
-            diagnostics
+            changed
                 .iter()
                 .filter_map(|(path, file_diags)| {
                     let uri = symbols::path_to_uri(path)?;
@@ -521,28 +632,21 @@ impl AsciiDocLsp {
                     let lsp_diags = diagnostics_convert::convert_diagnostics(file_diags, &content);
                     Some((uri, lsp_diags))
                 })
+                .chain(
+                    cleared
+                        .iter()
+                        .filter_map(|path| Some((symbols::path_to_uri(path)?, Vec::new()))),
+                )
                 .collect()
         };
 
-        let mut new_published = HashSet::new();
         for (uri, lsp_diags) in conversions {
-            self.client
-                .publish_diagnostics(uri.clone(), lsp_diags, None)
-                .await;
-            new_published.insert(uri);
+            #[cfg(test)]
+            self.publications
+                .lock()
+                .push((uri.clone(), lsp_diags.clone()));
+            self.client.publish_diagnostics(uri, lsp_diags, None).await;
         }
-
-        // Clear diagnostics for files that no longer have any
-        let old_published = self.published_diagnostics.lock().clone();
-        for uri in &old_published {
-            if !new_published.contains(uri) {
-                self.client
-                    .publish_diagnostics(uri.clone(), vec![], None)
-                    .await;
-            }
-        }
-
-        *self.published_diagnostics.lock() = new_published;
     }
 
     /// Scan `root` for all `.adoc` files in the background, then install the
@@ -632,6 +736,8 @@ impl AsciiDocLsp {
                 let open = changes
                     .config_changed
                     .then(|| open_contents(&self.documents.lock()));
+                // Nothing is published before the install: every file with
+                // diagnostics is published, whatever its text.
                 apply_classified_events(ws, changes, open.as_ref());
             }
             self.recompute_diagnostics(ws)
@@ -835,6 +941,7 @@ impl LanguageServer for AsciiDocLsp {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
                         register_open_buffer(ws, &path, &canonical, &overrides);
+                        self.content_changed.lock().insert(canonical.clone());
                         Some(self.recompute_diagnostics(ws))
                     } else {
                         None
@@ -874,29 +981,28 @@ impl LanguageServer for AsciiDocLsp {
             }
         }
 
-        // Per-file: update only this file, then recalculate diagnostics
+        // Per-file: update only this file at once, so navigation and
+        // completion see the edit; the diagnostics wait for a quiet period.
+        // The workspace refresh (include targets, docdir) runs only with the
+        // diagnostics, as it costs O(workspace): navigation into a freshly
+        // typed include target can lag by up to the quiet period.
         if let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) {
             if let Ok(canonical) = path.canonicalize() {
                 let overrides = build_content_overrides(&self.documents, &uri);
-                let diagnostics = {
-                    let mut ws = self.workspace.lock();
-                    if let Some(ws) = ws.as_mut() {
-                        tracing::debug!(
-                            raw_path = ?path,
-                            ?canonical,
-                            "did_change: update file"
-                        );
-                        if let Some(dir) = path.parent() {
-                            ws.set_doc_dir(&canonical, dir);
-                        }
-                        ws.update_file(&canonical, &overrides);
-                        Some(self.recompute_diagnostics(ws))
-                    } else {
-                        None
+                let mut ws = self.workspace.lock();
+                if let Some(ws) = ws.as_mut() {
+                    tracing::debug!(
+                        raw_path = ?path,
+                        ?canonical,
+                        "did_change: update file"
+                    );
+                    if let Some(dir) = path.parent() {
+                        ws.set_doc_dir(&canonical, dir);
                     }
-                };
-                if let Some(diagnostics) = diagnostics {
-                    self.publish_workspace_diagnostics(&diagnostics).await;
+                    ws.update_file(&canonical, &overrides);
+                    self.content_changed.lock().insert(canonical.clone());
+                    let generation = self.diagnostics_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.schedule_diagnostics(generation);
                 }
             }
         }
@@ -919,6 +1025,7 @@ impl LanguageServer for AsciiDocLsp {
                             "did_close: re-index file from disk"
                         );
                         ws.update_file(&canonical, &HashMap::new());
+                        self.content_changed.lock().insert(canonical.clone());
                         Some(self.recompute_diagnostics(ws))
                     } else {
                         self.defer_until_installed(ClassifiedEvents::changed_on_disk(path));
@@ -1493,12 +1600,13 @@ impl ClassifiedEvents {
 }
 
 /// Apply watcher events to `ws` without recomputing its diagnostics. `open`
-/// holds the open buffers' content when the config changed.
+/// holds the open buffers' content when the config changed. Returns the
+/// files parsed again from disk.
 fn apply_classified_events(
     ws: &mut Workspace,
     classified: ClassifiedEvents,
     open: Option<&HashMap<PathBuf, Arc<String>>>,
-) {
+) -> Vec<PathBuf> {
     if let Some(open) = open {
         ws.reload_config(open);
     }
@@ -1506,6 +1614,7 @@ fn apply_classified_events(
     // CREATED/CHANGED re-parse from disk (no overrides — open buffers were
     // filtered upstream). DELETED drops the file from all indexes.
     let overrides = HashMap::new();
+    let mut reparsed = Vec::new();
     for (path, typ) in classified.adoc_events {
         if typ == FileChangeType::DELETED {
             ws.remove_file(&resolve_deleted_doc_key(&path));
@@ -1525,9 +1634,11 @@ fn apply_classified_events(
             } else {
                 ws.ensure_file(&canonical, &overrides);
             }
+            reparsed.push(canonical);
         }
         // Other (server-side proposed) FileChangeType values: ignored.
     }
+    reparsed
 }
 
 /// Filter and bucket a watcher-event batch.
@@ -2790,6 +2901,290 @@ mod tests {
 
         change_document(server, &uri, 2, "\u{FEFF}:b: 2\n").await;
         assert_eq!(*server.get_document_content(&uri).unwrap(), ":b: 2\n");
+    }
+
+    fn recalculations(server: &AsciiDocLsp) -> usize {
+        server.recalculations.load(Ordering::SeqCst)
+    }
+
+    /// Forget the recalculations and publications so far.
+    fn reset_observations(server: &AsciiDocLsp) {
+        server.recalculations.store(0, Ordering::SeqCst);
+        server.publications.lock().clear();
+    }
+
+    /// The diagnostics published for `uri`, one entry per publication.
+    fn publications_for(server: &AsciiDocLsp, uri: &Uri) -> Vec<Vec<Diagnostic>> {
+        server
+            .publications
+            .lock()
+            .iter()
+            .filter(|(published, _)| published == uri)
+            .map(|(_, diagnostics)| diagnostics.clone())
+            .collect()
+    }
+
+    /// Let the quiet period after the last edit pass. Under paused test time
+    /// the runtime jumps to each timer, so this is instant and the debounced
+    /// work, due earlier, has run when it returns.
+    async fn quiet_period_passes() {
+        tokio::time::sleep(DIAGNOSTICS_DEBOUNCE * 2).await;
+    }
+
+    /// A workspace of one clean file `a.adoc`, open in the editor.
+    async fn server_with_open_file() -> (
+        tempfile::TempDir,
+        LspService<AsciiDocLsp>,
+        tower_lsp_server::ClientSocket,
+        Uri,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        fs::write(&path, "= A\n\nText.\n").unwrap();
+        let uri = file_uri(&path);
+        let (service, socket) = initialized_server(&root).await;
+        open_document(service.inner(), &uri, "= A\n\nText.\n").await;
+        (tmp, service, socket, uri)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rapid_edits_recompute_the_diagnostics_once() {
+        let (_tmp, service, _socket, uri) = server_with_open_file().await;
+        let server = service.inner();
+        reset_observations(server);
+
+        for version in 2..201 {
+            change_document(server, &uri, version, &format!("= A\n\nEdit {version}.\n")).await;
+        }
+        change_document(server, &uri, 201, "= A\n\nSee <<missing>>.\n").await;
+        quiet_period_passes().await;
+
+        assert_eq!(recalculations(server), 1);
+        let published = publications_for(server, &uri);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].len(), 1);
+        assert!(published[0][0].message.contains("missing"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_single_edit_gets_its_diagnostics_after_the_quiet_period() {
+        let (_tmp, service, _socket, uri) = server_with_open_file().await;
+        let server = service.inner();
+        reset_observations(server);
+
+        change_document(server, &uri, 2, "= A\n\nSee <<missing>>.\n").await;
+        tokio::time::advance(DIAGNOSTICS_DEBOUNCE - std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(recalculations(server), 0);
+
+        quiet_period_passes().await;
+        assert_eq!(recalculations(server), 1);
+        let published = publications_for(server, &uri);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].len(), 1);
+    }
+
+    /// `a.adoc` defines the anchor `sec-a` and includes `b.adoc`, which
+    /// refers to it; `c.adoc` has a broken xref. All on disk, `a.adoc` open.
+    async fn server_with_dependent_files() -> (
+        tempfile::TempDir,
+        LspService<AsciiDocLsp>,
+        tower_lsp_server::ClientSocket,
+        [PathBuf; 3],
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let [a, b, c] = ["a.adoc", "b.adoc", "c.adoc"].map(|name| root.join(name));
+        fs::write(&a, A_WITH_ANCHOR).unwrap();
+        fs::write(&b, "See <<sec-a>>.\n").unwrap();
+        fs::write(&c, "= C\n\nSee <<missing>>.\n").unwrap();
+        let (service, socket) = initialized_server(&root).await;
+        open_document(service.inner(), &file_uri(&a), A_WITH_ANCHOR).await;
+        (tmp, service, socket, [a, b, c])
+    }
+
+    const A_WITH_ANCHOR: &str = "= A\n\n[[sec-a]]\n== S\n\ninclude::b.adoc[]\n";
+    const A_WITHOUT_ANCHOR: &str = "= A\n\n== S\n\ninclude::b.adoc[]\n";
+
+    #[tokio::test(start_paused = true)]
+    async fn test_edit_does_not_republish_files_whose_diagnostics_stay() {
+        let (_tmp, service, _socket, [a, b, c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        reset_observations(server);
+
+        let text = format!("{A_WITH_ANCHOR}\nMore.\n");
+        change_document(server, &file_uri(&a), 2, &text).await;
+        quiet_period_passes().await;
+
+        assert_eq!(recalculations(server), 1);
+        assert!(publications_for(server, &file_uri(&b)).is_empty());
+        assert!(publications_for(server, &file_uri(&c)).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_edit_publishes_a_file_whose_diagnostics_change_and_clears_it_again() {
+        let (_tmp, service, _socket, [a, b, _c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        let b_uri = file_uri(&b);
+        reset_observations(server);
+
+        change_document(server, &file_uri(&a), 2, A_WITHOUT_ANCHOR).await;
+        quiet_period_passes().await;
+        let published = publications_for(server, &b_uri);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].len(), 1);
+        assert!(published[0][0].message.contains("sec-a"));
+
+        reset_observations(server);
+        change_document(server, &file_uri(&a), 3, A_WITH_ANCHOR).await;
+        quiet_period_passes().await;
+        assert_eq!(publications_for(server, &b_uri), vec![Vec::new()]);
+    }
+
+    /// Positions are converted against the text, so the edited file is
+    /// published again even when its diagnostics are the same.
+    #[tokio::test(start_paused = true)]
+    async fn test_edit_republishes_the_edited_file_with_the_same_diagnostics() {
+        let (_tmp, service, _socket, [_a, _b, c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        let uri = file_uri(&c);
+        let text = "= C\n\nSee <<missing>>.\n";
+        open_document(server, &uri, text).await;
+        reset_observations(server);
+
+        change_document(server, &uri, 2, &format!("{text}\nMore.\n")).await;
+        quiet_period_passes().await;
+
+        assert_eq!(publications_for(server, &uri).len(), 1);
+    }
+
+    /// A file closed in the editor falls back to its disk text, which the
+    /// positions of its diagnostics are converted against again.
+    #[tokio::test(start_paused = true)]
+    async fn test_close_republishes_the_file_with_the_same_diagnostics() {
+        let (_tmp, service, _socket, [_a, _b, c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        let uri = file_uri(&c);
+        open_document(server, &uri, "= C\n\nSee <<missing>>. Typed.\n").await;
+        reset_observations(server);
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&uri),
+            })
+            .await;
+
+        assert_eq!(publications_for(server, &uri).len(), 1);
+    }
+
+    /// A file changed on disk is published again even when its diagnostics
+    /// are the same; the others are not.
+    #[tokio::test(start_paused = true)]
+    async fn test_disk_change_republishes_only_the_changed_file() {
+        let (_tmp, service, _socket, [_a, b, c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        reset_observations(server);
+
+        fs::write(&c, "= C\n\nSee <<missing>>. Changed.\n").unwrap();
+        notify_watched(server, &c, FileChangeType::CHANGED).await;
+
+        assert_eq!(publications_for(server, &file_uri(&c)).len(), 1);
+        assert!(publications_for(server, &file_uri(&b)).is_empty());
+    }
+
+    /// Give `path` the buffer `text` and recompute, as an edit and its
+    /// debounced work do, without publishing.
+    fn recompute_with_buffer(server: &AsciiDocLsp, path: &Path, text: &str) -> Recomputed {
+        let uri = file_uri(path);
+        server.documents.lock().insert(
+            uri.clone(),
+            DocumentState {
+                content: Arc::new(text.into()),
+                version: 100,
+            },
+        );
+        let overrides = build_content_overrides(&server.documents, &uri);
+        let mut guard = server.workspace.lock();
+        let ws = guard.as_mut().unwrap();
+        ws.update_file(path, &overrides);
+        server.content_changed.lock().insert(path.to_path_buf());
+        server.recompute_diagnostics(ws)
+    }
+
+    /// Two publications that overtake each other: the older one, arriving
+    /// last, does not put its diagnostics back on the client.
+    #[tokio::test(start_paused = true)]
+    async fn test_older_recomputation_published_last_does_not_win() {
+        let (_tmp, service, _socket, [a, b, _c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        let older = recompute_with_buffer(server, &a, A_WITHOUT_ANCHOR);
+        let newer = recompute_with_buffer(server, &a, A_WITH_ANCHOR);
+        reset_observations(server);
+
+        server.publish_workspace_diagnostics(&newer).await;
+        server.publish_workspace_diagnostics(&older).await;
+
+        let published = publications_for(server, &file_uri(&b));
+        assert!(published.last().is_none_or(Vec::is_empty), "{published:?}");
+    }
+
+    /// A file whose text changed before the older of two overtaking
+    /// recomputations is still converted against its new text.
+    #[tokio::test(start_paused = true)]
+    async fn test_older_recomputation_published_last_keeps_its_changed_text() {
+        let (_tmp, service, _socket, [a, _b, c]) = server_with_dependent_files().await;
+        let server = service.inner();
+        server.content_changed.lock().insert(c.clone());
+        let older = recompute_with_buffer(server, &a, A_WITH_ANCHOR);
+        let newer = recompute_with_buffer(server, &a, &format!("{A_WITH_ANCHOR}\nMore.\n"));
+        reset_observations(server);
+
+        server.publish_workspace_diagnostics(&newer).await;
+        server.publish_workspace_diagnostics(&older).await;
+
+        let published = publications_for(server, &file_uri(&c));
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].len(), 1);
+    }
+
+    /// A save within the quiet period recomputes at once and covers the
+    /// edit: the debounced recomputation is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn test_save_after_an_edit_cancels_the_debounced_recomputation() {
+        let (_tmp, service, _socket, uri) = server_with_open_file().await;
+        let server = service.inner();
+        reset_observations(server);
+
+        change_document(server, &uri, 2, "= A\n\nSee <<missing>>.\n").await;
+        server
+            .did_save(DidSaveTextDocumentParams {
+                text_document: document_id(&uri),
+                text: None,
+            })
+            .await;
+        assert_eq!(recalculations(server), 1);
+        quiet_period_passes().await;
+
+        assert_eq!(recalculations(server), 1);
+        assert_eq!(publications_for(server, &uri).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_did_open_recomputes_the_diagnostics_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        fs::write(&path, "= A\n").unwrap();
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        reset_observations(server);
+
+        let uri = file_uri(&path);
+        open_document(server, &uri, "= A\n\nSee <<missing>>.\n").await;
+
+        assert_eq!(recalculations(server), 1);
+        assert_eq!(publications_for(server, &uri).len(), 1);
     }
 
     #[tokio::test]
@@ -4781,7 +5176,7 @@ mod tests {
     /// Without a watcher event for a new subdirectory file (Neovim's
     /// `watchdirs` fallback), the next edit of the including document
     /// indexes the include target and clears both errors.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_edit_indexes_include_target_created_without_watch_event() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -4801,6 +5196,7 @@ mod tests {
         )
         .unwrap();
         change_document(server, &file_uri(&index), 2, &format!("{text}\n")).await;
+        quiet_period_passes().await;
         assert!(broken_xrefs(server, &index).is_empty());
         assert_eq!(broken_includes(server, &index), 0);
     }
