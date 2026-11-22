@@ -13,6 +13,7 @@ mod symbols;
 #[cfg(test)]
 mod test_support;
 mod version;
+mod watchdog;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -532,6 +533,10 @@ impl AsciiDocLsp {
 #[allow(clippy::unused_async_trait_impl)]
 impl LanguageServer for AsciiDocLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        if let Some(pid) = params.process_id {
+            watchdog::watch(pid);
+        }
+
         // Capture client capability for dynamic watcher registration so we can
         // call `register_capability` in `initialized()` only when supported.
         {
