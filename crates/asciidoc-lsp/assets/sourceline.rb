@@ -20,8 +20,13 @@
 #   `<script id="adoc-body-classes">` lists the body classes for the page,
 #   `[]` when the standalone page would add none.
 #
+# - `<script id="adoc-page-title">` is the document title as a JSON string of
+#   plain text, for the page's tab title; without a title, the file's base
+#   name. It does not depend on `showtitle`.
+#
 # Loaded with `asciidoctor -r <this file>`.
 require 'asciidoctor/extensions'
+require 'cgi'
 require 'json'
 require 'stringio'
 
@@ -169,6 +174,18 @@ class TocLayoutPostprocessor < Asciidoctor::Extensions::Postprocessor
   end
 end
 
+# The document title as plain text: tags stripped, the entities that
+# Asciidoctor writes decoded.
+class PageTitlePostprocessor < Asciidoctor::Extensions::Postprocessor
+  def process(doc, output)
+    title = CGI.unescapeHTML(doc.doctitle(sanitize: true).to_s).strip
+    title = doc.attr('docname').to_s if title.empty?
+    # "</" must not end the script element early.
+    json = JSON.generate(title).gsub('</', '<\/')
+    %(#{output}\n<script type="application/json" id="adoc-page-title">#{json}</script>\n)
+  end
+end
+
 # Rewrites the `src` of every `<img>` that names a local file below the
 # workspace root. The page lives at `/<token>/`, so `images/a.png` would
 # resolve there and `../images/a.png` would drop the token; `files/...` is
@@ -234,5 +251,6 @@ Asciidoctor::Extensions.register do
   treeprocessor SourceLineTreeprocessor
   postprocessor SourceFilesPostprocessor
   postprocessor TocLayoutPostprocessor
+  postprocessor PageTitlePostprocessor
   postprocessor ImageSrcPostprocessor
 end

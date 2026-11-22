@@ -821,6 +821,44 @@ mod tests {
         serde_json::from_str(&html[start..end]).unwrap()
     }
 
+    /// The `adoc-page-title` table: the document title as plain text.
+    fn page_title(html: &str) -> String {
+        let open = r#"<script type="application/json" id="adoc-page-title">"#;
+        let start = html
+            .find(open)
+            .unwrap_or_else(|| panic!("no table: {html}"))
+            + open.len();
+        let end = start + html[start..].find("</script>").unwrap();
+        serde_json::from_str(&html[start..end]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_page_title_is_the_plain_document_title() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= The *Bold* & \"Quoted\" Title\n\nText.\n").await;
+        assert_eq!(page_title(&html), "The Bold & \"Quoted\" Title");
+    }
+
+    #[tokio::test]
+    async fn test_page_title_ignores_showtitle() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("= Hidden\n:!showtitle:\n\nText.\n").await;
+        assert_eq!(page_title(&html), "Hidden");
+    }
+
+    #[tokio::test]
+    async fn test_page_title_falls_back_to_the_file_name() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_plain("Text without a title.\n").await;
+        assert_eq!(page_title(&html), "doc");
+    }
+
     #[tokio::test]
     async fn test_toc_left_is_a_sidebar() {
         if !asciidoctor_available() {

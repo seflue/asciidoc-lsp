@@ -34,6 +34,7 @@
   'use strict'
 
   /** CSS selector of the elements that carry a `data-line-N` class. */
+  var PRODUCT = 'AsciiDoc Preview'
   var ANCHOR_SELECTOR = '[class^="data-line-"], [class*=" data-line-"]'
 
   /**
@@ -294,6 +295,20 @@
   }
 
   /**
+   * The tab title for a page: `text` is the JSON text of
+   * `<script id="adoc-page-title">`, a string, the plain-text document title.
+   */
+  function pageTitle(text) {
+    var title
+    try {
+      title = JSON.parse(text)
+    } catch (error) {
+      return PRODUCT
+    }
+    return typeof title === 'string' && title !== '' ? title + ' \u2013 ' + PRODUCT : PRODUCT
+  }
+
+  /**
    * The include table of a page: the JSON text of
    * `<script id="adoc-source-includes">`, an array of `{parent, line, file}`
    * (`parent` null for the main file, else a file table index). Empty for
@@ -437,6 +452,7 @@
     parseIncludeTable: parseIncludeTable,
     parseFileTable: parseFileTable,
     bodyClassName: bodyClassName,
+    pageTitle: pageTitle,
     srcForFile: srcForFile,
     withSentinel: withSentinel,
     withPageTop: withPageTop,

@@ -31,7 +31,7 @@ const assert = Object.assign(Object.create(strict), {
 test('script publishes AdocScrollMap on the global like in the browser', () => {
   assert.equal(typeof map, 'object')
   for (const name of ['parseAnchorClass', 'fileAnchors', 'mainFileAnchors',
-    'parseFileTable', 'bodyClassName', 'srcForFile', 'withSentinel', 'withPageTop', 'anchorIndicesForLine',
+    'parseFileTable', 'bodyClassName', 'pageTitle', 'srcForFile', 'withSentinel', 'withPageTop', 'anchorIndicesForLine',
     'scrollTopForLine', 'sourceLineAtViewportTop', 'shouldScroll']) {
     assert.equal(typeof map[name], 'function', name)
   }
@@ -555,4 +555,14 @@ test('a page scrolled to the top stays at the top when it is pinned', () => {
   const line = map.sourceLineAtViewportTop(page, 0)
   assert.equal(line, 1)
   assert.equal(map.scrollTopForLine(page, 0, line), 0)
+})
+
+test('pageTitle puts the document title before the product name', () => {
+  assert.equal(map.pageTitle('"My Doc"'), 'My Doc – AsciiDoc Preview')
+})
+
+test('pageTitle falls back to the product name', () => {
+  assert.equal(map.pageTitle('""'), 'AsciiDoc Preview')
+  assert.equal(map.pageTitle('[]'), 'AsciiDoc Preview')
+  assert.equal(map.pageTitle('not json'), 'AsciiDoc Preview')
 })

@@ -65,6 +65,12 @@
     document.body.className = maps.bodyClassName(baseBodyClass, script ? script.textContent : '[]')
   }
 
+  /** The tab title: the document title, set as text. */
+  function applyTitle() {
+    var script = document.getElementById('adoc-page-title')
+    document.title = maps.pageTitle(script ? script.textContent : '""')
+  }
+
   /**
    * Anchors of one file (`src`: `null` for the shown file, else K) with their
    * current client-Y, ready for the mapping functions. Only the shown file
@@ -133,6 +139,7 @@
     lineCount = message.lineCount
     readFileTable()
     applyBodyClasses()
+    applyTitle()
     showError(null)
     if (followOn() && cursorApplies()) revealCursor()
     else if (keepLine !== null) pinToLine(keepLine)
