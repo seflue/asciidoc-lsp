@@ -1,0 +1,8 @@
+= Book
+:doctype: book
+
+= Part One
+
+== In Part
+
+See <<_part_one>>.

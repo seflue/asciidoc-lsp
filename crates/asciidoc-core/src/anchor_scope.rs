@@ -180,6 +180,29 @@ impl<'ws> CatalogCache<'ws> {
         top_level_documents_in(self.roots(), &file).is_some()
     }
 
+    /// The IDs Asciidoctor generates for the section titled on `line` of
+    /// `file`, one per top-level document that reads the file, in the order
+    /// of [`Self::scopes_at`], each ID once with its first definition. The
+    /// `idprefix` and `idseparator` of each document shape its ID, and a
+    /// taken name its suffix. Empty for a section with an ID of its own.
+    pub fn section_ids(&self, file: &Path, line: usize) -> Vec<(String, AnchorLocation)> {
+        let file = self.workspace.indexed_path(file);
+        let mut ids: Vec<(String, AnchorLocation)> = Vec::new();
+        for scope in self.scopes_at(&file) {
+            let generated = scope.ids().filter(|(_, location)| {
+                location.kind == AnchorKind::ImplicitSection
+                    && location.file == file
+                    && location.line == line
+            });
+            for (id, location) in generated {
+                if !ids.iter().any(|(known, _)| known == id) {
+                    ids.push((id.to_string(), location.clone()));
+                }
+            }
+        }
+        ids
+    }
+
     /// Where `xref` points when read in `scope`, one top-level document.
     /// The file part of the target is resolved from the folder of that
     /// document (`xref_file` holds the rule); `attributes`, the scope

@@ -1,0 +1,43 @@
+= Main Title
+
+include::chapters.adoc[]
+
+include::titled.adoc[leveloffset=+1]
+
+include::tagged.adoc[]
+
+include::tagged.adoc[tag=keep]
+
+[[cli,Command line]]
+== CLI Options
+
+[#anchored]
+== Anchored Title
+
+== Inline Title [[inline-id]]
+
+== Unreferenced
+
+[source]
+----
+== Kein Titel
+----
+
+== Xrefs
+
+See <<_first_chapter>>.
+See xref:#_first_chapter[the first chapter].
+See <<First Chapter>>.
+See <<_sub_section>>.
+See <<cli>>.
+See <<Command line>>.
+See <<_cli_options>>.
+See xref:#anchored[].
+See <<_anchored_title>>.
+See <<inline-id>>.
+See <<_chapter_title>>.
+See <<_kept_section>>.
+See <<Sub Section>>.
+See <<chapters.adoc#_first_chapter,the chapter>>.
+See <<chapters.adoc#,the chapters>>.
+See <<_inline_title>>.

@@ -17,7 +17,7 @@ use asciidoc_core::targets::{
     resolve_include_in_folder, ImageOutcome, ImageResult, IncludeResult, Readings, Target,
 };
 use asciidoc_core::types::{
-    AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref,
+    AnchorKind, AnchorLocation, DiagnosticKind, FileLocation, Placement, ResolvedXref, Section,
 };
 use asciidoc_core::workspace::{
     entry_name, AttributeDefinition, AttributeOrigin, AttributeScope, ConfigOverride, Workspace,
@@ -51,6 +51,9 @@ pub(crate) enum NodeKind {
         inline: bool,
         attrlist: String,
     },
+    /// The title line of a section; `top_level` when no section of the file
+    /// has a lower level, the header title counted as level 0
+    Heading { section: Section, top_level: bool },
 }
 
 /// Information about a recognized node at a cursor position.
@@ -109,7 +112,27 @@ pub(crate) fn find_node_at_position(content: &str, pos: Position) -> Option<Node
         }
     }
 
-    None
+    // Anywhere else on a title line: the section itself.
+    classify_heading(block_tree.root_node(), content.as_bytes(), line_1)
+}
+
+/// The section whose title stands on `line`. A title inside a delimited
+/// block, table or list is no section, nor is one the grammar could not
+/// parse.
+fn classify_heading(root: tree_sitter::Node, source: &[u8], line: usize) -> Option<NodeInfo> {
+    let sections: Vec<Section> = asciidoc_core::extractors::extract_sections(root, source)
+        .into_iter()
+        .filter(|section| section.placement == Placement::Body)
+        .collect();
+    let highest = sections.iter().map(|section| section.level).min()?;
+    let section = sections.into_iter().find(|section| section.line == line)?;
+    Some(NodeInfo {
+        kind: NodeKind::Heading {
+            top_level: section.level == highest,
+            section,
+        },
+        line,
+    })
 }
 
 /// Parse `range` with the inline grammar and classify the node at `point`.
@@ -192,8 +215,10 @@ pub fn resolve_goto_definitions(
                     .map(|resolved| (resolved.file, resolved.line)),
             )
         }
-        // On a definition or anchor goto-definition is a no-op.
-        NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } => Vec::new(),
+        // On a definition, anchor or heading goto-definition is a no-op.
+        NodeKind::AttributeDef { .. } | NodeKind::Anchor { .. } | NodeKind::Heading { .. } => {
+            Vec::new()
+        }
     }
 }
 
@@ -227,13 +252,10 @@ pub fn resolve_references(
         NodeKind::Include { path } => {
             let targets =
                 resolve_include_targets(path, doc_path, Some(ws), node_info.line, Readings::Build);
-            let mut r = Vec::new();
-            for target in existing_targets(&targets) {
-                let filename = target.file_name().and_then(|f| f.to_str()).unwrap_or("");
-                r.extend(ws.find_all_include_references(&target));
-                r.extend(ws.find_all_file_xrefs(filename));
-            }
-            r
+            existing_targets(&targets)
+                .iter()
+                .flat_map(|target| file_reference_locations(ws, target))
+                .collect()
         }
         NodeKind::Anchor { id } => {
             let definitions = anchor_definitions_of_anchor(ws, &catalogs, doc_path, id);
@@ -270,6 +292,26 @@ pub fn resolve_references(
             // Images have no references semantics — find-references is a no-op
             return None;
         }
+        NodeKind::Heading { section, top_level } => {
+            let mut r = heading_reference_locations(ws, &catalogs, doc_path, section, overrides);
+            // The include brings every heading on the file's highest level
+            // into the document.
+            let file = ws.indexed_path(doc_path);
+            if *top_level {
+                // `<<file.adoc#id,…>>` is found as an xref to the ID and to
+                // the file; it stays one place, at the ID.
+                let file_references: Vec<FileLocation> = file_reference_locations(ws, &file)
+                    .into_iter()
+                    .filter(|loc| !r.iter().any(|x| x.path == loc.path && x.line == loc.line))
+                    .collect();
+                r.extend(file_references);
+            }
+            // The heading line, not an ID line above it, is the declaration.
+            if include_declaration {
+                r.push(FileLocation::new(file, section.line, 0, 0));
+            }
+            r
+        }
     };
 
     // Deduplicate results (same file+line can appear from multiple sources)
@@ -286,6 +328,39 @@ pub fn resolve_references(
     } else {
         Some(results)
     }
+}
+
+/// The `include::` lines that read `file` and the xrefs to it.
+fn file_reference_locations(ws: &Workspace, file: &Path) -> Vec<FileLocation> {
+    let filename = file.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let mut locations = ws.find_all_include_references(file);
+    locations.extend(ws.find_all_file_xrefs(filename));
+    locations
+}
+
+/// The xrefs that reach the section titled on `section.line` of `doc_path`:
+/// with an ID of its own those its ID line finds, else those to the ID each
+/// top-level document that reads the file generates for it, which
+/// `idprefix` and `idseparator` of that document shape.
+fn heading_reference_locations(
+    ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
+    doc_path: &Path,
+    section: &Section,
+    overrides: &HashMap<PathBuf, Arc<String>>,
+) -> Vec<FileLocation> {
+    if let Some(id) = &section.id {
+        let definitions = anchor_definitions_of_anchor(ws, catalogs, doc_path, id);
+        return anchor_reference_locations(catalogs, id, &definitions, false, true, overrides);
+    }
+    catalogs
+        .section_ids(doc_path, section.line)
+        .into_iter()
+        .flat_map(|(id, definition)| {
+            let definitions = close_definitions(ws, catalogs, &id, vec![definition]);
+            anchor_reference_locations(catalogs, &id, &definitions, false, true, overrides)
+        })
+        .collect()
 }
 
 /// The anchor id an xref target names: the part after `#`, or a plain id.
@@ -594,6 +669,7 @@ pub fn resolve_hover(
             .collect();
             (!texts.is_empty()).then(|| per_document_hover(texts))
         }
+        NodeKind::Heading { .. } => None,
     }
 }
 
@@ -1083,6 +1159,12 @@ fn explain_node(info: &NodeInfo) -> Value {
             json!({ "name": name })
         }
         NodeKind::Anchor { id } => json!({ "id": id }),
+        NodeKind::Heading { section, top_level } => json!({
+            "title": section.title,
+            "level": section.level,
+            "id": section.id,
+            "top_level": top_level,
+        }),
     };
     json!({ "kind": node_kind_name(&info.kind), "line": info.line, "fields": fields })
 }
@@ -1097,6 +1179,7 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::AttributeDef { .. } => "attribute_def",
         NodeKind::Anchor { .. } => "anchor",
         NodeKind::Image { .. } => "image",
+        NodeKind::Heading { .. } => "heading",
     }
 }
 
@@ -1171,6 +1254,7 @@ fn explain_resolution(info: &NodeInfo, doc_path: &Path, workspace: Option<&Works
                     .collect();
             json!({ "scopes": scopes })
         }
+        NodeKind::Heading { .. } => Value::Null,
     }
 }
 
@@ -1658,7 +1742,7 @@ pub fn prepare_rename(
                 end_col: end,
             })
         }
-        NodeKind::Include { .. } | NodeKind::Image { .. } => None,
+        NodeKind::Include { .. } | NodeKind::Image { .. } | NodeKind::Heading { .. } => None,
     }
 }
 
@@ -1725,7 +1809,7 @@ pub fn rename_conflict(
             (new_name != name && !defined.is_empty())
                 .then(|| format!("attribute `{new_name}` is already defined"))
         }
-        NodeKind::Include { .. } | NodeKind::Image { .. } => None,
+        NodeKind::Include { .. } | NodeKind::Image { .. } | NodeKind::Heading { .. } => None,
     }
 }
 
@@ -1798,7 +1882,7 @@ pub fn resolve_rename(
             );
             resolve_rename_anchor(anchor_id, &definitions, &catalogs, overrides)
         }
-        NodeKind::Include { .. } | NodeKind::Image { .. } => None,
+        NodeKind::Include { .. } | NodeKind::Image { .. } | NodeKind::Heading { .. } => None,
     }
 }
 
@@ -2048,7 +2132,6 @@ mod tests {
 
     #[rstest]
     #[case("plain text", "= Title\n\nJust plain text.\n", 2, 5)]
-    #[case("section heading", "= Title\n\n== Chapter\n", 2, 5)]
     fn test_find_node_none(
         #[case] _name: &str,
         #[case] content: &str,
@@ -2672,6 +2755,223 @@ mod tests {
             references_in_fixture("solo2/main.adoc", 9, 22, false),
             vec![("solo2/main.adoc".to_string(), 10)]
         );
+    }
+
+    // --- find-references from a heading (fixture `heading_references`) ---
+
+    /// Find-references at (`line`, `character`), both 0-based, of `file` in
+    /// the fixture `heading_references`: each location as (path relative to
+    /// the fixture, 1-based line), `None` for no result.
+    fn heading_references(
+        file: &str,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Option<Vec<(String, usize)>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/heading_references")
+            .canonicalize()
+            .unwrap();
+        let mut ws = Workspace::new(&root);
+        ws.scan_workspace();
+        ws.refresh();
+        let path = root.join(file);
+        let content = fs::read_to_string(&path).unwrap();
+        let locations = resolve_references(
+            &content,
+            Position { line, character },
+            &path,
+            Some(&ws),
+            include_declaration,
+            &HashMap::new(),
+        )?;
+        Some(
+            locations
+                .into_iter()
+                .map(|loc| {
+                    (
+                        loc.path.strip_prefix(&root).unwrap().display().to_string(),
+                        loc.line,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn at(file: &str, line: usize) -> (String, usize) {
+        (file.to_string(), line)
+    }
+
+    /// `=== Sub Section` has no ID of its own: the xref to its implicit ID
+    /// `_sub_section` in `main.adoc`, which includes the file, refers to it.
+    #[test]
+    fn test_references_from_heading_find_xrefs_to_its_implicit_id() {
+        assert_eq!(
+            heading_references("chapters.adoc", 2, 6, false),
+            Some(vec![at("main.adoc", 31), at("main.adoc", 40)])
+        );
+    }
+
+    /// The cursor may stand anywhere on the title line: on the marker, in
+    /// the title, at the line end. `<<Sub Section>>` (line 40) is a natural
+    /// xref by title.
+    #[rstest]
+    #[case::marker(0)]
+    #[case::title(8)]
+    #[case::line_end(15)]
+    fn test_references_from_heading_anywhere_on_the_line(#[case] character: u32) {
+        assert_eq!(
+            heading_references("chapters.adoc", 2, character, false),
+            Some(vec![at("main.adoc", 31), at("main.adoc", 40)])
+        );
+    }
+
+    /// A heading with an explicit ID finds what its ID line finds:
+    /// `[[cli,Command line]]` (line 11), `[#anchored]` (line 14) and the
+    /// inline `[[inline-id]]` (line 17, the heading itself). The xref to
+    /// the implicit ID (`<<_cli_options>>`, `<<_anchored_title>>`,
+    /// `<<_inline_title>>`) is none:
+    /// with an ID of its own Asciidoctor generates no `_title` ID.
+    #[rstest]
+    #[case::block_anchor((10, 3), (11, 5), vec![32, 33])]
+    #[case::attribute_list((13, 3), (14, 5), vec![35])]
+    #[case::inline_anchor((16, 20), (16, 5), vec![37])]
+    fn test_references_from_heading_with_explicit_id_match_its_id_line(
+        #[case] id_line: (u32, u32),
+        #[case] heading: (u32, u32),
+        #[case] expected: Vec<usize>,
+    ) {
+        let expected: Vec<_> = expected.into_iter().map(|l| at("main.adoc", l)).collect();
+        assert_eq!(
+            heading_references("main.adoc", id_line.0, id_line.1, false),
+            Some(expected.clone()),
+            "on the ID"
+        );
+        assert_eq!(
+            heading_references("main.adoc", heading.0, heading.1, false),
+            Some(expected),
+            "on the heading"
+        );
+    }
+
+    /// `prefix_a.adoc` and `prefix_b.adoc` both read `shared.adoc`: the
+    /// natural xref in the shared file, found by both readings, counts once.
+    #[test]
+    fn test_references_from_heading_list_each_place_once() {
+        let found = heading_references("shared.adoc", 2, 5, false).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .filter(|place| **place == at("shared.adoc", 5))
+                .count(),
+            1,
+            "{found:?}"
+        );
+    }
+
+    /// `other.adoc` does not read `chapters.adoc`: its `<<_sub_section>>`
+    /// (line 6) is broken there and no reference of `=== Sub Section`.
+    #[test]
+    fn test_references_from_heading_skip_documents_that_do_not_read_it() {
+        let found = heading_references("chapters.adoc", 2, 5, false).unwrap();
+        assert!(!found.contains(&at("other.adoc", 6)), "{found:?}");
+    }
+
+    /// A heading on the highest level of its file also finds the
+    /// `include::` lines that bring the file into a document and the xrefs
+    /// to the file. `chapters.adoc` has two `==` chapters, both on the
+    /// highest level; `titled.adoc` has a document title, which is the
+    /// highest level, and `main.adoc` reads it with `leveloffset`. An
+    /// include with `tag` counts whatever its tag selects: the LSP does not
+    /// evaluate tag regions.
+    #[rstest]
+    // Line 41 is an xref to the section and to its file at once: one place.
+    #[case::first_chapter("chapters.adoc", 0, vec![
+        at("main.adoc", 3), at("main.adoc", 28), at("main.adoc", 29),
+        at("main.adoc", 30), at("main.adoc", 41), at("main.adoc", 42),
+        at("other.adoc", 5),
+    ])]
+    #[case::second_chapter("chapters.adoc", 4, vec![
+        at("main.adoc", 3), at("main.adoc", 41), at("main.adoc", 42),
+        at("other.adoc", 5),
+    ])]
+    #[case::document_title_of_included_file("titled.adoc", 0, vec![
+        at("main.adoc", 5), at("main.adoc", 38),
+    ])]
+    #[case::inside_the_tag("tagged.adoc", 1, vec![
+        at("main.adoc", 7), at("main.adoc", 9), at("main.adoc", 39),
+    ])]
+    #[case::outside_the_tag("tagged.adoc", 4, vec![
+        at("main.adoc", 7), at("main.adoc", 9),
+    ])]
+    #[case::document_title_of_top_level_document("main.adoc", 0, vec![
+        at("other.adoc", 4),
+    ])]
+    fn test_references_from_top_level_heading_find_includes_and_file_xrefs(
+        #[case] file: &str,
+        #[case] line: u32,
+        #[case] expected: Vec<(String, usize)>,
+    ) {
+        assert_eq!(heading_references(file, line, 3, false), Some(expected));
+    }
+
+    /// With `includeDeclaration` the heading line is the declaration, also
+    /// for a heading with an explicit ID: `[[cli,Command line]]` (line 11)
+    /// stays out.
+    #[rstest]
+    #[case::implicit_id("chapters.adoc", 2, vec![
+        at("chapters.adoc", 3), at("main.adoc", 31), at("main.adoc", 40),
+    ])]
+    #[case::explicit_id("main.adoc", 11, vec![
+        at("main.adoc", 12), at("main.adoc", 32), at("main.adoc", 33),
+    ])]
+    fn test_references_from_heading_declare_the_heading_line(
+        #[case] file: &str,
+        #[case] line: u32,
+        #[case] expected: Vec<(String, usize)>,
+    ) {
+        assert_eq!(heading_references(file, line, 3, true), Some(expected));
+    }
+
+    /// `== Unreferenced` has no reference; `== Kein Titel` inside a listing
+    /// is no heading at all. Both give no result.
+    #[rstest]
+    #[case::unreferenced(18)]
+    #[case::inside_listing(22)]
+    fn test_references_from_heading_without_reference_are_empty(#[case] line: u32) {
+        assert_eq!(heading_references("main.adoc", line, 3, false), None);
+    }
+
+    /// A book part (level 0 after the header of a `book`) gets an ID like
+    /// any section: `<<_part_one>>` (line 8) refers to it.
+    #[test]
+    fn test_references_from_book_part_find_xrefs_to_its_id() {
+        assert_eq!(
+            heading_references("book.adoc", 3, 3, false),
+            Some(vec![at("book.adoc", 8)])
+        );
+    }
+
+    /// `== Under Chapter` lies below the document title of `titled.adoc`:
+    /// no `include::` line, and no xref reaches it.
+    #[test]
+    fn test_references_from_deeper_heading_find_no_includes() {
+        assert_eq!(heading_references("titled.adoc", 2, 3, false), None);
+    }
+
+    /// The grammar cannot parse the `====` block in `unparsed.adoc`, whose
+    /// `----` never closes (an `ERROR`), so `== Hidden` inside it is no section
+    /// to find references from, not even the heading line itself.
+    #[test]
+    fn test_references_from_heading_inside_unparsed_part_stay_empty() {
+        assert_eq!(heading_references("unparsed.adoc", 5, 3, true), None);
+    }
+
+    /// On `[#anchored]` find-references works only with the cursor on the
+    /// ID, as before: the line is no heading.
+    #[test]
+    fn test_references_on_attribute_list_beside_the_id_stay_empty() {
+        assert_eq!(heading_references("main.adoc", 13, 0, false), None);
     }
 
     /// `book.adoc` reads `shared` in `setup.adoc` first and again in

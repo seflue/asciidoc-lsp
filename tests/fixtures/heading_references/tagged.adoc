@@ -1,0 +1,5 @@
+// tag::keep[]
+== Kept Section
+// end::keep[]
+
+== Outside Tag

@@ -1,0 +1,6 @@
+= Prefix B
+:idprefix: b_
+
+include::shared.adoc[]
+
+See <<b_shared_sub>>.
