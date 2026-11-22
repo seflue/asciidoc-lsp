@@ -1,0 +1,8 @@
+== Setup
+
+// Read by index.adoc, which sets both attributes: each xref names
+// chapters/notes.adoc, resolved from the folder of index.adoc.
+
+See xref:{chapdir}/notes.adoc[the notes].
+
+See xref:{notes}.adoc[the notes].

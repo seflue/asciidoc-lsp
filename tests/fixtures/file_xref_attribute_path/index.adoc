@@ -1,0 +1,5 @@
+= Master
+:chapdir: chapters
+:notes: chapters/notes
+
+include::chapters/setup.adoc[]

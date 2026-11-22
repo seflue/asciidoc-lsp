@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::anchor_scope::AnchorScope;
-use crate::anchor_scope::CatalogCache;
+use crate::anchor_scope::{xref_file, CatalogCache};
 use crate::attributes::DOCDIR;
 use crate::paths::{
     canonicalize_if_exists, display_path, is_uri, join_doc_path, normalize_lexically,
@@ -30,7 +30,7 @@ use crate::paths::{
 use crate::references::parse_xref_target;
 pub use crate::types::{imagesdir_note, ImagesdirOrigin};
 use crate::types::{AnchorLocation, DiagnosticKind, FileLocation, ResolvedXref, Xref};
-use crate::workspace::{AttributeScope, Workspace};
+use crate::workspace::{top_level_documents_in, AttributeScope, Workspace};
 
 /// A target as written in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +366,43 @@ impl<'ws> CatalogCache<'ws> {
                 if reaches_definition {
                     let (col, end_col) = xref.id_span().map_or((0, 0), |(_, c, e)| (c, e));
                     references.push(FileLocation::new(path.clone(), xref.line, col, end_col));
+                }
+            }
+        }
+        references
+    }
+
+    /// The xrefs whose file part names `file` in at least one top-level
+    /// document that reads them, resolved from the folder of that document
+    /// (ADR-009); the preview takes no part (ADR-010). A file of the same
+    /// name elsewhere is not `file`, and an xref is found whether or not its
+    /// ID exists there.
+    #[must_use]
+    pub fn file_xref_references(&self, file: &Path) -> Vec<FileLocation> {
+        let workspace = self.workspace();
+        let file = workspace.indexed_path(file);
+        let mut references = Vec::new();
+        for (path, doc) in &workspace.documents {
+            for xref in &doc.xrefs {
+                let Some(part) = parse_xref_target(&xref.target).0 else {
+                    continue;
+                };
+                let names = |document: &Path, attributes| {
+                    xref_file(workspace, document, attributes, part)
+                        .is_some_and(|resolved| workspace.indexed_path(&resolved) == file)
+                };
+                let found = if part.contains('{') {
+                    self.reading_scopes(path, xref.line, false)
+                        .iter()
+                        .any(|scope| names(scope.document(), Some(scope)))
+                } else {
+                    top_level_documents_in(self.roots(), path)
+                        .unwrap_or_else(|| vec![path.clone()])
+                        .iter()
+                        .any(|document| names(document, None))
+                };
+                if found {
+                    references.push(FileLocation::new(path.clone(), xref.line, 0, 0));
                 }
             }
         }

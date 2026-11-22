@@ -389,33 +389,6 @@ impl Workspace {
         results
     }
 
-    /// Find all xrefs that reference the given filename (file part of xref target).
-    #[must_use]
-    pub fn find_all_file_xrefs(&self, filename: &str) -> Vec<FileLocation> {
-        let mut results = Vec::new();
-        for doc in self.documents.values() {
-            for xref in &doc.xrefs {
-                let file_part = if let Some((file, _anchor)) = xref.target.split_once('#') {
-                    if file.is_empty() {
-                        continue;
-                    }
-                    file
-                } else if xref.target.contains('.') {
-                    xref.target.as_str()
-                } else {
-                    continue; // plain anchor, not a file reference
-                };
-                if file_part == filename
-                    || file_part.ends_with(&format!("/{filename}"))
-                    || filename.ends_with(&format!("/{file_part}"))
-                {
-                    results.push(FileLocation::new(doc.path.clone(), xref.line, 0, 0));
-                }
-            }
-        }
-        results
-    }
-
     /// Ensure a file is present in the workspace, parsing it on-demand if needed.
     ///
     /// This is idempotent: if the file is already in `documents`, it returns immediately.
@@ -1167,50 +1140,6 @@ mod tests {
         let refs = ws.find_all_include_references(&a_canon);
 
         assert!(refs.is_empty(), "Expected no include refs, got: {:?}", refs);
-    }
-
-    // --- find_all_file_xrefs ---
-
-    #[test]
-    fn test_find_file_xrefs_cross_doc() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.adoc");
-        let b = tmp.path().join("b.adoc");
-
-        fs::write(
-            &a,
-            "= Doc A\n\nSee xref:b.adoc#anchor[link text].\n\ninclude::b.adoc[]\n",
-        )
-        .unwrap();
-        fs::write(&b, "[[anchor]]\n== Chapter B\n\nContent.\n").unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
-        let refs = ws.find_all_file_xrefs("b.adoc");
-
-        assert_eq!(refs.len(), 1, "Expected 1 file xref, got: {:?}", refs);
-    }
-
-    #[test]
-    fn test_find_file_xrefs_multiple() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.adoc");
-        let b = tmp.path().join("b.adoc");
-
-        fs::write(
-            &a,
-            "= Doc A\n\nSee xref:b.adoc#a1[one] and xref:b.adoc#a2[two].\n\ninclude::b.adoc[]\n",
-        )
-        .unwrap();
-        fs::write(
-            &b,
-            "[[a1]]\n== Chapter 1\n\n[[a2]]\n== Chapter 2\n\nContent.\n",
-        )
-        .unwrap();
-
-        let ws = Workspace::build(tmp.path(), &a);
-        let refs = ws.find_all_file_xrefs("b.adoc");
-
-        assert_eq!(refs.len(), 2, "Expected 2 file xrefs, got: {:?}", refs);
     }
 
     // --- anchor_references ---

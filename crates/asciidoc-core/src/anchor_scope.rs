@@ -297,7 +297,7 @@ impl<'ws> CatalogCache<'ws> {
 /// `document`, also when the xref stands in an included file (ADR-009).
 /// `attributes`, the scope of `document` on the line of the xref, fills in
 /// attribute references in it, else the registry does.
-fn xref_file(
+pub(crate) fn xref_file(
     workspace: &Workspace,
     document: &Path,
     attributes: Option<&AttributeScope<'_>>,

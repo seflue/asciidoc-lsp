@@ -254,7 +254,7 @@ pub fn resolve_references(
                 resolve_include_targets(path, doc_path, Some(ws), node_info.line, Readings::Build);
             existing_targets(&targets)
                 .iter()
-                .flat_map(|target| file_reference_locations(ws, target))
+                .flat_map(|target| file_reference_locations(ws, &catalogs, target))
                 .collect()
         }
         NodeKind::Anchor { id } => {
@@ -300,10 +300,11 @@ pub fn resolve_references(
             if *top_level {
                 // `<<file.adoc#id,…>>` is found as an xref to the ID and to
                 // the file; it stays one place, at the ID.
-                let file_references: Vec<FileLocation> = file_reference_locations(ws, &file)
-                    .into_iter()
-                    .filter(|loc| !r.iter().any(|x| x.path == loc.path && x.line == loc.line))
-                    .collect();
+                let file_references: Vec<FileLocation> =
+                    file_reference_locations(ws, &catalogs, &file)
+                        .into_iter()
+                        .filter(|loc| !r.iter().any(|x| x.path == loc.path && x.line == loc.line))
+                        .collect();
                 r.extend(file_references);
             }
             // The heading line, not an ID line above it, is the declaration.
@@ -331,10 +332,13 @@ pub fn resolve_references(
 }
 
 /// The `include::` lines that read `file` and the xrefs to it.
-fn file_reference_locations(ws: &Workspace, file: &Path) -> Vec<FileLocation> {
-    let filename = file.file_name().and_then(|f| f.to_str()).unwrap_or("");
+fn file_reference_locations(
+    ws: &Workspace,
+    catalogs: &CatalogCache<'_>,
+    file: &Path,
+) -> Vec<FileLocation> {
     let mut locations = ws.find_all_include_references(file);
-    locations.extend(ws.find_all_file_xrefs(filename));
+    locations.extend(catalogs.file_xref_references(file));
     locations
 }
 
@@ -2768,8 +2772,27 @@ mod tests {
         character: u32,
         include_declaration: bool,
     ) -> Option<Vec<(String, usize)>> {
+        fixture_references(
+            "heading_references",
+            file,
+            line,
+            character,
+            include_declaration,
+        )
+    }
+
+    /// Find-references like [`heading_references`], in the fixture
+    /// `fixture`.
+    fn fixture_references(
+        fixture: &str,
+        file: &str,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Option<Vec<(String, usize)>> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/heading_references")
+            .join("../../tests/fixtures")
+            .join(fixture)
             .canonicalize()
             .unwrap();
         let mut ws = Workspace::new(&root);
@@ -2972,6 +2995,60 @@ mod tests {
     #[test]
     fn test_references_on_attribute_list_beside_the_id_stay_empty() {
         assert_eq!(heading_references("main.adoc", 13, 0, false), None);
+    }
+
+    // --- xrefs to a file, by the path Asciidoctor resolves (ADR-009) ---
+
+    /// `index.adoc` reads `chapters/setup.adoc`, so Asciidoctor resolves the
+    /// file part of its xrefs from the folder of `index.adoc`:
+    /// `xref:chapters/reference.adoc#ref-options[]` (line 9) names
+    /// `chapters/reference.adoc`, `xref:reference.adoc#ref-options[]`
+    /// (line 11) the top-level `reference.adoc`, and
+    /// `xref:setup.adoc#setup-notes[]` (line 18) a `setup.adoc` next to
+    /// `index.adoc` that does not exist. Each xref is a reference of the
+    /// file it names only, not of a file of the same name elsewhere.
+    #[rstest]
+    #[case::include_of_chapters_reference("index.adoc", 4, 12, vec![
+        at("chapters/setup.adoc", 9), at("index.adoc", 5),
+    ])]
+    #[case::title_of_chapters_reference("chapters/reference.adoc", 0, 3, vec![
+        at("chapters/setup.adoc", 9), at("index.adoc", 5),
+    ])]
+    #[case::title_of_top_level_reference("reference.adoc", 0, 3, vec![
+        at("chapters/setup.adoc", 11),
+    ])]
+    #[case::include_of_setup("index.adoc", 2, 12, vec![at("index.adoc", 3)])]
+    fn test_file_references_follow_the_path_from_the_top_level_document(
+        #[case] file: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] expected: Vec<(String, usize)>,
+    ) {
+        assert_eq!(
+            fixture_references("xref_path_in_include", file, line, character, false),
+            Some(expected)
+        );
+    }
+
+    /// `index.adoc` sets `chapdir` to `chapters` and `notes` to
+    /// `chapters/notes` and reads `chapters/setup.adoc`. Asciidoctor
+    /// substitutes the attributes in the xref target and resolves the path
+    /// from the folder of `index.adoc`: `xref:{chapdir}/notes.adoc[]`
+    /// (line 6) and `xref:{notes}.adoc[]` (line 8) both name
+    /// `chapters/notes.adoc`, none names the top-level `notes.adoc`.
+    #[rstest]
+    #[case::named_file("chapters/notes.adoc", Some(vec![
+        at("chapters/setup.adoc", 6), at("chapters/setup.adoc", 8),
+    ]))]
+    #[case::file_of_the_same_name("notes.adoc", None)]
+    fn test_file_references_substitute_attributes_in_the_path(
+        #[case] file: &str,
+        #[case] expected: Option<Vec<(String, usize)>>,
+    ) {
+        assert_eq!(
+            fixture_references("file_xref_attribute_path", file, 0, 3, false),
+            expected
+        );
     }
 
     /// `book.adoc` reads `shared` in `setup.adoc` first and again in
@@ -4480,7 +4557,8 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
     #[test]
     fn test_integration_include_references_multi_file() {
-        // arc42-like structure: index includes intro + concepts, concepts xrefs intro
+        // arc42-like structure: index includes intro + concepts, concepts xrefs intro.
+        // The xref path starts from the folder of index.adoc (ADR-009).
         let tmp = tempfile::tempdir().unwrap();
         let chapters = tmp.path().join("chapters");
         fs::create_dir(&chapters).unwrap();
@@ -4498,7 +4576,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
         .unwrap();
         fs::write(
             chapters.join("concepts.adoc"),
-            "== Concepts\n\nSee xref:intro.adoc#intro[Introduction].\n",
+            "== Concepts\n\nSee xref:chapters/intro.adoc#intro[Introduction].\n",
         )
         .unwrap();
 
