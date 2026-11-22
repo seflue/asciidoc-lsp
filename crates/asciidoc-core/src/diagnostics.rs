@@ -1599,6 +1599,52 @@ mod tests {
         assert_eq!(broken_xrefs(&ws, &root.join("solo2/main.adoc")), vec![]);
     }
 
+    /// Asciidoctor generates a section ID from the `idprefix` in effect
+    /// where it parses the section: `prefix_a.adoc` sets `a_` before it
+    /// includes `shared.adoc`, so `=== Shared Sub` there is `a_shared_sub`.
+    /// Expected from that rule (`Section.generate_id` reads the document
+    /// attributes), not probed with Asciidoctor.
+    #[test]
+    fn test_xref_to_id_prefixed_by_the_including_document_is_not_broken() {
+        let (root, ws) = fixture_workspace("heading_references");
+
+        assert_eq!(broken_xrefs(&ws, &root.join("prefix_a.adoc")), vec![]);
+        assert_eq!(broken_xrefs(&ws, &root.join("prefix_b.adoc")), vec![]);
+    }
+
+    /// The broken targets of `file` in the fixture `idprefix_reading`,
+    /// sorted.
+    fn idprefix_reading_broken(file: &str) -> Vec<String> {
+        let (root, ws) = fixture_workspace("idprefix_reading");
+        let mut targets: Vec<String> = broken_xrefs(&ws, &root.join(file))
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Asciidoctor applies an attribute entry from its line on: the last
+    /// `idprefix`/`idseparator` entry before a section in the reading
+    /// stream (the top-level document with its includes where they stand)
+    /// shapes its ID. An entry after the section does not; an unset falls
+    /// back to the default `_`, an empty `idprefix` drops the prefix. An
+    /// entry in an included file holds for the rest of the reading,
+    /// back in the including document too. Expected from that rule
+    /// (`Section.generate_id` reads the document attributes when the parser
+    /// creates the section), not probed with Asciidoctor.
+    #[rstest::rstest]
+    #[case::entry_after_section("after.adoc", &["_late", "late_early"])]
+    #[case::entry_in_included_file("master.adoc", &["m_after-part", "m_in-part"])]
+    #[case::unset_and_empty_prefix("unset.adoc", &["_three", "u_two"])]
+    #[case::separator_by_position("separator.adoc", &["_baz_qux", "_foo-bar"])]
+    fn test_generated_id_uses_the_attribute_in_effect_at_the_section(
+        #[case] file: &str,
+        #[case] expected: &[&str],
+    ) {
+        assert_eq!(idprefix_reading_broken(file), expected);
+    }
+
     /// Asciidoctor (`foo.adoc`): `INFO: possible invalid reference: _foo_3`
     /// only; the second `== Foo` is `_foo_2`.
     #[test]

@@ -1,0 +1,9 @@
+= Master
+:idprefix: m_
+:idseparator: -
+
+include::part.adoc[]
+
+== After Part
+
+<<m_before-part>> <<p_in-part>> <<p_after-part>> <<m_in-part>> <<m_after-part>>

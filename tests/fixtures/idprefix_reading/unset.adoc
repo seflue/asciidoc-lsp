@@ -1,0 +1,14 @@
+= Unset
+:idprefix: u_
+
+== One
+
+:idprefix!:
+
+== Two
+
+:idprefix:
+
+== Three
+
+<<u_one>> <<_two>> <<three>> <<u_two>> <<_three>>

@@ -1,0 +1,13 @@
+= Separator
+
+== Foo Bar
+
+:idseparator: -
+
+== Baz Qux
+
+:idseparator!:
+
+== Zap Zing
+
+<<_foo_bar>> <<_baz-qux>> <<_zap_zing>> <<_foo-bar>> <<_baz_qux>>

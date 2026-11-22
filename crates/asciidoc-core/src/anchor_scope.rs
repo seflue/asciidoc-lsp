@@ -14,10 +14,12 @@ use crate::paths::{canonicalize_if_exists, join_doc_path, resolve_doc_target};
 use crate::reading::{read_in_order, ReadingVisitor};
 use crate::references::{effective_id_separator, generate_section_id, parse_xref_target};
 use crate::types::{
-    Anchor, AnchorKind, AnchorLocation, DiagnosticKind, DocumentModel, IncludeEdge, ResolvedXref,
-    Section, Xref,
+    Anchor, AnchorKind, AnchorLocation, AttributeDef, DiagnosticKind, DocumentModel, IncludeEdge,
+    ResolvedXref, Section, Xref,
 };
-use crate::workspace::{is_own_top_level, top_level_documents_in, AttributeScope, Workspace};
+use crate::workspace::{
+    is_own_top_level, top_level_documents_in, AttributeScope, AttributeState, Workspace,
+};
 
 /// An explicit ID that a taken name rejects.
 #[derive(Debug, Clone)]
@@ -378,6 +380,7 @@ impl Workspace {
         let document = document.to_path_buf();
         let mut walk = AnchorWalk {
             workspace: self,
+            attributes: AttributeState::new(self, document.clone(), false),
             region_depth: 0,
             scope: AnchorScope {
                 document: document.clone(),
@@ -482,15 +485,21 @@ fn definition_id<'b>(location: &AnchorLocation, id: &'b str) -> Option<&'b str> 
     (location.kind != AnchorKind::ImplicitSection).then_some(id)
 }
 
-/// A line of a file that defines an ID.
+/// A line of a file that defines an ID, or an attribute entry that shapes
+/// the IDs of the sections after it.
 enum Definition<'a> {
     /// An anchor, with the title of the block it names.
     Anchor(&'a Anchor, Option<&'a str>),
     Section(&'a Section),
+    Attribute(&'a AttributeDef),
 }
 
 struct AnchorWalk<'a> {
     workspace: &'a Workspace,
+    /// The attributes in effect at the line being read: Asciidoctor takes
+    /// `idprefix` and `idseparator` from the document when it parses the
+    /// section.
+    attributes: AttributeState<'a>,
     /// Includes with a region between the top-level document and the file
     /// being read. The walk knows no tag regions, so it cannot tell which
     /// IDs of such a file Asciidoctor reads: it counts a definition it meets
@@ -530,6 +539,11 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
                     .iter()
                     .map(|section| (section.line, Definition::Section(section))),
             )
+            .chain(
+                doc.attributes
+                    .iter()
+                    .map(|attr| (attr.line, Definition::Attribute(attr))),
+            )
             .collect()
     }
 
@@ -558,6 +572,9 @@ impl<'a> ReadingVisitor<'a> for AnchorWalk<'a> {
                     let plain_reread = self.note_plain_reading(file, section.line, None);
                     self.define_section(file, section, plain_reread);
                 }
+            }
+            Definition::Attribute(attr) => {
+                self.attributes.define(file, attr);
             }
         }
     }
@@ -672,10 +689,11 @@ impl AnchorWalk<'_> {
     }
 
     fn define_section(&mut self, file: &Path, section: &Section, plain_reread: bool) {
-        let registry = &self.workspace.attributes;
-        let prefix = registry.resolve(file, "idprefix").unwrap_or("_");
-        let separator =
-            effective_id_separator(registry.resolve(file, "idseparator").unwrap_or("_"));
+        // An unset attribute falls back to the default, an empty one counts.
+        let prefix = self.attributes.value("idprefix");
+        let prefix = prefix.as_deref().unwrap_or("_");
+        let separator = self.attributes.value("idseparator");
+        let separator = effective_id_separator(separator.as_deref().unwrap_or("_"));
         let base = generate_section_id(&section.title, prefix, separator);
         let location = AnchorLocation {
             file: file.to_path_buf(),

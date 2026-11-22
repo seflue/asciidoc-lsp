@@ -315,10 +315,8 @@ impl Workspace {
     /// The scope on `line` of `file`, reading the document `root`.
     fn scope(&self, root: PathBuf, file: &Path, line: usize, preview: bool) -> AttributeScope<'_> {
         let mut walk = ReadingWalk {
-            workspace: self,
             reference: (file, line),
-            preview,
-            current: HashMap::new(),
+            state: AttributeState::new(self, root.clone(), preview),
             at_reference: None,
             definitions: Vec::new(),
         };
@@ -770,14 +768,9 @@ fn value_of(
 /// Reading-order walk of one top-level document for
 /// [`Workspace::scopes_at`]. A file included twice is read twice.
 struct ReadingWalk<'a> {
-    workspace: &'a Workspace,
     reference: (&'a Path, usize),
-    /// Reading a preview ([`Workspace::preview_scope_at`]).
-    preview: bool,
-    /// The last definition of each name so far; its `value` is `None` once
-    /// unset.
-    current: HashMap<String, AttributeDefinition>,
-    /// `current` when the reference was reached, and how many definitions
+    state: AttributeState<'a>,
+    /// `state.current` when the reference was reached, and how many definitions
     /// came before it.
     at_reference: Option<(HashMap<String, AttributeDefinition>, usize)>,
     definitions: Vec<(String, AttributeDefinition)>,
@@ -817,20 +810,50 @@ impl<'a> ReadingVisitor<'a> for ReadingWalk<'a> {
         matches!(item, WalkStep::Reference)
     }
 
-    fn item(&mut self, stack: &[PathBuf], file: &Path, item: WalkStep<'a>) {
+    fn item(&mut self, _stack: &[PathBuf], file: &Path, item: WalkStep<'a>) {
         match item {
             WalkStep::Reference => {
                 if self.at_reference.is_none() {
-                    self.at_reference = Some((self.current.clone(), self.definitions.len()));
+                    self.at_reference = Some((self.state.current.clone(), self.definitions.len()));
                 }
             }
-            WalkStep::Definition(attr) => self.define(stack, file, attr),
+            WalkStep::Definition(attr) => {
+                let definition = self.state.define(file, attr);
+                self.definitions.push(definition);
+            }
         }
     }
 }
 
-impl ReadingWalk<'_> {
-    fn define(&mut self, stack: &[PathBuf], file: &Path, attr: &AttributeDef) {
+/// The attributes of one top-level document while it is read in order:
+/// what the entries read so far set, over its config chain and builtins.
+pub(crate) struct AttributeState<'a> {
+    workspace: &'a Workspace,
+    document: PathBuf,
+    /// Reading a preview ([`Workspace::preview_scope_at`]).
+    preview: bool,
+    /// The last definition of each name so far; its `value` is `None` once
+    /// unset.
+    current: HashMap<String, AttributeDefinition>,
+}
+
+impl<'a> AttributeState<'a> {
+    /// The state before the first line of the top-level document `document`.
+    pub(crate) fn new(workspace: &'a Workspace, document: PathBuf, preview: bool) -> Self {
+        Self {
+            workspace,
+            document,
+            preview,
+            current: HashMap::new(),
+        }
+    }
+
+    /// Reads the entry `attr` of `file`; returns its name and definition.
+    pub(crate) fn define(
+        &mut self,
+        file: &Path,
+        attr: &AttributeDef,
+    ) -> (String, AttributeDefinition) {
         let (name, unset) = entry_name(&attr.name);
         let definition = AttributeDefinition {
             source: Some(AttributeSource {
@@ -839,21 +862,23 @@ impl ReadingWalk<'_> {
             }),
             origin: AttributeOrigin::Document,
             raw: (!unset).then(|| attr.value.clone()),
-            value: (!unset).then(|| self.substitute(stack, &attr.value)),
+            value: (!unset).then(|| self.substitute(&attr.value)),
         };
         self.current.insert(name.to_string(), definition.clone());
-        self.definitions.push((name.to_string(), definition));
+        (name.to_string(), definition)
+    }
+
+    /// The value of `name` now; `None` when unset or unknown.
+    pub(crate) fn value(&self, name: &str) -> Option<String> {
+        value_of(&self.current, name, || {
+            self.workspace.preset(&self.document, name, self.preview)
+        })
     }
 
     /// `input` with the values in effect substituted; an unset or unknown
     /// reference stays as written.
-    fn substitute(&self, stack: &[PathBuf], input: &str) -> String {
-        substitute_attributes(input, |name| {
-            value_of(&self.current, name, || {
-                let root = stack.first()?;
-                self.workspace.preset(root, name, self.preview)
-            })
-        })
+    fn substitute(&self, input: &str) -> String {
+        substitute_attributes(input, |name| self.value(name))
     }
 }
 

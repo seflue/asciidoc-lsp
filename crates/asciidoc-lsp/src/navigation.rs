@@ -2892,6 +2892,27 @@ mod tests {
         );
     }
 
+    /// Asciidoctor generates the ID from the `idprefix` in effect where it
+    /// parses the section: `prefix_a.adoc` and `prefix_b.adoc` set `a_` and
+    /// `b_` before they include `shared.adoc`, so their `<<a_shared_sub>>`
+    /// and `<<b_shared_sub>>` (line 6 each) reach `=== Shared Sub`, as does
+    /// the natural xref in the shared file. Expected from that rule
+    /// (`Section.generate_id` reads the document attributes), not probed
+    /// with Asciidoctor.
+    #[test]
+    fn test_references_from_heading_use_the_prefix_of_each_reading_document() {
+        let mut found = heading_references("shared.adoc", 2, 5, false).unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                at("prefix_a.adoc", 6),
+                at("prefix_b.adoc", 6),
+                at("shared.adoc", 5)
+            ]
+        );
+    }
+
     /// `other.adoc` does not read `chapters.adoc`: its `<<_sub_section>>`
     /// (line 6) is broken there and no reference of `=== Sub Section`.
     #[test]
