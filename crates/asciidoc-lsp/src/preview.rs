@@ -11,7 +11,7 @@
 //! replaces hyper, hyper-util and http-body-util.
 //!
 //! Routes below `/<token>/`: the page itself, `style.css`, `page.js`,
-//! `scroll-map.js`, `morphdom.js` and `events` (SSE), and `files/<path>`: an
+//! `scroll-map.js`, `morphdom.js`, the Font Awesome CSS and font, and `events` (SSE), and `files/<path>`: an
 //! image file below the workspace root that the shown document names. The
 //! converter lists those images at the end of its HTML; the server resolves
 //! each to a canonical path and serves a request only if its own canonical
@@ -49,6 +49,9 @@ const PAGE: &str = include_str!("../assets/preview/index.html");
 const PAGE_JS: &str = include_str!("../assets/preview/page.js");
 const SCROLL_MAP_JS: &str = include_str!("../assets/preview/scroll-map.js");
 const MORPHDOM_JS: &str = include_str!("../assets/preview/morphdom.js");
+/// Font Awesome 4.7.0 for `:icons: font`; the standalone page links it from a CDN.
+const FONT_AWESOME_CSS: &str = include_str!("../assets/preview/font-awesome.min.css");
+const FONT_AWESOME_WOFF2: &[u8] = include_bytes!("../assets/preview/fontawesome-webfont.woff2");
 
 /// Longest request head (request line and headers) the server reads.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -403,7 +406,7 @@ fn parse_request(head: &str) -> Option<Request<'_>> {
 enum Routed<'a> {
     Body {
         content_type: &'static str,
-        body: &'a str,
+        body: &'a [u8],
     },
     Redirect(String),
     Events,
@@ -434,13 +437,21 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         // The page loads its assets by relative URL, so it needs the slash.
         return Routed::Redirect(format!("/{token}/"));
     }
-    let body = |content_type, body| Routed::Body { content_type, body };
+    let body = |content_type, body: &'a str| Routed::Body {
+        content_type,
+        body: body.as_bytes(),
+    };
     match rest {
         "" => body("text/html; charset=utf-8", PAGE),
         "style.css" => body("text/css; charset=utf-8", &shared.stylesheet),
         "page.js" => body("text/javascript; charset=utf-8", PAGE_JS),
         "scroll-map.js" => body("text/javascript; charset=utf-8", SCROLL_MAP_JS),
         "morphdom.js" => body("text/javascript; charset=utf-8", MORPHDOM_JS),
+        "font-awesome.min.css" => body("text/css; charset=utf-8", FONT_AWESOME_CSS),
+        "fontawesome-webfont.woff2" => Routed::Body {
+            content_type: "font/woff2",
+            body: FONT_AWESOME_WOFF2,
+        },
         "events" => Routed::Events,
         _ => match rest.strip_prefix("files/") {
             Some(file) => Routed::File(file.to_owned()),
@@ -484,7 +495,7 @@ fn reason(status: u16) -> &'static str {
 const COMMON_HEADERS: &str = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
                               Referrer-Policy: no-referrer\r\n\
                               Content-Security-Policy: default-src 'none'; script-src 'self'; \
-                              style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; \
+                              style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: https:; \
                               connect-src 'self'; base-uri 'none'; form-action 'none'; \
                               frame-ancestors 'none'\r\n";
 
@@ -519,7 +530,7 @@ async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<
     };
     match route(shared, &request) {
         Routed::Body { content_type, body } => {
-            write_response(&mut stream, 200, content_type, "", body.as_bytes()).await
+            write_response(&mut stream, 200, content_type, "", body).await
         }
         Routed::Redirect(location) => {
             let extra = format!("Location: {location}\r\n");
@@ -766,6 +777,23 @@ pub(crate) mod testing {
         request(port, "GET", target, host).await
     }
 
+    /// A GET read to the end of the connection: head text and body bytes.
+    pub(crate) async fn get_bytes(port: u16, target: &str, host: &str) -> (String, Vec<u8>) {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let text = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        stream.write_all(text.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let split = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let head = String::from_utf8_lossy(&response[..split]).into_owned();
+        (head, response[split + 4..].to_vec())
+    }
+
     pub(crate) async fn request(port: u16, method: &str, target: &str, host: &str) -> String {
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
             .await
@@ -822,7 +850,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{address, get, request, start, start_with_images, Stream};
+    use super::testing::{address, get, get_bytes, request, start, start_with_images, Stream};
     use super::*;
 
     fn status_line(response: &str) -> &str {
@@ -1159,6 +1187,38 @@ mod tests {
         }
         let response = get(port, &format!("/{token}/nope"), &host).await;
         assert!(status_line(&response).contains("404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn font_awesome_is_served_with_its_types() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let host = format!("127.0.0.1:{port}");
+        let (head, body) = get_bytes(port, &format!("/{token}/font-awesome.min.css"), &host).await;
+        assert!(head.contains("200"), "{head}");
+        assert!(
+            head.contains("Content-Type: text/css; charset=utf-8"),
+            "{head}"
+        );
+        let css = String::from_utf8(body).unwrap();
+        assert!(css.contains("url('fontawesome-webfont.woff2') format('woff2')"));
+        assert!(!css.contains("../fonts/"));
+        let (head, body) =
+            get_bytes(port, &format!("/{token}/fontawesome-webfont.woff2"), &host).await;
+        assert!(head.contains("200"), "{head}");
+        assert!(head.contains("Content-Type: font/woff2\r\n"), "{head}");
+        assert_eq!(
+            body,
+            include_bytes!("../assets/preview/fontawesome-webfont.woff2")
+        );
+    }
+
+    #[tokio::test]
+    async fn csp_allows_fonts_from_the_server_only() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let response = get(port, &format!("/{token}/"), &format!("127.0.0.1:{port}")).await;
+        assert!(response.contains("font-src 'self';"), "{response}");
     }
 
     #[tokio::test]
