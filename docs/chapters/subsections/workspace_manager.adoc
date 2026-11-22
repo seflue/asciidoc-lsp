@@ -3,8 +3,8 @@
 [[workspace]]
 The Workspace Manager holds the extracted data of all documents in the workspace and the relationships between them, primarily include directives.
 
-On `initialize`, the server scans the workspace root for AsciiDoc files and calculates the diagnostics.
-The scan runs synchronously, before the server answers the `initialize` request:
+On `initialized`, the server scans the workspace root for AsciiDoc files and then calculates and publishes the diagnostics.
+The scan runs on a thread of its own, so the server keeps answering requests and ends on `exit` while it runs; until the scan is done, there is no workspace:
 
 [source,rust]
 ----
@@ -12,6 +12,7 @@ include::{lsp-source-dir}/main.rs[tags=workspace-setup]
 ----
 
 `textDocument/didOpen`, `didChange`, and `didSave` re-parse only the affected file.
+Before the scan has finished, they parse nothing; the installed workspace takes the content of the open buffers.
 File watchers pick up external changes to AsciiDoc and `.asciidoctorconfig` files.
 After a change, the diagnostics are recalculated.
 

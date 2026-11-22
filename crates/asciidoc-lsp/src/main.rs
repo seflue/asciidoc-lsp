@@ -59,8 +59,21 @@ struct DocumentState {
 // AsciiDocLsp Server
 // ---------------------------------------------------------------------------
 
+/// The server. Cheap to clone: the background workspace scan keeps a clone
+/// to install its result.
+#[derive(Debug, Clone)]
+struct AsciiDocLsp(Arc<ServerState>);
+
+impl std::ops::Deref for AsciiDocLsp {
+    type Target = ServerState;
+
+    fn deref(&self) -> &ServerState {
+        &self.0
+    }
+}
+
 #[derive(Debug)]
-struct AsciiDocLsp {
+struct ServerState {
     client: Client,
     documents: Mutex<HashMap<Uri, DocumentState>>,
     workspace: Mutex<Option<Workspace>>,
@@ -74,7 +87,22 @@ struct AsciiDocLsp {
     /// `workspace/didChangeWatchedFiles`. Set in `initialize()`,
     /// consumed in `initialized()`.
     can_request_file_watcher: Mutex<bool>,
+    /// File changes reported while the workspace scan runs, replayed when
+    /// the workspace is installed. `None` while no scan runs: before it, without
+    /// a workspace root, and once the workspace is installed. Lock order:
+    /// `workspace`, then `pending_changes`; never held with `documents`.
+    pending_changes: Mutex<Option<Vec<ClassifiedEvents>>>,
+    /// `false` while a workspace scan runs. Requests that read the workspace
+    /// wait for `true`, so they do not answer from a workspace that is not
+    /// there yet.
+    workspace_ready: tokio::sync::watch::Sender<bool>,
     preview: PreviewState,
+    /// The task that installs the scanned workspace, for tests to await.
+    #[cfg(test)]
+    scan: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The scan thread, for tests to wait until the scan has read the disk.
+    #[cfg(test)]
+    scan_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// What the live preview keeps between requests. Each field has its own
@@ -114,7 +142,7 @@ impl PreviewState {
 
 impl AsciiDocLsp {
     fn new(client: Client) -> Self {
-        Self {
+        Self(Arc::new(ServerState {
             client,
             documents: Mutex::new(HashMap::new()),
             workspace: Mutex::new(None),
@@ -122,8 +150,14 @@ impl AsciiDocLsp {
             diagnostics: Mutex::new(HashMap::new()),
             published_diagnostics: Mutex::new(HashSet::new()),
             can_request_file_watcher: Mutex::new(false),
+            pending_changes: Mutex::new(None),
+            workspace_ready: tokio::sync::watch::Sender::new(true),
             preview: PreviewState::default(),
-        }
+            #[cfg(test)]
+            scan: Mutex::new(None),
+            #[cfg(test)]
+            scan_thread: Mutex::new(None),
+        }))
     }
 
     /// The running preview server, started on first use. Fails with a hint
@@ -280,6 +314,7 @@ impl AsciiDocLsp {
         let preview = self.ensure_preview().await?;
         *self.preview.mode.lock() = mode;
         *self.preview.active.lock() = Some(uri.clone());
+        self.workspace_ready().await;
         if let Some(request) = self.preview_request(&uri) {
             self.send_preview_request(&preview, request);
         }
@@ -379,7 +414,8 @@ impl AsciiDocLsp {
     }
 
     /// Apply a classified batch of watcher events to the workspace and return
-    /// fresh diagnostics. Returns `None` if the workspace is not initialized.
+    /// fresh diagnostics. Returns `None` if the workspace is not initialized;
+    /// during the scan the batch is kept for the install.
     fn apply_watcher_events(
         &self,
         classified: ClassifiedEvents,
@@ -389,40 +425,22 @@ impl AsciiDocLsp {
         let open = classified
             .config_changed
             .then(|| open_contents(&self.documents.lock()));
-        let mut ws = self.workspace.lock();
-        let ws = ws.as_mut()?;
-
-        if let Some(open) = open {
-            ws.reload_config(&open);
-        }
-
-        // CREATED/CHANGED re-parse from disk (no overrides — open buffers were
-        // filtered upstream). DELETED drops the file from all indexes.
-        let overrides = HashMap::new();
-        for (path, typ) in classified.adoc_events {
-            if typ == FileChangeType::DELETED {
-                ws.remove_file(&resolve_deleted_doc_key(&path));
-            } else if typ == FileChangeType::CREATED || typ == FileChangeType::CHANGED {
-                let Ok(canonical) = path.canonicalize() else {
-                    continue;
-                };
-                let indexed = ws.documents().contains_key(&canonical);
-                tracing::debug!(
-                    raw_path = ?path,
-                    ?canonical,
-                    indexed,
-                    "did_change_watched_files: register file"
-                );
-                if indexed {
-                    ws.update_file(&canonical, &overrides);
-                } else {
-                    ws.ensure_file(&canonical, &overrides);
-                }
-            }
-            // Other (server-side proposed) FileChangeType values: ignored.
-        }
-
+        let mut guard = self.workspace.lock();
+        let Some(ws) = guard.as_mut() else {
+            self.defer_until_installed(classified);
+            return None;
+        };
+        apply_classified_events(ws, classified, open.as_ref());
         Some(self.recompute_diagnostics(ws))
+    }
+
+    /// Keep `changes` for the install if the workspace scan runs. The caller
+    /// holds the workspace lock and found no workspace: the install, which
+    /// takes the queue under that lock, cannot have run in between.
+    fn defer_until_installed(&self, changes: ClassifiedEvents) {
+        if let Some(pending) = self.pending_changes.lock().as_mut() {
+            pending.push(changes);
+        }
     }
 
     /// Snapshot of all paths that correspond to an open editor buffer,
@@ -526,6 +544,112 @@ impl AsciiDocLsp {
 
         *self.published_diagnostics.lock() = new_published;
     }
+
+    /// Scan `root` for all `.adoc` files in the background, then install the
+    /// workspace and publish its diagnostics. Until then, notifications find
+    /// no workspace and requests that read it wait.
+    ///
+    /// The scan runs on its own OS thread, not on `spawn_blocking`: dropping
+    /// the runtime waits for blocking tasks, so `exit` would wait for the
+    /// scan. The thread ends with the process.
+    fn start_scan(&self, root: PathBuf) {
+        self.workspace_ready.send_replace(false);
+        *self.pending_changes.lock() = Some(Vec::new());
+        let (scan_tx, scan_rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("workspace-scan".into())
+            .spawn(move || {
+                // tag::workspace-setup[]
+                let mut ws = Workspace::new(&root);
+                ws.scan_workspace();
+                // end::workspace-setup[]
+                // The receiver is gone only when the server has ended.
+                scan_tx.send(ws).ok();
+            });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(err) => {
+                tracing::error!(?err, "cannot start the workspace scan");
+                *self.pending_changes.lock() = None;
+                self.workspace_ready.send_replace(true);
+                return;
+            }
+        };
+        #[cfg(test)]
+        {
+            *self.scan_thread.lock() = Some(thread);
+        }
+        #[cfg(not(test))]
+        drop(thread);
+        let server = self.clone();
+        let install = tokio::spawn(async move {
+            if let Ok(ws) = scan_rx.await {
+                server.install_workspace(ws).await;
+            } else {
+                // The scan thread panicked: no install will take the queue.
+                *server.pending_changes.lock() = None;
+                server.workspace_ready.send_replace(true);
+            }
+        });
+        #[cfg(test)]
+        {
+            *self.scan.lock() = Some(install);
+        }
+        #[cfg(not(test))]
+        drop(install);
+    }
+
+    /// Make the scanned `ws` the server's workspace and publish its
+    /// diagnostics. Buffers opened during the scan replace their disk text,
+    /// as `did_open` does once there is a workspace; then the file changes
+    /// reported during the scan are applied in order, except to the files
+    /// open now, whose buffers win as they do over later watcher events.
+    async fn install_workspace(&self, ws: Workspace) {
+        let diagnostics = {
+            let mut guard = self.workspace.lock();
+            let ws = guard.insert(ws);
+            // Unlike the other handlers, open buffers are read under the
+            // workspace lock (order: workspace, then documents): `did_open`
+            // stores its buffer before it takes the workspace lock, so a
+            // buffer read before installing could miss one opened meanwhile.
+            let open: Vec<Uri> = self.documents.lock().keys().cloned().collect();
+            for uri in open {
+                let Some(path) = uri.to_file_path().map(std::borrow::Cow::into_owned) else {
+                    continue;
+                };
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                let overrides = build_content_overrides(&self.documents, &uri);
+                register_open_buffer(ws, &path, &canonical, &overrides);
+            }
+            let pending = self.pending_changes.lock().take().unwrap_or_default();
+            let open_paths = self.open_buffer_paths();
+            for mut changes in pending {
+                changes
+                    .adoc_events
+                    .retain(|(path, _)| !is_path_open(path, &open_paths));
+                let open = changes
+                    .config_changed
+                    .then(|| open_contents(&self.documents.lock()));
+                apply_classified_events(ws, changes, open.as_ref());
+            }
+            self.recompute_diagnostics(ws)
+        };
+        self.workspace_ready.send_replace(true);
+        self.publish_workspace_diagnostics(&diagnostics).await;
+    }
+
+    /// Wait until no workspace scan runs: at once without one, else until its
+    /// workspace is installed or the scan failed.
+    async fn workspace_ready(&self) {
+        // The sender lives in `self`, so the wait never ends with an error.
+        self.workspace_ready
+            .subscribe()
+            .wait_for(|ready| *ready)
+            .await
+            .ok();
+    }
 }
 
 // Handlers without `.await` stay `async fn`: the trait's signature, and the
@@ -571,16 +695,8 @@ impl LanguageServer for AsciiDocLsp {
             })
             .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
-        if let Some(ref root) = root_path {
-            *self.root.lock() = Some(root.clone());
-
-            // Create workspace and scan for all .adoc files
-            // tag::workspace-setup[]
-            let mut ws = Workspace::new(root);
-            ws.scan_workspace();
-            self.recompute_diagnostics(&mut ws);
-            // end::workspace-setup[]
-            *self.workspace.lock() = Some(ws);
+        if let Some(root) = root_path {
+            *self.root.lock() = Some(root);
         }
 
         self.client
@@ -654,6 +770,13 @@ impl LanguageServer for AsciiDocLsp {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Start the scan before the first await, so a request that arrives
+        // during the watcher registration already waits for the workspace.
+        let root = self.root.lock().clone();
+        if let Some(root) = root {
+            self.start_scan(root);
+        }
+
         // Register file watchers if the client supports dynamic registration.
         // Without this, external edits to `.asciidoctorconfig*`, `.adoc` and theme `.yml` files
         // outside open buffers leave caches stale.
@@ -667,14 +790,6 @@ impl LanguageServer for AsciiDocLsp {
                 "client does not support dynamic registration of didChangeWatchedFiles; \
                  external file changes will not invalidate caches"
             );
-        }
-
-        let diagnostics = {
-            let ws = self.workspace.lock();
-            ws.is_some().then(|| self.diagnostics.lock().clone())
-        };
-        if let Some(diagnostics) = diagnostics {
-            self.publish_workspace_diagnostics(&diagnostics).await;
         }
     }
 
@@ -719,24 +834,7 @@ impl LanguageServer for AsciiDocLsp {
                 let diagnostics = {
                     let mut ws = self.workspace.lock();
                     if let Some(ws) = ws.as_mut() {
-                        // Use update_file if already indexed (e.g. from background scan)
-                        // to apply editor content over disk content.
-                        // Use ensure_file for new files not yet in the workspace.
-                        let indexed = ws.documents().contains_key(&canonical);
-                        tracing::debug!(
-                            raw_path = ?path,
-                            ?canonical,
-                            indexed,
-                            "did_open: register file"
-                        );
-                        if let Some(dir) = path.parent() {
-                            ws.set_doc_dir(&canonical, dir);
-                        }
-                        if indexed {
-                            ws.update_file(&canonical, &overrides);
-                        } else {
-                            ws.ensure_file(&canonical, &overrides);
-                        }
+                        register_open_buffer(ws, &path, &canonical, &overrides);
                         Some(self.recompute_diagnostics(ws))
                     } else {
                         None
@@ -823,6 +921,7 @@ impl LanguageServer for AsciiDocLsp {
                         ws.update_file(&canonical, &HashMap::new());
                         Some(self.recompute_diagnostics(ws))
                     } else {
+                        self.defer_until_installed(ClassifiedEvents::changed_on_disk(path));
                         None
                     }
                 };
@@ -920,6 +1019,7 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         log_navigation_request("hover", &doc_path, position, &content, ws.is_some());
         let hover_text = navigation::resolve_hover(&content, position, &doc_path, ws.as_ref());
@@ -938,6 +1038,7 @@ impl LanguageServer for AsciiDocLsp {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         let Some(ws) = ws.as_ref() else {
             return Ok(None);
@@ -966,6 +1067,7 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         log_navigation_request(
             "goto_definition",
@@ -1020,6 +1122,7 @@ impl LanguageServer for AsciiDocLsp {
         let include_declaration = params.context.include_declaration;
 
         let overrides = build_content_overrides(&self.documents, uri);
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         log_navigation_request("references", &doc_path, position, &content, ws.is_some());
         let results = navigation::resolve_references(
@@ -1081,6 +1184,7 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         log_navigation_request(
             "prepare_rename",
@@ -1137,6 +1241,7 @@ impl LanguageServer for AsciiDocLsp {
 
         let overrides = build_content_overrides(&self.documents, uri);
 
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         log_navigation_request("rename", &doc_path, position, &content, ws.is_some());
         if let Some(reason) =
@@ -1207,6 +1312,7 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        self.workspace_ready().await;
         let mut actions = self.quick_fix_actions(uri, params.range, &content);
 
         let (line, _) = positions::from_lsp_position(params.range.start, &content);
@@ -1263,6 +1369,7 @@ impl LanguageServer for AsciiDocLsp {
             )));
         };
 
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         Ok(Some(navigation::explain_position(
             &content,
@@ -1290,6 +1397,7 @@ impl LanguageServer for AsciiDocLsp {
             return Ok(None);
         };
 
+        self.workspace_ready().await;
         let ws = self.workspace.lock();
         let line = position.line as usize + 1;
         let items = completion::resolve_completions(ctx, &doc_path, line, ws.as_ref());
@@ -1372,6 +1480,54 @@ struct ClassifiedEvents {
     images_changed: bool,
     theme_changed: bool,
     adoc_events: Vec<(PathBuf, FileChangeType)>,
+}
+
+impl ClassifiedEvents {
+    /// `path` changed on disk: what `didClose` reports.
+    fn changed_on_disk(path: PathBuf) -> Self {
+        Self {
+            adoc_events: vec![(path, FileChangeType::CHANGED)],
+            ..Self::default()
+        }
+    }
+}
+
+/// Apply watcher events to `ws` without recomputing its diagnostics. `open`
+/// holds the open buffers' content when the config changed.
+fn apply_classified_events(
+    ws: &mut Workspace,
+    classified: ClassifiedEvents,
+    open: Option<&HashMap<PathBuf, Arc<String>>>,
+) {
+    if let Some(open) = open {
+        ws.reload_config(open);
+    }
+
+    // CREATED/CHANGED re-parse from disk (no overrides — open buffers were
+    // filtered upstream). DELETED drops the file from all indexes.
+    let overrides = HashMap::new();
+    for (path, typ) in classified.adoc_events {
+        if typ == FileChangeType::DELETED {
+            ws.remove_file(&resolve_deleted_doc_key(&path));
+        } else if typ == FileChangeType::CREATED || typ == FileChangeType::CHANGED {
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            let indexed = ws.documents().contains_key(&canonical);
+            tracing::debug!(
+                raw_path = ?path,
+                ?canonical,
+                indexed,
+                "did_change_watched_files: register file"
+            );
+            if indexed {
+                ws.update_file(&canonical, &overrides);
+            } else {
+                ws.ensure_file(&canonical, &overrides);
+            }
+        }
+        // Other (server-side proposed) FileChangeType values: ignored.
+    }
 }
 
 /// Filter and bucket a watcher-event batch.
@@ -1571,6 +1727,27 @@ fn location_range(
     Range {
         start: positions::to_lsp_position(loc.line, loc.col, &content),
         end: positions::to_lsp_position(loc.line, loc.end_col, &content),
+    }
+}
+
+/// Index the open buffer at `path` (canonical: `canonical`) with its editor
+/// content from `overrides`. A file already indexed, e.g. by the scan, is
+/// re-parsed so the editor content replaces the disk content.
+fn register_open_buffer(
+    ws: &mut Workspace,
+    path: &Path,
+    canonical: &Path,
+    overrides: &HashMap<PathBuf, Arc<String>>,
+) {
+    let indexed = ws.documents().contains_key(canonical);
+    tracing::debug!(raw_path = ?path, ?canonical, indexed, "register open buffer");
+    if let Some(dir) = path.parent() {
+        ws.set_doc_dir(canonical, dir);
+    }
+    if indexed {
+        ws.update_file(canonical, overrides);
+    } else {
+        ws.ensure_file(canonical, overrides);
     }
 }
 
@@ -2585,7 +2762,17 @@ mod tests {
             })
             .await
             .unwrap();
+        service.inner().initialized(InitializedParams {}).await;
+        scanned(service.inner()).await;
         (service, socket)
+    }
+
+    /// Wait until the workspace scan started by `initialized` is installed.
+    async fn scanned(server: &AsciiDocLsp) {
+        let install = server.scan.lock().take();
+        if let Some(install) = install {
+            install.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2603,6 +2790,286 @@ mod tests {
 
         change_document(server, &uri, 2, "\u{FEFF}:b: 2\n").await;
         assert_eq!(*server.get_document_content(&uri).unwrap(), ":b: 2\n");
+    }
+
+    #[tokio::test]
+    async fn test_buffer_opened_during_the_scan_wins_over_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let opened = root.join("opened.adoc");
+        let closed = root.join("closed.adoc");
+        fs::write(&opened, "= Opened\n\nSee <<missing>>.\n").unwrap();
+        fs::write(&closed, "= Closed\n\nSee <<missing>>.\n").unwrap();
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let server = service.inner();
+        server
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(&root),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        server.initialized(InitializedParams {}).await;
+
+        // The test runtime runs the install only once the test awaits it.
+        let uri = file_uri(&opened);
+        open_document(server, &uri, "= Opened\n\nNo xref.\n").await;
+        assert!(server.workspace.lock().is_none());
+        assert_eq!(definition(server, &uri, Position::new(0, 2)).await, None);
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&opened).map(Vec::len).unwrap_or(0), 0);
+        assert_eq!(diagnostics.get(&closed).map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_request_during_the_scan_waits_for_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let index = root.join("index.adoc");
+        let target = root.join("target.adoc");
+        let text = "= Index\n\ninclude::target.adoc[]\n\nSee <<goal>>.\n";
+        fs::write(&index, text).unwrap();
+        fs::write(&target, "[[goal]]\n== Goal\n").unwrap();
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let server = service.inner();
+        server
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(&root),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        server.initialized(InitializedParams {}).await;
+
+        let uri = file_uri(&index);
+        open_document(server, &uri, text).await;
+        assert!(server.workspace.lock().is_none());
+        let location = definition(server, &uri, Position::new(4, 7)).await;
+
+        assert_eq!(location.map(|l| l.uri), Some(file_uri(&target)));
+    }
+
+    #[tokio::test]
+    async fn test_buffer_changed_during_the_scan_wins_over_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let opened = root.join("opened.adoc");
+        let disk = "= Opened\n\nSee <<missing>>.\n";
+        fs::write(&opened, disk).unwrap();
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let server = service.inner();
+        server
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(&root),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        server.initialized(InitializedParams {}).await;
+
+        // The test runtime runs the install only once the test awaits it.
+        let uri = file_uri(&opened);
+        open_document(server, &uri, disk).await;
+        change_document(server, &uri, 2, "= Opened\n\nNo xref.\n").await;
+        assert!(server.workspace.lock().is_none());
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&opened).map(Vec::len).unwrap_or(0), 0);
+    }
+
+    /// A server whose scan of `root` has read the disk but is not installed:
+    /// the test runtime runs the install only once the test awaits it.
+    async fn server_with_scan_read(
+        root: &Path,
+    ) -> (LspService<AsciiDocLsp>, tower_lsp_server::ClientSocket) {
+        let (service, socket) = LspService::new(AsciiDocLsp::new);
+        let server = service.inner();
+        server
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                    uri: file_uri(root),
+                    name: "test".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        server.initialized(InitializedParams {}).await;
+        let thread = server.scan_thread.lock().take().unwrap();
+        thread.join().unwrap();
+        assert!(server.workspace.lock().is_none());
+        (service, socket)
+    }
+
+    #[tokio::test]
+    async fn test_file_changed_on_disk_during_the_scan_counts_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        fs::write(&path, "= A\n\nSee <<missing>>.\n").unwrap();
+        let (service, _socket) = server_with_scan_read(&root).await;
+        let server = service.inner();
+
+        fs::write(&path, "= A\n\nNo xref.\n").unwrap();
+        notify_watched(server, &path, FileChangeType::CHANGED).await;
+        assert!(server.workspace.lock().is_none());
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&path).map(Vec::len).unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn test_file_created_on_disk_during_the_scan_counts_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (service, _socket) = server_with_scan_read(&root).await;
+        let server = service.inner();
+
+        let path = root.join("new.adoc");
+        fs::write(&path, "= New\n\nSee <<missing>>.\n").unwrap();
+        notify_watched(server, &path, FileChangeType::CREATED).await;
+        assert!(server.workspace.lock().is_none());
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&path).map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_file_deleted_on_disk_during_the_scan_is_gone_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        fs::write(&path, "= A\n\nSee <<missing>>.\n").unwrap();
+        let (service, _socket) = server_with_scan_read(&root).await;
+        let server = service.inner();
+
+        fs::remove_file(&path).unwrap();
+        notify_watched(server, &path, FileChangeType::DELETED).await;
+        assert!(server.workspace.lock().is_none());
+
+        scanned(server).await;
+        let indexed = server
+            .workspace
+            .lock()
+            .as_ref()
+            .unwrap()
+            .documents()
+            .contains_key(&path);
+        assert!(!indexed);
+        assert!(server.diagnostics.lock().get(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_config_changed_during_the_scan_counts_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        let config = root.join(".asciidoctorconfig");
+        fs::write(&path, "= A\n\nGreeting: {greeting}\n").unwrap();
+        fs::write(&config, ":other: x\n").unwrap();
+        let (service, _socket) = server_with_scan_read(&root).await;
+        let server = service.inner();
+
+        fs::write(&config, ":greeting: hello\n").unwrap();
+        notify_watched(server, &config, FileChangeType::CHANGED).await;
+        assert!(server.workspace.lock().is_none());
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&path).map(Vec::len).unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_saved_and_closed_during_the_scan_counts_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        let old = "= A\n\nSee <<missing>>.\n";
+        fs::write(&path, old).unwrap();
+        let (service, _socket) = server_with_scan_read(&root).await;
+        let server = service.inner();
+
+        let uri = file_uri(&path);
+        let saved = "= A\n\nNo xref.\n";
+        open_document(server, &uri, old).await;
+        change_document(server, &uri, 2, saved).await;
+        fs::write(&path, saved).unwrap();
+        server
+            .did_save(DidSaveTextDocumentParams {
+                text_document: document_id(&uri),
+                text: None,
+            })
+            .await;
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: document_id(&uri),
+            })
+            .await;
+        assert!(server.workspace.lock().is_none());
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&path).map(Vec::len).unwrap_or(0), 0);
+    }
+
+    /// A disk change reported during the scan does not replace a buffer that
+    /// is open when the workspace is installed.
+    #[tokio::test]
+    async fn test_buffer_opened_after_a_disk_change_during_the_scan_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("a.adoc");
+        fs::write(&path, "= A\n\nNo xref.\n").unwrap();
+        let (service, _socket) = server_with_scan_read(&root).await;
+        let server = service.inner();
+
+        fs::write(&path, "= A\n\nSee <<missing>>.\n").unwrap();
+        notify_watched(server, &path, FileChangeType::CHANGED).await;
+        open_document(server, &file_uri(&path), "= A\n\nStill no xref.\n").await;
+
+        scanned(server).await;
+        let diagnostics = server.diagnostics.lock().clone();
+        assert_eq!(diagnostics.get(&path).map(Vec::len).unwrap_or(0), 0);
+    }
+
+    /// Without a workspace root no scan runs: file changes are not kept for
+    /// an install that never comes.
+    #[tokio::test]
+    async fn test_file_changes_without_a_root_are_not_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap().join("a.adoc");
+        fs::write(&path, "= A\n").unwrap();
+        let (service, _socket) = LspService::new(AsciiDocLsp::new);
+        let server = service.inner();
+        server
+            .initialize(InitializeParams::default())
+            .await
+            .unwrap();
+        server.initialized(InitializedParams {}).await;
+
+        notify_watched(server, &path, FileChangeType::CHANGED).await;
+        server
+            .did_save(DidSaveTextDocumentParams {
+                text_document: document_id(&file_uri(&path)),
+                text: None,
+            })
+            .await;
+
+        assert!(server.pending_changes.lock().is_none());
     }
 
     #[tokio::test]
