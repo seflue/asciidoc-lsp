@@ -1,4 +1,4 @@
-//! How features present the readings of a value (ADR-4), without any path
+//! How features present the readings of a value (ADR-3), without any path
 //! semantics. Shared by navigation and completion.
 
 use std::path::Path;
@@ -7,7 +7,7 @@ use asciidoc_core::targets::Reading;
 use asciidoc_core::workspace::AttributeScope;
 
 /// Keeps only the first of `items` when every neighbouring pair is `same`:
-/// scopes that agree give one result, not one per scope (ADR-4).
+/// scopes that agree give one result, not one per scope (ADR-3).
 pub(crate) fn collapse_if_agree<T>(items: &mut Vec<T>, same: impl Fn(&T, &T) -> bool) {
     if items.windows(2).all(|pair| same(&pair[0], &pair[1])) {
         items.truncate(1);

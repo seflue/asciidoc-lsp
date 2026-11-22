@@ -9,7 +9,7 @@
 
 *Context:*
 The LSP server needs a parser that handles incomplete and syntactically invalid documents and produces a concrete syntax tree that preserves all source information (whitespace, comments, positions).
-Three parser options were evaluated: writing a custom PEG parser, using the `acdc-parser` crate (an existing PEG-based AsciiDoc parser), and using the cathaysia Tree-sitter grammar for AsciiDoc.
+Three parser options were evaluated: writing a custom PEG parser, using an existing AsciiDoc parser library, and using the cathaysia Tree-sitter grammar for AsciiDoc.
 
 *Decision:*
 We chose Tree-sitter as the parser.
@@ -47,56 +47,32 @@ Tree-sitter's Rust bindings are first-class, and Rust's ownership model prevents
 
 For the building block structure, see xref:chapters/05_building_block_view.adoc#building-blocks[Building Block View].
 
-[[adr-dual-parser]]
-== ADR-3: Tree-sitter-Only-First, Dual-Parser Later
-
-*Status:* Superseded by xref:chapters/09_architecture_decisions.adoc#adr-semantics[ADR-4]
-
-*Context:*
-The `acdc-parser` crate (PEG-based) provides semantic-level parsing of AsciiDoc, including attribute substitution, conditional processing, and include resolution.
-However, integrating two parsers from the start increases complexity and creates the risk of inconsistent behavior when both parsers disagree on the document structure.
-
-*Decision:*
-We adopt a *Tree-sitter-only-first* strategy: the initial LSP features (document symbols, go-to-definition, basic diagnostics) are built entirely on the Tree-sitter CST.
-The `acdc-parser` is introduced only if specific semantic features (full attribute substitution, conditional includes) cannot be adequately implemented with Tree-sitter tree queries alone.
-
-*Consequences:*
-
-* Positive: Simpler initial architecture with a single parsing pipeline. Easier to debug, test, and reason about.
-* Positive: The decision is reversible — adding `acdc-parser` later does not require rewriting existing features.
-* Negative: Some advanced AsciiDoc features (conditional directives, complex attribute substitution) may have limited support in the initial release.
-* Negative: If `acdc-parser` is needed later, integrating it into an existing codebase is harder than designing for it from the start.
-
-The quality goals and stakeholder expectations that drove this trade-off are documented in xref:chapters/01_introduction_and_goals.adoc[Introduction and Goals] and xref:chapters/08_concepts.adoc#parsing-concepts[Parsing Concepts].
-
 [[adr-semantics]]
-== ADR-4: Resolve AsciiDoc Semantics in asciidoc-core
+== ADR-3: Resolve AsciiDoc Semantics in asciidoc-core
 
 *Status:* Accepted
 
 *Context:*
 Asciidoctor converts one top-level document per run.
-`include::` is replaced textually before parsing, and an attribute entry applies from its line on in that reading order.
-The value of `{x}` in a shared file is therefore not a property of the line but of the pair (top-level document, position).
-If `book.adoc` and `web.adoc` include the same file with different `imagesdir` values, both results are correct.
-
-Asciidoctor sets `docdir` to the folder of the converted document and locks it, so a `:docdir:` entry in the document is ignored.
-Included files belong to the same document and keep that value.
-Tree-sitter parses syntax only. It knows nothing about attribute values, include order, or `docdir`.
+Includes are textual: `include::` is replaced before parsing, and an attribute entry applies from its line on in that reading order.
+So the value of `{x}` in a shared file depends on the top-level document and the position, not on the line alone.
+If `book.adoc` and `web.adoc` include the same file and set different `imagesdir` values, both results are correct.
+`docdir` is the folder of the converted document, and Asciidoctor locks it.
+Tree-sitter parses syntax only. It knows nothing about attribute values, include order or `docdir`.
+A second, semantic parser could provide them, but two parsers can disagree on the structure of the same document.
 
 *Decision:*
 
-* There is no second parser. Attributes, includes, `docdir`, and cross-reference targets are resolved in `asciidoc-core` on top of the Tree-sitter trees. `asciidoc-lsp` translates the results into LSP types.
-* Attribute values are resolved per (top-level document, position). A definition applies from its line on, and an unset hides an earlier value. A file included by several top-level documents can have one value per document.
-* `asciidoc-core` returns the attribute scopes of all top-level documents and does not pick one; each feature decides how to show them. Path existence checks count a `{docdir}` target as broken only if it is broken for every including document.
+* There is no second parser. `asciidoc-core` resolves attributes, includes, `docdir` and xref targets on top of the Tree-sitter trees. `asciidoc-lsp` translates the results into LSP types.
+* Attribute values are resolved per (top-level document, position). A definition applies from its line on, and an unset hides an earlier value.
 * A top-level document is a document that no other document includes.
-* `{docdir}` is the folder of the top-level document, as in Asciidoctor. A document without an includer is its own top-level document. A `:docdir:` entry in a document or in `.asciidoctorconfig` is ignored.
-* Each top-level document is read as the editor previews it: its own `.asciidoctorconfig` chain first, then the document.
-* For paths, a file that other documents include is also resolved as its own preview: its config chain and its own folder as base, without the attributes of the including document. Hover shows this preview as information. Go to definition and find references on an xref, image, or include, and rename on an xref, follow only the top-level documents that read the file, as Asciidoctor does when it converts them. Path and xref completion follow the same documents. Attribute values (hover, go to definition on `{name}`) show only the top-level documents.
-* Each feature decides how to present the results. If all agree, it shows one result. If they differ, it shows each result with the document name.
+* `{docdir}` is the folder of the top-level document. A `:docdir:` entry in a document or in `.asciidoctorconfig` is ignored.
+* Each top-level document is read as the editor previews it: its `.asciidoctorconfig` chain first, then the document.
+* `asciidoc-core` returns the results for all top-level documents and picks none. If they agree, a feature shows one result. If they differ, it shows each with the document name.
+* For paths, an included file is also resolved as its own preview, with its config chain and its own folder as base. Hover shows this preview as information. Go to definition, find references, rename and completion follow only the top-level documents that read the file. Attribute values show only the top-level documents.
 
 *Consequences:*
 
-* Positive: One resolution rule for hover, go to definition, image, include, and xref paths, and completion.
-* Positive: Setups with several top-level documents (print and web, draft and book) are shown correctly and do not depend on file names.
-* Negative: The top-level document is derived from the include graph, not from build configuration.
+* Positive: Hover, go to definition, completion and path checks share one resolution rule.
+* Positive: Several top-level documents on the same files (print and web) work without relying on file names.
+* Negative: The top-level document comes from the include graph, not from the build configuration.

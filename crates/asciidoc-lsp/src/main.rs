@@ -3592,7 +3592,7 @@ mod tests {
     // `include::../part-up.adoc[]` reaches `part-up.adoc` from the real folder
     // and `config/part-up.adoc` from the link; only the preview of the link
     // side gets `imagesdir` from `config/.asciidoctorconfig`, the build of
-    // `via-link.adoc`, which includes the file, does not (ADR-4).
+    // `via-link.adoc`, which includes the file, does not (ADR-3).
 
     fn first_include_target(server: &AsciiDocLsp, file: &Path) -> PathBuf {
         let ws = server.workspace.lock();
@@ -3606,7 +3606,7 @@ mod tests {
     /// keeps the canonical folder, though it reaches the file through the
     /// link), and from the link's folder once opened through the link. The
     /// link folder's config chain enters only through the preview scope of
-    /// the file (ADR-4); the scope of the including document `via-link.adoc`
+    /// the file (ADR-3); the scope of the including document `via-link.adoc`
     /// does not get it.
     #[cfg(unix)]
     #[tokio::test]
@@ -3642,7 +3642,7 @@ mod tests {
         // `via-link.adoc` includes the file, so its build has no `imagesdir`.
         // The preview of the file takes `imagesdir` from the chain of
         // `config/`; its literal `../assets` resolves from the link folder to
-        // `config/assets`, as in Asciidoctor (ADR-4).
+        // `config/assets`, as in Asciidoctor (ADR-3).
         assert_eq!(
             image.as_deref(),
             Some(
@@ -5066,7 +5066,7 @@ mod tests {
         let chapters = fx.join("docs/shared/chapters.adoc");
         let (service, _socket, uri, text) = open_fixture(&fx, &chapters).await;
         let server = service.inner();
-        // Each top-level document has its own docdir (ADR-4).
+        // Each top-level document has its own docdir (ADR-3).
         assert_eq!(
             hover_text(server, &uri, position_of(&text, "{docdir}", 2)).await,
             Some(format!(

@@ -1631,7 +1631,7 @@ fn resolve_syntax_catalog(
 /// - `Attribute` → `resolve_attribute_completions`
 ///
 /// `line` (1-based) is where the completion happens: attribute values are
-/// those in effect there (ADR-4).
+/// those in effect there (ADR-3).
 pub(crate) fn resolve_completions(
     ctx: CompletionContext,
     doc_path: &Path,
@@ -3107,7 +3107,7 @@ mod tests {
         );
     }
 
-    // --- Completion over several attribute scopes (ADR-4) ---
+    // --- Completion over several attribute scopes (ADR-3) ---
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
         items.iter().map(|i| i.label.as_str()).collect()
@@ -5348,11 +5348,11 @@ mod tests {
         let result = accept_at_cursor(
             &doc,
             None,
-            "Use `include::fo|` and see xref:adr-4[ADR-4].",
+            "Use `include::fo|` and see xref:adr-4[ADR-3].",
             "foo.adoc",
         );
         assert!(
-            result.ends_with("` and see xref:adr-4[ADR-4]."),
+            result.ends_with("` and see xref:adr-4[ADR-3]."),
             "text after the cursor was replaced: {result}"
         );
     }
@@ -5365,11 +5365,11 @@ mod tests {
         let result = accept_at_cursor(
             &doc,
             None,
-            "Use `image::fo|` and see xref:adr-4[ADR-4].",
+            "Use `image::fo|` and see xref:adr-4[ADR-3].",
             "foo.png",
         );
         assert!(
-            result.ends_with("` and see xref:adr-4[ADR-4]."),
+            result.ends_with("` and see xref:adr-4[ADR-3]."),
             "text after the cursor was replaced: {result}"
         );
     }

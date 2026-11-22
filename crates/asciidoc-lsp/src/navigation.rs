@@ -138,7 +138,7 @@ fn classify_in_range(
 /// Resolve a go-to-definition request to target files and lines
 /// (1-indexed). An attribute reference yields every definition, the one
 /// Asciidoctor uses first; an include, xref or image yields each scope's
-/// existing target once, the preview of an included file none (ADR-4).
+/// existing target once, the preview of an included file none (ADR-3).
 ///
 /// Extracted from the `LanguageServer` handler for testability (V-8).
 pub fn resolve_goto_definitions(
@@ -629,7 +629,7 @@ fn xref_hover(ws: &Workspace, resolved: &ResolvedXref) -> String {
 }
 
 /// Hover text from one text per scope, each with its label: the text alone
-/// when all agree, else each one under its label (ADR-4).
+/// when all agree, else each one under its label (ADR-3).
 fn per_document_hover(mut texts: Vec<(String, String)>) -> String {
     collapse_if_agree(&mut texts, |a, b| a.1 == b.1);
     if let [(_, text)] = texts.as_slice() {
@@ -1201,7 +1201,7 @@ fn explain_image(label: &str, result: ImageResult) -> Value {
     }
 }
 
-/// `name` on `line` per top-level document (ADR-4: no preview scope for
+/// `name` on `line` per top-level document (ADR-3: no preview scope for
 /// attribute values).
 fn explain_attribute(ws: &Workspace, doc_path: &Path, name: &str, line: usize) -> Value {
     let scopes: Vec<Value> = ws
@@ -3462,25 +3462,25 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
 
     #[test]
     fn test_find_node_xref_real_adr_second_passthrough_xref() {
-        // second affected xref on line 70, also inside the false passthrough.
+        // second affected xref on line 24, also inside the false passthrough.
         let content = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/chapters/09_architecture_decisions.adoc"
         ))
         .unwrap();
 
-        // Line 70 (1-indexed): "...documented in xref:chapters/01_introduction_and_goals.adoc[...]..."
-        // "xref:" starts at character 91, target at 96
+        // Line 24 (1-indexed): "...see xref:chapters/08_concepts.adoc#parsing-concepts[...]."
+        // "xref:" starts at character 98, target at 103
         let pos = Position {
-            line: 69,
-            character: 100,
+            line: 23,
+            character: 110,
         };
         let info = find_node_at_position(&content, pos);
-        assert!(info.is_some(), "xref on line 70 must be found");
+        assert!(info.is_some(), "xref on line 24 must be found");
         assert_eq!(
             info.unwrap().kind,
             NodeKind::Xref {
-                target: "chapters/01_introduction_and_goals.adoc".into()
+                target: "chapters/08_concepts.adoc#parsing-concepts".into()
             }
         );
     }
@@ -5204,7 +5204,7 @@ For details see xref:05_building_block_view.adoc#building-blocks[see Building Bl
     }
 
     /// An include target takes the attribute values of each top-level
-    /// document and of the editor's preview, like an image (ADR-4).
+    /// document and of the editor's preview, like an image (ADR-3).
     #[test]
     fn test_hover_include_shows_preview_of_included_file_where_it_breaks() {
         let chapter = "== C\n\ninclude::{parts}/p.adoc[]\n";

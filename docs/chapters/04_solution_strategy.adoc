@@ -2,7 +2,7 @@
 
 * Parsing is based on tree-sitter grammars (xref:chapters/09_architecture_decisions.adoc#adr-treesitter[ADR-1]).
 * The server is written in Rust (xref:chapters/09_architecture_decisions.adoc#adr-rust[ADR-2]).
-* AsciiDoc semantics are resolved in `asciidoc-core`, without a second parser (xref:chapters/09_architecture_decisions.adoc#adr-semantics[ADR-4]).
+* AsciiDoc semantics are resolved in `asciidoc-core`, without a second parser (xref:chapters/09_architecture_decisions.adoc#adr-semantics[ADR-3]).
 
 == Grammar
 

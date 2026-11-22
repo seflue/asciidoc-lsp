@@ -182,7 +182,7 @@ impl Workspace {
     /// The attributes in effect on `line` of `file`, one scope per top-level
     /// document that reaches `file`, in path order. Asciidoctor converts each
     /// top-level document on its own, so each scope is correct for its
-    /// document and none is preferred (ADR-4). A file no document includes
+    /// document and none is preferred (ADR-3). A file no document includes
     /// is its own top-level document.
     #[must_use]
     pub fn scopes_at(&self, file: &Path, line: usize) -> Vec<AttributeScope<'_>> {
@@ -196,7 +196,7 @@ impl Workspace {
     /// The attributes in effect on `line` of `file` when the editor previews
     /// `file` on its own: its own config chain, its own folder as `docdir`,
     /// nothing from the documents that include it. `None` for a top-level
-    /// document, whose preview is its [`Self::scopes_at`] scope (ADR-4).
+    /// document, whose preview is its [`Self::scopes_at`] scope (ADR-3).
     #[must_use]
     pub fn preview_scope_at(&self, file: &Path, line: usize) -> Option<AttributeScope<'_>> {
         let file = self.indexed_path(file);
