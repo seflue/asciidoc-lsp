@@ -7,6 +7,10 @@
  *   cursor        {file, line}             cursor line, 1-based source line
  *                                          (the server added 1 to the LSP line)
  *   convert-error {message}                the conversion failed
+ *   debug         {enabled}                the debug log was switched; while
+ *                                          it is on, `cursor` carries `seq` and
+ *                                          the page reports on each event
+ *                                          (`POST debug`, see scroll-debug.js)
  * In `html`, `file` is the converted document: the top-level document in
  * whole-document mode, else the active file. In `cursor`, `file` is the file
  * the editor is in, which can be one the shown document includes. The page
@@ -32,6 +36,7 @@
 
   var maps = window.AdocScrollMap
   var sync = window.AdocPageSync
+  var debug = window.AdocScrollDebug
   var content = document.getElementById('content')
   var followBox = document.getElementById('follow')
   var jumpBox = document.getElementById('jump')
@@ -41,6 +46,7 @@
   var sourceBanner = document.getElementById('preview-source')
   var sourceText = document.getElementById('preview-source-text')
   var sourceOpen = document.getElementById('preview-source-open')
+  var debugBox = document.getElementById('preview-debug')
 
   var gate = sync.createScrollGate({ inputWindow: 600, echoWindow: 250, throttle: 100 })
   var trailingTimer = null
@@ -54,7 +60,7 @@
   var END_OF_FILE = 2147483647
   var fileTable = [] // included files of the shown document, index = K
   var includeTable = [] // its include directives: {parent, line, file}
-  var cursor = null // last cursor event: {file, line}
+  var cursor = null // last cursor event: {file, line[, seq]}
   var baseBodyClass = document.body.className // what the page itself puts on its body
 
   function followOn() {
@@ -122,8 +128,8 @@
    * current client-Y, ready for the mapping functions. Only the shown file
    * gets the end sentinel: the page knows no line count for an included one.
    */
-  function anchors(src) {
-    var own = maps.fileAnchorsWithIncludes(rawEntries(), includeTable, src)
+  function anchors(src, entries) {
+    var own = maps.fileAnchorsWithIncludes(entries || rawEntries(), includeTable, src)
     if (src !== null) return own
     return maps.withSentinel(
       maps.withPageTop(own, window.scrollY),
@@ -142,6 +148,7 @@
       var rect = elements[i].getBoundingClientRect()
       parsed.top = rect.top
       parsed.bottom = rect.bottom
+      parsed.what = elements[i].className
       entries.push(parsed)
     }
     return entries
@@ -153,14 +160,48 @@
     if (top !== undefined) scrollPage(top)
   }
 
+  /** The `seq` of the last cursor event, 0 before the first. */
+  function lastSeq() {
+    return cursor !== null && typeof cursor.seq === 'number' ? cursor.seq : 0
+  }
+
+  var reporter = debug.createReporter({
+    post: post,
+    show: function (text) { debugBox.textContent = text },
+  })
+  var sendDebug = reporter.send
+
+  /** Report on the cursor event: `info` adds what `revealCursor` saw. */
+  function debugReveal(info) {
+    if (!reporter.enabled() || cursor === null) return
+    sendDebug(debug.revealReport({
+      seq: lastSeq(),
+      file: cursor.file,
+      line: cursor.line,
+      src: info.src,
+      skipped: info.skipped,
+      anchors: info.anchors,
+      entries: info.entries,
+      scrollBefore: info.scrollBefore === undefined ? window.scrollY : info.scrollBefore,
+      scrollAfter: window.scrollY,
+      viewport: window.innerHeight,
+      target: info.target,
+      action: info.action,
+    }))
+  }
+
   /** Bring the cursor line into view, unless it is already comfortably there. */
   function revealCursor() {
+    if (!cursorApplies()) return debugReveal({ skipped: 'not-shown' })
     // While the page leads, the editor is where the page put it, not at the
     // last cursor it reported.
-    if (!cursorApplies() || gate.pageLeads()) return
+    if (gate.pageLeads()) return debugReveal({ src: cursorSrc(), skipped: 'page-leads' })
     var src = cursorSrc()
-    var top = maps.scrollTopForLine(anchors(src), window.scrollY, cursor.line)
-    if (top === undefined) return
+    var before = window.scrollY
+    var entries = rawEntries()
+    var list = anchors(src, entries)
+    var top = maps.scrollTopForLine(list, before, cursor.line)
+    if (top === undefined) return debugReveal({ src: src, skipped: 'no-anchors' })
     var action = sync.followAction({
       line: cursor.line,
       // The end of the page is the end of the shown file only.
@@ -171,6 +212,9 @@
     })
     if (action === 'end') scrollPage(document.documentElement.scrollHeight - window.innerHeight)
     else if (action === 'align') scrollPage(top)
+    debugReveal({
+      src: src, anchors: list, entries: entries, scrollBefore: before, target: top, action: action,
+    })
   }
 
   /**
@@ -186,6 +230,9 @@
   function report(body) {
     post('scroll', body)
     gate.reported()
+    sendDebug(debug.scrollReport({
+      seq: lastSeq(), file: body.file, line: body.line, cursor: body.cursor, scrollY: window.scrollY,
+    }))
   }
 
   /**
@@ -271,6 +318,7 @@
     var following = followOn() && cursorApplies() && !gate.pageLeads()
     var keepLine =
       following || message.file !== shownFile ? null : maps.sourceLineAtViewportTop(anchors(null), 0)
+    var scrollBefore = window.scrollY
     // A page of another height moves the scroll position by itself (the
     // browser clamps it): that scroll is not the reader's.
     gate.ownScroll(now())
@@ -283,6 +331,10 @@
     showError(null)
     if (following) revealCursor()
     else if (keepLine !== null) pinToLine(keepLine)
+    sendDebug(debug.htmlReport({
+      seq: lastSeq(), file: message.file, following: following, keepLine: keepLine,
+      scrollBefore: scrollBefore, scrollAfter: window.scrollY,
+    }))
     scheduleBanner()
   }
 
@@ -296,10 +348,13 @@
       // end, then follow: the editor reports no move it was made to do, so
       // what arrives is the reader's own move and must not be lost.
       if (gate.followsCursor(time)) revealCursor()
-      else followTimer = setTimeout(function () {
-        if (followOn()) revealCursor()
-      }, gate.followDelay(time))
-    }
+      else {
+        debugReveal({ src: cursorSrc(), skipped: 'deferred' })
+        followTimer = setTimeout(function () {
+          if (followOn()) revealCursor()
+        }, gate.followDelay(time))
+      }
+    } else debugReveal({ src: cursorSrc(), skipped: 'follow-off' })
     scheduleBanner()
   }
 
@@ -366,5 +421,9 @@
   listen(source, 'cursor', onCursor)
   listen(source, 'convert-error', function (message) {
     showError(message.message)
+  })
+  listen(source, 'debug', function (message) {
+    reporter.switchTo(message.enabled)
+    debugBox.hidden = !reporter.enabled()
   })
 })()

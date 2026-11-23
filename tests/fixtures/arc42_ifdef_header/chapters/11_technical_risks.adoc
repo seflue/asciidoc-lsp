@@ -1,0 +1,54 @@
+[[section-technical-risks]]
+== Risiken und technische Schulden
+
+[role="arc42help"]
+****
+Hilfetext für Kapitel 11.
+Zweite Zeile des Hilfetexts.
+****
+
+=== Abschnitt 11.1
+
+Absatz 1 im Abschnitt 11.1. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 2 im Abschnitt 11.1. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 3 im Abschnitt 11.1. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+[options="header"]
+|===
+|Name |Beschreibung
+|Eins |Erste Zeile
+|Zwei |Zweite Zeile
+|===
+
+=== Abschnitt 11.2
+
+Absatz 1 im Abschnitt 11.2. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 2 im Abschnitt 11.2. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 3 im Abschnitt 11.2. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+[options="header"]
+|===
+|Name |Beschreibung
+|Eins |Erste Zeile
+|Zwei |Zweite Zeile
+|===
+
+=== Abschnitt 11.3
+
+Absatz 1 im Abschnitt 11.3. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 2 im Abschnitt 11.3. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 3 im Abschnitt 11.3. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+[options="header"]
+|===
+|Name |Beschreibung
+|Eins |Erste Zeile
+|Zwei |Zweite Zeile
+|===
+

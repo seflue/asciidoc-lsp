@@ -405,6 +405,29 @@ impl AsciiDocLsp {
         Ok(Some(serde_json::json!({ "url": preview.url() })))
     }
 
+    /// `workspace/executeCommand` [`PREVIEW_DEBUG_COMMAND`]: switch the
+    /// scroll-sync debug log on or off (answers `{"enabled": bool}`) or show
+    /// it (answers [`preview::Preview::debug_log`]).
+    fn preview_debug(&self, arguments: &[serde_json::Value]) -> Result<Option<serde_json::Value>> {
+        let action = arguments.first().and_then(serde_json::Value::as_str);
+        let Some(action @ ("on" | "off" | "show")) = action else {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "{PREVIEW_DEBUG_COMMAND}: expected \"on\", \"off\" or \"show\""
+            )));
+        };
+        let Some(preview) = self.preview.running() else {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "{PREVIEW_DEBUG_COMMAND}: no preview is open"
+            )));
+        };
+        if action == "show" {
+            return Ok(Some(preview.debug_log()));
+        }
+        let enabled = action == "on";
+        preview.set_debug(enabled);
+        Ok(Some(serde_json::json!({ "enabled": enabled })))
+    }
+
     /// Notification [`CURSOR_MOVED_METHOD`]: the editor's cursor is on
     /// `params.line` (0-based) of `params.uri`. Ignored while no preview is
     /// open. A different document becomes the shown one.
@@ -893,6 +916,7 @@ impl LanguageServer for AsciiDocLsp {
                     commands: vec![
                         EXPLAIN_POSITION_COMMAND.to_string(),
                         PREVIEW_OPEN_COMMAND.to_string(),
+                        PREVIEW_DEBUG_COMMAND.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -1500,6 +1524,9 @@ impl LanguageServer for AsciiDocLsp {
         if params.command == PREVIEW_OPEN_COMMAND {
             return self.preview_open(params.arguments).await;
         }
+        if params.command == PREVIEW_DEBUG_COMMAND {
+            return self.preview_debug(&params.arguments);
+        }
         let args = parse_explain_position_command(&params.command, params.arguments)?;
         let uri = &args.text_document.uri;
 
@@ -1802,6 +1829,10 @@ const EXPLAIN_POSITION_COMMAND: &str = "asciidoc.explainPosition";
 /// top-level document that includes it; `part`: the document alone). Answers
 /// `{"url": "<page URL>"}`.
 const PREVIEW_OPEN_COMMAND: &str = "asciidoc.preview.open";
+
+/// Command for the preview's scroll-sync debug log: `"on"`, `"off"` or
+/// `"show"`. Fails while no preview is open.
+const PREVIEW_DEBUG_COMMAND: &str = "asciidoc.preview.debug";
 
 /// Notification from the editor: its cursor moved. Params
 /// [`CursorMovedParams`].
@@ -6164,6 +6195,53 @@ mod tests {
         assert!(
             server.preview.server.lock().is_none(),
             "nothing starts on bad input"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preview_debug_switches_the_log_and_shows_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.adoc");
+        fs::write(&a, "").unwrap();
+        let uri_a = file_uri(&a);
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let debug = |action: &str| vec![serde_json::json!(action)];
+
+        assert!(
+            server.preview_debug(&debug("on")).is_err(),
+            "no preview is open"
+        );
+
+        *server.preview.server.lock() = Some(Arc::new(preview::testing::start().await));
+        assert!(server.preview_debug(&[]).is_err());
+        assert!(server.preview_debug(&debug("loud")).is_err());
+
+        assert_eq!(
+            server.preview_debug(&debug("on")).unwrap(),
+            Some(serde_json::json!({ "enabled": true }))
+        );
+        open_document(server, &uri_a, "alpha").await;
+        server
+            .cursor_moved(CursorMovedParams {
+                uri: uri_a.clone(),
+                line: 2,
+            })
+            .await;
+        assert_eq!(
+            server.preview_debug(&debug("off")).unwrap(),
+            Some(serde_json::json!({ "enabled": false }))
+        );
+        let shown = server.preview_debug(&debug("show")).unwrap().unwrap();
+        assert_eq!(shown["enabled"], serde_json::json!(false));
+        assert_eq!(
+            shown["pairs"],
+            serde_json::json!([{
+                "seq": 1,
+                "sent": {"file": a.to_string_lossy(), "line": 3},
+                "page": [],
+            }])
         );
     }
 

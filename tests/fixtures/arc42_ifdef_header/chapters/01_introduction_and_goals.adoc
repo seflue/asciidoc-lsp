@@ -1,0 +1,57 @@
+[[section-introduction-and-goals]]
+== Einführung und Ziele
+
+[role="arc42help"]
+****
+Hilfetext für Kapitel 01.
+Zweite Zeile des Hilfetexts.
+****
+
+[[dup-anchor]]
+Doppelter Anker in 01_introduction_and_goals.
+
+=== Abschnitt 01.1
+
+Absatz 1 im Abschnitt 01.1. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 2 im Abschnitt 01.1. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 3 im Abschnitt 01.1. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+[options="header"]
+|===
+|Name |Beschreibung
+|Eins |Erste Zeile
+|Zwei |Zweite Zeile
+|===
+
+=== Abschnitt 01.2
+
+Absatz 1 im Abschnitt 01.2. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 2 im Abschnitt 01.2. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 3 im Abschnitt 01.2. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+[options="header"]
+|===
+|Name |Beschreibung
+|Eins |Erste Zeile
+|Zwei |Zweite Zeile
+|===
+
+=== Abschnitt 01.3
+
+Absatz 1 im Abschnitt 01.3. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 2 im Abschnitt 01.3. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+Absatz 3 im Abschnitt 01.3. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.
+
+[options="header"]
+|===
+|Name |Beschreibung
+|Eins |Erste Zeile
+|Zwei |Zweite Zeile
+|===
+

@@ -909,4 +909,16 @@ editor shows. Do not save the fixtures: the automated tests read them.
 //   `Done.`
 // Then `:e!` to drop the change.
 
+=== T11.3: Preview scroll-sync debug log
+
+// [ ] PASS  [ ] FAIL
+// Open `tests/fixtures/arc42_ifdef_header/index.adoc` (an arc42 book whose
+// header has `ifdef` blocks before twelve included chapters), run
+// `:AsciidocPreview`, then `:AsciidocPreview debug on`, `G`, `gg` and
+// `:AsciidocPreview debug show`.
+// Expected: the page shows a debug box with the last report; the table
+// lists one row per cursor line with the page's anchors around it, its
+// target and action; after `G` the action is `end`, after `gg` the page
+// is at Y 0.
+
 ---

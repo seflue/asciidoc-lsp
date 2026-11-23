@@ -19,6 +19,8 @@
 #preview-source { padding: 0.25em 0.6em; font: 0.8em/1.4 sans-serif; background: #fffbea; border: 1px solid #e0c96b;
   border-radius: 3px; }
 #preview-source button { margin-left: 0.6em; font: inherit; cursor: pointer; }
+#preview-debug { margin: 0; padding: 0.4em 0.6em; font: 0.75em/1.35 monospace; background: #fffff0;
+  border: 1px solid #c90; border-radius: 3px; white-space: pre-wrap; max-width: 60em; }
 #preview-banner { margin: 0 auto; max-width: 62.5em; padding: 0.6em 1.25em; background: #fbeaea;
   border-bottom: 1px solid #c33; color: #7a2518; font: 0.9em/1.4 sans-serif; white-space: pre-wrap; }
 </style>
@@ -31,6 +33,7 @@
 <label><input type="checkbox" id="scroll-editor" checked> Scroll editor with page</label>
 <span id="preview-status">Connecting...</span>
 </div>
+<pre id="preview-debug" hidden></pre>
 <div id="preview-source" hidden><span id="preview-source-text"></span><button type="button" id="preview-source-open">Open in editor</button></div>
 </div>
 <div id="preview-banner" hidden></div>
@@ -39,6 +42,7 @@
 <script src="morphdom.js"></script>
 <script src="scroll-map.js"></script>
 <script src="page-sync.js"></script>
+<script src="scroll-debug.js"></script>
 <script src="page.js"></script>
 </body>
 </html>

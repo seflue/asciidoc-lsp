@@ -1,0 +1,14 @@
+:homepage: https://arc42.org
+:keywords: software-architecture, documentation, template, arc42
+:numbered!:
+:source-highlighter: highlightjs
+ifdef::backend-pdf[]
+:imagesdir: ../images
+endif::backend-pdf[]
+:caution-caption: Achtung
+:important-caption: Wichtig
+:note-caption: Hinweis
+:tip-caption: Tipp
+:warning-caption: Warnung
+:figure-caption: Abbildung
+:table-caption: Tabelle

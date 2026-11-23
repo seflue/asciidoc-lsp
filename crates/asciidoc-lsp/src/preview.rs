@@ -12,7 +12,7 @@
 //! http-body-util.
 //!
 //! Routes below `/<token>/`: the page itself, `style.css`, `page.js`,
-//! `scroll-map.js`, `page-sync.js`, `morphdom.js`, the Font Awesome CSS and font, and `events` (SSE), and `files/<path>`: an
+//! `scroll-map.js`, `page-sync.js`, `scroll-debug.js`, `morphdom.js`, the Font Awesome CSS and font, and `events` (SSE), and `files/<path>`: an
 //! image file below the workspace root that the shown document names. The
 //! converter lists those images at the end of its HTML; the server resolves
 //! each to a canonical path and serves a request only if its own canonical
@@ -28,6 +28,8 @@
 //!   be one that `file` includes, and `line` a 1-based source line of it, see
 //!   [`Preview::set_cursor`].
 //! - `convert-error`: `{message}`, the conversion failed.
+//! - `debug`: `{enabled}`, the scroll-sync debug log was switched; while it
+//!   is on, `cursor` also carries `seq`, see [`Preview::set_debug`].
 //!
 //! Page actions, `POST` with a JSON body `{file, line}` (`line` 1-based, as
 //! in `data-line-N`; `file` an absolute path, as in the file table):
@@ -35,13 +37,16 @@
 //! - `scroll`: the reader scrolled, and `line` of `file` is on the page's
 //!   reading line; with `"cursor": true` the editor's cursor goes there too.
 //!
+//! `POST debug` takes the page's debug report on a cursor event (a JSON
+//! object with its `seq`), while the debug log is on.
+//!
 //! Besides host and token, a page action needs the page's own `Origin`
 //! (403 otherwise), so another site in the same browser cannot send one, and
 //! `file` must be part of the shown document: the shown file or an entry of
 //! its file table (400 otherwise). Accepted actions answer 204 and come out
 //! of [`Preview::take_actions`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io;
 use std::net::Ipv4Addr;
@@ -62,6 +67,7 @@ const PAGE: &str = include_str!("../assets/preview/index.html");
 const PAGE_JS: &str = include_str!("../assets/preview/page.js");
 const SCROLL_MAP_JS: &str = include_str!("../assets/preview/scroll-map.js");
 const PAGE_SYNC_JS: &str = include_str!("../assets/preview/page-sync.js");
+const SCROLL_DEBUG_JS: &str = include_str!("../assets/preview/scroll-debug.js");
 const MORPHDOM_JS: &str = include_str!("../assets/preview/morphdom.js");
 /// Font Awesome 4.7.0 for `:icons: font`; the standalone page links it from a CDN.
 const FONT_AWESOME_CSS: &str = include_str!("../assets/preview/font-awesome.min.css");
@@ -81,6 +87,13 @@ const MAX_BODY_BYTES: usize = 4 * 1024;
 /// Page actions waiting for the editor; more are dropped, so a page that
 /// floods the server cannot grow the queue.
 const ACTION_BACKLOG: usize = 64;
+/// Cursor events the debug log keeps, with the page's reports on each.
+const DEBUG_PAIRS: usize = 50;
+/// Page reports kept per cursor event; a page that sends more loses the rest.
+/// Room for a deferred reveal after several conversions under one event.
+const DEBUG_REPORTS_PER_PAIR: usize = 16;
+/// Longest debug report body the server reads.
+const MAX_DEBUG_BODY_BYTES: usize = 16 * 1024;
 
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +112,7 @@ enum EventKind {
     Html,
     Cursor,
     ConvertError,
+    Debug,
 }
 
 impl EventKind {
@@ -108,6 +122,7 @@ impl EventKind {
             Self::Html => "html",
             Self::Cursor => "cursor",
             Self::ConvertError => "convert-error",
+            Self::Debug => "debug",
         }
     }
 }
@@ -172,11 +187,13 @@ struct Snapshot {
     html: Option<Event>,
     cursor: Option<Event>,
     error: Option<Event>,
+    debug: Option<Event>,
 }
 
 impl Snapshot {
     fn replay(&self) -> Vec<Event> {
-        [&self.html, &self.cursor, &self.error]
+        // The debug switch first: the page reports on the cursor that follows.
+        [&self.debug, &self.html, &self.cursor, &self.error]
             .into_iter()
             .flatten()
             .cloned()
@@ -203,6 +220,59 @@ struct Shared {
     shown_files: Mutex<HashSet<PathBuf>>,
     /// Where accepted page actions go.
     actions: mpsc::Sender<PageAction>,
+    /// The scroll-sync debug log, see [`Preview::set_debug`].
+    debug: Mutex<DebugLog>,
+}
+
+/// What the server sent and what the page made of it, while debug is on.
+#[derive(Debug, Default)]
+struct DebugLog {
+    enabled: bool,
+    /// Number of the last cursor event sent while debug was on.
+    seq: u64,
+    pairs: VecDeque<DebugPair>,
+}
+
+/// One cursor event and the page's reports on it. `sent` is `None` for a
+/// report whose event the log does not hold (dropped, or never sent).
+#[derive(Debug, serde::Serialize)]
+struct DebugPair {
+    seq: u64,
+    sent: Option<serde_json::Value>,
+    page: Vec<serde_json::Value>,
+}
+
+impl DebugLog {
+    fn push(&mut self, pair: DebugPair) {
+        if self.pairs.len() == DEBUG_PAIRS {
+            self.pairs.pop_front();
+        }
+        self.pairs.push_back(pair);
+    }
+
+    /// File `report` with the cursor event of its `seq`. A report whose
+    /// event the log does not hold gets a pair of its own, in `seq` order;
+    /// in a full log that pair is the oldest and goes again at once.
+    fn add_report(&mut self, seq: u64, report: serde_json::Value) {
+        if let Some(pair) = self.pairs.iter_mut().find(|pair| pair.seq == seq) {
+            if pair.page.len() < DEBUG_REPORTS_PER_PAIR {
+                pair.page.push(report);
+            }
+            return;
+        }
+        let at = self.pairs.partition_point(|pair| pair.seq < seq);
+        self.pairs.insert(
+            at,
+            DebugPair {
+                seq,
+                sent: None,
+                page: vec![report],
+            },
+        );
+        if self.pairs.len() > DEBUG_PAIRS {
+            self.pairs.pop_front();
+        }
+    }
 }
 
 impl Shared {
@@ -218,6 +288,7 @@ impl Shared {
             }
             EventKind::Cursor => snapshot.cursor = Some(event.clone()),
             EventKind::ConvertError => snapshot.error = Some(event.clone()),
+            EventKind::Debug => snapshot.debug = Some(event.clone()),
         }
         // No receiver is fine: nobody has the page open.
         let _ = self.events.send(event);
@@ -314,6 +385,28 @@ impl Shared {
         }
         Ok(())
     }
+
+    /// Accept a debug report: a JSON object with the `seq` of the cursor
+    /// event it answers, 0 before the page has seen one. 409 while debug is
+    /// off, 400 for a `seq` the server has not sent yet: a pair under that
+    /// number would shadow the event that gets it later.
+    fn accept_debug(&self, body: &[u8]) -> Result<(), u16> {
+        let report: serde_json::Value = serde_json::from_slice(body).map_err(|_| 400_u16)?;
+        let seq = report
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(400_u16)?;
+        let mut log = self.debug.lock();
+        if !log.enabled {
+            return Err(409);
+        }
+        if seq > log.seq {
+            return Err(400);
+        }
+        tracing::debug!(seq, %report, "preview debug: page report");
+        log.add_report(seq, report);
+        Ok(())
+    }
 }
 
 /// A running preview server and the converter feeding it.
@@ -368,6 +461,7 @@ impl Preview {
             line_counts: Mutex::new(HashMap::new()),
             shown_files: Mutex::new(HashSet::new()),
             actions,
+            debug: Mutex::new(DebugLog::default()),
         });
         let url = format!("http://127.0.0.1:{port}/{}/", shared.token);
         let (convert, outcomes) = preview_converter::spawn(converter, debounce);
@@ -416,14 +510,51 @@ impl Preview {
     /// `lsp_line` is 0-based, as in every LSP position. Asciidoctor's
     /// `data-line-N` classes count from 1, so the event carries
     /// `lsp_line + 1`; the page compares it with the anchors as it is.
+    ///
+    /// While debug is on, the event also carries `seq`, its number in the
+    /// debug log, and the log records it.
     pub fn set_cursor(&self, file: &Path, lsp_line: u32) {
+        let mut data = serde_json::json!({
+            "file": file.to_string_lossy(),
+            "line": u64::from(lsp_line) + 1,
+        });
+        {
+            let mut log = self.shared.debug.lock();
+            if log.enabled {
+                log.seq += 1;
+                let seq = log.seq;
+                tracing::debug!(seq, sent = %data, "preview debug: cursor event");
+                log.push(DebugPair {
+                    seq,
+                    sent: Some(data.clone()),
+                    page: Vec::new(),
+                });
+                data["seq"] = seq.into();
+            }
+        }
+        self.shared.publish(Event::new(EventKind::Cursor, &data));
+    }
+
+    /// Switch the scroll-sync debug log on or off and tell the page, which
+    /// then reports how it handled each cursor event (`POST debug`). The
+    /// log keeps its pairs when switched off.
+    pub fn set_debug(&self, enabled: bool) {
+        self.shared.debug.lock().enabled = enabled;
         self.shared.publish(Event::new(
-            EventKind::Cursor,
-            &serde_json::json!({
-                "file": file.to_string_lossy(),
-                "line": u64::from(lsp_line) + 1,
-            }),
+            EventKind::Debug,
+            &serde_json::json!({ "enabled": enabled }),
         ));
+    }
+
+    /// The debug log: `{enabled, pairs: [{seq, sent, page: [report]}]}`,
+    /// oldest pair first. `sent` is `{file, line}` or `null`.
+    #[must_use]
+    pub fn debug_log(&self) -> serde_json::Value {
+        let log = self.shared.debug.lock();
+        serde_json::json!({
+            "enabled": log.enabled,
+            "pairs": log.pairs,
+        })
     }
 }
 
@@ -529,6 +660,8 @@ enum Routed<'a> {
     Events,
     /// A page action; the body is still to be read.
     Action(ActionKind),
+    /// A debug report of the page; the body is still to be read.
+    Debug,
     /// A workspace file by its still percent-encoded path below the root.
     File(String),
     Status(u16),
@@ -550,9 +683,10 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         return Routed::Status(404);
     }
     if request.method == "POST" {
-        let kind = match rest {
-            "click" => ActionKind::Click,
-            "scroll" => ActionKind::Scroll,
+        let routed = match rest {
+            "click" => Routed::Action(ActionKind::Click),
+            "scroll" => Routed::Action(ActionKind::Scroll),
+            "debug" => Routed::Debug,
             _ => return Routed::Status(405),
         };
         if !request
@@ -561,7 +695,7 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         {
             return Routed::Status(403);
         }
-        return Routed::Action(kind);
+        return routed;
     }
     if request.method != "GET" {
         return Routed::Status(405);
@@ -580,6 +714,7 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         "page.js" => body("text/javascript; charset=utf-8", PAGE_JS),
         "scroll-map.js" => body("text/javascript; charset=utf-8", SCROLL_MAP_JS),
         "page-sync.js" => body("text/javascript; charset=utf-8", PAGE_SYNC_JS),
+        "scroll-debug.js" => body("text/javascript; charset=utf-8", SCROLL_DEBUG_JS),
         "morphdom.js" => body("text/javascript; charset=utf-8", MORPHDOM_JS),
         "font-awesome.min.css" => body("text/css; charset=utf-8", FONT_AWESOME_CSS),
         "fontawesome-webfont.woff2" => Routed::Body {
@@ -625,6 +760,7 @@ fn reason(status: u16) -> &'static str {
         400 => "Bad Request",
         403 => "Forbidden",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         _ => "Not Found",
     }
 }
@@ -709,6 +845,22 @@ async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<
                 Some(body) => shared
                     .accept_action(kind, &body)
                     .map_or_else(|s| s, |()| 204),
+                None => 400,
+            };
+            let text = if status == 204 { "" } else { reason(status) };
+            write_response(&mut stream, status, "text/plain", "", text.as_bytes()).await
+        }
+        Routed::Debug => {
+            let body = match request.content_length {
+                Some(length) if length <= MAX_DEBUG_BODY_BYTES => {
+                    tokio::time::timeout(HEAD_TIMEOUT, read_body(&mut stream, body_start, length))
+                        .await
+                        .unwrap_or(Ok(None))?
+                }
+                _ => None,
+            };
+            let status = match body {
+                Some(body) => shared.accept_debug(&body).map_or_else(|s| s, |()| 204),
                 None => 400,
             };
             let text = if status == 204 { "" } else { reason(status) };
@@ -1432,6 +1584,7 @@ mod tests {
             ("page.js", "EventSource"),
             ("scroll-map.js", "AdocScrollMap"),
             ("page-sync.js", "AdocPageSync"),
+            ("scroll-debug.js", "AdocScrollDebug"),
             ("morphdom.js", "morphdom"),
         ] {
             let response = get(port, &format!("/{token}/{path}"), &host).await;
@@ -1771,5 +1924,188 @@ mod tests {
         assert_eq!(parse_request("GET /"), None);
         assert_eq!(parse_request("GET / HTTP/1.1\r\nHost: a\r\nHost: b"), None);
         assert_eq!(parse_request("GET / HTTP/1.1 extra\r\nHost: a"), None);
+    }
+
+    #[tokio::test]
+    async fn debug_on_is_announced_and_cursor_events_carry_rising_seq() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        preview.set_debug(true);
+        stream.until(r#"event: debug"#).await;
+        let all = stream.until(r#"{"enabled":true}"#).await;
+        assert!(all.contains("event: debug"), "{all}");
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        preview.set_cursor(Path::new("/doc.adoc"), 3);
+        let all = stream.until(r#""seq":2"#).await;
+        assert!(
+            all.contains(r#"data: {"file":"/doc.adoc","line":1,"seq":1}"#),
+            "{all}"
+        );
+        assert!(
+            all.contains(r#"data: {"file":"/doc.adoc","line":4,"seq":2}"#),
+            "{all}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_stream_learns_that_debug_is_on_before_the_cursor() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        let mut late = Stream::open(port, &token).await;
+        let replay = late.until(r#""seq":1}"#).await;
+        let debug = replay.find("event: debug").expect("debug event replayed");
+        let cursor = replay.find("event: cursor").expect("cursor event replayed");
+        assert!(debug < cursor, "{replay}");
+    }
+
+    #[tokio::test]
+    async fn a_page_report_pairs_with_the_cursor_event_it_answers() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        preview.set_cursor(Path::new("/doc.adoc"), 4);
+        let report = r#"{"seq":1,"kind":"reveal","target":120}"#;
+        let response = post(port, &token, "debug", Some(&page_origin(port)), report).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(
+            preview.debug_log(),
+            serde_json::json!({
+                "enabled": true,
+                "pairs": [{
+                    "seq": 1,
+                    "sent": {"file": "/doc.adoc", "line": 5},
+                    "page": [{"seq": 1, "kind": "reveal", "target": 120}],
+                }],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_before_the_first_event_is_kept_unpaired_in_order() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        let report = r#"{"seq":0,"kind":"html"}"#;
+        let response = post(port, &token, "debug", Some(&page_origin(port)), report).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(
+            preview.debug_log()["pairs"],
+            serde_json::json!([
+                {"seq": 0, "sent": null, "page": [{"seq": 0, "kind": "html"}]},
+                {"seq": 1, "sent": {"file": "/doc.adoc", "line": 1}, "page": []},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_on_an_event_the_full_log_dropped_is_dropped_too() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        for line in 0..60 {
+            preview.set_cursor(Path::new("/doc.adoc"), line);
+        }
+        let report = r#"{"seq":3,"kind":"scroll"}"#;
+        let response = post(port, &token, "debug", Some(&page_origin(port)), report).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        let log = preview.debug_log();
+        let pairs = log["pairs"].as_array().unwrap();
+        assert_eq!(pairs.len(), 50);
+        assert_eq!(pairs[0]["seq"], 11);
+        assert_eq!(pairs[49]["seq"], 60);
+    }
+
+    #[tokio::test]
+    async fn a_report_for_a_seq_never_sent_is_refused() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        let report = r#"{"seq":2,"kind":"reveal"}"#;
+        let response = post(port, &token, "debug", Some(&page_origin(port)), report).await;
+        assert!(status_line(&response).contains("400"), "{response}");
+        // The event that does get number 2 pairs as usual.
+        preview.set_cursor(Path::new("/doc.adoc"), 1);
+        let response = post(port, &token, "debug", Some(&page_origin(port)), report).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(preview.debug_log()["pairs"][1]["page"][0]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_pair_keeps_sixteen_page_reports() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        for n in 0..17 {
+            let report = format!(r#"{{"seq":1,"n":{n}}}"#);
+            let response = post(port, &token, "debug", Some(&page_origin(port)), &report).await;
+            assert!(status_line(&response).contains("204"), "{n}: {response}");
+        }
+        let page = preview.debug_log()["pairs"][0]["page"].clone();
+        assert_eq!(page.as_array().unwrap().len(), 16);
+        assert_eq!(page[15]["n"], 15);
+    }
+
+    #[tokio::test]
+    async fn a_report_may_be_up_to_sixteen_kib() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        preview.set_cursor(Path::new("/doc.adoc"), 0);
+        let report = |size: usize| {
+            let frame = r#"{"seq":1,"pad":""}"#.len();
+            format!(r#"{{"seq":1,"pad":"{}"}}"#, "x".repeat(size - frame))
+        };
+        let origin = page_origin(port);
+        let response = post(port, &token, "debug", Some(&origin), &report(16 * 1024)).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        let response = post(port, &token, "debug", Some(&origin), &report(16 * 1024 + 1)).await;
+        assert!(status_line(&response).contains("400"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn reports_are_refused_while_debug_is_off() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let report = r#"{"seq":1,"kind":"reveal"}"#;
+        let response = post(port, &token, "debug", Some(&page_origin(port)), report).await;
+        assert!(status_line(&response).contains("409"), "{response}");
+        assert_eq!(preview.debug_log()["pairs"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_report_needs_the_page_origin_and_a_seq() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        preview.set_debug(true);
+        let report = r#"{"seq":1,"kind":"reveal"}"#;
+        let response = post(port, &token, "debug", None, report).await;
+        assert!(status_line(&response).contains("403"), "{response}");
+        let response = post(port, &token, "debug", Some("http://evil.example"), report).await;
+        assert!(status_line(&response).contains("403"), "{response}");
+        let origin = page_origin(port);
+        let response = post(port, &token, "debug", Some(&origin), r#"{"kind":"x"}"#).await;
+        assert!(status_line(&response).contains("400"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn the_debug_log_keeps_the_last_fifty_pairs_also_after_debug_off() {
+        let preview = start().await;
+        preview.set_debug(true);
+        for line in 0..60 {
+            preview.set_cursor(Path::new("/doc.adoc"), line);
+        }
+        preview.set_debug(false);
+        let log = preview.debug_log();
+        assert_eq!(log["enabled"], serde_json::json!(false));
+        let pairs = log["pairs"].as_array().unwrap();
+        assert_eq!(pairs.len(), 50);
+        assert_eq!(pairs[0]["seq"], serde_json::json!(11));
+        assert_eq!(pairs[49]["seq"], serde_json::json!(60));
     }
 }
