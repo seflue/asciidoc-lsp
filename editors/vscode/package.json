@@ -62,8 +62,29 @@
         "command": "asciidoc-lsp.restartServer",
         "title": "Restart Language Server",
         "category": "AsciiDoc LSP"
+      },
+      {
+        "command": "asciidoc-lsp.preview.openToSide",
+        "title": "Open Preview to the Side",
+        "category": "AsciiDoc LSP",
+        "icon": "$(open-preview)",
+        "enablement": "editorLangId == asciidoc || activeWebviewPanelId == asciidoc-lsp.preview"
+      },
+      {
+        "command": "asciidoc-lsp.preview.openInBrowser",
+        "title": "Open Preview in Browser",
+        "category": "AsciiDoc LSP"
       }
     ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "asciidoc-lsp.preview.openToSide",
+          "when": "editorLangId == asciidoc",
+          "group": "navigation"
+        }
+      ]
+    },
     "semanticTokenTypes": [
       {
         "id": "heading",

@@ -2,11 +2,15 @@ import { existsSync } from "node:fs";
 import * as vscode from "vscode";
 import { LanguageClient, State } from "vscode-languageclient/node";
 import { disposeQuietly, runningStatus, startFailure } from "./lifecycle";
+import { Preview } from "./preview";
 import { binaryName, resolveServer, type ResolvedServer } from "./serverPath";
 
 let client: LanguageClient | undefined;
 
-function createClient(context: vscode.ExtensionContext): { client: LanguageClient; server: ResolvedServer } {
+function createClient(
+  context: vscode.ExtensionContext,
+  preview: Preview,
+): { client: LanguageClient; server: ResolvedServer } {
   const server = resolveServer({
     setting: vscode.workspace.getConfiguration("asciidoc-lsp").get<string>("server.path", ""),
     bundled: context.asAbsolutePath(`server/${binaryName(process.platform)}`),
@@ -16,7 +20,7 @@ function createClient(context: vscode.ExtensionContext): { client: LanguageClien
     "asciidoc-lsp",
     "AsciiDoc LSP",
     { command: server.command },
-    { documentSelector: [{ language: "asciidoc", scheme: "file" }] },
+    { documentSelector: [{ language: "asciidoc", scheme: "file" }], middleware: preview.middleware },
   );
   return { client, server };
 }
@@ -27,10 +31,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   status.name = "AsciiDoc LSP";
   context.subscriptions.push(status);
+  const preview = new Preview();
+  context.subscriptions.push(preview);
 
   const start = async (): Promise<void> => {
-    const { client: current, server } = createClient(context);
+    const { client: current, server } = createClient(context, preview);
     client = current;
+    preview.setClient(current);
     status.detail = undefined;
     status.text = "AsciiDoc LSP: starting";
     status.severity = vscode.LanguageStatusSeverity.Information;
@@ -59,7 +66,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("asciidoc-lsp.restartServer", async () => {
       await disposeQuietly(client);
       await start();
+      await preview.reopen();
     }),
+    vscode.commands.registerCommand("asciidoc-lsp.preview.openToSide", () => preview.openToSide()),
+    vscode.commands.registerCommand("asciidoc-lsp.preview.openInBrowser", () => preview.openInBrowser()),
   );
   await start();
 }
