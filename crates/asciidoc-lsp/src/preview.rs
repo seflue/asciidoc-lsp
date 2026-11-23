@@ -59,7 +59,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -73,6 +73,15 @@ use crate::preview_converter::{
 };
 
 const PAGE: &str = include_str!("../assets/preview/index.html");
+/// [`PAGE`] with the server's version in the toolbar, as `--version` prints
+/// it (`asciidoc-lsp 0.9.0+3.abc1234`), so the reader sees which build
+/// rendered the page.
+static PAGE_WITH_VERSION: LazyLock<String> = LazyLock::new(|| {
+    PAGE.replace(
+        "{{version}}",
+        &crate::version::version_line(&crate::version::build_version()),
+    )
+});
 const PAGE_JS: &str = include_str!("../assets/preview/page.js");
 const SCROLL_MAP_JS: &str = include_str!("../assets/preview/scroll-map.js");
 const PAGE_SYNC_JS: &str = include_str!("../assets/preview/page-sync.js");
@@ -793,7 +802,7 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         body: body.as_bytes(),
     };
     match rest {
-        "" => body("text/html; charset=utf-8", PAGE),
+        "" => body("text/html; charset=utf-8", &PAGE_WITH_VERSION),
         "style.css" => body("text/css; charset=utf-8", &shared.stylesheet),
         "page.js" => body("text/javascript; charset=utf-8", PAGE_JS),
         "scroll-map.js" => body("text/javascript; charset=utf-8", SCROLL_MAP_JS),
@@ -1714,6 +1723,14 @@ mod tests {
             let response = get(port, &format!("/{token}/"), &host).await;
             assert!(status_line(&response).contains("200"), "{response}");
             assert!(response.contains("Follow cursor"));
+            // The toolbar names the server that renders the page.
+            assert!(
+                response.contains(&format!(
+                    r#"<span id="preview-version">{}</span>"#,
+                    crate::version::version_line(&crate::version::build_version())
+                )),
+                "{response}"
+            );
         }
         let host = format!("127.0.0.1:{port}");
         for (path, marker) in [

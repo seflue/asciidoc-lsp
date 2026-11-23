@@ -10,6 +10,10 @@ Before 1.0, a minor version may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- The preview's toolbar shows the asciidoc-lsp version that renders the page.
+
 ### Fixed
 
 - An include whose target uses an attribute that references another one

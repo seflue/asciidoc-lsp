@@ -22,6 +22,7 @@ body { padding-top: var(--bar-height); }
 #preview-toolbar select { width: auto; height: auto; margin: 0; padding: 0.15em 0.3em;
   font: inherit; color: #333; background: #fff; border: 1px solid #ccc; border-radius: 3px; }
 #preview-status { color: #7a2518; }
+#preview-version { color: #888; }
 #preview-source { margin-left: auto; display: inline-flex; align-items: center; gap: 0.6em;
   padding: 0.2em 0.6em; background: #fffbea; border: 1px solid #e0c96b; border-radius: 3px; color: #333; }
 #preview-source[hidden] { display: none; }
@@ -46,6 +47,7 @@ body { padding-top: var(--bar-height); }
 </select></label>
 <span id="preview-status">Connecting...</span>
 <span id="preview-source" hidden><span id="preview-source-text"></span><button type="button" id="preview-source-open">Open in editor</button></span>
+<span id="preview-version">{{version}}</span>
 </div>
 <pre id="preview-debug" hidden></pre>
 <div id="preview-banner" hidden></div>
