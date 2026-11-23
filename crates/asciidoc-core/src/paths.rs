@@ -65,12 +65,14 @@ pub fn resolve_doc_path(
     let base = registry.doc_dir(source)?;
     let join = |resolved: String| join_doc_path(base, &resolved);
     let docdirs = registry.docdirs(source);
+    // `{docdir}` can come from an attribute's value (`{partsdir}`).
+    let target = registry.expand_references(source, target);
     if docdirs.len() < 2 || !target.contains("{docdir}") {
-        return Some(join(registry.substitute(source, target)));
+        return Some(join(registry.substitute(source, &target)));
     }
     let mut candidates = docdirs
         .iter()
-        .map(|docdir| join(registry.substitute_with_docdir(source, target, docdir)));
+        .map(|docdir| join(registry.substitute_with_docdir(source, &target, docdir)));
     let first = candidates.next()?;
     if first.exists() {
         return Some(first);

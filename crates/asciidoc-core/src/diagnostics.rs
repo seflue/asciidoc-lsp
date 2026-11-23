@@ -1265,6 +1265,69 @@ mod tests {
         );
     }
 
+    /// Every diagnostic of `file`, by line, as its message.
+    fn all_messages(ws: &crate::workspace::Workspace, file: &Path) -> Vec<(usize, String)> {
+        diagnostics_for(ws, file)
+            .iter()
+            .map(|d| (d.line, d.kind.to_string()))
+            .collect()
+    }
+
+    /// `book/main.adoc` sets `imagesdir: {docdir}/../images` and
+    /// includes the sibling `parts/part.adoc` by `{docdir}/../parts/...`;
+    /// `parts/.asciidoctorconfig` sets `imagesdir: ../images` for the part on
+    /// its own. Asciidoctor 2.0.26 resolves the image in both builds
+    /// (`images/sub/pic.png`), so no file has a diagnostic.
+    #[test]
+    fn test_image_in_sibling_folder_include_via_docdir_is_found() {
+        let (root, ws) = fixture_workspace("image_sibling_docdir");
+
+        assert_eq!(all_messages(&ws, &root.join("book/main.adoc")), vec![]);
+        assert_eq!(all_messages(&ws, &root.join("parts/part.adoc")), vec![]);
+    }
+
+    /// As [`test_image_in_sibling_folder_include_via_docdir_is_found`], but
+    /// the include goes through `:partsdir: {docdir}/../parts`. Asciidoctor
+    /// expands the value when it reads the entry, so the include resolves.
+    #[test]
+    fn test_include_via_attribute_that_references_docdir_resolves() {
+        let (root, ws) = fixture_workspace("image_sibling_attr_include");
+
+        assert_eq!(all_messages(&ws, &root.join("book/main.adoc")), vec![]);
+        assert_eq!(all_messages(&ws, &root.join("parts/part.adoc")), vec![]);
+    }
+
+    /// Both sibling-folder fixtures with a root that leaves `parts/` and
+    /// `images/` outside, as a client rooted at the book's folder sees them.
+    /// The build of `book/main.adoc` finds the image. The part's own preview
+    /// does not: its `parts/.asciidoctorconfig` lies outside the root, and
+    /// the config chain stops at the root, as in `IntelliJ` and VS Code.
+    #[test]
+    fn test_sibling_folder_fixtures_with_root_at_the_book() {
+        for name in ["image_sibling_docdir", "image_sibling_attr_include"] {
+            let (fixture, _) = fixture_workspace(name);
+            let mut ws = crate::workspace::Workspace::new(&fixture.join("book"));
+            ws.scan_workspace();
+            ws.refresh();
+
+            assert_eq!(
+                all_messages(&ws, &fixture.join("book/main.adoc")),
+                vec![],
+                "{name}"
+            );
+            assert_eq!(
+                all_messages(&ws, &fixture.join("parts/part.adoc")),
+                vec![(
+                    3,
+                    "Image not found: sub/pic.png (../parts/part.adoc (preview): \
+                     imagesdir not set in this build)"
+                        .to_string()
+                )],
+                "{name}"
+            );
+        }
+    }
+
     /// Found by the only top-level document, missing in the file's own
     /// preview: a warning too, the file's `.asciidoctorconfig` can fix it.
     #[test]

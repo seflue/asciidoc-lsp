@@ -10,6 +10,13 @@ Before 1.0, a minor version may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- An include whose target uses an attribute that references another one
+  (`:partsdir: {docdir}/../parts`, `include::{partsdir}/part.adoc[]`)
+  resolves. The included file was not linked to its document: the preview
+  showed it on its own, and its diagnostics left out the document's build.
+
 ## [0.9.0] - 2026-11-19
 
 ### Added

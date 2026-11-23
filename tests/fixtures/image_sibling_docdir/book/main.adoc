@@ -1,0 +1,4 @@
+= Book
+:imagesdir: {docdir}/../images
+
+include::{docdir}/../parts/part.adoc[]

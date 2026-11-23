@@ -2826,6 +2826,38 @@ mod tests {
         assert_eq!(ws.definition_sites(&main, 6, "v"), vec![site(5), site(1)]);
     }
 
+    /// An include whose target comes from an attribute whose value references
+    /// another one (`:partsdir: {docdir}/../parts`,
+    /// `include::{partsdir}/part.adoc[]`) reaches `parts/part.adoc` as
+    /// `include::{docdir}/../parts/part.adoc[]` does: Asciidoctor expands the
+    /// value when it reads the entry. Both with a root that holds every
+    /// folder and with one that leaves `parts/` outside.
+    #[test]
+    fn test_include_via_attribute_referencing_docdir_reaches_the_part() {
+        for name in ["image_sibling_docdir", "image_sibling_attr_include"] {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures")
+                .join(name)
+                .canonicalize()
+                .unwrap();
+            let main = fixture.join("book/main.adoc");
+            let part = fixture.join("parts/part.adoc");
+
+            for root in [fixture.clone(), fixture.join("book")] {
+                let mut ws = Workspace::new(&root);
+                ws.scan_workspace();
+                ws.refresh();
+
+                assert_eq!(
+                    ws.including_top_level_documents(&part),
+                    vec![main.clone()],
+                    "{name}, root {}",
+                    root.display()
+                );
+            }
+        }
+    }
+
     /// The scan follows includes out of the workspace root: Asciidoctor reads
     /// `include::../shared/attributes.adoc[]` wherever it lies, so its
     /// attribute definitions must be found too.

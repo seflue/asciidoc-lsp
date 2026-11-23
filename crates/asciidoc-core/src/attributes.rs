@@ -513,14 +513,42 @@ impl AttributeRegistry {
     /// Substitute all `{attr}` references in a string using `resolve()`.
     #[must_use]
     pub(crate) fn substitute(&self, file: &Path, input: &str) -> String {
-        substitute_attributes(input, |name| self.resolve(file, name))
+        substitute_attributes(&self.expand_references(file, input), |name| {
+            self.resolve(file, name)
+        })
+    }
+
+    /// `input` with every reference except `{docdir}` replaced, again and
+    /// again, so a value that references another attribute
+    /// (`:partsdir: {docdir}/../parts`) expands too: Asciidoctor expands an
+    /// entry's value when it reads the entry, the registry keeps it as
+    /// written. `{docdir}` stays, it depends on the top-level document (see
+    /// [`Self::docdirs`]). The depth is bounded, so a cycle ends.
+    #[must_use]
+    pub(crate) fn expand_references(&self, file: &Path, input: &str) -> String {
+        const MAX_DEPTH: usize = 8;
+        let mut current = input.to_owned();
+        for _ in 0..MAX_DEPTH {
+            let next = substitute_attributes(&current, |name| {
+                if name == DOCDIR {
+                    None
+                } else {
+                    self.resolve(file, name)
+                }
+            });
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        current
     }
 
     /// [`Self::substitute`] with `docdir` taken as `docdir`: the value for
     /// one particular top-level document (see [`Self::docdirs`]).
     #[must_use]
     pub(crate) fn substitute_with_docdir(&self, file: &Path, input: &str, docdir: &str) -> String {
-        substitute_attributes(input, |name| {
+        substitute_attributes(&self.expand_references(file, input), |name| {
             if name == DOCDIR {
                 Some(docdir)
             } else {
@@ -1309,6 +1337,34 @@ mod tests {
         let file = Path::new("/tmp/any.adoc");
         let result = registry.substitute(file, "{unknown}/path");
         assert_eq!(result, "{unknown}/path");
+    }
+
+    /// A value that references another attribute expands too, and a
+    /// reference cycle ends after a bounded depth instead of looping.
+    #[test]
+    fn test_substitute_expands_values_that_reference_attributes() {
+        let mut registry = AttributeRegistry::new(Path::new("/project/docs"));
+        let file = Path::new("/project/docs/any.adoc");
+        let def = |name: &str, value: &str| AttributeDef {
+            name: name.into(),
+            value: value.into(),
+            line: 1,
+        };
+        registry.register_file_attributes(
+            file,
+            &[
+                def("partsdir", "{docdir}/../parts"),
+                def("a", "{b}"),
+                def("b", "{a}"),
+            ],
+        );
+
+        assert_eq!(
+            registry.substitute(file, "{partsdir}/part.adoc"),
+            "/project/docs/../parts/part.adoc"
+        );
+        // Eight expansions bring `{a}` back to `{a}`, the final pass to `{b}`.
+        assert_eq!(registry.substitute(file, "{a}"), "{b}");
     }
 
     // --- resolve_source() tests ---
