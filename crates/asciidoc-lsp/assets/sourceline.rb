@@ -104,15 +104,32 @@ class SourceLinePreprocessor < Asciidoctor::Extensions::Preprocessor
 end
 
 class SourceLineTreeprocessor < Asciidoctor::Extensions::Treeprocessor
+  # The `[file, line]` of `node`. Asciidoctor parses the content of a `> `
+  # quote from a reader of its own, which knows no file and counts from 1:
+  # such a block lies before the block that holds it, or has no file where
+  # that block has one. It takes the line in the holder's file instead.
+  def place(node, loc, places)
+    holder = node.parent
+    holder = holder.parent while holder && !places.key?(holder)
+    return [loc.file, loc.lineno] unless holder
+    file, line = places[holder]
+    fresh = (loc.file.nil? && !file.nil?) || (loc.file == file && loc.lineno < line)
+    return [loc.file, loc.lineno] unless fresh
+    [file, line + loc.lineno - 1]
+  end
+
   def process(doc)
     docfile = doc.attr 'docfile'
     files = []
+    places = {}
     doc.find_by(traverse_documents: true).each do |node|
       loc = node.source_location
       next unless loc && !node.is_a?(Asciidoctor::Document)
-      file = loc.file.to_s
-      role = "data-line-#{loc.lineno}"
-      unless loc.file.nil? || file == docfile
+      places[node] = place(node, loc, places)
+      loc_file, lineno = places[node]
+      file = loc_file.to_s
+      role = "data-line-#{lineno}"
+      unless loc_file.nil? || file == docfile
         file = AdocBufferOverlay.canonical(file)
         idx = files.index(file) || (files << file).size - 1
         role = "data-src-#{idx} #{role}"

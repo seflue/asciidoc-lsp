@@ -698,6 +698,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_markdown_quote_content_keeps_the_line_of_the_quote() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/markdown_quote")
+            .canonicalize()
+            .unwrap();
+        let file = dir.join("index.adoc");
+        let converter = AsciidoctorConverter::new().unwrap();
+        let html = converter
+            .convert(&ConvertRequest {
+                text: std::fs::read_to_string(&file).unwrap(),
+                file,
+                attributes: Vec::new(),
+                overlay: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // Asciidoctor parses a `> ` quote from a reader of its own, which
+        // knows no file and counts from 1; the content takes the quote's
+        // place instead of line 1 of the main file.
+        assert!(html.contains(r#"class="paragraph data-line-5""#), "{html}");
+        assert!(
+            html.contains(r#"class="paragraph data-src-0 data-line-5""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"class="paragraph data-src-0 data-line-8""#),
+            "{html}"
+        );
+        // Also inside an AsciiDoc table cell and a list item.
+        assert!(
+            html.contains(r#"class="paragraph data-src-0 data-line-15""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"class="paragraph data-src-0 data-line-20""#),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_nested_include_html_lists_the_includes() {
         if !asciidoctor_available() {
             return;
