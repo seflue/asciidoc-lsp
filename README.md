@@ -43,6 +43,14 @@ Provides navigation, diagnostics, completions, and refactoring for AsciiDoc proj
 
 - **Rename** (`vim.lsp.buf.rename()`): rename anchors and attributes across the entire workspace, with `prepareRename` validation
 
+### Preview
+
+- Live HTML preview in the browser, converted by `asciidoctor` (must be on `PATH`) and served by the language server on `127.0.0.1`.
+- Shows the whole document that includes the current file, with unsaved changes of open buffers, or only the current file.
+- The page follows the cursor. Scrolling the page moves the editor, and a double-click on a block opens its source line, also in an included file.
+- A TOC select in the toolbar puts the table of contents on the left or right, or hides it. Auto uses the document's `:toc:` or a sidebar for long documents.
+- Clients start it with the `asciidoc.preview.open` command; asciidoc.nvim and the VS Code extension provide it.
+
 ### Workspace
 
 - Reads `.asciidoctorconfig` and resolves attributes in it, including `{asciidoctorconfigdir}`.
@@ -159,6 +167,8 @@ The extension is not on the Marketplace yet. Install it from a VSIX attached to 
 The extension starts the server for `.adoc`, `.asciidoc`, `.asc` and `.ad` files. It picks the server in this order: the `asciidoc-lsp.server.path` setting, the bundled binary, `asciidoc-lsp` on `PATH`. The language status item of an AsciiDoc file shows the running server version. `AsciiDoc LSP: Restart Language Server` restarts it, and `asciidoc-lsp.trace.server` traces the protocol traffic.
 
 The extension highlights AsciiDoc with the server's semantic tokens and turns semantic highlighting on for AsciiDoc files whatever the theme says. The colors come from the theme's markup rules (`markup.heading`, `markup.bold`, ...); the token types are `heading`, `strong`, `emphasis`, `raw`, `link` and others, so `editor.semanticTokenColorCustomizations` can restyle them. The file shows no colors until the server has started. The extension also configures `//` and `////` comments and bracket pairs. If you also install [asciidoctor-vscode](https://marketplace.visualstudio.com/items?itemName=asciidoctor.asciidoctor-vscode), its TextMate grammar and our tokens apply to the same text, and its own completion, hover and symbol providers run next to this server, so expect duplicate suggestions.
+
+`AsciiDoc LSP: Open Preview to the Side` and `Open Preview in Browser` open the [live preview](#preview); `Set Preview TOC` chooses its table of contents.
 
 ### Other editors
 

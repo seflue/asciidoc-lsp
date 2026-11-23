@@ -12,7 +12,29 @@ Before 1.0, a minor version may contain breaking changes.
 
 ### Added
 
-- The preview's toolbar shows the asciidoc-lsp version that renders the page.
+- Live preview with two-way scroll sync between editor and page.
+- VS Code: live preview in a panel or the browser.
+- Warnings for missing images, per top-level document that includes the
+  file. Hover on such an image says the same.
+- Missing files referenced in a PDF theme (`extends`, images, fonts) are
+  reported at the `pdf-theme` line.
+- Find references on a section heading lists the xrefs to it and the
+  includes that bring its file in. Natural xrefs (`<<Section title>>`) are
+  listed as references.
+- The sentence-per-line action works in quote and open blocks.
+
+### Changed
+
+- The server answers `initialize` before it scans the workspace, so the
+  editor attaches at once.
+- While typing, diagnostics are recomputed after a short pause instead of on
+  every keystroke.
+- The server exits when the editor process dies.
+- PDF settings are checked only where Asciidoctor PDF reads them: the last
+  entry in the document header.
+- A broken include names the documents that miss its target. Quick-fixes
+  offer only targets that resolve in every one of them.
+- Local builds print their version as `X.Y.Z+<commits>.<hash>`.
 
 ### Fixed
 
@@ -20,6 +42,24 @@ Before 1.0, a minor version may contain breaking changes.
   (`:partsdir: {docdir}/../parts`, `include::{partsdir}/part.adoc[]`)
   resolves. The included file was not linked to its document: the preview
   showed it on its own, and its diagnostics left out the document's build.
+- Section IDs use the `idprefix` and `idseparator` set by the including
+  document, so xrefs to them resolve.
+- Find references matches file xrefs by the path Asciidoctor resolves, not
+  by file name.
+- No image warnings where Asciidoctor renders no image: listing, literal and
+  verse content, `a|` cells and conditional branches. Any URI scheme counts
+  as remote.
+- PDF paths starting with `~`, and PDF paths in included files that use the
+  including document's attributes, are no longer reported.
+- `tags="a,b"` reports a missing tag, and an empty attribute value such as
+  `tag=` no longer breaks the attributes after it.
+- An `endif` for another target closes nothing, and `ifdef` in
+  `.asciidoctorconfig` matches attribute names in any case, as in
+  Asciidoctor.
+- A leading byte order mark no longer hides the document title or a config
+  entry.
+- Highlighting: listings, source styles, every paragraph of an admonition
+  block, and inline markup in quote blocks.
 
 ## [0.9.0] - 2026-11-19
 
