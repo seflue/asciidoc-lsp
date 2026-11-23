@@ -629,12 +629,16 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// `frame-ancestors` admits only the clients that show the page in an iframe:
+/// VS Code's webview, whose frames sit in the workbench (`vscode-file:`).
+/// Browsers and JCEF load the URL directly and need no entry. Other sites
+/// cannot frame the page without its token.
 const COMMON_HEADERS: &str = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
                               Referrer-Policy: no-referrer\r\n\
                               Content-Security-Policy: default-src 'none'; script-src 'self'; \
                               style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: https:; \
                               connect-src 'self'; base-uri 'none'; form-action 'none'; \
-                              frame-ancestors 'none'\r\n";
+                              frame-ancestors vscode-webview: vscode-file:\r\n";
 
 async fn write_response(
     stream: &mut TcpStream,
@@ -1129,7 +1133,10 @@ mod tests {
                     .contains("Content-Security-Policy: default-src 'none'; script-src 'self';"),
                 "{target}: {response}"
             );
-            assert!(response.contains("frame-ancestors 'none'"), "{target}");
+            assert!(
+                response.contains("frame-ancestors vscode-webview: vscode-file:\r\n"),
+                "{target}: {response}"
+            );
             assert!(
                 response.contains("img-src 'self' data: https:; connect-src 'self';"),
                 "{target}: {response}"
