@@ -7,7 +7,7 @@
 //! address and port (anything else is a 403, which stops DNS rebinding).
 //!
 //! HTTP is hand-written on `tokio::net`: the server answers `GET` for five
-//! fixed routes and one event stream, and `POST` for the two page actions,
+//! fixed routes and one event stream, and `POST` for the three page actions,
 //! so a request parser of a few lines replaces hyper, hyper-util and
 //! http-body-util.
 //!
@@ -30,12 +30,19 @@
 //! - `convert-error`: `{message}`, the conversion failed.
 //! - `debug`: `{enabled}`, the scroll-sync debug log was switched; while it
 //!   is on, `cursor` also carries `seq`, see [`Preview::set_debug`].
+//! - `toc`: `{mode}`, the preview's TOC choice (`auto`, `off`, `left`,
+//!   `right`), for the page's select; see [`Preview::set_toc`]. The layout
+//!   itself comes with the next `html`.
 //!
 //! Page actions, `POST` with a JSON body `{file, line}` (`line` 1-based, as
 //! in `data-line-N`; `file` an absolute path, as in the file table):
 //! - `click`: the reader double-clicked a block of `file`.
 //! - `scroll`: the reader scrolled, and `line` of `file` is on the page's
 //!   reading line; with `"cursor": true` the editor's cursor goes there too.
+//!
+//! `POST toc` with `{mode}` is the reader's TOC choice (400 for an unknown
+//! mode); it needs host, token and `Origin` like the actions above and comes
+//! out of [`Preview::take_actions`] as [`PageAction::Toc`].
 //!
 //! `POST debug` takes the page's debug report on a cursor event (a JSON
 //! object with its `seq`), while the debug log is on.
@@ -51,7 +58,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,7 +68,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::preview_converter::{self, Convert, ConvertOutcome, ConvertRequest};
+use crate::preview_converter::{
+    self, Convert, ConvertOutcome, ConvertRequest, TocMode, TocPlacement,
+};
 
 const PAGE: &str = include_str!("../assets/preview/index.html");
 const PAGE_JS: &str = include_str!("../assets/preview/page.js");
@@ -94,6 +103,8 @@ const DEBUG_PAIRS: usize = 50;
 const DEBUG_REPORTS_PER_PAIR: usize = 16;
 /// Longest debug report body the server reads.
 const MAX_DEBUG_BODY_BYTES: usize = 16 * 1024;
+/// Opening tag of the extension's `adoc-toc` report.
+const TOC_REPORT_OPEN: &str = r#"<script type="application/json" id="adoc-toc">"#;
 
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +124,7 @@ enum EventKind {
     Cursor,
     ConvertError,
     Debug,
+    Toc,
 }
 
 impl EventKind {
@@ -123,6 +135,7 @@ impl EventKind {
             Self::Cursor => "cursor",
             Self::ConvertError => "convert-error",
             Self::Debug => "debug",
+            Self::Toc => "toc",
         }
     }
 }
@@ -162,6 +175,8 @@ pub enum PageAction {
         line: u32,
         cursor: bool,
     },
+    /// The reader chose a TOC mode in the page.
+    Toc(TocMode),
 }
 
 /// Which page action a `POST` route names.
@@ -169,6 +184,13 @@ pub enum PageAction {
 enum ActionKind {
     Click,
     Scroll,
+    Toc,
+}
+
+/// The body of `POST toc`.
+#[derive(Debug, serde::Deserialize)]
+struct TocBody {
+    mode: TocMode,
 }
 
 /// The body of a page action.
@@ -188,16 +210,23 @@ struct Snapshot {
     cursor: Option<Event>,
     error: Option<Event>,
     debug: Option<Event>,
+    toc: Option<Event>,
 }
 
 impl Snapshot {
     fn replay(&self) -> Vec<Event> {
         // The debug switch first: the page reports on the cursor that follows.
-        [&self.debug, &self.html, &self.cursor, &self.error]
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect()
+        [
+            &self.debug,
+            &self.toc,
+            &self.html,
+            &self.cursor,
+            &self.error,
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
     }
 }
 
@@ -222,6 +251,12 @@ struct Shared {
     actions: mpsc::Sender<PageAction>,
     /// The scroll-sync debug log, see [`Preview::set_debug`].
     debug: Mutex<DebugLog>,
+    /// The `adoc-toc` report of the last conversion since the last
+    /// [`Preview::set_toc`], with its file; see [`Preview::request_convert`].
+    toc_placement: Mutex<Option<(PathBuf, TocPlacement)>>,
+    /// The first generation converted after the last [`Preview::set_toc`]:
+    /// reports of older conversions belong to the mode before.
+    toc_since: AtomicU64,
 }
 
 /// What the server sent and what the page made of it, while debug is on.
@@ -289,6 +324,7 @@ impl Shared {
             EventKind::Cursor => snapshot.cursor = Some(event.clone()),
             EventKind::ConvertError => snapshot.error = Some(event.clone()),
             EventKind::Debug => snapshot.debug = Some(event.clone()),
+            EventKind::Toc => snapshot.toc = Some(event.clone()),
         }
         // No receiver is fine: nobody has the page open.
         let _ = self.events.send(event);
@@ -307,6 +343,10 @@ impl Shared {
                 // it has the HTML, and may send an action right after.
                 self.set_allowed_images(&images);
                 *self.shown_files.lock() = shown_files(&outcome.file, html);
+                if outcome.generation >= self.toc_since.load(Ordering::SeqCst) {
+                    *self.toc_placement.lock() =
+                        toc_placement(html).map(|placement| (outcome.file.clone(), placement));
+                }
                 let line_count = self
                     .line_counts
                     .lock()
@@ -363,27 +403,40 @@ impl Shared {
 
     /// Accept a page action of `kind` with `body`, or say why not.
     fn accept_action(&self, kind: ActionKind, body: &[u8]) -> Result<(), u16> {
-        let body: ActionBody = serde_json::from_slice(body).map_err(|_| 400_u16)?;
-        if body.line == 0 || !self.shown_files.lock().contains(&body.file) {
-            return Err(400);
-        }
         let action = match kind {
-            ActionKind::Click => PageAction::Click {
-                file: body.file,
-                line: body.line,
-            },
-            ActionKind::Scroll => PageAction::Scroll {
-                file: body.file,
-                line: body.line,
-                cursor: body.cursor,
-            },
+            ActionKind::Toc => {
+                let body: TocBody = serde_json::from_slice(body).map_err(|_| 400_u16)?;
+                PageAction::Toc(body.mode)
+            }
+            ActionKind::Click | ActionKind::Scroll => {
+                let body: ActionBody = serde_json::from_slice(body).map_err(|_| 400_u16)?;
+                if body.line == 0 || !self.shown_files.lock().contains(&body.file) {
+                    return Err(400);
+                }
+                if kind == ActionKind::Click {
+                    PageAction::Click {
+                        file: body.file,
+                        line: body.line,
+                    }
+                } else {
+                    PageAction::Scroll {
+                        file: body.file,
+                        line: body.line,
+                        cursor: body.cursor,
+                    }
+                }
+            }
         };
+        self.send_action(action);
+        Ok(())
+    }
+
+    fn send_action(&self, action: PageAction) {
         // A full queue or a backend that stopped taking actions loses this
         // one; the page needs no answer either way.
         if let Err(error) = self.actions.try_send(action) {
             tracing::debug!(%error, "page action dropped");
         }
-        Ok(())
     }
 
     /// Accept a debug report: a JSON object with the `seq` of the cursor
@@ -462,6 +515,8 @@ impl Preview {
             shown_files: Mutex::new(HashSet::new()),
             actions,
             debug: Mutex::new(DebugLog::default()),
+            toc_placement: Mutex::new(None),
+            toc_since: AtomicU64::new(0),
         });
         let url = format!("http://127.0.0.1:{port}/{}/", shared.token);
         let (convert, outcomes) = preview_converter::spawn(converter, debounce);
@@ -494,7 +549,22 @@ impl Preview {
 
     /// Queue a conversion; the result reaches the page as an `html` event.
     /// A newer request replaces one that has not been converted yet.
-    pub fn request_convert(&self, request: ConvertRequest) {
+    ///
+    /// In Auto mode, the request gets as `previous` the placement of the
+    /// last conversion of the same file since the last [`Self::set_toc`], so
+    /// the TOC stays put while the writer types.
+    pub fn request_convert(&self, mut request: ConvertRequest) {
+        if let Some(toc) = &mut request.toc {
+            if toc.mode == TocMode::Auto {
+                toc.previous = self
+                    .shared
+                    .toc_placement
+                    .lock()
+                    .as_ref()
+                    .filter(|(file, _)| *file == request.file)
+                    .map(|(_, placement)| *placement);
+            }
+        }
         let line_count = request.text.lines().count().max(1);
         self.shared
             .line_counts
@@ -543,6 +613,19 @@ impl Preview {
         self.shared.publish(Event::new(
             EventKind::Debug,
             &serde_json::json!({ "enabled": enabled }),
+        ));
+    }
+
+    /// Tell every page the preview's TOC mode, for its select; a page that
+    /// connects later gets the last one. The next Auto conversion decides
+    /// afresh.
+    pub fn set_toc(&self, mode: TocMode) {
+        let next = self.convert.latest_generation().load(Ordering::SeqCst) + 1;
+        self.shared.toc_since.store(next, Ordering::SeqCst);
+        *self.shared.toc_placement.lock() = None;
+        self.shared.publish(Event::new(
+            EventKind::Toc,
+            &serde_json::json!({ "mode": mode }),
         ));
     }
 
@@ -686,6 +769,7 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         let routed = match rest {
             "click" => Routed::Action(ActionKind::Click),
             "scroll" => Routed::Action(ActionKind::Scroll),
+            "toc" => Routed::Action(ActionKind::Toc),
             "debug" => Routed::Debug,
             _ => return Routed::Status(405),
         };
@@ -960,6 +1044,12 @@ fn last_json_script<'a>(html: &'a str, open: &str) -> Option<(usize, &'a str, &'
     ))
 }
 
+/// The `adoc-toc` report at the end of `html`, if the conversion wrote one.
+fn toc_placement(html: &str) -> Option<TocPlacement> {
+    let (_, json, _) = last_json_script(html, TOC_REPORT_OPEN)?;
+    serde_json::from_str(json).ok()
+}
+
 /// Cut the image list off the end of `html`: the HTML without it, and the
 /// paths it names. The list sits at the very end, so only the last opening
 /// tag counts and document text that looks like one cannot take its place.
@@ -1066,7 +1156,7 @@ async fn serve_events(mut stream: TcpStream, shared: &Shared) -> io::Result<()> 
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use crate::preview_converter::ConvertError;
+    use crate::preview_converter::{ConvertError, TocInstruction};
 
     /// Converts to `<p>` plus the request text, without Ruby. Every line
     /// `src:<path>` of the text is an included file, listed in the file
@@ -1112,6 +1202,49 @@ pub(crate) mod testing {
                 serde_json::to_string(&images).unwrap()
             ))
         }
+    }
+
+    /// Converts to `<p>` plus the request text and keeps each request's
+    /// TOC instruction. A line `toc:<json>` of the text is the `adoc-toc`
+    /// report, as Ruby's postprocessor writes it.
+    ///
+    /// With `hold`, each conversion announces its start on `started` and
+    /// waits for a permit on `hold`.
+    #[derive(Default, Clone)]
+    pub(crate) struct TocConverter {
+        pub(crate) seen: Arc<Mutex<Vec<Option<TocInstruction>>>>,
+        pub(crate) started: Arc<tokio::sync::Notify>,
+        pub(crate) hold: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl Convert for TocConverter {
+        async fn convert(&self, request: &ConvertRequest) -> Result<String, ConvertError> {
+            self.seen.lock().push(request.toc);
+            if let Some(hold) = &self.hold {
+                self.started.notify_one();
+                hold.notified().await;
+            }
+            let report = request
+                .text
+                .lines()
+                .find_map(|line| line.strip_prefix("toc:"))
+                .map_or_else(String::new, |json| {
+                    format!("\n<script type=\"application/json\" id=\"adoc-toc\">{json}</script>\n")
+                });
+            Ok(format!("<p>{}</p>{report}", request.text))
+        }
+    }
+
+    /// A preview with `converter`.
+    pub(crate) async fn start_with<C: Convert>(converter: C) -> Preview {
+        Preview::start(
+            converter,
+            Duration::from_millis(10),
+            "body{}".to_owned(),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     pub(crate) async fn start() -> Preview {
@@ -1250,9 +1383,11 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::testing::{
-        address, get, get_bytes, post, request, start, start_with_images, Stream,
+        address, get, get_bytes, post, request, start, start_with, start_with_images, Stream,
+        TocConverter,
     };
     use super::*;
+    use crate::preview_converter::{TocInstruction, TocPosition};
 
     fn status_line(response: &str) -> &str {
         response.lines().next().unwrap_or_default()
@@ -1330,6 +1465,7 @@ mod tests {
             text,
             attributes: Vec::new(),
             overlay: Vec::new(),
+            toc: None,
         });
         stream.until(&format!("done{tag}</p>")).await;
     }
@@ -1455,6 +1591,7 @@ mod tests {
             text: "img:images/other.png\nfail".to_owned(),
             attributes: Vec::new(),
             overlay: Vec::new(),
+            toc: None,
         });
         stream.until("event: convert-error").await;
         assert!(file_status(port, &token, "images/pic.png")
@@ -1659,6 +1796,7 @@ mod tests {
             text: "one\ntwo\nthree\n".to_owned(),
             attributes: Vec::new(),
             overlay: Vec::new(),
+            toc: None,
         });
         let all = stream.until(r#""lineCount":3}"#).await;
         assert!(all.contains("event: html"), "{all}");
@@ -1695,6 +1833,7 @@ mod tests {
             text: "x".to_owned(),
             attributes: Vec::new(),
             overlay: Vec::new(),
+            toc: None,
         });
         first.until("</p>").await;
         preview.set_cursor(Path::new("/doc.adoc"), 4);
@@ -1724,6 +1863,7 @@ mod tests {
             text,
             attributes: Vec::new(),
             overlay: Vec::new(),
+            toc: None,
         });
         stream.until("shown</p>").await;
         actions
@@ -2107,5 +2247,185 @@ mod tests {
         assert_eq!(pairs.len(), 50);
         assert_eq!(pairs[0]["seq"], serde_json::json!(11));
         assert_eq!(pairs[49]["seq"], serde_json::json!(60));
+    }
+
+    #[tokio::test]
+    async fn a_toc_choice_reaches_the_editor() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        for (name, mode) in [
+            ("auto", TocMode::Auto),
+            ("off", TocMode::Off),
+            ("left", TocMode::Left),
+            ("right", TocMode::Right),
+        ] {
+            let body = format!(r#"{{"mode":"{name}"}}"#);
+            let response = post(port, &token, "toc", Some(&origin), &body).await;
+            assert!(status_line(&response).contains("204"), "{name}: {response}");
+            assert_eq!(actions.recv().await, Some(PageAction::Toc(mode)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_toc_choice_needs_a_known_mode_the_origin_and_the_token() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        for body in [r#"{"mode":"top"}"#, r#"{"mode":1}"#, "{}", "nope"] {
+            let response = post(port, &token, "toc", Some(&origin), body).await;
+            assert!(status_line(&response).contains("400"), "{body}: {response}");
+        }
+        let body = r#"{"mode":"left"}"#;
+        for origin in [Some("http://evil.example"), None] {
+            let response = post(port, &token, "toc", origin, body).await;
+            assert!(
+                status_line(&response).contains("403"),
+                "{origin:?}: {response}"
+            );
+        }
+        let response = post(port, "wrong", "toc", Some(&origin), body).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_toc_mode_reaches_every_stream_and_late_ones() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let mut first = Stream::open(port, &token).await;
+        let mut second = Stream::open(port, &token).await;
+        preview.set_toc(TocMode::Right);
+        for stream in [&mut first, &mut second] {
+            let seen = stream.until(r#"{"mode":"right"}"#).await;
+            assert!(seen.contains("event: toc"), "{seen}");
+        }
+        preview.set_toc(TocMode::Off);
+        first.until(r#"{"mode":"off"}"#).await;
+        let mut late = Stream::open(port, &token).await;
+        let replay = late.until(r#"{"mode":"off"}"#).await;
+        assert!(replay.contains("event: toc"), "{replay}");
+        assert!(!replay.contains("right"), "{replay}");
+    }
+
+    fn auto() -> Option<TocInstruction> {
+        Some(TocInstruction {
+            mode: TocMode::Auto,
+            previous: None,
+        })
+    }
+
+    /// Convert `report` plus `tag` as `file` in Auto mode and wait until
+    /// the page has it.
+    async fn show_auto(
+        preview: &Preview,
+        stream: &mut Stream,
+        file: &str,
+        report: &str,
+        tag: &str,
+    ) {
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from(file),
+            text: format!("{report}\n{tag}"),
+            attributes: Vec::new(),
+            overlay: Vec::new(),
+            toc: auto(),
+        });
+        stream.until(&format!("{tag}</p>")).await;
+    }
+
+    const LEFT: &str = r#"toc:{"position":"left","docToc":null}"#;
+
+    #[tokio::test]
+    async fn auto_gets_the_last_placement_of_the_same_file() {
+        let converter = TocConverter::default();
+        let seen = Arc::clone(&converter.seen);
+        let preview = start_with(converter).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show_auto(&preview, &mut stream, "/a.adoc", LEFT, "first").await;
+        show_auto(&preview, &mut stream, "/a.adoc", "", "edited").await;
+        let previous = TocPlacement {
+            position: TocPosition::Left,
+            doc_toc: None,
+        };
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                auto(),
+                Some(TocInstruction {
+                    mode: TocMode::Auto,
+                    previous: Some(previous),
+                }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_decides_again_for_another_file_and_after_a_mode_change() {
+        let converter = TocConverter::default();
+        let seen = Arc::clone(&converter.seen);
+        let preview = start_with(converter).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show_auto(&preview, &mut stream, "/a.adoc", LEFT, "a1").await;
+        show_auto(&preview, &mut stream, "/b.adoc", "", "b").await;
+        show_auto(&preview, &mut stream, "/a.adoc", LEFT, "a2").await;
+        preview.set_toc(TocMode::Auto);
+        show_auto(&preview, &mut stream, "/a.adoc", "", "after").await;
+        assert_eq!(*seen.lock(), vec![auto(); 4]);
+    }
+
+    #[tokio::test]
+    async fn a_non_auto_mode_is_sent_as_it_is() {
+        let converter = TocConverter::default();
+        let seen = Arc::clone(&converter.seen);
+        let preview = start_with(converter).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        show_auto(&preview, &mut stream, "/a.adoc", LEFT, "first").await;
+        let off = Some(TocInstruction {
+            mode: TocMode::Off,
+            previous: None,
+        });
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/a.adoc"),
+            text: "off".to_owned(),
+            attributes: Vec::new(),
+            overlay: Vec::new(),
+            toc: off,
+        });
+        stream.until("off</p>").await;
+        assert_eq!(seen.lock()[1], off);
+    }
+
+    #[tokio::test]
+    async fn a_conversion_requested_before_the_mode_change_is_no_previous() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let converter = TocConverter {
+            hold: Some(Arc::clone(&hold)),
+            ..TocConverter::default()
+        };
+        let (seen, started) = (Arc::clone(&converter.seen), Arc::clone(&converter.started));
+        let preview = start_with(converter).await;
+        let (port, token) = address(&preview);
+        let mut stream = Stream::open(port, &token).await;
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/a.adoc"),
+            text: format!("{LEFT}\nbefore"),
+            attributes: Vec::new(),
+            overlay: Vec::new(),
+            toc: auto(),
+        });
+        started.notified().await;
+        // The switch comes while that conversion runs; it finishes after.
+        preview.set_toc(TocMode::Auto);
+        hold.notify_one();
+        stream.until("before</p>").await;
+        hold.notify_one();
+        show_auto(&preview, &mut stream, "/a.adoc", "", "after").await;
+        assert_eq!(*seen.lock(), vec![auto(); 2]);
     }
 }

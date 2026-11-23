@@ -30,6 +30,10 @@ const OVERLAY_ENV: &str = "ASCIIDOC_LSP_OVERLAY";
 /// image URLs below it become `files/<path>`.
 const ROOT_ENV: &str = "ASCIIDOC_LSP_ROOT";
 
+/// Environment variable that carries the [`TocInstruction`] as JSON for the
+/// Ruby extension.
+const TOC_ENV: &str = "ASCIIDOC_LSP_TOC";
+
 /// How long the worker waits for further requests before it converts.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -67,6 +71,58 @@ pub struct ConvertRequest {
     /// by absolute path. Asciidoctor reads these instead of the file, with
     /// all include semantics (`leveloffset`, `tags`, `lines`, nesting).
     pub overlay: Vec<(PathBuf, String)>,
+    /// How the preview overrides `toc`; `None` leaves it to the document.
+    pub toc: Option<TocInstruction>,
+}
+
+/// The preview's choice for the table of contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TocMode {
+    /// The document's `:toc: left|right`, else left for a long document and
+    /// none for a short one.
+    #[default]
+    Auto,
+    Off,
+    Left,
+    Right,
+}
+
+/// A side of the page for a sidebar TOC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TocSide {
+    Left,
+    Right,
+}
+
+/// Where the TOC of a conversion went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TocPosition {
+    Off,
+    Left,
+    Right,
+}
+
+/// Where a conversion put the TOC, as the extension reports it in
+/// `<script id="adoc-toc">`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TocPlacement {
+    pub position: TocPosition,
+    /// The document's own `:toc: left|right`, if it has one.
+    #[serde(rename = "docToc")]
+    pub doc_toc: Option<TocSide>,
+}
+
+/// What the extension gets in [`TOC_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct TocInstruction {
+    pub mode: TocMode,
+    /// In `auto` mode, the placement of the last conversion of the same
+    /// file: the extension keeps it while the document's own value stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<TocPlacement>,
 }
 
 /// The result for one request.
@@ -386,6 +442,11 @@ impl AsciidoctorConverter {
         if let Some(root) = &self.root {
             command.env(ROOT_ENV, root);
         }
+        if let Some(toc) = &request.toc {
+            if let Ok(json) = serde_json::to_string(toc) {
+                command.env(TOC_ENV, json);
+            }
+        }
         command
             .args(["-o", "-", "-"])
             .stdin(Stdio::piped())
@@ -464,6 +525,7 @@ pub(crate) fn asciidoctor_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -500,6 +562,7 @@ mod tests {
             text: text.to_owned(),
             attributes: Vec::new(),
             overlay: Vec::new(),
+            toc: None,
         }
     }
 
@@ -681,6 +744,7 @@ mod tests {
                 file,
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap();
@@ -714,6 +778,7 @@ mod tests {
                 file,
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap();
@@ -757,6 +822,7 @@ mod tests {
                 file,
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap();
@@ -797,6 +863,7 @@ mod tests {
                 file,
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap();
@@ -989,6 +1056,343 @@ mod tests {
         assert!(html.contains(r#"<div id="toc" class="toc">"#), "{html}");
     }
 
+    /// Convert `text` as `/doc.adoc` with the preview's TOC `mode`.
+    async fn convert_toc(text: &str, mode: TocMode, previous: Option<TocPlacement>) -> String {
+        let mut request = request(text);
+        request.toc = Some(TocInstruction { mode, previous });
+        AsciidoctorConverter::new()
+            .unwrap()
+            .convert(&request)
+            .await
+            .unwrap()
+    }
+
+    /// The `adoc-toc` report: where the conversion put the TOC.
+    fn toc_report(html: &str) -> serde_json::Value {
+        let open = r#"<script type="application/json" id="adoc-toc">"#;
+        let start = html
+            .find(open)
+            .unwrap_or_else(|| panic!("no report: {html}"))
+            + open.len();
+        let end = start + html[start..].find("</script>").unwrap();
+        serde_json::from_str(&html[start..end]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_toc_off_removes_the_documents_sidebar() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_toc("= T\n:toc: left\n\n== A\n\nText.\n", TocMode::Off, None).await;
+        assert!(!html.contains(r#"id="toc""#), "{html}");
+        assert_eq!(body_classes(&html), serde_json::json!([]));
+        assert_eq!(
+            toc_report(&html),
+            serde_json::json!({"position": "off", "docToc": "left"})
+        );
+    }
+
+    /// A document with `header` lines, `chapters` level-1 sections and
+    /// `subsections` level-2 sections, all in the first chapter.
+    fn outline(header: &str, chapters: usize, subsections: usize) -> String {
+        let mut text = format!("= T\n{header}\n\n");
+        for chapter in 0..chapters {
+            let _ = write!(text, "== C{chapter}\n\nText.\n\n");
+            if chapter == 0 {
+                for sub in 0..subsections {
+                    let _ = write!(text, "=== S{sub}\n\nText.\n\n");
+                }
+            }
+        }
+        text
+    }
+
+    /// The side of the sidebar the page gets, from the body classes;
+    /// `None` without a sidebar.
+    fn sidebar(html: &str) -> Option<&'static str> {
+        let classes = body_classes(html);
+        let classes = classes.as_array().unwrap();
+        if classes.iter().any(|class| class == "toc-left") {
+            Some("left")
+        } else if classes.iter().any(|class| class == "toc-right") {
+            Some("right")
+        } else {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toc_auto_takes_the_documents_sidebar() {
+        if !asciidoctor_available() {
+            return;
+        }
+        // Short documents: the author's choice wins over the length.
+        for (header, side) in [(":toc: left", "left"), (":toc: right", "right")] {
+            let html = convert_toc(&outline(header, 1, 0), TocMode::Auto, None).await;
+            assert_eq!(sidebar(&html), Some(side), "{header}: {html}");
+            assert_eq!(
+                toc_report(&html),
+                serde_json::json!({"position": side, "docToc": side})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toc_auto_sidebar_from_the_config_chain() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let mut request = request(&outline("", 1, 0));
+        request.attributes = vec![("toc".to_owned(), "right".to_owned())];
+        request.toc = Some(TocInstruction {
+            mode: TocMode::Auto,
+            previous: None,
+        });
+        let html = AsciidoctorConverter::new()
+            .unwrap()
+            .convert(&request)
+            .await
+            .unwrap();
+        assert_eq!(sidebar(&html), Some("right"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_toc_auto_without_a_sidebar_value_decides_by_length() {
+        if !asciidoctor_available() {
+            return;
+        }
+        // Pinned: a short document with an empty `:toc:` gets no TOC, and
+        // `:toc!:` does not hide the TOC of a long one.
+        for header in [
+            "",
+            ":toc:",
+            ":toc: auto",
+            ":toc: preamble",
+            ":toc: macro",
+            ":toc!:",
+        ] {
+            let short = convert_toc(&outline(header, 2, 5), TocMode::Auto, None).await;
+            assert_eq!(sidebar(&short), None, "{header}: {short}");
+            assert!(!short.contains(r#"id="toc""#), "{header}: {short}");
+            assert_eq!(
+                toc_report(&short),
+                serde_json::json!({"position": "off", "docToc": null}),
+                "{header}"
+            );
+            let long = convert_toc(&outline(header, 2, 6), TocMode::Auto, None).await;
+            assert_eq!(sidebar(&long), Some("left"), "{header}: {long}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toc_heuristic_needs_more_than_one_chapter_and_five_subsections() {
+        if !asciidoctor_available() {
+            return;
+        }
+        for (chapters, subsections, side) in [
+            (2, 6, Some("left")),
+            (1, 6, None),
+            (2, 5, None),
+            (7, 0, None),
+        ] {
+            let html = convert_toc(&outline("", chapters, subsections), TocMode::Auto, None).await;
+            assert_eq!(sidebar(&html), side, "{chapters}/{subsections}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toc_heuristic_does_not_count_parts() {
+        if !asciidoctor_available() {
+            return;
+        }
+        // Pinned: two parts around one chapter are still one chapter.
+        let mut text = String::from("= B\n:doctype: book\n\n= P1\n\n== C\n\n");
+        for sub in 0..6 {
+            let _ = write!(text, "=== S{sub}\n\nText.\n\n");
+        }
+        text.push_str("= P2\n\nText.\n");
+        let html = convert_toc(&text, TocMode::Auto, None).await;
+        assert_eq!(sidebar(&html), None, "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_toc_heuristic_counts_the_sections_of_included_files() {
+        if !asciidoctor_available() {
+            return;
+        }
+        // Committed fixture `tests/fixtures/preview_toc_includes`: the book
+        // has no section of its own, its two chapters have three each.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/preview_toc_includes")
+            .canonicalize()
+            .unwrap();
+        let convert = |name: &str| {
+            let file = dir.join(name);
+            let text = std::fs::read_to_string(&file).unwrap();
+            async move {
+                AsciidoctorConverter::new()
+                    .unwrap()
+                    .convert(&ConvertRequest {
+                        file,
+                        text,
+                        attributes: Vec::new(),
+                        overlay: Vec::new(),
+                        toc: Some(TocInstruction {
+                            mode: TocMode::Auto,
+                            previous: None,
+                        }),
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let book = convert("book.adoc").await;
+        assert_eq!(sidebar(&book), Some("left"), "{book}");
+        // A chapter on its own is short.
+        let chapter = convert("one.adoc").await;
+        assert_eq!(sidebar(&chapter), None, "{chapter}");
+    }
+
+    fn placement(position: TocPosition, doc_toc: Option<TocSide>) -> Option<TocPlacement> {
+        Some(TocPlacement { position, doc_toc })
+    }
+
+    #[tokio::test]
+    async fn test_toc_auto_keeps_the_previous_placement_while_the_document_value_stays() {
+        if !asciidoctor_available() {
+            return;
+        }
+        // Pinned: the sixth subsection does not make the TOC pop in, and
+        // removing one does not make it go.
+        let html = convert_toc(
+            &outline("", 2, 6),
+            TocMode::Auto,
+            placement(TocPosition::Off, None),
+        )
+        .await;
+        assert_eq!(sidebar(&html), None, "{html}");
+        let html = convert_toc(
+            &outline("", 1, 0),
+            TocMode::Auto,
+            placement(TocPosition::Left, None),
+        )
+        .await;
+        assert_eq!(sidebar(&html), Some("left"), "{html}");
+        let html = convert_toc(
+            &outline(":toc: left", 1, 0),
+            TocMode::Auto,
+            placement(TocPosition::Right, Some(TocSide::Left)),
+        )
+        .await;
+        assert_eq!(sidebar(&html), Some("right"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_toc_auto_decides_again_when_the_document_value_changed() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let html = convert_toc(
+            &outline(":toc: right", 1, 0),
+            TocMode::Auto,
+            placement(TocPosition::Off, None),
+        )
+        .await;
+        assert_eq!(sidebar(&html), Some("right"), "{html}");
+        let html = convert_toc(
+            &outline("", 2, 6),
+            TocMode::Auto,
+            placement(TocPosition::Right, Some(TocSide::Right)),
+        )
+        .await;
+        assert_eq!(sidebar(&html), Some("left"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_toc_off_left_right_override_every_document_value() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let headers = [
+            "",
+            ":toc:",
+            ":toc: left",
+            ":toc: right",
+            ":toc: preamble",
+            ":toc: macro",
+            ":toc!:",
+        ];
+        for header in headers {
+            // A preamble and a toc macro, so `preamble` and `macro` have a
+            // place to put a TOC.
+            let text = format!("= T\n{header}\n\nPreamble.\n\ntoc::[]\n\n== A\n\nText.\n");
+            for (mode, side) in [
+                (TocMode::Off, None),
+                (TocMode::Left, Some("left")),
+                (TocMode::Right, Some("right")),
+            ] {
+                let html = convert_toc(&text, mode, None).await;
+                assert_eq!(sidebar(&html), side, "{header} {mode:?}: {html}");
+                let tocs = html.matches(r#"id="toc""#).count();
+                assert_eq!(
+                    tocs,
+                    usize::from(side.is_some()),
+                    "{header} {mode:?}: {html}"
+                );
+                if side.is_some() {
+                    assert!(html.contains(r#"<div id="toc" class="toc2">"#), "{html}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toc_override_keeps_toc_class_and_toclevels() {
+        if !asciidoctor_available() {
+            return;
+        }
+        let text = "= T\n:toc:\n:toc-class: side\n:toclevels: 1\n\n== A\n\n=== Deep\n\nText.\n";
+        let html = convert_toc(text, TocMode::Right, None).await;
+        assert!(html.contains(r#"<div id="toc" class="side">"#), "{html}");
+        assert_eq!(
+            body_classes(&html),
+            serde_json::json!(["side", "toc-right"])
+        );
+        assert!(!html.contains("#_deep"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn test_toc_choice_without_sections_renders_no_toc() {
+        if !asciidoctor_available() {
+            return;
+        }
+        for mode in [TocMode::Auto, TocMode::Off, TocMode::Left, TocMode::Right] {
+            let html = convert_toc("= T\n:toc: left\n\nText.\n", mode, None).await;
+            assert!(!html.contains(r#"id="toc""#), "{mode:?}: {html}");
+            assert_eq!(body_classes(&html), serde_json::json!([]), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn test_toc_instruction_on_the_wire() {
+        let instruction = TocInstruction {
+            mode: TocMode::Auto,
+            previous: placement(TocPosition::Off, Some(TocSide::Right)),
+        };
+        assert_eq!(
+            serde_json::to_value(instruction).unwrap(),
+            serde_json::json!({"mode": "auto", "previous": {"position": "off", "docToc": "right"}})
+        );
+        let instruction = TocInstruction {
+            mode: TocMode::Left,
+            previous: None,
+        };
+        assert_eq!(
+            serde_json::to_value(instruction).unwrap(),
+            serde_json::json!({"mode": "left"})
+        );
+    }
+
     /// Convert `text` as `file` with `root` as the workspace root.
     async fn convert_with_root(root: &Path, file: PathBuf, text: &str) -> String {
         AsciidoctorConverter::new()
@@ -999,6 +1403,7 @@ mod tests {
                 text: text.to_owned(),
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap()
@@ -1130,6 +1535,7 @@ mod tests {
                 text: "image::images/a.png[]\n".to_owned(),
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap();
@@ -1204,6 +1610,7 @@ mod tests {
                 file,
                 attributes: Vec::new(),
                 overlay,
+                toc: None,
             })
             .await
             .unwrap();
@@ -1234,6 +1641,7 @@ mod tests {
                 text: "= Book\n\ninclude::fresh.adoc[]\n".to_owned(),
                 attributes: Vec::new(),
                 overlay: overlay_of(&dir, &[("fresh.adoc", "only in the buffer\n")]),
+                toc: None,
             })
             .await
             .unwrap();
@@ -1259,6 +1667,7 @@ mod tests {
                 text: "= Book\n\ninclude::shared/ch.adoc[]\n".to_owned(),
                 attributes: Vec::new(),
                 overlay: overlay_of(&dir, &[("real/ch.adoc", "unsaved text\n")]),
+                toc: None,
             })
             .await
             .unwrap();
@@ -1286,6 +1695,7 @@ mod tests {
                 file,
                 attributes: Vec::new(),
                 overlay: Vec::new(),
+                toc: None,
             })
             .await
             .unwrap();

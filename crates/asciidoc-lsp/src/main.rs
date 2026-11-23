@@ -171,6 +171,9 @@ struct PreviewState {
     /// The document of the last conversion request: the top-level document
     /// in whole-document mode, else the active one.
     shown: Mutex<Option<PathBuf>>,
+    /// The preview's TOC choice, for every conversion; set by
+    /// [`PREVIEW_TOC_COMMAND`] and by the page.
+    toc: Mutex<preview_converter::TocMode>,
 }
 
 impl PreviewState {
@@ -254,6 +257,10 @@ impl AsciiDocLsp {
         mut actions: tokio::sync::mpsc::Receiver<preview::PageAction>,
     ) {
         while let Some(action) = actions.recv().await {
+            if let preview::PageAction::Toc(mode) = action {
+                self.set_preview_toc(mode);
+                continue;
+            }
             let active = self.preview.active.lock().clone();
             let client_uris = active
                 .as_ref()
@@ -322,6 +329,10 @@ impl AsciiDocLsp {
             text,
             attributes,
             overlay,
+            toc: Some(preview_converter::TocInstruction {
+                mode: *self.preview.toc.lock(),
+                previous: None,
+            }),
         })
     }
 
@@ -426,6 +437,41 @@ impl AsciiDocLsp {
         let enabled = action == "on";
         preview.set_debug(enabled);
         Ok(Some(serde_json::json!({ "enabled": enabled })))
+    }
+
+    /// `workspace/executeCommand` [`PREVIEW_TOC_COMMAND`]: set the preview's
+    /// TOC mode. Fails while no preview is open.
+    fn preview_toc(&self, arguments: &[serde_json::Value]) -> Result<Option<serde_json::Value>> {
+        let mode = match arguments {
+            [mode] => serde_json::from_value(mode.clone()).ok(),
+            _ => None,
+        };
+        let Some(mode) = mode else {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "{PREVIEW_TOC_COMMAND}: expected \"auto\", \"off\", \"left\" or \"right\""
+            )));
+        };
+        if self.preview.running().is_none() {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "{PREVIEW_TOC_COMMAND}: no preview is open"
+            )));
+        }
+        self.set_preview_toc(mode);
+        Ok(None)
+    }
+
+    /// The one place the TOC mode changes, from the editor or the page:
+    /// keep it, tell every page, and convert the document on show again.
+    fn set_preview_toc(&self, mode: preview_converter::TocMode) {
+        *self.preview.toc.lock() = mode;
+        let Some(preview) = self.preview.running() else {
+            return;
+        };
+        preview.set_toc(mode);
+        let active = self.preview.active.lock().clone();
+        if let Some(request) = active.and_then(|active| self.preview_request(&active)) {
+            self.send_preview_request(&preview, request);
+        }
     }
 
     /// Notification [`CURSOR_MOVED_METHOD`]: the editor's cursor is on
@@ -917,6 +963,7 @@ impl LanguageServer for AsciiDocLsp {
                         EXPLAIN_POSITION_COMMAND.to_string(),
                         PREVIEW_OPEN_COMMAND.to_string(),
                         PREVIEW_DEBUG_COMMAND.to_string(),
+                        PREVIEW_TOC_COMMAND.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -1527,6 +1574,9 @@ impl LanguageServer for AsciiDocLsp {
         if params.command == PREVIEW_DEBUG_COMMAND {
             return self.preview_debug(&params.arguments);
         }
+        if params.command == PREVIEW_TOC_COMMAND {
+            return self.preview_toc(&params.arguments);
+        }
         let args = parse_explain_position_command(&params.command, params.arguments)?;
         let uri = &args.text_document.uri;
 
@@ -1834,6 +1884,10 @@ const PREVIEW_OPEN_COMMAND: &str = "asciidoc.preview.open";
 /// `"show"`. Fails while no preview is open.
 const PREVIEW_DEBUG_COMMAND: &str = "asciidoc.preview.debug";
 
+/// Command that sets the preview's TOC: `"auto"`, `"off"`, `"left"` or
+/// `"right"`. Answers `null`; fails while no preview is open.
+const PREVIEW_TOC_COMMAND: &str = "asciidoc.preview.toc";
+
 /// Notification from the editor: its cursor moved. Params
 /// [`CursorMovedParams`].
 const CURSOR_MOVED_METHOD: &str = "asciidoc/cursorMoved";
@@ -1899,6 +1953,8 @@ fn editor_request(
                 selection: Some(Range::new(start, start)),
             }))
         }
+        // The LSP handles it itself, see `forward_page_actions`.
+        preview::PageAction::Toc(_) => None,
         preview::PageAction::Scroll { file, line, cursor } => {
             let active = active?;
             (document_path(active)? == file).then(|| {
@@ -6242,6 +6298,78 @@ mod tests {
                 "sent": {"file": a.to_string_lossy(), "line": 3},
                 "page": [],
             }])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preview_toc_from_the_command_and_the_page_sets_one_mode() {
+        use preview::testing::{address, start_with, Stream, TocConverter};
+        use preview_converter::{TocInstruction, TocMode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.adoc");
+        fs::write(&a, "").unwrap();
+        let uri_a = file_uri(&a);
+        let (service, _socket) = initialized_server(&root).await;
+        let server = service.inner();
+        let toc = |mode: &str| vec![serde_json::json!(mode)];
+
+        let error = server.preview_toc(&toc("left")).unwrap_err();
+        assert!(error.message.contains("no preview is open"), "{error:?}");
+
+        let converter = TocConverter::default();
+        let seen = Arc::clone(&converter.seen);
+        let preview = Arc::new(start_with(converter).await);
+        *server.preview.server.lock() = Some(Arc::clone(&preview));
+        let (port, token) = address(&preview);
+        let mut first = Stream::open(port, &token).await;
+        let mut second = Stream::open(port, &token).await;
+        for bad in [vec![], toc("top"), vec![serde_json::json!(1)]] {
+            let error = server.preview_toc(&bad).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("\"auto\", \"off\", \"left\" or \"right\""),
+                "{error:?}"
+            );
+        }
+        open_document(server, &uri_a, "alpha").await;
+        *server.preview.active.lock() = Some(uri_a.clone());
+
+        assert_eq!(server.preview_toc(&toc("left")).unwrap(), None);
+        for stream in [&mut first, &mut second] {
+            let seen = stream.until("alpha</p>").await;
+            assert!(
+                seen.contains("event: toc\ndata: {\"mode\":\"left\"}"),
+                "{seen}"
+            );
+        }
+        assert_eq!(
+            seen.lock().last().copied(),
+            Some(Some(TocInstruction {
+                mode: TocMode::Left,
+                previous: None,
+            }))
+        );
+
+        // The page's choice goes the same way, and later conversions keep it.
+        let (actions, receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(server.clone().forward_page_actions(receiver));
+        actions
+            .send(preview::PageAction::Toc(TocMode::Right))
+            .await
+            .unwrap();
+        first.until(r#"{"mode":"right"}"#).await;
+        first.until("alpha</p>").await;
+        change_document(server, &uri_a, 2, "beta").await;
+        first.until("beta</p>").await;
+        assert_eq!(
+            seen.lock().last().copied(),
+            Some(Some(TocInstruction {
+                mode: TocMode::Right,
+                previous: None,
+            }))
         );
     }
 

@@ -5,8 +5,11 @@ import {
   EchoGuard,
   TrailingThrottle,
   isRevealLineParams,
+  TOC_COMMAND,
+  TOC_MODES,
   previewUrl,
   revealAction,
+  tocRequest,
   webviewHtml,
 } from "../src/previewSync";
 
@@ -147,4 +150,23 @@ test("the webview escapes the URL in the attribute", () => {
   const html = webviewHtml('http://127.0.0.1:4711/a"b&c/');
   assert.doesNotMatch(html, /a"b/);
   assert.match(html, /a&quot;b&amp;c/);
+});
+
+test("the TOC quick pick offers the four modes in the order of the page", () => {
+  assert.deepEqual(TOC_MODES.map((mode) => mode.label), ["Auto", "Off", "Left", "Right"]);
+});
+
+test("a picked TOC mode becomes the server command", () => {
+  for (const mode of TOC_MODES) {
+    assert.deepEqual(tocRequest(mode), { command: TOC_COMMAND, arguments: [mode.value] });
+  }
+  assert.equal(TOC_COMMAND, "asciidoc.preview.toc");
+  assert.deepEqual(
+    TOC_MODES.map((mode) => mode.value),
+    ["auto", "off", "left", "right"],
+  );
+});
+
+test("a cancelled TOC quick pick sends nothing", () => {
+  assert.equal(tocRequest(undefined), undefined);
 });

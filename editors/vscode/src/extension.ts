@@ -70,6 +70,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("asciidoc-lsp.preview.openToSide", () => preview.openToSide()),
     vscode.commands.registerCommand("asciidoc-lsp.preview.openInBrowser", () => preview.openInBrowser()),
+    vscode.commands.registerCommand("asciidoc-lsp.preview.setToc", () => preview.setToc()),
   );
   await start();
 }

@@ -156,3 +156,26 @@ export function webviewHtml(url: string): string {
 </body>
 </html>`;
 }
+
+/** The server command that sets the preview's TOC. */
+export const TOC_COMMAND = "asciidoc.preview.toc";
+
+/** A choice of the TOC quick pick. */
+export interface TocMode {
+  label: string;
+  value: "auto" | "off" | "left" | "right";
+}
+
+/** The TOC modes, in the order of the page's select. */
+export const TOC_MODES: readonly TocMode[] = [
+  { label: "Auto", value: "auto" },
+  { label: "Off", value: "off" },
+  { label: "Left", value: "left" },
+  { label: "Right", value: "right" },
+];
+
+/** The `workspace/executeCommand` params for a picked mode; none for a cancelled pick. */
+export function tocRequest(picked: TocMode | undefined): { command: string; arguments: string[] } | undefined {
+  return picked === undefined ? undefined : { command: TOC_COMMAND, arguments: [picked.value] };
+}
+

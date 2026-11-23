@@ -8,34 +8,46 @@
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="font-awesome.min.css">
 <style>
-#preview-overlay { position: fixed; top: 0.5em; right: 0.75em; z-index: 1001; display: flex;
-  flex-direction: column; align-items: flex-end; gap: 0.3em; max-width: calc(100% - 1.5em); }
-#preview-toolbar { padding: 0.25em 0.6em;
-  font: 0.8em/1.4 sans-serif; background: rgba(255, 255, 255, 0.92); border: 1px solid #ddddd8;
-  border-radius: 3px; }
-#preview-toolbar label { cursor: pointer; }
-#preview-status { margin-left: 0.8em; color: #7a2518; }
-#preview-toolbar label + label { margin-left: 0.8em; }
-#preview-source { padding: 0.25em 0.6em; font: 0.8em/1.4 sans-serif; background: #fffbea; border: 1px solid #e0c96b;
-  border-radius: 3px; }
-#preview-source button { margin-left: 0.6em; font: inherit; cursor: pointer; }
-#preview-debug { margin: 0; padding: 0.4em 0.6em; font: 0.75em/1.35 monospace; background: #fffff0;
-  border: 1px solid #c90; border-radius: 3px; white-space: pre-wrap; max-width: 60em; }
+/* The toolbar sits at the top of the page, above Asciidoctor's fixed
+   sidebar TOC, which starts below it. */
+:root { --bar-height: 2rem; scroll-padding-top: var(--bar-height); }
+body { padding-top: var(--bar-height); }
+#preview-toolbar { position: fixed; top: 0; left: 0; right: 0; z-index: 1001; box-sizing: border-box;
+  height: var(--bar-height); display: flex; align-items: center; gap: 1.25em; padding: 0 0.9em;
+  font: 13px/1 sans-serif; color: #555; background: #f8f8f7; border-bottom: 1px solid #e7e7e9;
+  white-space: nowrap; overflow-x: auto; }
+#preview-toolbar label { display: inline-flex; align-items: center; gap: 0.35em; margin: 0;
+  font: inherit; color: inherit; cursor: pointer; }
+#preview-toolbar input[type="checkbox"] { margin: 0; }
+#preview-toolbar select { width: auto; height: auto; margin: 0; padding: 0.15em 0.3em;
+  font: inherit; color: #333; background: #fff; border: 1px solid #ccc; border-radius: 3px; }
+#preview-status { color: #7a2518; }
+#preview-source { margin-left: auto; display: inline-flex; align-items: center; gap: 0.6em;
+  padding: 0.2em 0.6em; background: #fffbea; border: 1px solid #e0c96b; border-radius: 3px; color: #333; }
+#preview-source[hidden] { display: none; }
+#preview-source button { margin: 0; padding: 0.1em 0.5em; font: inherit; cursor: pointer;
+  background: #fff; border: 1px solid #ccc; border-radius: 3px; }
+#preview-debug { position: fixed; top: calc(var(--bar-height) + 0.4em); right: 0.75em; z-index: 1001; margin: 0;
+  padding: 0.4em 0.6em; font: 0.75em/1.35 monospace; background: #fffff0; border: 1px solid #c90;
+  border-radius: 3px; white-space: pre-wrap; max-width: 60em; }
+#toc.toc2 { top: var(--bar-height); height: calc(100% - var(--bar-height)); }
 #preview-banner { margin: 0 auto; max-width: 62.5em; padding: 0.6em 1.25em; background: #fbeaea;
   border-bottom: 1px solid #c33; color: #7a2518; font: 0.9em/1.4 sans-serif; white-space: pre-wrap; }
 </style>
 </head>
 <body class="article">
-<div id="preview-overlay">
 <div id="preview-toolbar">
 <label><input type="checkbox" id="follow" checked> Follow cursor</label>
 <label><input type="checkbox" id="jump" checked> Double-click jumps to editor</label>
 <label><input type="checkbox" id="scroll-editor" checked> Scroll editor with page</label>
+<label>TOC <select id="toc-mode" autocomplete="off">
+<option value="auto">Auto</option><option value="off">Off</option>
+<option value="left">Left</option><option value="right">Right</option>
+</select></label>
 <span id="preview-status">Connecting...</span>
+<span id="preview-source" hidden><span id="preview-source-text"></span><button type="button" id="preview-source-open">Open in editor</button></span>
 </div>
 <pre id="preview-debug" hidden></pre>
-<div id="preview-source" hidden><span id="preview-source-text"></span><button type="button" id="preview-source-open">Open in editor</button></div>
-</div>
 <div id="preview-banner" hidden></div>
 <div id="header"></div>
 <div id="content"><p>Waiting for the first conversion...</p></div>

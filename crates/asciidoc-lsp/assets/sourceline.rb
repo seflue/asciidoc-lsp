@@ -20,6 +20,12 @@
 #   `<script id="adoc-body-classes">` lists the body classes for the page,
 #   `[]` when the standalone page would add none.
 #
+# - The preview's TOC choice comes in ASCIIDOC_LSP_TOC as JSON
+#   `{mode, previous}`; see TocOverrideTreeprocessor. With it, the output
+#   carries `<script id="adoc-toc">`, `{position, docToc}`: where the TOC went
+#   and the document's own `:toc: left|right`. Without it, `toc` stays as the
+#   document has it.
+#
 # - `<script id="adoc-page-title">` is the document title as a JSON string of
 #   plain text, for the page's tab title; without a title, the file's base
 #   name. It does not depend on `showtitle`.
@@ -164,6 +170,90 @@ class SourceFilesPostprocessor < Asciidoctor::Extensions::Postprocessor
   end
 end
 
+# Sets or removes `toc` after parsing, so the preview's choice wins over the
+# header and the config chain, which Asciidoctor has resolved by then.
+#
+# - `off`, `left`, `right`: exactly that.
+# - `auto`: the `previous` placement if the document's own value is the same
+#   as then (the TOC must not pop in while the writer types), else the
+#   document's `:toc: left|right`, else a long document gets `left` and a
+#   short one none. Long: more than one level-1 section and more than five of
+#   level 2 or deeper, includes counted, level-0 parts not.
+class TocOverrideTreeprocessor < Asciidoctor::Extensions::Treeprocessor
+  POSITIONS = %w[off left right].freeze
+
+  def process(doc)
+    instruction = TocOverrideTreeprocessor.instruction
+    return nil unless instruction
+    doc_toc = document_toc(doc)
+    position = position_for(instruction, doc_toc, doc)
+    apply(doc, position)
+    doc.set_attr 'adoc-toc', JSON.generate('position' => position, 'docToc' => doc_toc)
+    nil
+  end
+
+  # The parsed ASCIIDOC_LSP_TOC, or nil without a usable one.
+  def self.instruction
+    raw = ENV['ASCIIDOC_LSP_TOC']
+    return nil if raw.nil? || raw.empty?
+    instruction = JSON.parse(raw)
+    instruction.is_a?(Hash) ? instruction : nil
+  rescue JSON::ParserError
+    nil
+  end
+
+  private
+
+  # `left` or `right` if the document asks for a sidebar, else nil. After
+  # parsing, `:toc: left` reads as `toc=""` with `toc-position="left"`.
+  def document_toc(doc)
+    return nil unless doc.attr?('toc') && doc.attr?('toc-placement', 'auto')
+    side = doc.attr 'toc-position'
+    %w[left right].include?(side) ? side : nil
+  end
+
+  def position_for(instruction, doc_toc, doc)
+    mode = instruction['mode']
+    return mode if POSITIONS.include?(mode)
+    previous = instruction['previous']
+    if previous.is_a?(Hash) && previous['docToc'] == doc_toc &&
+       POSITIONS.include?(previous['position'])
+      return previous['position']
+    end
+    doc_toc || heuristic(doc)
+  end
+
+  def heuristic(doc)
+    sections = doc.find_by(context: :section)
+    level1 = sections.count { |section| section.level == 1 }
+    deeper = sections.count { |section| section.level >= 2 }
+    level1 > 1 && deeper > 5 ? 'left' : 'off'
+  end
+
+  # The attributes `save_attributes` derives from `:toc: left|right`; the
+  # html5 converter reads them when it writes the output. `toclevels` stays.
+  def apply(doc, position)
+    if position == 'off'
+      doc.remove_attr 'toc'
+      return
+    end
+    doc.set_attr 'toc', ''
+    doc.set_attr 'toc-placement', 'auto'
+    doc.set_attr 'toc-position', position
+    doc.set_attr 'toc-class', 'toc2' unless doc.attr? 'toc-class'
+  end
+end
+
+# The `adoc-toc` report of TocOverrideTreeprocessor, if it ran.
+class TocReportPostprocessor < Asciidoctor::Extensions::Postprocessor
+  def process(doc, output)
+    report = doc.attr 'adoc-toc'
+    return output unless report
+    # "</" must not end the script element early.
+    %(#{output}\n<script type="application/json" id="adoc-toc">#{report.gsub('</', '<\/')}</script>\n)
+  end
+end
+
 # The standalone page's body classes for a sidebar toc, which embedded output
 # lacks (html5 converter, `convert_document`): the same condition decides.
 # The toc div gets the `toc-class` the standalone page gives it; the embedded
@@ -266,8 +356,10 @@ end
 Asciidoctor::Extensions.register do
   preprocessor SourceLinePreprocessor
   treeprocessor SourceLineTreeprocessor
+  treeprocessor TocOverrideTreeprocessor
   postprocessor SourceFilesPostprocessor
   postprocessor TocLayoutPostprocessor
+  postprocessor TocReportPostprocessor
   postprocessor PageTitlePostprocessor
   postprocessor ImageSrcPostprocessor
 end

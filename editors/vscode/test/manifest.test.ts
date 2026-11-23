@@ -97,3 +97,12 @@ test("language configuration is referenced, shipped and comments out with // and
   assert.ok(configuration.brackets.length > 0);
   assert.ok(configuration.autoClosingPairs.length > 0);
 });
+
+test("the TOC command is declared and registered", () => {
+  const command = manifest.contributes.commands.find(
+    (c: { command: string }) => c.command === "asciidoc-lsp.preview.setToc",
+  );
+  assert.ok(command, "asciidoc-lsp.preview.setToc is not declared");
+  assert.equal(`${command.category}: ${command.title}`, "AsciiDoc LSP: Set Preview TOC");
+  assert.match(read("src/extension.ts"), /registerCommand\("asciidoc-lsp\.preview\.setToc"/);
+});

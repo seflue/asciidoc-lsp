@@ -74,6 +74,11 @@
         "command": "asciidoc-lsp.preview.openInBrowser",
         "title": "Open Preview in Browser",
         "category": "AsciiDoc LSP"
+      },
+      {
+        "command": "asciidoc-lsp.preview.setToc",
+        "title": "Set Preview TOC",
+        "category": "AsciiDoc LSP"
       }
     ],
     "menus": {

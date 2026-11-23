@@ -14,9 +14,11 @@ import {
 import {
   EchoGuard,
   TrailingThrottle,
+  TOC_MODES,
   isRevealLineParams,
   previewUrl,
   revealAction,
+  tocRequest,
   webviewHtml,
 } from "./previewSync";
 
@@ -119,6 +121,24 @@ export class Preview implements vscode.Disposable {
       this.panel.webview.html = html;
     }
     this.sendCursor();
+  }
+
+  /** Pick the preview's TOC mode and send it to the server. */
+  async setToc(): Promise<void> {
+    if (!this.client?.isRunning()) {
+      void vscode.window.showErrorMessage("AsciiDoc Preview: the language server is not running.");
+      return;
+    }
+    const request = tocRequest(await vscode.window.showQuickPick(TOC_MODES, { placeHolder: "Preview TOC" }));
+    if (request === undefined) {
+      return;
+    }
+    try {
+      await this.client.sendRequest(ExecuteCommandRequest.type, request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`AsciiDoc Preview: ${message}`);
+    }
   }
 
   /** The page of the current asciidoc editor, in the browser. */

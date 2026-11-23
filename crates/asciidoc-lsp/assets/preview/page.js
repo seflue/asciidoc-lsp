@@ -11,6 +11,9 @@
  *                                          it is on, `cursor` carries `seq` and
  *                                          the page reports on each event
  *                                          (`POST debug`, see scroll-debug.js)
+ *   toc           {mode}                   the preview's TOC choice: auto, off,
+ *                                          left or right; sets the select only,
+ *                                          the layout comes with the next html
  * In `html`, `file` is the converted document: the top-level document in
  * whole-document mode, else the active file. In `cursor`, `file` is the file
  * the editor is in, which can be one the shown document includes. The page
@@ -26,7 +29,9 @@
  * with the source line on the reading line, a quarter down the page (see
  * page-sync.js `readPoint`), and a banner names the file there when it is
  * not the editor's. What counts as the reader's scroll, and
- * when the page keeps still, is page-sync.js's scroll gate.
+ * when the page keeps still, is page-sync.js's scroll gate. The TOC select
+ * sends `POST toc {mode}` and shows what the last `toc` event says, so page
+ * and editor never disagree.
  *
  * Mapping logic lives in scroll-map.js and page-sync.js; this file only
  * touches the DOM.
@@ -47,6 +52,8 @@
   var sourceText = document.getElementById('preview-source-text')
   var sourceOpen = document.getElementById('preview-source-open')
   var debugBox = document.getElementById('preview-debug')
+  var toolbar = document.getElementById('preview-toolbar')
+  var tocSelect = document.getElementById('toc-mode')
 
   var gate = sync.createScrollGate({ inputWindow: 600, echoWindow: 250, throttle: 100 })
   var trailingTimer = null
@@ -62,6 +69,7 @@
   var includeTable = [] // its include directives: {parent, line, file}
   var cursor = null // last cursor event: {file, line[, seq]}
   var baseBodyClass = document.body.className // what the page itself puts on its body
+  var tocMode = tocSelect.value // the mode of the last `toc` event
 
   function followOn() {
     return followBox.checked
@@ -84,6 +92,11 @@
   /** The file the editor is in: the last cursor's, else the shown one. */
   function activeFile() {
     return cursor === null ? shownFile : cursor.file
+  }
+
+  /** Height of the toolbar fixed over the top of the page. */
+  function barHeight() {
+    return toolbar.offsetHeight
   }
 
   /** Scroll the page by itself; the scroll gate does not report it. */
@@ -207,11 +220,12 @@
       // The end of the page is the end of the shown file only.
       lastLine: src === null && lineCount > 0 ? lineCount : Infinity,
       include: sync.isIncludeLine(includeTable, src, cursor.line),
-      targetY: top - window.scrollY,
+      // The toolbar covers the top of the page: the target counts from below it.
+      targetY: top - window.scrollY - barHeight(),
       viewportHeight: window.innerHeight,
     })
     if (action === 'end') scrollPage(document.documentElement.scrollHeight - window.innerHeight)
-    else if (action === 'align') scrollPage(top)
+    else if (action === 'align') scrollPage(top - barHeight())
     debugReveal({
       src: src, anchors: list, entries: entries, scrollBefore: before, target: top, action: action,
     })
@@ -406,6 +420,13 @@
     post('click', target)
   })
 
+  tocSelect.addEventListener('change', function () {
+    var chosen = tocSelect.value
+    // The select shows the server's mode; its `toc` event brings the choice.
+    tocSelect.value = tocMode
+    post('toc', { mode: chosen })
+  })
+
   sourceOpen.addEventListener('click', function () {
     if (bannerTarget !== null) post('click', bannerTarget)
   })
@@ -421,6 +442,10 @@
   listen(source, 'cursor', onCursor)
   listen(source, 'convert-error', function (message) {
     showError(message.message)
+  })
+  listen(source, 'toc', function (message) {
+    tocMode = message.mode
+    tocSelect.value = tocMode
   })
   listen(source, 'debug', function (message) {
     reporter.switchTo(message.enabled)
