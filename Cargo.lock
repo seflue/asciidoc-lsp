@@ -75,7 +75,7 @@ checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "asciidoc-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "asciidoc-core",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "asciidoc-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "asciidoc-lsp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "asciidoc-core",
