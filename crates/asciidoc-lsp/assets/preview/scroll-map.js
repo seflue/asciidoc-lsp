@@ -432,17 +432,6 @@
     return previous.line
   }
 
-  /**
-   * Whether to move for a target at client-Y `clientY` in a viewport of
-   * `viewportHeight`: not when the line is already comfortably on screen.
-   * Lines in the top quarter still snap to the top, so lockstep scrolling
-   * does not stall (asciidoctor-vscode #638).
-   */
-  function shouldScroll(clientY, viewportHeight) {
-    var snapZone = viewportHeight / 4
-    return !(clientY > snapZone && clientY < viewportHeight)
-  }
-
   return {
     ANCHOR_SELECTOR: ANCHOR_SELECTOR,
     parseAnchorClass: parseAnchorClass,
@@ -459,6 +448,5 @@
     anchorIndicesForLine: anchorIndicesForLine,
     scrollTopForLine: scrollTopForLine,
     sourceLineAtViewportTop: sourceLineAtViewportTop,
-    shouldScroll: shouldScroll,
   }
 })

@@ -10,7 +10,7 @@ Language server for AsciiDoc, built on tree-sitter. The LSP server is the produc
 
 ## Commands
 
-Run every build, test, lint and format step through a `just` target (`justfile` at the repo root; `just --list` shows them all). Key targets: `build`, `test`, `lint`, `fmt`, `ci` (fmt-check + lint + test, same as CI), `test-js` (Node tests for the preview page's `scroll-map.js` in `crates/asciidoc-lsp/tests/js/`; needs Node, not part of `ci`, CI runs it as its own job), `run <file>` (CLI), `lsp`.
+Run every build, test, lint and format step through a `just` target (`justfile` at the repo root; `just --list` shows them all). Key targets: `build`, `test`, `lint`, `fmt`, `ci` (fmt-check + lint + test, same as CI), `test-js` (Node tests for the preview page's `scroll-map.js` and `page-sync.js` in `crates/asciidoc-lsp/tests/js/`; needs Node, not part of `ci`, CI runs it as its own job), `run <file>` (CLI), `lsp`.
 
 - Call `just`, never `cargo` directly. When no target covers what you need (for example, `just test` takes no filter argument), stop and tell the user what you need instead of working around it.
 - `just lint` runs clippy with workspace-wide `pedantic` lints and `-D warnings`: every pedantic warning fails the build.

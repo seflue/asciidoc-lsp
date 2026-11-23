@@ -35,10 +35,10 @@ use tower_lsp_server::ls_types::{
     InitializedParams, Location, MarkedString, MessageType, OneOf, Position, PrepareRenameResponse,
     Range, ReferenceParams, Registration, RenameOptions, RenameParams, SaveOptions, SemanticTokens,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, ShowDocumentParams,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -121,6 +121,9 @@ struct ServerState {
     /// `workspace/didChangeWatchedFiles`. Set in `initialize()`,
     /// consumed in `initialized()`.
     can_request_file_watcher: Mutex<bool>,
+    /// Whether the client handles `window/showDocument`, which a click in
+    /// the preview turns into. Set in `initialize()`.
+    can_show_document: Mutex<bool>,
     /// File changes reported while the workspace scan runs, replayed when
     /// the workspace is installed. `None` while no scan runs: before it, without
     /// a workspace root, and once the workspace is installed. Lock order:
@@ -196,6 +199,7 @@ impl AsciiDocLsp {
             published: tokio::sync::Mutex::new(Published::default()),
             content_changed: Mutex::new(HashSet::new()),
             can_request_file_watcher: Mutex::new(false),
+            can_show_document: Mutex::new(false),
             pending_changes: Mutex::new(None),
             workspace_ready: tokio::sync::watch::Sender::new(true),
             diagnostics_generation: AtomicU64::new(0),
@@ -236,8 +240,37 @@ impl AsciiDocLsp {
                 .await
                 .map_err(preview_error)?;
         let preview = Arc::new(preview);
+        if let Some(actions) = preview.take_actions() {
+            tokio::spawn(self.clone().forward_page_actions(actions));
+        }
         *self.preview.server.lock() = Some(Arc::clone(&preview));
         Ok(preview)
+    }
+
+    /// Hand the page's actions to the editor, one at a time, until the
+    /// preview server goes away.
+    async fn forward_page_actions(
+        self,
+        mut actions: tokio::sync::mpsc::Receiver<preview::PageAction>,
+    ) {
+        while let Some(action) = actions.recv().await {
+            let active = self.preview.active.lock().clone();
+            let client_uris = active
+                .as_ref()
+                .map_or_else(HashMap::new, |active| self.client_uris(active));
+            let can_show_document = *self.can_show_document.lock();
+            match editor_request(action, active.as_ref(), &client_uris, can_show_document) {
+                Some(EditorRequest::ShowDocument(params)) => {
+                    if let Err(error) = self.client.show_document(params).await {
+                        tracing::warn!(?error, "window/showDocument for a preview click failed");
+                    }
+                }
+                Some(EditorRequest::RevealLine(params)) => {
+                    self.client.send_notification::<RevealLine>(params).await;
+                }
+                None => {}
+            }
+        }
     }
 
     /// The texts of the open buffers by canonical path.
@@ -778,6 +811,13 @@ impl LanguageServer for AsciiDocLsp {
                 .and_then(|c| c.dynamic_registration)
                 .unwrap_or(false);
             *self.can_request_file_watcher.lock() = supported;
+            let show_document = params
+                .capabilities
+                .window
+                .as_ref()
+                .and_then(|w| w.show_document.as_ref())
+                .is_some_and(|c| c.support);
+            *self.can_show_document.lock() = show_document;
         }
 
         // As a server we read whichever workspace representation the client
@@ -1774,6 +1814,71 @@ struct CursorMovedParams {
     /// 0-based, like an LSP position. The preview server turns it into the
     /// 1-based line of Asciidoctor's `data-line-N`.
     line: u32,
+}
+
+/// Notification to the editor: the reader scrolled the preview, show this
+/// line. Params [`RevealLineParams`]. Sent for the active document only.
+enum RevealLine {}
+
+impl tower_lsp_server::ls_types::notification::Notification for RevealLine {
+    type Params = RevealLineParams;
+    const METHOD: &'static str = "asciidoc/revealLine";
+}
+
+/// Params of [`RevealLine`].
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RevealLineParams {
+    uri: Uri,
+    /// 0-based, like an LSP position; past the end means the last line.
+    line: u32,
+    /// Move the cursor to `line` as well, not only the view.
+    cursor: bool,
+}
+
+/// What the editor gets for a page action.
+#[derive(Debug, PartialEq)]
+enum EditorRequest {
+    ShowDocument(ShowDocumentParams),
+    RevealLine(RevealLineParams),
+}
+
+/// The request for a page action, or `None` if there is nothing to send.
+///
+/// A click opens its file at its line, also another file than the active
+/// one, by the client's URI for an open buffer (`client_uris`), and only if
+/// the client handles `window/showDocument`. A scroll reveals its line only
+/// in the `active` document: it never switches the file. The page's lines
+/// are 1-based source lines; LSP lines are 0-based.
+fn editor_request(
+    action: preview::PageAction,
+    active: Option<&Uri>,
+    client_uris: &HashMap<PathBuf, Uri>,
+    can_show_document: bool,
+) -> Option<EditorRequest> {
+    match action {
+        preview::PageAction::Click { file, line } => {
+            if !can_show_document {
+                return None;
+            }
+            let start = Position::new(line.saturating_sub(1), 0);
+            Some(EditorRequest::ShowDocument(ShowDocumentParams {
+                uri: result_uri(&file, client_uris)?,
+                external: None,
+                take_focus: Some(true),
+                selection: Some(Range::new(start, start)),
+            }))
+        }
+        preview::PageAction::Scroll { file, line, cursor } => {
+            let active = active?;
+            (document_path(active)? == file).then(|| {
+                EditorRequest::RevealLine(RevealLineParams {
+                    uri: active.clone(),
+                    line: line.saturating_sub(1),
+                    cursor,
+                })
+            })
+        }
+    }
 }
 
 /// A preview failure as a JSON-RPC error with the cause as message.
@@ -5959,6 +6064,90 @@ mod tests {
             .await,
             Some(format!(":pdf-themesdir: {}", path("docs/theme")))
         );
+    }
+
+    #[test]
+    fn test_page_click_opens_the_file_at_its_zero_based_line() {
+        let chapter = PathBuf::from("/book/chapter.adoc");
+        let action = preview::PageAction::Click {
+            file: chapter.clone(),
+            line: 5,
+        };
+        let Some(EditorRequest::ShowDocument(params)) =
+            editor_request(action, None, &HashMap::new(), true)
+        else {
+            panic!("a click shows the document");
+        };
+        assert_eq!(params.uri, Uri::from_file_path(&chapter).unwrap());
+        assert_eq!(params.take_focus, Some(true));
+        let start = Position::new(4, 0);
+        assert_eq!(params.selection, Some(Range::new(start, start)));
+    }
+
+    #[test]
+    fn test_page_click_addresses_an_open_buffer_by_its_client_uri() {
+        let chapter = PathBuf::from("/book/chapter.adoc");
+        let client_uri: Uri = "file:///book/./chapter.adoc".parse().unwrap();
+        let open = HashMap::from([(chapter.clone(), client_uri.clone())]);
+        let action = preview::PageAction::Click {
+            file: chapter,
+            line: 1,
+        };
+        let Some(EditorRequest::ShowDocument(params)) = editor_request(action, None, &open, true)
+        else {
+            panic!("a click shows the document");
+        };
+        assert_eq!(params.uri, client_uri);
+    }
+
+    #[test]
+    fn test_page_click_is_dropped_without_show_document_support() {
+        let action = preview::PageAction::Click {
+            file: PathBuf::from("/book/chapter.adoc"),
+            line: 1,
+        };
+        assert_eq!(editor_request(action, None, &HashMap::new(), false), None);
+    }
+
+    #[test]
+    fn test_page_scroll_reveals_the_zero_based_line_of_the_active_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().canonicalize().unwrap().join("a.adoc");
+        fs::write(&file, "").unwrap();
+        let active = file_uri(&file);
+        let action = preview::PageAction::Scroll {
+            file: file.clone(),
+            line: 10,
+            cursor: true,
+        };
+        assert_eq!(
+            editor_request(action, Some(&active), &HashMap::new(), true),
+            Some(EditorRequest::RevealLine(RevealLineParams {
+                uri: active,
+                line: 9,
+                cursor: true
+            }))
+        );
+    }
+
+    #[test]
+    fn test_page_scroll_never_switches_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a.adoc"), root.join("b.adoc"));
+        fs::write(&a, "").unwrap();
+        fs::write(&b, "").unwrap();
+        let action = || preview::PageAction::Scroll {
+            file: b.clone(),
+            line: 3,
+            cursor: false,
+        };
+        let active = file_uri(&a);
+        assert_eq!(
+            editor_request(action(), Some(&active), &HashMap::new(), true),
+            None
+        );
+        assert_eq!(editor_request(action(), None, &HashMap::new(), true), None);
     }
 
     #[tokio::test]

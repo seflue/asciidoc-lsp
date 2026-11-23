@@ -7,11 +7,12 @@
 //! address and port (anything else is a 403, which stops DNS rebinding).
 //!
 //! HTTP is hand-written on `tokio::net`: the server answers `GET` for five
-//! fixed routes and one event stream, so a request parser of a few lines
-//! replaces hyper, hyper-util and http-body-util.
+//! fixed routes and one event stream, and `POST` for the two page actions,
+//! so a request parser of a few lines replaces hyper, hyper-util and
+//! http-body-util.
 //!
 //! Routes below `/<token>/`: the page itself, `style.css`, `page.js`,
-//! `scroll-map.js`, `morphdom.js`, the Font Awesome CSS and font, and `events` (SSE), and `files/<path>`: an
+//! `scroll-map.js`, `page-sync.js`, `morphdom.js`, the Font Awesome CSS and font, and `events` (SSE), and `files/<path>`: an
 //! image file below the workspace root that the shown document names. The
 //! converter lists those images at the end of its HTML; the server resolves
 //! each to a canonical path and serves a request only if its own canonical
@@ -27,6 +28,18 @@
 //!   be one that `file` includes, and `line` a 1-based source line of it, see
 //!   [`Preview::set_cursor`].
 //! - `convert-error`: `{message}`, the conversion failed.
+//!
+//! Page actions, `POST` with a JSON body `{file, line}` (`line` 1-based, as
+//! in `data-line-N`; `file` an absolute path, as in the file table):
+//! - `click`: the reader double-clicked a block of `file`.
+//! - `scroll`: the reader scrolled, and `line` of `file` is on the page's
+//!   reading line; with `"cursor": true` the editor's cursor goes there too.
+//!
+//! Besides host and token, a page action needs the page's own `Origin`
+//! (403 otherwise), so another site in the same browser cannot send one, and
+//! `file` must be part of the shown document: the shown file or an entry of
+//! its file table (400 otherwise). Accepted actions answer 204 and come out
+//! of [`Preview::take_actions`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -48,6 +61,7 @@ use crate::preview_converter::{self, Convert, ConvertOutcome, ConvertRequest};
 const PAGE: &str = include_str!("../assets/preview/index.html");
 const PAGE_JS: &str = include_str!("../assets/preview/page.js");
 const SCROLL_MAP_JS: &str = include_str!("../assets/preview/scroll-map.js");
+const PAGE_SYNC_JS: &str = include_str!("../assets/preview/page-sync.js");
 const MORPHDOM_JS: &str = include_str!("../assets/preview/morphdom.js");
 /// Font Awesome 4.7.0 for `:icons: font`; the standalone page links it from a CDN.
 const FONT_AWESOME_CSS: &str = include_str!("../assets/preview/font-awesome.min.css");
@@ -62,6 +76,11 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(15);
 /// Buffered events per stream; a slower reader gets the current state again.
 const EVENT_BACKLOG: usize = 64;
+/// Longest page action body the server reads.
+const MAX_BODY_BYTES: usize = 4 * 1024;
+/// Page actions waiting for the editor; more are dropped, so a page that
+/// floods the server cannot grow the queue.
+const ACTION_BACKLOG: usize = 64;
 
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +133,39 @@ impl Event {
     }
 }
 
+/// What the page asks the editor to do. Lines are 1-based source lines, as
+/// in `data-line-N`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageAction {
+    /// The reader double-clicked a block: open `file` at `line`.
+    Click { file: PathBuf, line: u32 },
+    /// The reader scrolled the page: `line` of `file` is on its reading
+    /// line; with `cursor` the editor's cursor goes there too (chapter
+    /// changes, start and end of the page).
+    Scroll {
+        file: PathBuf,
+        line: u32,
+        cursor: bool,
+    },
+}
+
+/// Which page action a `POST` route names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionKind {
+    Click,
+    Scroll,
+}
+
+/// The body of a page action.
+#[derive(Debug, serde::Deserialize)]
+struct ActionBody {
+    file: PathBuf,
+    line: u32,
+    /// Scroll only; absent means `false`.
+    #[serde(default)]
+    cursor: bool,
+}
+
 /// The latest event of each kind, replayed to a stream that connects late.
 #[derive(Debug, Default)]
 struct Snapshot {
@@ -146,6 +198,11 @@ struct Shared {
     snapshot: Mutex<Snapshot>,
     /// Lines of the last text requested per file, for the page's end sentinel.
     line_counts: Mutex<HashMap<PathBuf, usize>>,
+    /// The files of the shown document: the converted file and its file
+    /// table. Page actions may name these only.
+    shown_files: Mutex<HashSet<PathBuf>>,
+    /// Where accepted page actions go.
+    actions: mpsc::Sender<PageAction>,
 }
 
 impl Shared {
@@ -176,8 +233,9 @@ impl Shared {
             Ok(html) => {
                 let (html, images) = split_image_list(&html);
                 // Before the event: the page asks for the images as soon as
-                // it has the HTML.
+                // it has the HTML, and may send an action right after.
                 self.set_allowed_images(&images);
+                *self.shown_files.lock() = shown_files(&outcome.file, html);
                 let line_count = self
                     .line_counts
                     .lock()
@@ -224,6 +282,38 @@ impl Shared {
         host == format!("127.0.0.1:{port}")
             || host.eq_ignore_ascii_case(&format!("localhost:{port}"))
     }
+
+    /// Whether `origin` is the page's own: the scheme plus an allowed host.
+    fn allows_origin(&self, origin: &str) -> bool {
+        origin
+            .strip_prefix("http://")
+            .is_some_and(|host| self.allows_host(host))
+    }
+
+    /// Accept a page action of `kind` with `body`, or say why not.
+    fn accept_action(&self, kind: ActionKind, body: &[u8]) -> Result<(), u16> {
+        let body: ActionBody = serde_json::from_slice(body).map_err(|_| 400_u16)?;
+        if body.line == 0 || !self.shown_files.lock().contains(&body.file) {
+            return Err(400);
+        }
+        let action = match kind {
+            ActionKind::Click => PageAction::Click {
+                file: body.file,
+                line: body.line,
+            },
+            ActionKind::Scroll => PageAction::Scroll {
+                file: body.file,
+                line: body.line,
+                cursor: body.cursor,
+            },
+        };
+        // A full queue or a backend that stopped taking actions loses this
+        // one; the page needs no answer either way.
+        if let Err(error) = self.actions.try_send(action) {
+            tracing::debug!(%error, "page action dropped");
+        }
+        Ok(())
+    }
 }
 
 /// A running preview server and the converter feeding it.
@@ -235,6 +325,8 @@ pub struct Preview {
     shared: Arc<Shared>,
     url: String,
     convert: preview_converter::ConvertHandle,
+    /// The receiving end of the page actions, until someone takes it.
+    actions: Mutex<Option<mpsc::Receiver<PageAction>>>,
     tasks: [JoinHandle<()>; 2],
 }
 
@@ -264,6 +356,7 @@ impl Preview {
             .map_err(PreviewError::Bind)?;
         let port = listener.local_addr().map_err(PreviewError::Bind)?.port();
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
+        let (actions, action_receiver) = mpsc::channel(ACTION_BACKLOG);
         let shared = Arc::new(Shared {
             token,
             port,
@@ -273,6 +366,8 @@ impl Preview {
             events,
             snapshot: Mutex::new(Snapshot::default()),
             line_counts: Mutex::new(HashMap::new()),
+            shown_files: Mutex::new(HashSet::new()),
+            actions,
         });
         let url = format!("http://127.0.0.1:{port}/{}/", shared.token);
         let (convert, outcomes) = preview_converter::spawn(converter, debounce);
@@ -286,8 +381,15 @@ impl Preview {
             shared,
             url,
             convert,
+            actions: Mutex::new(Some(action_receiver)),
             tasks: [accept, pump],
         })
+    }
+
+    /// The page actions the reader triggers, in order. Only the first call
+    /// gets them; later calls get `None`.
+    pub fn take_actions(&self) -> Option<mpsc::Receiver<PageAction>> {
+        self.actions.lock().take()
     }
 
     /// The URL of the page, token included.
@@ -372,9 +474,13 @@ struct Request<'a> {
     method: &'a str,
     target: &'a str,
     host: Option<&'a str>,
+    origin: Option<&'a str>,
+    /// `None` without the header or with a value that is no number.
+    content_length: Option<usize>,
 }
 
-/// Parse a request head. `None` if it is malformed or has two `Host` headers.
+/// Parse a request head. `None` if it is malformed or has two `Host`,
+/// `Origin` or `Content-Length` headers.
 fn parse_request(head: &str) -> Option<Request<'_>> {
     let mut lines = head.split("\r\n");
     let mut parts = lines.next()?.split(' ');
@@ -384,20 +490,31 @@ fn parse_request(head: &str) -> Option<Request<'_>> {
         return None;
     }
     let mut host = None;
+    let mut origin = None;
+    let mut content_length = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("host") {
-                if host.is_some() {
-                    return None;
-                }
-                host = Some(value.trim());
+            let slot = if name.eq_ignore_ascii_case("host") {
+                &mut host
+            } else if name.eq_ignore_ascii_case("origin") {
+                &mut origin
+            } else if name.eq_ignore_ascii_case("content-length") {
+                &mut content_length
+            } else {
+                continue;
+            };
+            if slot.is_some() {
+                return None;
             }
+            *slot = Some(value.trim());
         }
     }
     Some(Request {
         method,
         target,
         host,
+        origin,
+        content_length: content_length.and_then(|value| value.parse().ok()),
     })
 }
 
@@ -410,6 +527,8 @@ enum Routed<'a> {
     },
     Redirect(String),
     Events,
+    /// A page action; the body is still to be read.
+    Action(ActionKind),
     /// A workspace file by its still percent-encoded path below the root.
     File(String),
     Status(u16),
@@ -430,6 +549,20 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
     if token != shared.token {
         return Routed::Status(404);
     }
+    if request.method == "POST" {
+        let kind = match rest {
+            "click" => ActionKind::Click,
+            "scroll" => ActionKind::Scroll,
+            _ => return Routed::Status(405),
+        };
+        if !request
+            .origin
+            .is_some_and(|origin| shared.allows_origin(origin))
+        {
+            return Routed::Status(403);
+        }
+        return Routed::Action(kind);
+    }
     if request.method != "GET" {
         return Routed::Status(405);
     }
@@ -446,6 +579,7 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
         "style.css" => body("text/css; charset=utf-8", &shared.stylesheet),
         "page.js" => body("text/javascript; charset=utf-8", PAGE_JS),
         "scroll-map.js" => body("text/javascript; charset=utf-8", SCROLL_MAP_JS),
+        "page-sync.js" => body("text/javascript; charset=utf-8", PAGE_SYNC_JS),
         "morphdom.js" => body("text/javascript; charset=utf-8", MORPHDOM_JS),
         "font-awesome.min.css" => body("text/css; charset=utf-8", FONT_AWESOME_CSS),
         "fontawesome-webfont.woff2" => Routed::Body {
@@ -460,15 +594,17 @@ fn route<'a>(shared: &'a Shared, request: &Request<'_>) -> Routed<'a> {
     }
 }
 
-/// Read up to the blank line that ends the request head. `None` if the
-/// client closed first or the head is too long.
-async fn read_head(stream: &mut TcpStream) -> io::Result<Option<String>> {
+/// Read up to the blank line that ends the request head: the head, and the
+/// bytes after it that came in the same reads (the start of a body). `None`
+/// if the client closed first or the head is too long.
+async fn read_head(stream: &mut TcpStream) -> io::Result<Option<(String, Vec<u8>)>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
     loop {
         if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let rest = buffer.split_off(end + 4);
             buffer.truncate(end);
-            return Ok(Some(String::from_utf8_lossy(&buffer).into_owned()));
+            return Ok(Some((String::from_utf8_lossy(&buffer).into_owned(), rest)));
         }
         if buffer.len() > MAX_HEAD_BYTES {
             return Ok(None);
@@ -484,6 +620,7 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<Option<String>> {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
         301 => "Moved Permanently",
         400 => "Bad Request",
         403 => "Forbidden",
@@ -522,7 +659,7 @@ async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<
         Ok(head) => head?,
         Err(_) => None,
     };
-    let Some(head) = head else {
+    let Some((head, body_start)) = head else {
         return write_response(&mut stream, 400, "text/plain", "", b"bad request").await;
     };
     let Some(request) = parse_request(&head) else {
@@ -555,7 +692,43 @@ async fn serve_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<
             }
         },
         Routed::Events => serve_events(stream, shared).await,
+        Routed::Action(kind) => {
+            let body = match request.content_length {
+                Some(length) if length <= MAX_BODY_BYTES => {
+                    tokio::time::timeout(HEAD_TIMEOUT, read_body(&mut stream, body_start, length))
+                        .await
+                        .unwrap_or(Ok(None))?
+                }
+                _ => None,
+            };
+            let status = match body {
+                Some(body) => shared
+                    .accept_action(kind, &body)
+                    .map_or_else(|s| s, |()| 204),
+                None => 400,
+            };
+            let text = if status == 204 { "" } else { reason(status) };
+            write_response(&mut stream, status, "text/plain", "", text.as_bytes()).await
+        }
     }
+}
+
+/// Read a body of `length` bytes, of which `start` has arrived already.
+/// `None` if the client closes first or sent more than `length`.
+async fn read_body(
+    stream: &mut TcpStream,
+    mut body: Vec<u8>,
+    length: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut chunk = [0_u8; 1024];
+    while body.len() < length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Ok((body.len() == length).then_some(body))
 }
 
 /// Decode `%XX` escapes. `None` for a bad escape or bytes that are no UTF-8.
@@ -595,21 +768,53 @@ fn content_type_of(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Opening tag of the file table that the converter puts after the blocks.
+const FILE_TABLE_OPEN: &str = r#"<script type="application/json" id="adoc-source-files">"#;
+
+/// The files a page showing `html` of `file` may name: `file` and every
+/// entry of the file table. Only the last table counts, as for the image
+/// list; without a well-formed one, `file` alone.
+fn shown_files(file: &Path, html: &str) -> HashSet<PathBuf> {
+    let mut files = HashSet::from([file.to_path_buf()]);
+    if let Some((_, table, _)) = last_json_script(html, FILE_TABLE_OPEN) {
+        match serde_json::from_str::<Vec<PathBuf>>(table) {
+            Ok(table) => files.extend(table),
+            Err(error) => tracing::warn!(%error, "preview file table is malformed"),
+        }
+    }
+    files
+}
+
 /// Opening tag of the image list that the converter puts last in its HTML.
 const IMAGE_LIST_OPEN: &str = r#"<script type="application/json" id="adoc-image-files">"#;
-const IMAGE_LIST_CLOSE: &str = "</script>\n";
+/// What follows the image list's `</script>`: it ends the HTML.
+const IMAGE_LIST_REST: &str = "\n";
+
+/// The last `<script>` block of `html` that starts with `open`: where it
+/// starts, its JSON, and what follows its `</script>`. The converter writes
+/// `<\/` for `</` inside the JSON, so the first `</script>` ends it.
+fn last_json_script<'a>(html: &'a str, open: &str) -> Option<(usize, &'a str, &'a str)> {
+    let start = html.rfind(open)?;
+    let json_and_rest = &html[start + open.len()..];
+    let end = json_and_rest.find("</script>")?;
+    Some((
+        start,
+        &json_and_rest[..end],
+        &json_and_rest[end + "</script>".len()..],
+    ))
+}
 
 /// Cut the image list off the end of `html`: the HTML without it, and the
 /// paths it names. The list sits at the very end, so only the last opening
 /// tag counts and document text that looks like one cannot take its place.
 /// Without a well-formed list, no image is allowed.
 fn split_image_list(html: &str) -> (&str, Vec<String>) {
-    let Some(start) = html.rfind(IMAGE_LIST_OPEN) else {
+    let Some((start, json, rest)) = last_json_script(html, IMAGE_LIST_OPEN) else {
         return (html, Vec::new());
     };
-    let Some(json) = html[start + IMAGE_LIST_OPEN.len()..].strip_suffix(IMAGE_LIST_CLOSE) else {
+    if rest != IMAGE_LIST_REST {
         return (html, Vec::new());
-    };
+    }
     // The converter wrote `<\/` for `</`, which is the same JSON string.
     let images = serde_json::from_str(json).unwrap_or_else(|error| {
         tracing::warn!(%error, "preview image list is malformed; serving no images");
@@ -707,12 +912,26 @@ pub(crate) mod testing {
     use super::*;
     use crate::preview_converter::ConvertError;
 
-    /// Converts to `<p>` plus the request text, without Ruby.
+    /// Converts to `<p>` plus the request text, without Ruby. Every line
+    /// `src:<path>` of the text is an included file, listed in the file
+    /// table as Ruby's postprocessor lists it.
     pub(crate) struct EchoConverter;
 
     impl Convert for EchoConverter {
         async fn convert(&self, request: &ConvertRequest) -> Result<String, ConvertError> {
-            Ok(format!("<p>{}</p>", request.text))
+            let files: Vec<&str> = request
+                .text
+                .lines()
+                .filter_map(|line| line.strip_prefix("src:"))
+                .collect();
+            if files.is_empty() {
+                return Ok(format!("<p>{}</p>", request.text));
+            }
+            Ok(format!(
+                "<p>{}</p>\n{FILE_TABLE_OPEN}{}</script>\n",
+                request.text,
+                serde_json::to_string(&files).unwrap()
+            ))
         }
     }
 
@@ -794,6 +1013,30 @@ pub(crate) mod testing {
         (head, response[split + 4..].to_vec())
     }
 
+    /// A POST of `body` to `/<token>/<route>`, read to the end of the
+    /// connection. `origin` is the `Origin` header, left out if `None`.
+    pub(crate) async fn post(
+        port: u16,
+        token: &str,
+        route: &str,
+        origin: Option<&str>,
+        body: &str,
+    ) -> String {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let origin = origin.map_or_else(String::new, |origin| format!("Origin: {origin}\r\n"));
+        let text = format!(
+            "POST /{token}/{route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(text.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
     pub(crate) async fn request(port: u16, method: &str, target: &str, host: &str) -> String {
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
             .await
@@ -850,7 +1093,9 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{address, get, get_bytes, request, start, start_with_images, Stream};
+    use super::testing::{
+        address, get, get_bytes, post, request, start, start_with_images, Stream,
+    };
     use super::*;
 
     fn status_line(response: &str) -> &str {
@@ -1179,6 +1424,7 @@ mod tests {
             ("style.css", "body{}"),
             ("page.js", "EventSource"),
             ("scroll-map.js", "AdocScrollMap"),
+            ("page-sync.js", "AdocPageSync"),
             ("morphdom.js", "morphdom"),
         ] {
             let response = get(port, &format!("/{token}/{path}"), &host).await;
@@ -1299,6 +1545,201 @@ mod tests {
         assert!(replay.contains("<p>x</p>"), "{replay}");
     }
 
+    /// Show `/doc.adoc` with the included files `includes` and return the
+    /// preview's page-action receiver.
+    async fn show_with_includes(
+        preview: &Preview,
+        includes: &[&str],
+    ) -> mpsc::Receiver<PageAction> {
+        let actions = preview.take_actions().expect("actions taken once");
+        let (port, token) = address(preview);
+        let mut stream = Stream::open(port, &token).await;
+        let mut text = String::new();
+        for file in includes {
+            text.push_str(&format!("src:{file}\n"));
+        }
+        text.push_str("shown");
+        preview.request_convert(ConvertRequest {
+            file: PathBuf::from("/doc.adoc"),
+            text,
+            attributes: Vec::new(),
+            overlay: Vec::new(),
+        });
+        stream.until("shown</p>").await;
+        actions
+    }
+
+    fn page_origin(port: u16) -> String {
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_click_on_the_shown_document_reaches_the_editor() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        let body = r#"{"file":"/doc.adoc","line":7}"#;
+        let response = post(port, &token, "click", Some(&origin), body).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(
+            actions.recv().await,
+            Some(PageAction::Click {
+                file: PathBuf::from("/doc.adoc"),
+                line: 7
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_click_on_an_included_file_reaches_the_editor() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &["/chapter.adoc"]).await;
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        let body = r#"{"file":"/chapter.adoc","line":2}"#;
+        let response = post(port, &token, "click", Some(&origin), body).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(
+            actions.recv().await,
+            Some(PageAction::Click {
+                file: PathBuf::from("/chapter.adoc"),
+                line: 2
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scroll_reaches_the_editor() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, token) = address(&preview);
+        let origin = format!("http://localhost:{port}");
+        let body = r#"{"file":"/doc.adoc","line":12}"#;
+        let response = post(port, &token, "scroll", Some(&origin), body).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(
+            actions.recv().await,
+            Some(PageAction::Scroll {
+                file: PathBuf::from("/doc.adoc"),
+                line: 12,
+                cursor: false
+            })
+        );
+        let body = r#"{"file":"/doc.adoc","line":7,"cursor":true}"#;
+        let response = post(port, &token, "scroll", Some(&origin), body).await;
+        assert!(status_line(&response).contains("204"), "{response}");
+        assert_eq!(
+            actions.recv().await,
+            Some(PageAction::Scroll {
+                file: PathBuf::from("/doc.adoc"),
+                line: 7,
+                cursor: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_action_from_another_origin_is_forbidden() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, token) = address(&preview);
+        let body = r#"{"file":"/doc.adoc","line":1}"#;
+        for route in ["click", "scroll"] {
+            for origin in [Some("http://evil.example"), Some("null"), None] {
+                let response = post(port, &token, route, origin, body).await;
+                assert!(
+                    status_line(&response).contains("403"),
+                    "{route} {origin:?}: {response}"
+                );
+            }
+        }
+        let other_port = format!("http://127.0.0.1:{}", port.wrapping_add(1));
+        let response = post(port, &token, "click", Some(&other_port), body).await;
+        assert!(status_line(&response).contains("403"), "{response}");
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_page_action_needs_the_token() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, _) = address(&preview);
+        let origin = page_origin(port);
+        let body = r#"{"file":"/doc.adoc","line":1}"#;
+        let response = post(port, "wrong", "click", Some(&origin), body).await;
+        assert!(status_line(&response).contains("404"), "{response}");
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_page_action_on_a_file_the_page_does_not_show_is_refused() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &["/chapter.adoc"]).await;
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        for route in ["click", "scroll"] {
+            let body = r#"{"file":"/etc/passwd","line":1}"#;
+            let response = post(port, &token, route, Some(&origin), body).await;
+            assert!(
+                status_line(&response).contains("400"),
+                "{route}: {response}"
+            );
+        }
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_page_action_is_refused() {
+        let preview = start().await;
+        let mut actions = show_with_includes(&preview, &[]).await;
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        let oversized = format!(
+            r#"{{"file":"/doc.adoc","line":1,"x":"{}"}}"#,
+            "a".repeat(8192)
+        );
+        for body in [
+            "not json",
+            r#"{"file":"/doc.adoc"}"#,
+            r#"{"file":"/doc.adoc","line":0}"#,
+            r#"{"file":"/doc.adoc","line":-3}"#,
+            oversized.as_str(),
+        ] {
+            let response = post(port, &token, "click", Some(&origin), body).await;
+            assert!(
+                status_line(&response).contains("400"),
+                "{body:.40}: {response}"
+            );
+        }
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn page_actions_are_refused_before_a_document_is_shown() {
+        let preview = start().await;
+        let mut actions = preview.take_actions().unwrap();
+        let (port, token) = address(&preview);
+        let origin = page_origin(port);
+        let body = r#"{"file":"/doc.adoc","line":1}"#;
+        let response = post(port, &token, "click", Some(&origin), body).await;
+        assert!(status_line(&response).contains("400"), "{response}");
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn get_on_a_page_action_route_is_not_found() {
+        let preview = start().await;
+        let (port, token) = address(&preview);
+        let response = get(
+            port,
+            &format!("/{token}/click"),
+            &format!("127.0.0.1:{port}"),
+        )
+        .await;
+        assert!(status_line(&response).contains("404"), "{response}");
+    }
+
     #[test]
     fn parse_request_reads_method_target_and_host() {
         let head = "GET /a/b?x=1 HTTP/1.1\r\nhOsT:  localhost:80 \r\nAccept: */*";
@@ -1308,7 +1749,17 @@ mod tests {
                 method: "GET",
                 target: "/a/b?x=1",
                 host: Some("localhost:80"),
+                origin: None,
+                content_length: None,
             })
+        );
+        let head = "POST /t/click HTTP/1.1\r\nHost: h\r\nOrigin: http://h\r\nContent-Length: 12";
+        let request = parse_request(head).unwrap();
+        assert_eq!(request.origin, Some("http://h"));
+        assert_eq!(request.content_length, Some(12));
+        assert_eq!(
+            parse_request("POST / HTTP/1.1\r\nOrigin: a\r\nOrigin: b"),
+            None
         );
         assert_eq!(parse_request("GET /"), None);
         assert_eq!(parse_request("GET / HTTP/1.1\r\nHost: a\r\nHost: b"), None);

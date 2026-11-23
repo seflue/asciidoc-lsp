@@ -32,7 +32,7 @@ test('script publishes AdocScrollMap on the global like in the browser', () => {
   assert.equal(typeof map, 'object')
   for (const name of ['parseAnchorClass', 'fileAnchors', 'mainFileAnchors',
     'parseFileTable', 'bodyClassName', 'pageTitle', 'srcForFile', 'withSentinel', 'withPageTop', 'anchorIndicesForLine',
-    'scrollTopForLine', 'sourceLineAtViewportTop', 'shouldScroll']) {
+    'scrollTopForLine', 'sourceLineAtViewportTop']) {
     assert.equal(typeof map[name], 'function', name)
   }
 })
@@ -143,16 +143,6 @@ test('scrollTopForLine and sourceLineAtViewportTop round-trip', () => {
     const top = map.scrollTopForLine(anchors, 0, line)
     assert.ok(Math.abs(map.sourceLineAtViewportTop(anchors, top) - line) < 1e-9, String(line))
   }
-})
-
-test('shouldScroll: snap zone is the top quarter of the viewport', () => {
-  const height = 800
-  assert.equal(map.shouldScroll(100, height), true) // inside the top quarter: snap
-  assert.equal(map.shouldScroll(200, height), true) // boundary counts as snap zone
-  assert.equal(map.shouldScroll(201, height), false) // comfortably on screen
-  assert.equal(map.shouldScroll(799, height), false)
-  assert.equal(map.shouldScroll(800, height), true) // at the bottom edge or below
-  assert.equal(map.shouldScroll(-30, height), true) // above the viewport
 })
 
 // A document that includes file 0 (Phase 2): blocks of the main file and of
