@@ -14,11 +14,30 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <notificationGroup id="asciidoc-lsp" displayType="BALLOON"/>
+        <toolWindow id="asciidoc-lsp Preview"
+                    anchor="right"
+                    canCloseContents="false"
+                    factoryClass="io.github.seflue.asciidoclsp.PreviewToolWindowFactory"/>
         <applicationConfigurable parentId="tools"
                                  id="io.github.seflue.asciidoclsp.settings"
                                  displayName="asciidoc-lsp"
                                  instance="io.github.seflue.asciidoclsp.AsciidocLspConfigurable"/>
     </extensions>
+
+    <actions>
+        <group id="io.github.seflue.asciidoclsp.preview">
+            <separator/>
+            <action id="io.github.seflue.asciidoclsp.preview.open"
+                    class="io.github.seflue.asciidoclsp.OpenPreviewAction"
+                    text="Open AsciiDoc Preview"
+                    description="Show the asciidoc-lsp preview of this document in a tool window"/>
+            <action id="io.github.seflue.asciidoclsp.preview.openInBrowser"
+                    class="io.github.seflue.asciidoclsp.OpenPreviewInBrowserAction"
+                    text="Open AsciiDoc Preview in Browser"
+                    description="Show the asciidoc-lsp preview of this document in the browser"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </group>
+    </actions>
 
     <extensions defaultExtensionNs="com.redhat.devtools.lsp4ij">
         <server id="asciidocLsp"

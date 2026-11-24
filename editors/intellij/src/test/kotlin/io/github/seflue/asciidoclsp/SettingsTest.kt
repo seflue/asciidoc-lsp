@@ -1,7 +1,5 @@
 package io.github.seflue.asciidoclsp
 
-import com.intellij.notification.Notification
-import com.intellij.notification.Notifications
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -100,18 +98,5 @@ class SettingsTest : AsciidocLspTestCase() {
         assertTrue(result is ServerResolution.Failed)
         val message = (result as ServerResolution.Failed).message
         assertTrue(message, message.contains("Windows 11/aarch64") && message.contains("custom server path"))
-    }
-
-    private fun collectNotifications(): List<Notification> {
-        val seen = java.util.concurrent.CopyOnWriteArrayList<Notification>()
-        project.messageBus.connect(testRootDisposable).subscribe(
-            Notifications.TOPIC,
-            object : Notifications {
-                override fun notify(notification: Notification) {
-                    seen += notification
-                }
-            },
-        )
-        return seen
     }
 }

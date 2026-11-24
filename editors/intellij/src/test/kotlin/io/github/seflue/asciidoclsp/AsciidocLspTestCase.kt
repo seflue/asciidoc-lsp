@@ -1,5 +1,7 @@
 package io.github.seflue.asciidoclsp
 
+import com.intellij.notification.Notification
+import com.intellij.notification.Notifications
 import com.intellij.openapi.application.WriteAction
 import com.intellij.openapi.module.EmptyModuleType
 import com.intellij.openapi.module.Module
@@ -124,6 +126,43 @@ abstract class AsciidocLspTestCase : BasePlatformTestCase() {
     /** Polls [condition] while the IDE processes events, failing with [message] after the timeout. */
     protected fun waitUntil(message: String, condition: () -> Boolean) {
         PlatformTestUtil.waitWithEventsDispatching(message, condition, TIMEOUT_SECONDS)
+    }
+
+    /**
+     * Whether a real Asciidoctor is installed, for tests that need one; as
+     * `asciidoctor_available` in the server's tests. A test that finds none skips itself,
+     * unless `ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR` is set: then the missing Asciidoctor fails
+     * the test, so CI cannot pass without having run it.
+     */
+    protected fun asciidoctorAvailable(): Boolean {
+        val available = runCatching {
+            ProcessBuilder("asciidoctor", "--version").redirectErrorStream(true).start().run {
+                inputStream.readAllBytes()
+                waitFor() == 0
+            }
+        }.getOrDefault(false)
+        if (!available) {
+            assertNull(
+                "asciidoctor is not on the PATH, but ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR is set",
+                System.getenv("ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR"),
+            )
+            System.err.println("skipped ${getTestName(false)}: asciidoctor is not on the PATH")
+        }
+        return available
+    }
+
+    /** Notifications the project shows from now on. */
+    protected fun collectNotifications(): List<Notification> {
+        val seen = java.util.concurrent.CopyOnWriteArrayList<Notification>()
+        project.messageBus.connect(testRootDisposable).subscribe(
+            Notifications.TOPIC,
+            object : Notifications {
+                override fun notify(notification: Notification) {
+                    seen += notification
+                }
+            },
+        )
+        return seen
     }
 
     companion object {

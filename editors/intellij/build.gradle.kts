@@ -79,5 +79,14 @@ tasks {
         providers.gradleProperty("testBinary").orNull?.let {
             environment("ASCIIDOC_LSP_TEST_BINARY", it)
         }
+        // Read through providers, so a change reconfigures and reruns the tests: the configuration
+        // cache otherwise keeps the environment of the run that stored it.
+        val requireAsciidoctor = providers.environmentVariable("ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR").orNull
+        inputs.property("requireAsciidoctor", requireAsciidoctor ?: "unset")
+        if (requireAsciidoctor == null) {
+            environment.remove("ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR")
+        } else {
+            environment("ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR", requireAsciidoctor)
+        }
     }
 }

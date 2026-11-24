@@ -6,6 +6,10 @@ The plugin bundles the server for Linux (x86_64, aarch64), macOS (x86_64, arm64)
 
 LSP4IJ shows the server's state and log in *View | Tool Windows | Language Servers*.
 
+## Preview
+
+*Open AsciiDoc Preview* (editor context menu or *Find Action*) shows the live preview in the *asciidoc-lsp Preview* tool window; *Open AsciiDoc Preview in Browser* opens it in the browser. The page follows the cursor, and scrolling or double-clicking the page moves the editor. The preview needs Asciidoctor on `PATH`. A chapter file shows inside the top-level document that includes it, as Asciidoctor builds that document. The preview runs next to the AsciiDoc plugin's own preview; neither replaces the other.
+
 ## Settings
 
 *Settings | Tools | asciidoc-lsp*:

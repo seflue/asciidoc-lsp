@@ -10,9 +10,11 @@ import com.intellij.openapi.project.ProjectManager
 import com.redhat.devtools.lsp4ij.LanguageServerFactory
 import com.redhat.devtools.lsp4ij.LanguageServerManager
 import com.redhat.devtools.lsp4ij.ServerStatus
+import com.redhat.devtools.lsp4ij.client.LanguageClientImpl
 import com.redhat.devtools.lsp4ij.server.CannotStartProcessException
 import com.redhat.devtools.lsp4ij.server.OSProcessStreamConnectionProvider
 import com.redhat.devtools.lsp4ij.server.StreamConnectionProvider
+import org.eclipse.lsp4j.services.LanguageServer
 import java.nio.file.Path
 
 const val PLUGIN_ID = "io.github.seflue.asciidoclsp"
@@ -22,6 +24,10 @@ private const val NOTIFICATION_GROUP = "asciidoc-lsp"
 class AsciidocLanguageServerFactory : LanguageServerFactory {
     override fun createConnectionProvider(project: Project): StreamConnectionProvider =
         AsciidocConnectionProvider(project)
+
+    override fun createLanguageClient(project: Project): LanguageClientImpl = AsciidocLanguageClient(project)
+
+    override fun getServerInterface(): Class<out LanguageServer> = AsciidocLanguageServerApi::class.java
 }
 
 /** Starts the binary the settings select; reports a missing binary as a notification. */
@@ -49,10 +55,14 @@ class AsciidocConnectionProvider(private val project: Project) : OSProcessStream
 
 fun pluginDir(): Path? = PluginManagerCore.getPlugin(PluginId.getId(PLUGIN_ID))?.pluginPath
 
-fun notifyError(project: Project?, message: String) {
+fun notifyError(project: Project?, message: String) = notify(project, message, NotificationType.ERROR)
+
+fun notifyInfo(project: Project?, message: String) = notify(project, message, NotificationType.INFORMATION)
+
+private fun notify(project: Project?, message: String, type: NotificationType) {
     NotificationGroupManager.getInstance()
         .getNotificationGroup(NOTIFICATION_GROUP)
-        .createNotification("asciidoc-lsp", message, NotificationType.ERROR)
+        .createNotification("asciidoc-lsp", message, type)
         .notify(project)
 }
 

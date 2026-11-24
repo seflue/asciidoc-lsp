@@ -105,7 +105,12 @@ jobs:
           java-version: 21
       - uses: gradle/actions/setup-gradle@v4
       - uses: extractions/setup-just@v2
+      - name: Install Asciidoctor
+        run: sudo gem install asciidoctor -v 2.0.26
       - run: just test-jetbrains
+        env:
+          # A missing Asciidoctor fails the tests that need it, not skips them.
+          ASCIIDOC_LSP_REQUIRE_ASCIIDOCTOR: "1"
 
   preview-js:
     name: Preview JS
