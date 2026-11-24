@@ -289,6 +289,23 @@ impl<'ws> CatalogCache<'ws> {
             .collect()
     }
 
+    /// Where a path in the value of an attribute entry of `file` on `line`
+    /// starts from in each top-level document that reads the line, with
+    /// `typed` as that document substitutes it: the top-level document's
+    /// folder, as Asciidoctor reads `imagesdir` and most other paths. The
+    /// preview takes no part, as in [`Self::base_dirs`].
+    pub fn attribute_value_base_dirs(&self, file: &Path, line: usize, typed: &str) -> Vec<BaseDir> {
+        let workspace = self.workspace();
+        let file = workspace.indexed_path(file);
+        self.reading_scopes(&file, line, false)
+            .iter()
+            .map(|scope| BaseDir {
+                dir: document_folder(workspace, scope.document()),
+                prefix: scope.substitute(typed),
+            })
+            .collect()
+    }
+
     /// The xrefs of `id` that point at one of the `definitions`: those that
     /// resolve to it in at least one top-level document that reads them, so
     /// an xref to the same ID in another document is no reference. Each

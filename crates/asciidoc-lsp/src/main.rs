@@ -1613,7 +1613,9 @@ impl LanguageServer for AsciiDocLsp {
         };
 
         // Detect completion context from cursor position
-        let Some(ctx) = completion::detect_completion_context(&content, position) else {
+        let Some(ctx) = completion::detect_completion_context(&content, position)
+            .or_else(|| completion::detect_attribute_value_path(&content, position))
+        else {
             return Ok(None);
         };
 

@@ -13,6 +13,9 @@ Before 1.0, a minor version may contain breaking changes.
 ### Added
 
 - Plugin for JetBrains IDEs.
+- Path completion in the value of an attribute entry, once the value holds
+  a `/` (`:testdir: {docdir}/../`). `{docdir}` and relative paths start from
+  the top-level document's folder.
 
 ## [0.10.0] - 2026-11-23
 

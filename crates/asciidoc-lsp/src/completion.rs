@@ -341,6 +341,8 @@ pub(crate) enum CompletionContext {
         /// `}` to append, or `""` when one already follows the cursor.
         closing: &'static str,
     },
+    /// `:name: {docdir}/../` — a path in the value of an attribute entry
+    AttributeValuePath { prefix: String, span: TargetSpan },
     /// `ima` at line start — block macro completion
     BlockMacro { prefix: String },
     /// `NO` at line start — admonition completion
@@ -428,6 +430,61 @@ fn attribute_value_target(before_cursor: &str) -> Option<(&'static str, usize)> 
     }
     let entry = builtin_attribute(name)?;
     (!entry.choices().is_empty()).then(|| (entry.name, before_cursor.len() - value.len()))
+}
+
+/// A path typed in the value of an attribute entry (`:testdir: {docdir}/../`):
+/// the line is one the block tree parses as an attribute entry, and the value
+/// typed so far holds a `/`. The span runs from the value's start to the
+/// cursor.
+pub(crate) fn detect_attribute_value_path(
+    content: &str,
+    pos: Position,
+) -> Option<CompletionContext> {
+    let line_str = content.lines().nth(pos.line as usize)?;
+    let (_, byte_col) = positions::from_lsp_position(pos, content);
+    let before_cursor = &line_str[..byte_col.min(line_str.len())];
+    let (name, after) = before_cursor.strip_prefix(':')?.split_once(':')?;
+    if name.is_empty() || !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let value = after.trim_start_matches([' ', '\t']);
+    if !value.contains('/') || !is_attribute_entry_line(content, pos.line as usize) {
+        return None;
+    }
+    let value_start = before_cursor.len() - value.len();
+    // LSP uses u32 for column offsets; real-world lines won't exceed u32::MAX.
+    #[allow(clippy::cast_possible_truncation)]
+    let start_col = line_str[..value_start].encode_utf16().count() as u32;
+    Some(CompletionContext::AttributeValuePath {
+        prefix: value.to_string(),
+        span: TargetSpan {
+            line: pos.line,
+            start_col,
+            end_col: pos.character,
+            next: None,
+        },
+    })
+}
+
+/// Whether the block tree parses line `line` (0-based) of `content` as an
+/// attribute entry, not as text in a block or a paragraph.
+fn is_attribute_entry_line(content: &str, line: usize) -> bool {
+    fn find(node: tree_sitter::Node<'_>, line: usize) -> bool {
+        if node.start_position().row > line || node.end_position().row < line {
+            return false;
+        }
+        if node.kind() == "document_attr" {
+            return node.start_position().row == line;
+        }
+        let mut cursor = node.walk();
+        let found = node.children(&mut cursor).any(|child| find(child, line));
+        found
+    }
+    let Ok(mut parser) = asciidoc_core::parser::init_block_parser() else {
+        return false;
+    };
+    asciidoc_core::parser::parse(&mut parser, content)
+        .is_ok_and(|tree| find(tree.root_node(), line))
 }
 
 /// How far a target token extends past the cursor.
@@ -1133,6 +1190,8 @@ enum PathCompletionFilter<'a> {
     IncludeTarget { current: &'a Path },
     /// Only image files (png, jpg, svg, ...)
     Image,
+    /// Every file except hidden ones
+    Visible,
 }
 
 /// Image file extensions for completion filtering.
@@ -1294,6 +1353,7 @@ fn list_path_items(
                                 && !is_same_file(&path, current)
                                 && is_text_file(&path)
                         }
+                        PathCompletionFilter::Visible => !name.starts_with('.'),
                         PathCompletionFilter::Image => {
                             Path::new(&name).extension().is_some_and(|ext| {
                                 IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
@@ -1326,6 +1386,26 @@ fn list_path_items(
             }
         })
         .collect()
+}
+
+/// Resolve paths in an attribute value: every visible file and folder,
+/// from the folder of each top-level document that reads the line
+/// ([`CatalogCache::attribute_value_base_dirs`]).
+fn resolve_attribute_value_path_completions(
+    prefix: &str,
+    doc_path: &Path,
+    line: usize,
+    ws: Option<&Workspace>,
+    span: TargetSpan,
+) -> Vec<CompletionItem> {
+    let listings = match ws {
+        Some(ws) => CatalogCache::new(ws).attribute_value_base_dirs(doc_path, line, prefix),
+        None => vec![BaseDir {
+            dir: document_dir(doc_path, None).to_path_buf(),
+            prefix: prefix.to_string(),
+        }],
+    };
+    resolve_path_completions(prefix, &listings, PathCompletionFilter::Visible, "", span)
 }
 
 /// Resolve include-path completions by listing every text file except hidden
@@ -1702,6 +1782,9 @@ pub(crate) fn resolve_completions(
             span,
             closing,
         } => resolve_attribute_completions(&prefix, doc_path, line, ws, closing, span),
+        CompletionContext::AttributeValuePath { prefix, span } => {
+            resolve_attribute_value_path_completions(&prefix, doc_path, line, ws, span)
+        }
         CompletionContext::BlockMacro { prefix } => resolve_block_macro_completions(&prefix),
         CompletionContext::Admonition { prefix } => resolve_admonition_completions(&prefix),
         CompletionContext::DocumentAttribute { prefix } => {
@@ -3146,6 +3229,79 @@ mod tests {
         let image =
             resolve_image_completions("{docdir}/../", &paths[1], 3, Some(&ws), AT_LINE_START);
         assert_eq!(labels(&image), vec!["assets/", "book/"]);
+    }
+
+    // --- Attribute entry values: paths once the value holds a `/` ---
+
+    /// The completion items at the end of line `line0` (0-based) of `path`,
+    /// or `None` when the line offers no path in an attribute value.
+    fn value_items(ws: &Workspace, path: &Path, line0: u32) -> Option<Vec<CompletionItem>> {
+        let content = std::fs::read_to_string(path).unwrap();
+        let col = content.lines().nth(line0 as usize).unwrap().len();
+        let pos = Position::new(line0, u32::try_from(col).unwrap());
+        let ctx = detect_completion_context(&content, pos)
+            .or_else(|| detect_attribute_value_path(&content, pos))?;
+        Some(resolve_completions(ctx, path, line0 as usize + 1, Some(ws)))
+    }
+
+    const VALUE_FILES: [(&str, &str); 4] = [
+        (
+            "book/main.adoc",
+            "= B\n:testdir: {docdir}/../\n:local: chapters/\n\ninclude::chapters/ch.adoc[]\n",
+        ),
+        ("book/chapters/ch.adoc", "== C\n\n:testdir: {docdir}/../\n"),
+        ("assets/pic.png", ""),
+        ("assets/.hidden", ""),
+    ];
+
+    /// `{docdir}` is the top-level document's folder, in the document itself
+    /// and in a file it includes from a subfolder; hidden files stay out.
+    #[test]
+    fn test_attribute_value_lists_paths_from_the_top_level_folder() {
+        let (_dir, ws, paths) = scanned(&VALUE_FILES);
+        let top = value_items(&ws, &paths[0], 1).unwrap();
+        assert_eq!(labels(&top), vec!["assets/", "book/"]);
+        let sub = value_items(&ws, &paths[1], 2).unwrap();
+        assert_eq!(labels(&sub), vec!["assets/", "book/"]);
+    }
+
+    /// A relative value starts from the top-level document's folder, as
+    /// Asciidoctor reads `imagesdir` and most other paths.
+    #[test]
+    fn test_attribute_value_relative_path_starts_from_the_top_level_folder() {
+        let (_dir, ws, paths) = scanned(&VALUE_FILES);
+        let items = value_items(&ws, &paths[0], 2).unwrap();
+        assert_eq!(labels(&items), vec!["ch.adoc"]);
+    }
+
+    /// The edit replaces the value typed so far and nothing after the cursor.
+    #[test]
+    fn test_attribute_value_edit_replaces_the_typed_value() {
+        let (_dir, ws, paths) = scanned(&VALUE_FILES);
+        let items = value_items(&ws, &paths[0], 1).unwrap();
+        let assets = items.iter().find(|i| i.label == "assets/").unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = &assets.text_edit else {
+            panic!("no edit: {assets:?}");
+        };
+        assert_eq!(edit.new_text, "{docdir}/../assets/");
+        assert_eq!(
+            (edit.range.start.character, edit.range.end.character),
+            (10, 22)
+        );
+    }
+
+    /// Only a line the block tree parses as an attribute entry offers paths:
+    /// not one in a listing or comment block, not one glued to a paragraph,
+    /// and not a value without a `/`.
+    #[test]
+    fn test_attribute_value_paths_only_in_real_entries_with_a_slash() {
+        let (_dir, ws, paths) = scanned(&[(
+            "doc.adoc",
+            "= D\n:author: Max\n\n----\n:x: ../\n----\n\n////\n:y: ../\n////\n\nPara.\n:z: ../\n",
+        )]);
+        for line0 in [1, 4, 8, 12] {
+            assert!(value_items(&ws, &paths[0], line0).is_none(), "line {line0}");
+        }
     }
 
     // --- Include targets: any text file, not hidden, not the document itself ---
