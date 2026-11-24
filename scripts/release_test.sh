@@ -48,6 +48,58 @@ test_release_stamps_manifest_and_lock() {
   rm -rf "$dir"
 }
 
+test_prepare_release_commits_and_tags_a_new_version() {
+  local dir; dir="$(scratch_repo)"
+  local before; before="$(git -C "$dir" rev-parse HEAD)"
+  in_repo "$dir" prepare_release 0.10.0 v0.10.0 2026-02-02 https://example.invalid >/dev/null 2>&1
+  assert_eq "$(git -C "$dir" rev-parse HEAD~1)" "$before" "one release commit"
+  assert_eq "$(git -C "$dir" rev-parse 'v0.10.0^{commit}')" "$(git -C "$dir" rev-parse HEAD)" "tag on release commit"
+  assert_eq "$(grep -c '^## \[0.10.0\] - 2026-02-02$' "$dir/CHANGELOG.md")" 1 "changelog section"
+  rm -rf "$dir"
+}
+
+# An aborted release whose tag was deleted, followed by a fix commit: the
+# rerun tags HEAD and leaves the changelog and history alone.
+test_prepare_release_only_tags_an_already_prepared_version() {
+  local dir; dir="$(scratch_repo)"
+  in_repo "$dir" prepare_release 0.10.0 v0.10.0 2026-02-02 https://example.invalid >/dev/null 2>&1
+  git -C "$dir" tag -d v0.10.0 >/dev/null
+  printf '// fix\n' >"$dir/crates/demo/src/lib.rs"
+  git -C "$dir" commit -q -am fix
+  local head changelog
+  head="$(git -C "$dir" rev-parse HEAD)"
+  changelog="$(cat "$dir/CHANGELOG.md")"
+  in_repo "$dir" prepare_release 0.10.0 v0.10.0 2026-02-03 https://example.invalid >/dev/null 2>&1
+  assert_eq "$(git -C "$dir" rev-parse HEAD)" "$head" "no new commit"
+  assert_eq "$(cat "$dir/CHANGELOG.md")" "$changelog" "changelog untouched"
+  assert_eq "$(git -C "$dir" rev-parse 'v0.10.0^{commit}')" "$head" "tag on HEAD"
+  rm -rf "$dir"
+}
+
+test_prepare_release_rejects_unreleased_entries_on_a_prepared_version() {
+  local dir; dir="$(scratch_repo)"
+  in_repo "$dir" prepare_release 0.10.0 v0.10.0 2026-02-02 https://example.invalid >/dev/null 2>&1
+  git -C "$dir" tag -d v0.10.0 >/dev/null
+  sed -i 's/^## \[Unreleased\]$/## [Unreleased]\n\n- Fixed a test/' "$dir/CHANGELOG.md"
+  git -C "$dir" commit -q -am fix
+  if in_repo "$dir" prepare_release 0.10.0 v0.10.0 2026-02-03 https://example.invalid >/dev/null 2>&1; then
+    fail "entries under [Unreleased] must stop a rerun of a prepared version"
+  fi
+  assert_eq "$(git -C "$dir" tag -l v0.10.0)" "" "no tag"
+  rm -rf "$dir"
+}
+
+test_prepare_release_rejects_prepared_changelog_with_stale_manifest() {
+  local dir; dir="$(scratch_repo)"
+  in_repo "$dir" update_changelog 0.10.0 v0.10.0 2026-02-02 https://example.invalid >/dev/null
+  git -C "$dir" commit -q -am "changelog only"
+  if in_repo "$dir" prepare_release 0.10.0 v0.10.0 2026-02-03 https://example.invalid >/dev/null 2>&1; then
+    fail "a changelog section without a matching manifest must fail"
+  fi
+  assert_eq "$(git -C "$dir" tag -l v0.10.0)" "" "no tag"
+  rm -rf "$dir"
+}
+
 test_stamp_only_touches_workspace_package_version() {
   local dir; dir="$(scratch_repo)"
   printf '\n[workspace.dependencies]\nfoo = { version = "1" }\n' >>"$dir/Cargo.toml"

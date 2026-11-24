@@ -118,21 +118,48 @@ stamp_manifest_version() {
   fi
 }
 
+tag_release() {
+  local version="$1" tag="$2"
+  # Annotated: `git push --follow-tags` only pushes annotated tags.
+  git tag -a "${tag}" -m "Release ${version}"
+}
+
 commit_and_tag() {
   local version="$1" tag="$2"
   git add CHANGELOG.md Cargo.toml Cargo.lock
   git commit -m "Release ${version}"
-  # Annotated: `git push --follow-tags` only pushes annotated tags.
-  git tag -a "${tag}" -m "Release ${version}"
+  tag_release "$version" "$tag"
+}
+
+# A rerun after an aborted release (tag deleted, fixes committed on top)
+# finds the version's section already in CHANGELOG.md. Then the release
+# commit exists: only HEAD is tagged, and the changelog stays as it is.
+# A section without the matching manifest version is a half-done release
+# and is rejected. So are entries under [Unreleased]: the tag would ship
+# them while the changelog and the release notes leave them out.
+prepare_release() {
+  local version="$1" tag="$2" date="$3" repository="$4"
+  if grep -q -- "^## \[${version}\]" CHANGELOG.md; then
+    "$(dirname "${BASH_SOURCE[0]}")/check-version.sh" "$tag" \
+      || die "CHANGELOG.md already has [${version}], but the manifest does not. Nothing was tagged."
+    [ -z "$(changelog_notes_for Unreleased | tr -d '[:space:]')" ] \
+      || die "[Unreleased] has entries, but [${version}] is already in CHANGELOG.md. Move them into [${version}], commit, and rerun. Nothing was tagged."
+    echo "⏭️  CHANGELOG.md already has [${version}]; tagging HEAD without a new release commit."
+    tag_release "$version" "$tag"
+  else
+    update_changelog "$version" "$tag" "$date" "$repository"
+    stamp_manifest_version "$version" "$tag"
+    commit_and_tag "$version" "$tag"
+    echo
+    echo "--- CHANGELOG.md and Cargo.toml changes for ${tag} ---"
+    git --no-pager diff HEAD~1 -- CHANGELOG.md Cargo.toml
+  fi
 }
 
 # Everything before this point is local and can still be undone
 # (git reset --hard, git tag -d). This is the point of no return.
 confirm_and_push() {
   local tag="$1"
-  echo
-  echo "--- CHANGELOG.md and Cargo.toml changes for ${tag} ---"
-  git --no-pager diff HEAD~1 -- CHANGELOG.md Cargo.toml
   echo
   local reply
   read -rp "Push ${tag} to origin and publish the GitHub release? [y/N] " reply
@@ -173,9 +200,7 @@ main() {
   date="$(date +%F)"
   repository="$(gh repo view --json url -q .url)"
 
-  update_changelog "$version" "$tag" "$date" "$repository"
-  stamp_manifest_version "$version" "$tag"
-  commit_and_tag "$version" "$tag"
+  prepare_release "$version" "$tag" "$date" "$repository"
   confirm_and_push "$tag"
   publish_release "$tag" "$version"
 
