@@ -159,16 +159,9 @@ LSP4IJ can export a user-defined language server as a zip, so you can hand the f
 
 ### VS Code
 
-The extension is not on the Marketplace yet. Install it from a VSIX attached to a [GitHub release](https://github.com/seflue/asciidoc-lsp/releases):
+Download `asciidoc-lsp-<platform>.vsix` from a [GitHub release](https://github.com/seflue/asciidoc-lsp/releases) and run `code --install-extension asciidoc-lsp-<platform>.vsix`. It bundles the server. From a clone, `just install-vscode-plugin` builds and installs it instead.
 
-1. Download the VSIX for your platform: `asciidoc-lsp-<platform>.vsix` with `linux-x64`, `linux-arm64`, `alpine-x64`, `alpine-arm64`, `darwin-x64`, `darwin-arm64` or `win32-x64`. It bundles the server, so no separate install is needed. On other platforms (for example `win32-arm64`), take `asciidoc-lsp-universal.vsix` and install the server yourself as described above.
-2. Install it: `code --install-extension asciidoc-lsp-<platform>.vsix`, or *Extensions: Install from VSIX...* in the command palette.
-
-The extension starts the server for `.adoc`, `.asciidoc`, `.asc` and `.ad` files. It picks the server in this order: the `asciidoc-lsp.server.path` setting, the bundled binary, `asciidoc-lsp` on `PATH`. The language status item of an AsciiDoc file shows the running server version. `AsciiDoc LSP: Restart Language Server` restarts it, and `asciidoc-lsp.trace.server` traces the protocol traffic.
-
-The extension highlights AsciiDoc with the server's semantic tokens and turns semantic highlighting on for AsciiDoc files whatever the theme says. The colors come from the theme's markup rules (`markup.heading`, `markup.bold`, ...); the token types are `heading`, `strong`, `emphasis`, `raw`, `link` and others, so `editor.semanticTokenColorCustomizations` can restyle them. The file shows no colors until the server has started. The extension also configures `//` and `////` comments and bracket pairs. If you also install [asciidoctor-vscode](https://marketplace.visualstudio.com/items?itemName=asciidoctor.asciidoctor-vscode), its TextMate grammar and our tokens apply to the same text, and its own completion, hover and symbol providers run next to this server, so expect duplicate suggestions.
-
-`AsciiDoc LSP: Open Preview to the Side` and `Open Preview in Browser` open the [live preview](#preview); `Set Preview TOC` chooses its table of contents.
+On platforms without their own VSIX (for example `win32-arm64`), use `asciidoc-lsp-universal.vsix` and install the server as described above. Settings, commands and highlighting are described in the [extension README](editors/vscode/README.md).
 
 ### Other editors
 
