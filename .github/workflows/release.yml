@@ -161,3 +161,55 @@ jobs:
         run: npm --prefix editors/vscode run package -- "${TAG#v}" --no-git-tag-version --out ../../asciidoc-lsp-universal.vsix
       - name: Upload to release
         run: gh release upload "$TAG" asciidoc-lsp-universal.vsix --clobber
+
+  jetbrains:
+    name: JetBrains plugin
+    needs: [verify-version, binaries]
+    if: ${{ !cancelled() && needs.verify-version.result == 'success' && needs.binaries.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      # One ZIP with all five binaries, as server/<target>/asciidoc-lsp[.exe]
+      - name: Fetch server binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: server-*
+          path: artifacts
+      - name: Lay out server binaries
+        run: |
+          for dir in artifacts/server-*; do
+            target="${dir#artifacts/server-}"
+            mkdir -p "editors/intellij/server/$target"
+            cp "$dir"/asciidoc-lsp* "editors/intellij/server/$target/"
+            chmod +x "editors/intellij/server/$target"/asciidoc-lsp*
+          done
+          test "$(ls editors/intellij/server | wc -l)" -eq 5
+      - name: Build plugin
+        run: |
+          editors/intellij/gradlew -p editors/intellij buildPlugin \
+            -PpluginVersion="${TAG#v}" -PserverDir="$GITHUB_WORKSPACE/editors/intellij/server"
+      - name: Write updatePlugins.xml
+        run: |
+          version="${TAG#v}"
+          since="$(sed -n 's/^pluginSinceBuild *= *//p' editors/intellij/gradle.properties)"
+          zip="asciidoc-lsp-jetbrains-${version}.zip"
+          cp "editors/intellij/build/distributions/asciidoc-lsp-${version}.zip" "$zip"
+          cat > updatePlugins.xml <<XML
+          <plugins>
+            <plugin id="io.github.seflue.asciidoclsp" version="${version}"
+                    url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${zip}">
+              <idea-version since-build="${since}"/>
+            </plugin>
+          </plugins>
+          XML
+          echo "ZIP=$zip" >> "$GITHUB_ENV"
+      - name: Upload to release
+        run: gh release upload "$TAG" "$ZIP" updatePlugins.xml --clobber

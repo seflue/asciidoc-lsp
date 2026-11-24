@@ -10,6 +10,10 @@ Before 1.0, a minor version may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Plugin for JetBrains IDEs.
+
 ## [0.10.0] - 2026-11-23
 
 ### Added

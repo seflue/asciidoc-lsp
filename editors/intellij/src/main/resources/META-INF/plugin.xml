@@ -1,0 +1,33 @@
+<idea-plugin>
+    <id>io.github.seflue.asciidoclsp</id>
+    <name>asciidoc-lsp</name>
+    <vendor url="https://github.com/seflue/asciidoc-lsp">seflue</vendor>
+    <description><![CDATA[
+    Language server for AsciiDoc: diagnostics, completion, navigation, references
+    and rename for xrefs, anchors, includes and attributes. Runs the bundled
+    asciidoc-lsp binary through LSP4IJ.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.redhat.devtools.lsp4ij</depends>
+    <depends optional="true" config-file="asciidoc-lsp-asciidoctor.xml">org.asciidoctor.intellij.asciidoc</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <notificationGroup id="asciidoc-lsp" displayType="BALLOON"/>
+        <applicationConfigurable parentId="tools"
+                                 id="io.github.seflue.asciidoclsp.settings"
+                                 displayName="asciidoc-lsp"
+                                 instance="io.github.seflue.asciidoclsp.AsciidocLspConfigurable"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="com.redhat.devtools.lsp4ij">
+        <server id="asciidocLsp"
+                name="asciidoc-lsp"
+                factoryClass="io.github.seflue.asciidoclsp.AsciidocLanguageServerFactory">
+            <description><![CDATA[AsciiDoc language server.]]></description>
+        </server>
+        <fileNamePatternMapping patterns="*.adoc;*.asciidoc"
+                                serverId="asciidocLsp"
+                                languageId="asciidoc"/>
+    </extensions>
+</idea-plugin>

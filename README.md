@@ -147,7 +147,9 @@ Recommended companion plugins:
 
 ### IntelliJ IDEA and other JetBrains IDEs
 
-Use [LSP4IJ](https://github.com/redhat-developer/lsp4ij) (Red Hat), which attaches any language server through a *user-defined language server*, without a dedicated plugin:
+The asciidoc-lsp plugin runs on [LSP4IJ](https://github.com/redhat-developer/lsp4ij) (Red Hat) and bundles the server. It needs an IDE from 2025.2 on. From a clone, close the IDE and run `just install-jetbrains`: it finds the installed JetBrains IDEs, asks which to use when there are several, and installs LSP4IJ and the plugin from the latest release. `just install-jetbrains-dev` builds the plugin from the clone and installs that instead. Settings and building are described in the [plugin README](editors/intellij/README.md).
+
+Without the plugin, LSP4IJ can attach the server as a *user-defined language server*:
 
 1. Install the LSP4IJ plugin from the JetBrains Marketplace.
 2. Open the *New Language Server* dialog, either with `[+]` at the top of `Settings | Languages & Frameworks | Language Servers (LSP4IJ)` or from the menu in the LSP console.
@@ -212,6 +214,7 @@ just lint           # Clippy with -D warnings (pedantic)
 just fmt-check      # Check formatting
 just ci             # All checks: fmt-check + lint + test
 just test-js        # Preview page JS tests (needs Node, not part of ci)
+just test-jetbrains # JetBrains plugin and install.sh tests (needs JDK 21, not part of ci)
 just lsp            # Start the LSP server (for manual testing)
 ```
 

@@ -86,6 +86,27 @@ jobs:
       - run: npm --prefix editors/vscode test
       - run: npm --prefix editors/vscode run package
 
+  jetbrains-plugin:
+    # Not part of `just ci`; runs on every push so a server change that breaks the plugin shows up here.
+    name: JetBrains plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: extractions/setup-just@v2
+      - run: just test-jetbrains
+
   preview-js:
     name: Preview JS
     runs-on: ubuntu-latest
